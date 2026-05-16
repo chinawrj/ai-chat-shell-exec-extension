@@ -25,15 +25,15 @@ Flow:
 
 ## Install
 
+Prerequisites:
+
+- macOS
+- Chrome or another Chromium browser with unpacked extensions enabled
+- Node.js available on `PATH`
+
 1. Open `chrome://extensions`.
 2. Enable Developer mode.
-3. Click Load unpacked and choose either the project root:
-
-   `/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell`
-
-   or the extension subdirectory:
-
-   `/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/extension`
+3. Click Load unpacked and choose either the cloned project root or the `extension/` subdirectory.
 
 4. Confirm the extension ID is:
 
@@ -42,7 +42,7 @@ Flow:
 5. Install and start the local shell server LaunchAgent:
 
    ```sh
-   /Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/install_shell_server_agent.sh
+   ./scripts/install_shell_server_agent.sh
    ```
 
    This creates `~/Library/LaunchAgents/com.local.universal-shell-tool-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`.
@@ -50,7 +50,7 @@ Flow:
    For a temporary foreground server during development, use:
 
    ```sh
-   /Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/start_shell_server.sh
+   ./scripts/start_shell_server.sh
    ```
 
 6. Reload the extension and reload the AI chat page.
@@ -143,7 +143,7 @@ After changing extension files:
 After changing server files with the LaunchAgent installed:
 
 ```sh
-/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/install_shell_server_agent.sh
+./scripts/install_shell_server_agent.sh
 ```
 
 For foreground development:
@@ -152,7 +152,7 @@ For foreground development:
 2. Start it again:
 
    ```sh
-   /Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/start_shell_server.sh
+   ./scripts/start_shell_server.sh
    ```
 
 Health check:
@@ -164,7 +164,7 @@ curl http://127.0.0.1:17371/health
 Uninstall the LaunchAgent:
 
 ```sh
-/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/uninstall_shell_server_agent.sh
+./scripts/uninstall_shell_server_agent.sh
 ```
 
 ## Legacy Native Host
@@ -174,5 +174,9 @@ The earlier Native Messaging prototype is still in `native-host/`, but the curre
 To uninstall the old Native Messaging manifest:
 
 ```sh
-/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/native-host/uninstall_native_host.sh
+./native-host/uninstall_native_host.sh
 ```
+
+## License
+
+MIT
