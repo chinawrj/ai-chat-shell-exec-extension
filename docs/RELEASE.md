@@ -20,8 +20,8 @@
 4. Create and push the tag:
 
    ```sh
-   git tag v0.1.0
-   git push origin main v0.1.0
+   git tag vX.Y.Z
+   git push origin main vX.Y.Z
    ```
 
 5. Create the GitHub release with the generated archives and `SHA256SUMS.txt`.

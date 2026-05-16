@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.1] - 2026-05-16
+
+- Adds AI instruction templates for ChatGPT, Claude, Copilot-style agents, and one-off prompts.
+- Documents safe shell-call behavior, chaining rules, and the expected `shell-output` feedback loop.
+- Updates README install flow to point users at the instruction templates before using the test button.
+
 ## [0.1.0] - 2026-05-16
 
 Initial public release.

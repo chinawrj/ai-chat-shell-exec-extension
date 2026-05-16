@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AI Chat Shell Exec",
   "description": "Runs explicit shell-call blocks from AI chat pages via a local WebSocket shell server and posts shell-output back to the conversation.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvadZ0gW30eAFEi+jN3mh9nfzQHpMafvCGkzjc58D7R/Fs2Ul+DtLEy7nh4ElpPBvHqSW7K9lwZEFX0JNxEm5RCvYuTLdW8p106L6y58yof/a53chiHJgPqwDJ0DJb5N/mBiAtU9yE7bzX2ElIZ7R4INnLhsgFGy4Fqgb/3f9QcPZdnBKXpzpDOcs71bINMF8q94IeDtVnR9Xbj0HxDEau0NvqsXtte5mxw6UxGwRPuOetY2cIyeC9zp9R3pEEbNc9QxWse5U78rHg/JEunZmV1HH7709+emaOkUWJS3tTgHvQxzhpT6SsvvP74LZYAZIhMqw8AZs+CIb10W5xZK/JQIDAQAB",
   "permissions": [
     "storage"

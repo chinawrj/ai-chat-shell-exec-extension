@@ -65,6 +65,22 @@ If you use the release source archive, unzip it and run the commands below from 
 
 After every extension code change, click Reload on the unpacked extension in `chrome://extensions`, then refresh each AI chat tab. Otherwise Chrome will keep running the old content script.
 
+## Configure AI Instructions
+
+For stable tool use, add shell tool instructions to the AI chat system you use. Put them in the chat system's custom instructions, project instructions, agent instructions, or the first message of a conversation.
+
+Start with:
+
+`docs/AI_INSTRUCTIONS.md`
+
+The short version is:
+
+```text
+When you need to run a local shell command, reply with exactly one fenced code block using the language shell-call and no prose. Put only the command inside the block. After I send back shell-output, use that output to continue. Do not repeat the same shell-call after receiving shell-output.
+```
+
+Then run the floating panel's `Test` button once on each AI chat site.
+
 The toolbar popup shows whether the local server is reachable and lets you change:
 
 - enabled/paused
