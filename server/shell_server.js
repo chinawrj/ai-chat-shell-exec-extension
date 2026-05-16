@@ -30,7 +30,9 @@ const server = http.createServer((req, res) => {
       pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
       allowedOrigin: ALLOWED_ORIGIN,
-      allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS
+      allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
+      stateDir: STATE_DIR,
+      ledgerEntries: Object.keys(serverLedger.calls || {}).length
     }));
     return;
   }

@@ -39,7 +39,15 @@ Flow:
 
    `lkmeogidbglhedgekjgbpbfjkpapnhke`
 
-5. Start the local shell server:
+5. Install and start the local shell server LaunchAgent:
+
+   ```sh
+   /Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/install_shell_server_agent.sh
+   ```
+
+   This creates `~/Library/LaunchAgents/com.local.universal-shell-tool-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`.
+
+   For a temporary foreground server during development, use:
 
    ```sh
    /Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/start_shell_server.sh
@@ -61,6 +69,7 @@ On a new chat site, click the chat input once. The content script remembers the 
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a `shell-call`; the extension then executes that returned command and posts the resulting `shell-output`.
+- `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered shell-call/code block area.
@@ -131,7 +140,13 @@ After changing extension files:
 2. Refresh every AI chat tab you want to use.
 3. Confirm the lower-right status badge shows the latest content script version.
 
-After changing server files:
+After changing server files with the LaunchAgent installed:
+
+```sh
+/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/install_shell_server_agent.sh
+```
+
+For foreground development:
 
 1. Stop the old shell server.
 2. Start it again:
@@ -144,6 +159,12 @@ Health check:
 
 ```sh
 curl http://127.0.0.1:17371/health
+```
+
+Uninstall the LaunchAgent:
+
+```sh
+/Users/rjwang/Documents/Codex/2026-05-15/https-chatgpt-com-shell-ai-shell/scripts/uninstall_shell_server_agent.sh
 ```
 
 ## Legacy Native Host

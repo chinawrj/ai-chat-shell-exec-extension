@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "chatgpt-shell-tool-status";
 const STATUS_TEXT_ID = "chatgpt-shell-tool-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.1";
+const CONTENT_SCRIPT_VERSION = "0.6.2";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -1292,6 +1292,7 @@ function injectStatus() {
   actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
   for (const [mode, label] of [
     ["test", "Test"],
+    ["check", "Check"],
     ["input", "Bind input"],
     ["send", "Bind send"],
     ["shell", "Bind shell"],
@@ -1370,6 +1371,13 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "check") {
+    runHealthCheck().catch((error) => {
+      setStatus(`Check failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
@@ -1381,6 +1389,28 @@ function handlePanelAction(action) {
 
   bindingMode = action;
   setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function runHealthCheck() {
+  setStatus("Checking shell server and bindings", "running");
+  const [health, profiles] = await Promise.all([
+    chrome.runtime.sendMessage({ type: "shell-health" }),
+    chrome.storage.local.get([composerProfileKey(), sendProfileKey(), shellProfileKey()])
+  ]);
+  const bindings = [
+    profiles[composerProfileKey()]?.selector ? "input" : "",
+    savedSendSelector || profiles[sendProfileKey()]?.selector ? "send" : "",
+    savedShellSelector || profiles[shellProfileKey()]?.selector ? "shell" : ""
+  ].filter(Boolean);
+
+  if (!health?.ok) {
+    setStatus(`Server offline: ${summarizeCommand(health?.error || "run install/start script")}`, "error");
+    return;
+  }
+
+  const boundText = bindings.length > 0 ? bindings.join("/") : "auto";
+  const pidText = health.pid ? ` pid ${health.pid}` : "";
+  setStatus(`Server ok${pidText}; bindings ${boundText}`, "ok");
 }
 
 async function runFullChainTest() {
