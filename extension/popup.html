@@ -54,6 +54,19 @@
         </label>
       </div>
 
+      <section class="portable">
+        <div>
+          <strong>Portable config</strong>
+          <small>Export or import settings and per-origin bindings.</small>
+        </div>
+        <textarea id="portableConfig" spellcheck="false" placeholder="Exported JSON appears here. Paste JSON here before importing."></textarea>
+        <div id="portableStatus" class="portable-status" aria-live="polite"></div>
+        <div class="portable-actions">
+          <button id="exportConfig" type="button">Export</button>
+          <button id="importConfig" type="button">Import</button>
+        </div>
+      </section>
+
       <footer>
         <button id="refreshHealth" type="button">Check server</button>
         <button id="save" type="button">Save</button>

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Defines the `v0.2.0` release target around diagnostics, portable calibration, and zero-knowledge hardening.
+- Adds popup export/import for settings and per-origin calibration bindings.
 - Adds an install doctor script for Node.js, manifest ID, shell server health, and origin-policy checks.
 - Shows extension/server origin mismatches in popup and floating health checks.
 - Makes the local WebSocket server tolerate TCP-fragmented and coalesced text frames.

@@ -87,6 +87,7 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
+- export/import settings and per-origin calibration bindings
 
 On a new chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
 
@@ -100,6 +101,8 @@ The floating status panel also has calibration controls for unknown chat systems
 - `Clear`: remove the saved bindings for the current origin.
 
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.
+
+Use the popup's portable config area to move settings and bindings to another Chrome profile or machine. It exports only extension settings and calibration selectors; it does not export shell command ledgers or page content.
 
 ## Tool Call Format
 
@@ -198,6 +201,7 @@ node --check extension/src/content.js
 node --check extension/src/background.js
 node --check server/shell_server.js
 node tests/server_websocket_frames.test.js
+node tests/popup_config.test.js
 bash -n scripts/*.sh
 ```
 

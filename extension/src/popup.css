@@ -74,7 +74,8 @@ h1 {
 }
 
 strong,
-.grid span {
+.grid span,
+.portable strong {
   font-size: 13px;
   font-weight: 600;
 }
@@ -112,6 +113,54 @@ input[type="number"] {
   border-radius: 6px;
   font: inherit;
   background: #fff;
+}
+
+.portable {
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+  margin-top: 10px;
+}
+
+.portable > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 78px;
+  max-height: 150px;
+  resize: vertical;
+  padding: 7px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.35;
+  background: #fff;
+  color: #111827;
+}
+
+.portable-status {
+  min-height: 16px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.portable-status[data-state="ok"] {
+  color: #047857;
+}
+
+.portable-status[data-state="error"] {
+  color: #b91c1c;
+}
+
+.portable-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 footer {
