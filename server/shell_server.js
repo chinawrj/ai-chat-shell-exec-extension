@@ -26,7 +26,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
-      service: "chatgpt-shell-server",
+      service: "ai-chat-shell-exec-server",
       pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
       allowedOrigin: ALLOWED_ORIGIN,

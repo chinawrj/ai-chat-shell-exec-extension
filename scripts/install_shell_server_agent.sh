@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_DIR="$ROOT_DIR/.state"
-LABEL="${SHELL_SERVER_AGENT_LABEL:-com.local.universal-shell-tool-server}"
+LABEL="${SHELL_SERVER_AGENT_LABEL:-com.local.ai-chat-shell-exec-server}"
+LEGACY_LABEL="com.local.universal-shell-tool-server"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$LABEL.plist"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
@@ -49,11 +50,17 @@ cat > "$PLIST_PATH" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
+if [[ "$LABEL" != "$LEGACY_LABEL" ]]; then
+  LEGACY_PLIST_PATH="$PLIST_DIR/$LEGACY_LABEL.plist"
+  launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST_PATH" >/dev/null 2>&1 || true
+  launchctl remove "$LEGACY_LABEL" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_PLIST_PATH"
+fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 for _ in {1..20}; do
-  if curl -fsS http://127.0.0.1:17371/health >/dev/null; then
+  if curl -fsS http://127.0.0.1:17371/health >/dev/null 2>&1; then
     echo "Shell server LaunchAgent installed and healthy."
     echo "Label: $LABEL"
     echo "Plist: $PLIST_PATH"

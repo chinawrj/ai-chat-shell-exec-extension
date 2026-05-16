@@ -1,6 +1,6 @@
-# Universal Local Shell Tool
+# AI Chat Shell Exec
 
-Prototype Chrome extension for explicit local shell tool calls on AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`.
+Prototype Chrome extension for explicit local shell execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`.
 
 An AI chat page can request a shell command by returning a fenced code block with the language `shell-call`:
 
@@ -45,7 +45,7 @@ Prerequisites:
    ./scripts/install_shell_server_agent.sh
    ```
 
-   This creates `~/Library/LaunchAgents/com.local.universal-shell-tool-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`.
+   This creates `~/Library/LaunchAgents/com.local.ai-chat-shell-exec-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`.
 
    For a temporary foreground server during development, use:
 
