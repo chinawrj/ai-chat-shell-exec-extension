@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Shell Tool</title>
+    <link rel="stylesheet" href="src/popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Universal Shell Tool</h1>
+        <div id="health" class="health" data-state="checking">Checking server...</div>
+      </header>
+
+      <p class="hint">On a new AI chat site, click the chat input once. The extension remembers that composer for this origin.</p>
+
+      <label class="row">
+        <span>
+          <strong>Enabled</strong>
+          <small>Scan ChatGPT for explicit shell-call blocks.</small>
+        </span>
+        <input id="enabled" type="checkbox">
+      </label>
+
+      <label class="row">
+        <span>
+          <strong>Auto-send results</strong>
+          <small>Post shell-output back after command completion.</small>
+        </span>
+        <input id="autoSend" type="checkbox">
+      </label>
+
+      <label class="row">
+        <span>
+          <strong>Confirm each command</strong>
+          <small>Show a browser prompt before running shell.</small>
+        </span>
+        <input id="requireApproval" type="checkbox">
+      </label>
+
+      <div class="grid">
+        <label>
+          <span>Timeout ms</span>
+          <input id="defaultTimeoutMs" type="number" min="1000" max="600000" step="1000">
+        </label>
+        <label>
+          <span>Max output chars</span>
+          <input id="maxOutputChars" type="number" min="1000" max="200000" step="1000">
+        </label>
+        <label>
+          <span>Chain limit</span>
+          <input id="maxChainCalls" type="number" min="1" max="20" step="1">
+        </label>
+      </div>
+
+      <footer>
+        <button id="refreshHealth" type="button">Check server</button>
+        <button id="save" type="button">Save</button>
+      </footer>
+    </main>
+    <script src="src/popup.js"></script>
+  </body>
+</html>

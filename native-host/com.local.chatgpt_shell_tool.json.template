@@ -1,0 +1,9 @@
+{
+  "name": "com.local.chatgpt_shell_tool",
+  "description": "Native shell runner for ChatGPT Local Shell Tool",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}
