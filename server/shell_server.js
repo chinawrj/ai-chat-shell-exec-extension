@@ -18,7 +18,7 @@ const STATE_DIR = path.join(__dirname, "..", ".state");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
-const ALLOW_UNTRUSTED_ORIGINS = process.env.CHATGPT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
+const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
 let serverLedger = loadServerLedger();
 
 const server = http.createServer((req, res) => {
@@ -101,7 +101,7 @@ server.on("upgrade", (req, socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`ChatGPT shell server listening on ws://${HOST}:${PORT}/shell`);
+  console.log(`AI Chat Shell Exec server listening on ws://${HOST}:${PORT}/shell`);
   console.log(`Allowed origin: ${ALLOWED_ORIGIN}`);
 });
 
@@ -120,7 +120,7 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 function shutdown() {
-  console.log("ChatGPT shell server stopping");
+  console.log("AI Chat Shell Exec server stopping");
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();
 }

@@ -1,6 +1,8 @@
 # AI Chat Shell Exec
 
-Prototype Chrome extension for explicit local shell execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`.
+Chrome extension for explicit local shell execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`.
+
+This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
 An AI chat page can request a shell command by returning a fenced code block with the language `shell-call`:
 
@@ -31,9 +33,15 @@ Prerequisites:
 - Chrome or another Chromium browser with unpacked extensions enabled
 - Node.js available on `PATH`
 
+Download the latest release from:
+
+`https://github.com/chinawrj/ai-chat-shell-exec-extension/releases`
+
+If you use the release source archive, unzip it and run the commands below from the extracted project directory. If you clone the repository, use the repository root.
+
 1. Open `chrome://extensions`.
 2. Enable Developer mode.
-3. Click Load unpacked and choose either the cloned project root or the `extension/` subdirectory.
+3. Click Load unpacked and choose either the project root or the `extension/` subdirectory.
 
 4. Confirm the extension ID is:
 
@@ -123,14 +131,14 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained shell calls are capped by `maxChainCalls` in extension storage. New human prompts reset the chain count; tool result replies do not.
 - Duplicate execution is blocked before the command reaches the shell server. The content script generates a stable call key from the site, latest human intent, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in `.state/shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
-- The WebSocket server only accepts Chrome extension requests by default. Set `CHATGPT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
+- The WebSocket server only accepts Chrome extension requests by default. Set `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
 - The shell server clamps timeout to 1 second through 10 minutes.
 - Commands longer than 8000 characters are rejected before execution.
 - Output is capped to avoid flooding the page.
 - Repeated shell-call output loops are suppressed when the assistant repeats the same command after receiving a shell-output reply.
 - A small status badge appears in the lower-right corner while the content script is active.
 
-This is intentionally a local prototype. Treat it as remote code execution on your machine: only approve commands you understand.
+Treat shell calls as remote code execution on your machine. Review the security notes in `SECURITY.md` before sharing this with other users.
 
 ## Development Loop
 
@@ -167,14 +175,10 @@ Uninstall the LaunchAgent:
 ./scripts/uninstall_shell_server_agent.sh
 ```
 
-## Legacy Native Host
-
-The earlier Native Messaging prototype is still in `native-host/`, but the current extension path uses the WebSocket server instead.
-
-To uninstall the old Native Messaging manifest:
+Build release archives:
 
 ```sh
-./native-host/uninstall_native_host.sh
+./scripts/package_release.sh
 ```
 
 ## License
