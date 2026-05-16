@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "chatgpt-shell-tool-status";
 const STATUS_TEXT_ID = "chatgpt-shell-tool-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.0";
+const CONTENT_SCRIPT_VERSION = "0.6.1";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -239,6 +239,10 @@ async function scanForShellCall() {
   const validation = validateShellCall(call);
   if (!validation.ok) {
     processedCalls.add(callKey);
+    if (isCopiedOutputRejectionReason(validation.reason)) {
+      setStatus(`Suppressed copied shell output: ${summarizeCommand(call.cmd)}`, "ok");
+      return;
+    }
     await replyWithRejectedCall(call, validation.reason);
     return;
   }
@@ -280,6 +284,7 @@ function isAssistantGenerating() {
 function getLastShellCallCandidate(root) {
   const candidates = extractShellCallCandidates(root)
     .filter((candidate) => candidate.call?.cmd)
+    .filter((candidate) => !isShellOutputText(candidate.node?.innerText || candidate.node?.textContent || ""))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
   return candidates.length > 0 ? candidates[candidates.length - 1] : null;
@@ -788,6 +793,13 @@ function validateShellCall(call) {
   return { ok: true };
 }
 
+function isCopiedOutputRejectionReason(reason) {
+  const lower = String(reason || "").toLowerCase();
+  return lower.includes("copied terminal/output text") ||
+    lower.includes("shell-output reply") ||
+    lower.includes("markdown wrapper");
+}
+
 async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
   setStatus(`Rejected shell call: ${reason}`, "error");
@@ -1279,6 +1291,7 @@ function injectStatus() {
   const actions = document.createElement("div");
   actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
   for (const [mode, label] of [
+    ["test", "Test"],
     ["input", "Bind input"],
     ["send", "Bind send"],
     ["shell", "Bind shell"],
@@ -1350,6 +1363,13 @@ function setStatus(text, state = "idle") {
 }
 
 function handlePanelAction(action) {
+  if (action === "test") {
+    runFullChainTest().catch((error) => {
+      setStatus(`Test failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
@@ -1361,6 +1381,25 @@ function handlePanelAction(action) {
 
   bindingMode = action;
   setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function runFullChainTest() {
+  const token = `shell-tool-self-test-${Date.now().toString(36)}`;
+  const command = `printf ${token}`;
+  const prompt = [
+    "Extension full-chain self-test.",
+    "Reply with exactly one fenced code block and no prose.",
+    "The fence language must be shell-call.",
+    "Put only this command inside the code block:",
+    command
+  ].join("\n");
+
+  setStatus(`Starting full test: ${token}`, "running");
+  await insertReply(prompt);
+  const sent = await clickSendWhenReady();
+  if (sent) {
+    setStatus(`Waiting for shell-call test: ${token}`, "running");
+  }
 }
 
 async function restorePanelPosition(panel) {
