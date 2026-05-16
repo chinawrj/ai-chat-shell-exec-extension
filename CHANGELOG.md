@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Makes the local WebSocket server tolerate TCP-fragmented and coalesced text frames.
+- Adds WebSocket frame parser coverage for partial, multiple, extended-length, masked, and server frames.
+
 ## [0.1.1] - 2026-05-16
 
 - Adds AI instruction templates for ChatGPT, Claude, Copilot-style agents, and one-off prompts.

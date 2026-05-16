@@ -78,46 +78,73 @@ server.on("upgrade", (req, socket) => {
     ""
   ].join("\r\n"));
 
+  let frameBuffer = Buffer.alloc(0);
+  let requestInFlight = false;
+
   socket.on("data", (chunk) => {
-    const message = decodeTextFrame(chunk);
-    if (!message) {
+    if (requestInFlight) {
       return;
     }
 
-    handleMessageText(message)
-      .then((response) => {
-        socket.write(encodeTextFrame(JSON.stringify(response)));
-        socket.end();
-      })
-      .catch((error) => {
-        console.error(`[error] ${error.message || String(error)}`);
-        socket.write(encodeTextFrame(JSON.stringify({
-          ok: false,
-          error: error.message || String(error)
-        })));
-        socket.end();
-      });
+    try {
+      frameBuffer = Buffer.concat([frameBuffer, chunk]);
+      const decoded = decodeTextFrames(frameBuffer);
+      frameBuffer = decoded.remaining;
+
+      const [message] = decoded.messages;
+      if (!message) {
+        return;
+      }
+
+      requestInFlight = true;
+      handleMessageText(message)
+        .then((response) => {
+          socket.write(encodeTextFrame(JSON.stringify(response)));
+          socket.end();
+        })
+        .catch((error) => {
+          console.error(`[error] ${error.message || String(error)}`);
+          socket.write(encodeTextFrame(JSON.stringify({
+            ok: false,
+            error: error.message || String(error)
+          })));
+          socket.end();
+        });
+    } catch (error) {
+      console.error(`[error] ${error.message || String(error)}`);
+      socket.write(encodeTextFrame(JSON.stringify({
+        ok: false,
+        error: error.message || String(error)
+      })));
+      socket.end();
+    }
   });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`AI Chat Shell Exec server listening on ws://${HOST}:${PORT}/shell`);
-  console.log(`Allowed origin: ${ALLOWED_ORIGIN}`);
-});
+if (require.main === module) {
+  startServer();
+}
 
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    console.error(`Port ${PORT} is already in use. Stop the existing shell server before starting another one.`);
-  } else if (error.code === "EACCES" || error.code === "EPERM") {
-    console.error(`Cannot listen on ${HOST}:${PORT}: ${error.message}`);
-  } else {
-    console.error(error);
-  }
-  process.exit(1);
-});
+function startServer() {
+  server.listen(PORT, HOST, () => {
+    console.log(`AI Chat Shell Exec server listening on ws://${HOST}:${PORT}/shell`);
+    console.log(`Allowed origin: ${ALLOWED_ORIGIN}`);
+  });
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(`Port ${PORT} is already in use. Stop the existing shell server before starting another one.`);
+    } else if (error.code === "EACCES" || error.code === "EPERM") {
+      console.error(`Cannot listen on ${HOST}:${PORT}: ${error.message}`);
+    } else {
+      console.error(error);
+    }
+    process.exit(1);
+  });
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
 
 function shutdown() {
   console.log("AI Chat Shell Exec server stopping");
@@ -365,50 +392,82 @@ function runShell(cmd, cwd, timeoutMs, maxOutputChars) {
   });
 }
 
-function decodeTextFrame(buffer) {
-  if (buffer.length < 6) {
-    return "";
-  }
+function decodeTextFrames(buffer) {
+  const messages = [];
+  let offset = 0;
 
-  const opcode = buffer[0] & 0x0f;
-  if (opcode === 0x8) {
-    return "";
-  }
-  if (opcode !== 0x1) {
-    throw new Error("Only text WebSocket frames are supported.");
-  }
-
-  const masked = Boolean(buffer[1] & 0x80);
-  let length = buffer[1] & 0x7f;
-  let offset = 2;
-
-  if (length === 126) {
-    length = buffer.readUInt16BE(offset);
-    offset += 2;
-  } else if (length === 127) {
-    const high = buffer.readUInt32BE(offset);
-    const low = buffer.readUInt32BE(offset + 4);
-    offset += 8;
-    if (high !== 0) {
-      throw new Error("WebSocket frame is too large.");
+  while (offset < buffer.length) {
+    if (buffer.length - offset < 2) {
+      break;
     }
-    length = low;
-  }
 
-  let mask;
-  if (masked) {
-    mask = buffer.subarray(offset, offset + 4);
-    offset += 4;
-  }
+    const frameStart = offset;
+    const opcode = buffer[offset] & 0x0f;
+    offset += 1;
 
-  const payload = Buffer.from(buffer.subarray(offset, offset + length));
-  if (masked) {
-    for (let i = 0; i < payload.length; i += 1) {
-      payload[i] ^= mask[i % 4];
+    if (opcode === 0x8) {
+      return { messages, remaining: Buffer.alloc(0) };
     }
+    if (opcode !== 0x1) {
+      throw new Error("Only complete text WebSocket frames are supported.");
+    }
+
+    const masked = Boolean(buffer[offset] & 0x80);
+    let length = buffer[offset] & 0x7f;
+    offset += 1;
+
+    if (length === 126) {
+      if (buffer.length - offset < 2) {
+        offset = frameStart;
+        break;
+      }
+      length = buffer.readUInt16BE(offset);
+      offset += 2;
+    } else if (length === 127) {
+      if (buffer.length - offset < 8) {
+        offset = frameStart;
+        break;
+      }
+      const high = buffer.readUInt32BE(offset);
+      const low = buffer.readUInt32BE(offset + 4);
+      offset += 8;
+      if (high !== 0) {
+        throw new Error("WebSocket frame is too large.");
+      }
+      length = low;
+    }
+
+    let mask;
+    if (masked) {
+      if (buffer.length - offset < 4) {
+        offset = frameStart;
+        break;
+      }
+      mask = buffer.subarray(offset, offset + 4);
+      offset += 4;
+    }
+
+    if (buffer.length - offset < length) {
+      offset = frameStart;
+      break;
+    }
+
+    const payload = Buffer.from(buffer.subarray(offset, offset + length));
+    offset += length;
+
+    if (masked) {
+      for (let i = 0; i < payload.length; i += 1) {
+        payload[i] ^= mask[i % 4];
+      }
+    }
+
+    messages.push(payload.toString("utf8"));
   }
 
-  return payload.toString("utf8");
+  return {
+    messages,
+    remaining: offset < buffer.length ? buffer.subarray(offset) : Buffer.alloc(0)
+  };
 }
 
 function encodeTextFrame(text) {
@@ -475,3 +534,9 @@ function resolveCwd(rawCwd) {
   }
   return resolved;
 }
+
+module.exports = {
+  decodeTextFrames,
+  encodeTextFrame,
+  startServer
+};

@@ -185,6 +185,15 @@ Health check:
 curl http://127.0.0.1:17371/health
 ```
 
+Local checks:
+
+```sh
+node --check extension/src/content.js
+node --check extension/src/background.js
+node --check server/shell_server.js
+node tests/server_websocket_frames.test.js
+```
+
 Uninstall the LaunchAgent:
 
 ```sh
