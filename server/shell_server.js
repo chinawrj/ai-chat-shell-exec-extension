@@ -14,7 +14,12 @@ const ALLOWED_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
+const STATE_DIR = path.join(__dirname, "..", ".state");
+const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
+const SERVER_LEDGER_LIMIT = 1000;
+const RUNNING_LOCK_GRACE_MS = 15000;
 const ALLOW_UNTRUSTED_ORIGINS = process.env.CHATGPT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
+let serverLedger = loadServerLedger();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -137,21 +142,145 @@ async function handleMessageText(text) {
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
   const cwd = resolveCwd(message.cwd);
+  const callKey = normalizeCallKey(message.callKey || message.id || hashText([
+    cmd,
+    cwd,
+    timeoutMs,
+    maxOutputChars
+  ].join("\n")));
   const started = Date.now();
+  const claim = claimServerShellCall(callKey, {
+    cmd,
+    cwd,
+    timeoutMs,
+    maxOutputChars,
+    seq: message.seq,
+    callMeta: message.callMeta || {}
+  });
+  if (claim.action === "skip") {
+    console.log(`[skip] reason=${claim.reason} callKey=${callKey} cmd=${JSON.stringify(cmd)}`);
+    return {
+      ok: true,
+      id: message.id,
+      callKey,
+      duplicate: true,
+      skipped: true,
+      reason: claim.reason,
+      cmd,
+      cwd,
+      timeoutMs,
+      durationMs: 0,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      timedOut: false
+    };
+  }
 
-  console.log(`[run] cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
+  console.log(`[run] callKey=${callKey} seq=${message.seq || ""} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
   const result = await runShell(cmd, cwd, timeoutMs, maxOutputChars);
   console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
-  return {
+  const response = {
     ok: true,
     id: message.id,
+    callKey,
     cmd,
     cwd,
     timeoutMs,
     durationMs: Date.now() - started,
     ...result
   };
+  completeServerShellCall(callKey, response);
+  return response;
+}
+
+function claimServerShellCall(callKey, payload) {
+  const now = Date.now();
+  const existing = serverLedger.calls?.[callKey];
+  const lockTtl = Math.max(5000, Number(payload.timeoutMs || DEFAULT_TIMEOUT_MS) + RUNNING_LOCK_GRACE_MS);
+
+  if (existing?.state === "completed") {
+    return { action: "skip", reason: "completed" };
+  }
+  if (existing?.state === "running" && now - Number(existing.startedAt || 0) < lockTtl) {
+    return { action: "skip", reason: "running" };
+  }
+
+  serverLedger.calls ||= {};
+  serverLedger.calls[callKey] = {
+    state: "running",
+    startedAt: now,
+    cmdHash: hashText(payload.cmd),
+    cwd: payload.cwd,
+    seq: payload.seq || "",
+    origin: payload.callMeta?.origin || "",
+    pathname: payload.callMeta?.pathname || "",
+    promptHash: payload.callMeta?.promptHash || ""
+  };
+  saveServerLedger();
+  return { action: "run" };
+}
+
+function completeServerShellCall(callKey, response) {
+  serverLedger.calls ||= {};
+  serverLedger.calls[callKey] = {
+    ...(serverLedger.calls[callKey] || {}),
+    state: "completed",
+    completedAt: Date.now(),
+    exitCode: response.exitCode,
+    durationMs: response.durationMs,
+    timedOut: response.timedOut === true,
+    truncated: response.truncated === true
+  };
+  pruneServerLedger();
+  saveServerLedger();
+}
+
+function loadServerLedger() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
+    if (parsed && typeof parsed === "object") {
+      return {
+        version: 1,
+        calls: parsed.calls && typeof parsed.calls === "object" ? parsed.calls : {}
+      };
+    }
+  } catch {
+    // Missing or invalid ledger files are treated as an empty ledger.
+  }
+  return { version: 1, calls: {} };
+}
+
+function saveServerLedger() {
+  pruneServerLedger();
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tempPath = `${LEDGER_PATH}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(serverLedger, null, 2));
+  fs.renameSync(tempPath, LEDGER_PATH);
+}
+
+function pruneServerLedger() {
+  const entries = Object.entries(serverLedger.calls || {});
+  if (entries.length <= SERVER_LEDGER_LIMIT) {
+    return;
+  }
+
+  entries
+    .sort(([, a], [, b]) => Number(b.completedAt || b.startedAt || 0) - Number(a.completedAt || a.startedAt || 0))
+    .slice(SERVER_LEDGER_LIMIT)
+    .forEach(([key]) => {
+      delete serverLedger.calls[key];
+    });
+}
+
+function normalizeCallKey(value) {
+  const raw = String(value || "").trim();
+  if (/^[a-zA-Z0-9._:-]{1,128}$/.test(raw)) {
+    return raw;
+  }
+  return hashText(raw || `${Date.now()}:${Math.random()}`);
 }
 
 function validateCommand(cmd) {
@@ -321,6 +450,14 @@ function clampNumber(value, min, max, fallback) {
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.floor(number)));
+}
+
+function hashText(input) {
+  return crypto
+    .createHash("sha256")
+    .update(String(input || ""))
+    .digest("hex")
+    .slice(0, 32);
 }
 
 function resolveCwd(rawCwd) {

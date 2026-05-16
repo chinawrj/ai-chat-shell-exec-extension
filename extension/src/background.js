@@ -1,5 +1,8 @@
 const SHELL_SERVER_URL = "ws://127.0.0.1:17371/shell";
 const SHELL_SERVER_HEALTH_URL = "http://127.0.0.1:17371/health";
+const CALL_LEDGER_KEY = "shellCallLedger:v1";
+const CALL_LEDGER_LIMIT = 500;
+const RUNNING_LOCK_GRACE_MS = 15000;
 const DEFAULT_SETTINGS = {
   enabled: true,
   requireApproval: false,
@@ -38,29 +41,62 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  chrome.storage.sync.get(
-    ["defaultTimeoutMs", "maxOutputChars"],
-    (settings) => {
-      const payload = {
-        type: "run",
-        id: message.id,
-        cmd: message.cmd,
-        cwd: message.cwd,
-        timeoutMs: message.timeoutMs || settings.defaultTimeoutMs || 30000,
-        maxOutputChars: message.maxOutputChars || settings.maxOutputChars || 20000
-      };
-
-      runShellViaWebSocket(payload)
-        .then(sendResponse)
-        .catch((error) => sendResponse({
-          ok: false,
-          error: error.message || String(error)
-        }));
-    }
-  );
+  handleRunShellMessage(message)
+    .then(sendResponse)
+    .catch((error) => sendResponse({
+      ok: false,
+      error: error.message || String(error)
+    }));
 
   return true;
 });
+
+async function handleRunShellMessage(message) {
+  const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
+  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
+  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
+  const callKey = message.callKey || message.id || "";
+  const payload = {
+    type: "run",
+    id: message.id,
+    callKey,
+    cmd: message.cmd,
+    cwd: message.cwd,
+    timeoutMs,
+    maxOutputChars,
+    callMeta: message.callMeta || {}
+  };
+
+  const claim = await claimShellCall(callKey, payload);
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      duplicate: true,
+      skipped: true,
+      callKey,
+      reason: claim.reason
+    };
+  }
+
+  payload.seq = claim.seq;
+  try {
+    const response = await runShellViaWebSocket(payload);
+    await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
+      completedAt: Date.now(),
+      exitCode: response?.exitCode,
+      durationMs: response?.durationMs,
+      duplicate: response?.duplicate === true,
+      skipped: response?.skipped === true
+    });
+    return response;
+  } catch (error) {
+    await markShellCall(callKey, "failed", {
+      completedAt: Date.now(),
+      error: error.message || String(error)
+    });
+    throw error;
+  }
+}
 
 async function checkShellServerHealth() {
   const controller = new AbortController();
@@ -102,6 +138,100 @@ function ensureDefaultSettings() {
       chrome.storage.sync.set(missing);
     }
   });
+}
+
+async function claimShellCall(callKey, payload) {
+  if (!callKey) {
+    return { action: "run", seq: Date.now() };
+  }
+
+  const now = Date.now();
+  const store = await localGet(CALL_LEDGER_KEY);
+  const ledger = store[CALL_LEDGER_KEY] || { nextSeq: 1, calls: {} };
+  ledger.calls ||= {};
+  const existing = ledger.calls[callKey];
+  const lockTtl = Math.max(5000, Number(payload.timeoutMs || 30000) + RUNNING_LOCK_GRACE_MS);
+
+  if (existing?.state === "completed") {
+    return { action: "skip", reason: "completed" };
+  }
+  if (existing?.state === "running" && now - Number(existing.claimedAt || 0) < lockTtl) {
+    return { action: "skip", reason: "running" };
+  }
+
+  const seq = Number(ledger.nextSeq || 1);
+  ledger.nextSeq = seq + 1;
+  ledger.calls[callKey] = {
+    state: "running",
+    seq,
+    claimedAt: now,
+    cmdHash: hashText(payload.cmd || ""),
+    origin: payload.callMeta?.origin || "",
+    pathname: payload.callMeta?.pathname || "",
+    promptHash: payload.callMeta?.promptHash || ""
+  };
+  pruneCallLedger(ledger);
+  await localSet({ [CALL_LEDGER_KEY]: ledger });
+  return { action: "run", seq };
+}
+
+async function markShellCall(callKey, state, extra = {}) {
+  if (!callKey) {
+    return;
+  }
+
+  const store = await localGet(CALL_LEDGER_KEY);
+  const ledger = store[CALL_LEDGER_KEY] || { nextSeq: 1, calls: {} };
+  ledger.calls ||= {};
+  ledger.calls[callKey] = {
+    ...(ledger.calls[callKey] || {}),
+    state,
+    ...extra
+  };
+  pruneCallLedger(ledger);
+  await localSet({ [CALL_LEDGER_KEY]: ledger });
+}
+
+function pruneCallLedger(ledger) {
+  const entries = Object.entries(ledger.calls || {});
+  if (entries.length <= CALL_LEDGER_LIMIT) {
+    return;
+  }
+
+  entries
+    .sort(([, a], [, b]) => Number(b.completedAt || b.claimedAt || 0) - Number(a.completedAt || a.claimedAt || 0))
+    .slice(CALL_LEDGER_LIMIT)
+    .forEach(([key]) => {
+      delete ledger.calls[key];
+    });
+}
+
+function syncGet(keys) {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(keys, resolve);
+  });
+}
+
+function localGet(keys) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(keys, resolve);
+  });
+}
+
+function localSet(values) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(values, resolve);
+  });
+}
+
+function hashText(input) {
+  let hash = 2166136261;
+  const text = String(input || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
 }
 
 function runShellViaWebSocket(payload) {

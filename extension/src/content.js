@@ -8,8 +8,12 @@ const TOOL_LANGS = new Set([
 const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "chatgpt-shell-tool-status";
-const CONTENT_SCRIPT_VERSION = "0.4.4";
+const STATUS_TEXT_ID = "chatgpt-shell-tool-status-text";
+const CONTENT_SCRIPT_VERSION = "0.6.0";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
+const SEND_PROFILE_PREFIX = "sendProfile:";
+const SHELL_PROFILE_PREFIX = "shellProfile:";
+const PANEL_PROFILE_PREFIX = "panelProfile:";
 const processedCalls = new Set();
 let scanTimer = 0;
 let lastThreadText = "";
@@ -20,11 +24,26 @@ let lastUserMessageText = "";
 let lastDisabledStatusAt = 0;
 let lastComposerElement = null;
 let lastComposerSelector = "";
+let bindingMode = "";
+let lastPointerTarget = null;
+let savedSendSelector = "";
+let savedShellSelector = "";
 
 injectStatus();
+loadLocalProfiles();
 observeThread();
 observeComposerFocus();
+observeBindingTargets();
 scheduleScan();
+
+async function loadLocalProfiles() {
+  const profiles = await chrome.storage.local.get([
+    sendProfileKey(),
+    shellProfileKey()
+  ]);
+  savedSendSelector = profiles[sendProfileKey()]?.selector || "";
+  savedShellSelector = profiles[shellProfileKey()]?.selector || "";
+}
 
 function observeThread() {
   const observer = new MutationObserver(() => {
@@ -52,6 +71,27 @@ function observeComposerFocus() {
   }, true);
 }
 
+function observeBindingTargets() {
+  document.addEventListener("pointerdown", (event) => {
+    lastPointerTarget = event.target;
+  }, true);
+
+  document.addEventListener("click", (event) => {
+    if (!bindingMode || isInsideShellToolPanel(event.target)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    bindElement(bindingMode, event.target);
+    bindingMode = "";
+  }, true);
+
+  document.addEventListener("dragstart", (event) => {
+    lastPointerTarget = event.target;
+  }, true);
+}
+
 function rememberComposer(target) {
   const editable = closestEditable(target);
   if (!editable || !isVisibleElement(editable)) {
@@ -72,6 +112,55 @@ function rememberComposer(target) {
       savedAt: new Date().toISOString()
     }
   });
+}
+
+function bindElement(mode, target) {
+  if (!target || !(target instanceof Element) || isInsideShellToolPanel(target)) {
+    setStatus("Binding skipped: no page element selected", "error");
+    return;
+  }
+
+  if (mode === "input") {
+    const editable = closestEditable(target);
+    if (!editable || !isVisibleElement(editable)) {
+      setStatus("Binding failed: selected element is not editable", "error");
+      return;
+    }
+    rememberComposer(editable);
+    setStatus("Bound chat input for this origin", "ok");
+    return;
+  }
+
+  const selector = buildStableSelector(target);
+  if (!selector) {
+    setStatus("Binding failed: could not build selector", "error");
+    return;
+  }
+
+  if (mode === "send") {
+    savedSendSelector = selector;
+    chrome.storage.local.set({
+      [sendProfileKey()]: {
+        selector,
+        host: location.host,
+        savedAt: new Date().toISOString()
+      }
+    });
+    setStatus("Bound send control for this origin", "ok");
+    return;
+  }
+
+  if (mode === "shell") {
+    savedShellSelector = selector;
+    chrome.storage.local.set({
+      [shellProfileKey()]: {
+        selector,
+        host: location.host,
+        savedAt: new Date().toISOString()
+      }
+    });
+    setStatus("Bound shell-call display area for this origin", "ok");
+  }
 }
 
 function scheduleScan() {
@@ -125,41 +214,44 @@ async function scanForShellCall() {
   }
 
   const call = candidate.call;
-  const callId = stableHash([
+  const callKey = stableHash([
     location.origin,
     location.pathname,
-    candidate.index,
+    stableHash(getLastUserMessageText()),
     call.cmd,
     call.cwd || "",
-    call.timeoutMs || ""
+    call.timeoutMs || "",
+    call.maxOutputChars || ""
   ].join("\n"));
-  if (processedCalls.has(callId)) {
+  if (processedCalls.has(callKey)) {
     return;
   }
 
-  const lastOutputText = getLastUserMessageText() || getLastShellOutputText();
-  if (isShellOutputText(lastOutputText) && isSameCommandAsShellOutput(call.cmd, lastOutputText)) {
-    processedCalls.add(callId);
-    setStatus(`Ignored repeated shell call: ${summarizeCommand(call.cmd)}`, "error");
+  const lastShellOutputText = getLastShellOutputText();
+  const lastPromptOrOutputText = getLastUserMessageText();
+  if ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
+    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText))) {
+    processedCalls.add(callKey);
+    setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
   }
 
   const validation = validateShellCall(call);
   if (!validation.ok) {
-    processedCalls.add(callId);
+    processedCalls.add(callKey);
     await replyWithRejectedCall(call, validation.reason);
     return;
   }
 
   const maxChainCalls = Number(settings.maxChainCalls || 5);
   if (chainCallCount >= maxChainCalls) {
-    processedCalls.add(callId);
+    processedCalls.add(callKey);
     await replyWithRejectedCall(call, `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`);
     return;
   }
 
-  processedCalls.add(callId);
-  await runAndReply(callId, call);
+  processedCalls.add(callKey);
+  await runAndReply(callKey, call);
 }
 
 function isSupportedPage() {
@@ -196,70 +288,84 @@ function getLastShellCallCandidate(root) {
 function extractShellCallCandidates(root) {
   let index = 0;
   const candidates = [];
+  const roots = [root, ...getBoundShellRoots(root)]
+    .filter((node, nodeIndex, all) => all.indexOf(node) === nodeIndex);
 
-  for (const pre of Array.from(root.querySelectorAll("pre"))) {
-    if (closestEditable(pre) || !isVisibleElement(pre)) {
-      continue;
+  for (const scanRoot of roots) {
+    for (const pre of Array.from(scanRoot.querySelectorAll("pre"))) {
+      if (closestEditable(pre) || !isVisibleElement(pre)) {
+        continue;
+      }
+
+      const code = pre.querySelector("code") || pre;
+      const cmdText = normalizeCommand(code.innerText || code.textContent || "");
+      if (!cmdText) {
+        continue;
+      }
+
+      const language = detectCodeLanguage(pre, code);
+      if (TOOL_LANGS.has(language) || shouldTreatShellLikeCodeAsTool(language, pre)) {
+        candidates.push({
+          call: parseCallPayload(cmdText),
+          node: closestMessageContainer(pre),
+          index: index += 1,
+          source: "rendered-code"
+        });
+      }
     }
 
-    const code = pre.querySelector("code") || pre;
-    const cmdText = normalizeCommand(code.innerText || code.textContent || "");
-    if (!cmdText) {
-      continue;
-    }
-
-    const language = detectCodeLanguage(pre, code);
-    if (TOOL_LANGS.has(language) || shouldTreatShellLikeCodeAsTool(language, pre)) {
+    for (const block of extractLabeledCodeBlockCalls(scanRoot)) {
       candidates.push({
-        call: parseCallPayload(cmdText),
-        node: closestMessageContainer(pre),
+        ...block,
         index: index += 1,
-        source: "rendered-code"
+        source: "labeled-code"
       });
     }
-  }
 
-  for (const block of extractLabeledCodeBlockCalls(root)) {
-    candidates.push({
-      ...block,
-      index: index += 1,
-      source: "labeled-code"
-    });
-  }
-
-  for (const block of extractLanguageLabelSiblingCalls(root)) {
-    candidates.push({
-      ...block,
-      index: index += 1,
-      source: "language-label"
-    });
-  }
-
-  for (const block of extractPlainTextLanguageSections(root)) {
-    candidates.push({
-      ...block,
-      index: index += 1,
-      source: "plain-text-language"
-    });
-  }
-
-  for (const textRoot of getTextScanRoots(root)) {
-    if (closestEditable(textRoot) || !isVisibleElement(textRoot)) {
-      continue;
+    for (const block of extractLanguageLabelSiblingCalls(scanRoot)) {
+      candidates.push({
+        ...block,
+        index: index += 1,
+        source: "language-label"
+      });
     }
 
-    for (const call of extractMarkdownFenceCalls(textRoot)) {
+    for (const block of extractPlainTextLanguageSections(scanRoot)) {
       candidates.push({
-        call,
-        node: closestMessageContainer(textRoot),
+        ...block,
         index: index += 1,
-        source: "markdown-text"
+        source: "plain-text-language"
       });
+    }
+
+    for (const textRoot of getTextScanRoots(scanRoot)) {
+      if (closestEditable(textRoot) || !isVisibleElement(textRoot)) {
+        continue;
+      }
+
+      for (const call of extractMarkdownFenceCalls(textRoot)) {
+        candidates.push({
+          call,
+          node: closestMessageContainer(textRoot),
+          index: index += 1,
+          source: "markdown-text"
+        });
+      }
     }
   }
 
   candidates.sort((a, b) => compareNodeOrder(a.node, b.node) || a.index - b.index);
   return candidates;
+}
+
+function getBoundShellRoots(root) {
+  if (!savedShellSelector) {
+    return [];
+  }
+
+  return Array.from(document.querySelectorAll(savedShellSelector))
+    .filter((node) => root === node || root.contains(node))
+    .filter(isVisibleElement);
 }
 
 function extractPlainTextLanguageSections(root) {
@@ -312,7 +418,7 @@ function extractLanguageLabelSiblingCalls(root) {
 
       const container = findLanguageLabelContainer(label, language);
       const command = extractCommandAfterLanguage(container, language);
-      if (!command || command.length > 8000 || command.toLowerCase().includes("claude is ai and can make mistakes")) {
+      if (!command || command.length > 8000) {
         return null;
       }
 
@@ -386,7 +492,7 @@ function extractLabeledCodeBlockCalls(root) {
         languageIndex = -1;
       }
       const command = trimCommandLines(lines.slice(languageIndex + 1)).join("\n");
-      if (!command || command.toLowerCase().includes("claude is ai and can make mistakes")) {
+      if (!command) {
         return null;
       }
 
@@ -434,16 +540,13 @@ function trimCommandLines(lines) {
     "edit",
     "message actions",
     "write a message...",
-    "write a message",
-    "claude works directly with your codebase"
+    "write a message"
   ]);
   const commandLines = [];
 
   for (const line of lines) {
     const lower = line.toLowerCase();
     if (stopWords.has(lower) ||
-      lower.startsWith("claude is ai") ||
-      lower.startsWith("let claude edit files") ||
       lower.startsWith("model:") ||
       lower === "adaptive") {
       break;
@@ -598,23 +701,23 @@ function getLastUserMessageText() {
     return normalizeCommand(last.innerText || last.textContent || "");
   }
 
-  const headings = Array.from(document.querySelectorAll("h1, h2, h3, [role='heading']"))
-    .filter(isVisibleElement);
-  const userHeading = headings.reverse().find((node) => normalizeText(node.textContent || "").toLowerCase().includes("you said"));
-  if (userHeading) {
-    const container = userHeading.closest("article, [role='article'], [data-testid], section, main > div, div");
-    const text = normalizeCommand(container?.innerText || container?.textContent || "");
-    if (text) {
-      return text;
-    }
-  }
-
-  const userish = Array.from(document.querySelectorAll("article, [role='article'], [data-testid], main > div"))
+  const promptLike = Array.from(document.querySelectorAll("article, [role='article'], [data-testid], section, main > div, h1, h2, h3, [role='heading']"))
     .filter(isVisibleElement)
     .map((node) => normalizeCommand(node.innerText || node.textContent || ""))
-    .filter((text) => text && (text.includes("Shell call result:") || text.includes("Shell call failed:") || text.includes("Shell call rejected:")));
+    .filter((text) => text && text.length <= 5000)
+    .filter((text) => !isShellOutputText(text))
+    .filter(containsToolLanguageHint);
 
-  return userish.length > 0 ? userish[userish.length - 1] : "";
+  if (promptLike.length > 0) {
+    return promptLike[promptLike.length - 1];
+  }
+
+  const toolOutputLike = Array.from(document.querySelectorAll("article, [role='article'], [data-testid], main > div"))
+    .filter(isVisibleElement)
+    .map((node) => normalizeCommand(node.innerText || node.textContent || ""))
+    .filter(isShellOutputText);
+
+  return toolOutputLike.length > 0 ? toolOutputLike[toolOutputLike.length - 1] : "";
 }
 
 function getLastShellOutputText() {
@@ -731,8 +834,19 @@ async function runAndReply(callId, call) {
     const response = await chrome.runtime.sendMessage({
       type: "run-shell",
       id: callId,
+      callKey: callId,
+      callMeta: {
+        origin: location.origin,
+        pathname: location.pathname,
+        promptHash: stableHash(getLastUserMessageText())
+      },
       ...call
     });
+
+    if (response?.duplicate === true && response?.skipped === true) {
+      setStatus("Skipped duplicate shell call", "ok");
+      return;
+    }
 
     const reply = formatShellOutput(call, response, startedAt);
     await insertReply(reply);
@@ -866,13 +980,11 @@ async function findReplyInput() {
   }
 
   const preferredSelectors = [
-    "#prompt-textarea",
     '[contenteditable="true"][role="textbox"]',
     '[role="textbox"][contenteditable="true"]',
-    'textarea[placeholder*="Ask"]',
-    'textarea[placeholder*="Message"]',
-    'textarea[placeholder*="Reply"]',
+    '[role="textbox"]',
     "textarea",
+    "input",
     '[contenteditable="true"]'
   ];
 
@@ -905,11 +1017,28 @@ function editableScore(node) {
 }
 
 async function clickSendWhenReady() {
+  const composer = lastComposerElement || closestEditable(document.activeElement);
+  const originalText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
+
   for (let attempt = 0; attempt < 80; attempt += 1) {
-    const sendButton = findSendButton();
+    if (attempt === 0 && trySubmitForm(composer)) {
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
+      }
+    }
+
+    if (attempt === 1 && tryKeyboardSubmit(composer)) {
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
+      }
+    }
+
+    const sendButton = findSendButton(attempt < 20);
     if (sendButton && !sendButton.disabled && sendButton.getAttribute("aria-disabled") !== "true") {
       sendButton.click();
-      return true;
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
+      }
     }
     await sleep(150);
   }
@@ -918,11 +1047,72 @@ async function clickSendWhenReady() {
   return false;
 }
 
-function findSendButton() {
+function trySubmitForm(composer) {
+  const form = composer?.closest?.("form");
+  if (!form) {
+    return false;
+  }
+
+  try {
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else {
+      form.dispatchEvent(new SubmitEvent("submit", {
+        bubbles: true,
+        cancelable: true
+      }));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryKeyboardSubmit(composer) {
+  if (!composer) {
+    return false;
+  }
+
+  composer.focus();
+  const events = [
+    new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true }),
+    new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true }),
+    new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, metaKey: true }),
+    new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, metaKey: true }),
+    new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, ctrlKey: true }),
+    new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, ctrlKey: true })
+  ];
+  for (const event of events) {
+    composer.dispatchEvent(event);
+  }
+  return true;
+}
+
+async function waitForSubmitted(composer, originalText) {
+  for (let i = 0; i < 8; i += 1) {
+    await sleep(125);
+    const currentText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
+    if (!currentText || (originalText && currentText !== originalText && !currentText.includes("Shell call"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findSendButton(preferBoundOnly = false) {
+  const bound = findBoundSendButton();
+  if (bound) {
+    return bound;
+  }
+  if (preferBoundOnly) {
+    return null;
+  }
+
   const composer = lastComposerElement || closestEditable(document.activeElement);
   const nearbyRoot = composer?.closest("form, footer, main, body") || document;
   const composerRect = composer?.getBoundingClientRect();
   const buttons = Array.from(nearbyRoot.querySelectorAll("button, [role='button']"))
+    .filter((button) => !isInsideShellToolPanel(button))
     .filter(isVisibleElement)
     .map((button) => {
       const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.textContent || ""}`.toLowerCase();
@@ -955,6 +1145,18 @@ function findSendButton() {
     .sort((a, b) => b.score - a.score);
 
   return buttons[0]?.button || null;
+}
+
+function findBoundSendButton() {
+  if (!savedSendSelector) {
+    return null;
+  }
+
+  return Array.from(document.querySelectorAll(savedSendSelector))
+    .filter((node) => !isInsideShellToolPanel(node))
+    .filter(isVisibleElement)
+    .find((node) => node instanceof HTMLButtonElement || node.getAttribute("role") === "button" || typeof node.click === "function") ||
+    null;
 }
 
 function closestEditable(target) {
@@ -1030,48 +1232,227 @@ function composerProfileKey() {
   return `${COMPOSER_PROFILE_PREFIX}${location.origin}`;
 }
 
+function sendProfileKey() {
+  return `${SEND_PROFILE_PREFIX}${location.origin}`;
+}
+
+function shellProfileKey() {
+  return `${SHELL_PROFILE_PREFIX}${location.origin}`;
+}
+
+function panelProfileKey() {
+  return `${PANEL_PROFILE_PREFIX}${location.origin}`;
+}
+
 function injectStatus() {
   if (document.getElementById(STATUS_ID)) {
     return;
   }
 
-  const status = document.createElement("div");
-  status.id = STATUS_ID;
-  status.textContent = `Shell tool ready v${CONTENT_SCRIPT_VERSION}`;
-  status.dataset.state = "idle";
-  status.style.cssText = [
+  const panel = document.createElement("div");
+  panel.id = STATUS_ID;
+  panel.dataset.state = "idle";
+  panel.style.cssText = [
     "position:fixed",
     "right:16px",
     "bottom:16px",
     "z-index:2147483647",
-    "max-width:360px",
-    "padding:8px 10px",
+    "max-width:420px",
+    "padding:8px",
     "border-radius:8px",
     "font:12px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
     "background:#111827",
     "color:#fff",
     "box-shadow:0 6px 24px rgba(0,0,0,.18)",
     "opacity:.88",
-    "pointer-events:none"
+    "pointer-events:auto",
+    "user-select:none"
   ].join(";");
-  document.documentElement.appendChild(status);
+
+  const statusText = document.createElement("div");
+  statusText.id = STATUS_TEXT_ID;
+  statusText.textContent = `Shell tool ready v${CONTENT_SCRIPT_VERSION}`;
+  statusText.style.cssText = "margin-bottom:6px;line-height:1.3;cursor:move";
+  statusText.title = "Drag to move";
+  panel.appendChild(statusText);
+
+  const actions = document.createElement("div");
+  actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
+  for (const [mode, label] of [
+    ["input", "Bind input"],
+    ["send", "Bind send"],
+    ["shell", "Bind shell"],
+    ["clear", "Clear"]
+  ]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.dataset.shellToolAction = mode;
+    button.style.cssText = [
+      "border:0",
+      "border-radius:6px",
+      "padding:4px 6px",
+      "font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "background:#374151",
+      "color:#fff",
+      "cursor:pointer"
+    ].join(";");
+    actions.appendChild(button);
+  }
+  panel.appendChild(actions);
+
+  panel.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-shell-tool-action]");
+    if (!button) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    handlePanelAction(button.dataset.shellToolAction);
+  }, true);
+
+  panel.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    panel.style.outline = "2px solid #93c5fd";
+  });
+  panel.addEventListener("dragleave", () => {
+    panel.style.outline = "";
+  });
+  panel.addEventListener("drop", (event) => {
+    event.preventDefault();
+    panel.style.outline = "";
+    const mode = event.dataTransfer?.getData("text/x-shell-tool-mode") || bindingMode || "shell";
+    bindElement(mode, lastPointerTarget);
+    bindingMode = "";
+  });
+
+  document.documentElement.appendChild(panel);
+  restorePanelPosition(panel);
+  installPanelDrag(panel, statusText);
 }
 
 function setStatus(text, state = "idle") {
-  const status = document.getElementById(STATUS_ID);
-  if (!status) {
+  const panel = document.getElementById(STATUS_ID);
+  const statusText = document.getElementById(STATUS_TEXT_ID);
+  if (!panel || !statusText) {
     return;
   }
 
-  status.textContent = text;
-  status.dataset.state = state;
+  statusText.textContent = text;
+  panel.dataset.state = state;
   const colors = {
     idle: "#111827",
     running: "#1d4ed8",
     ok: "#047857",
     error: "#b91c1c"
   };
-  status.style.background = colors[state] || colors.idle;
+  panel.style.background = colors[state] || colors.idle;
+}
+
+function handlePanelAction(action) {
+  if (action === "clear") {
+    savedSendSelector = "";
+    savedShellSelector = "";
+    lastComposerSelector = "";
+    chrome.storage.local.remove([composerProfileKey(), sendProfileKey(), shellProfileKey()]);
+    setStatus("Cleared bindings for this origin", "ok");
+    return;
+  }
+
+  bindingMode = action;
+  setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function restorePanelPosition(panel) {
+  const profile = await chrome.storage.local.get(panelProfileKey());
+  const saved = profile[panelProfileKey()];
+  if (!saved || !Number.isFinite(saved.left) || !Number.isFinite(saved.top)) {
+    return;
+  }
+
+  const left = Math.max(8, Math.min(saved.left, window.innerWidth - panel.offsetWidth - 8));
+  const top = Math.max(8, Math.min(saved.top, window.innerHeight - panel.offsetHeight - 8));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+}
+
+function installPanelDrag(panel, handle) {
+  let drag = null;
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const rect = panel.getBoundingClientRect();
+    panel.style.left = `${rect.left}px`;
+    panel.style.top = `${rect.top}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    drag = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top
+    };
+    handle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+    event.stopPropagation();
+  });
+
+  handle.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+
+    const left = Math.max(8, Math.min(event.clientX - drag.offsetX, window.innerWidth - panel.offsetWidth - 8));
+    const top = Math.max(8, Math.min(event.clientY - drag.offsetY, window.innerHeight - panel.offsetHeight - 8));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    event.preventDefault();
+    event.stopPropagation();
+  });
+
+  const finishDrag = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    drag = null;
+    const rect = panel.getBoundingClientRect();
+    chrome.storage.local.set({
+      [panelProfileKey()]: {
+        left: Math.round(rect.left),
+        top: Math.round(rect.top),
+        host: location.host,
+        savedAt: new Date().toISOString()
+      }
+    });
+    try {
+      handle.releasePointerCapture?.(event.pointerId);
+    } catch {
+      // Ignore pointer-capture races.
+    }
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  handle.addEventListener("pointerup", finishDrag);
+  handle.addEventListener("pointercancel", finishDrag);
+
+  window.addEventListener("resize", () => {
+    const rect = panel.getBoundingClientRect();
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - panel.offsetWidth - 8));
+    const top = Math.max(8, Math.min(rect.top, window.innerHeight - panel.offsetHeight - 8));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  });
+}
+
+function isInsideShellToolPanel(target) {
+  return target instanceof Element && Boolean(target.closest(`#${STATUS_ID}`));
 }
 
 function summarizeCommand(command) {
