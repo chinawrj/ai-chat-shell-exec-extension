@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.3";
+const CONTENT_SCRIPT_VERSION = "0.6.4";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -1402,6 +1402,11 @@ async function runHealthCheck() {
     savedSendSelector || profiles[sendProfileKey()]?.selector ? "send" : "",
     savedShellSelector || profiles[shellProfileKey()]?.selector ? "shell" : ""
   ].filter(Boolean);
+
+  if (health && health.originMatches === false) {
+    setStatus(`Server origin mismatch: ${health.extensionId || "current extension"}`, "error");
+    return;
+  }
 
   if (!health?.ok) {
     setStatus(`Server offline: ${summarizeCommand(health?.error || "run install/start script")}`, "error");

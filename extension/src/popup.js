@@ -68,6 +68,10 @@ async function refreshHealth() {
     }
 
     health.dataset.state = "error";
+    if (response?.originMatches === false) {
+      health.textContent = `Extension ID mismatch. Expected ${response.allowedOrigin || "server origin"}`;
+      return;
+    }
     health.textContent = response?.error || "Server not reachable";
   } catch (error) {
     health.dataset.state = "error";

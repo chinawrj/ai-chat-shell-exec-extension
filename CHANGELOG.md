@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Adds an install doctor script for Node.js, manifest ID, shell server health, and origin-policy checks.
+- Shows extension/server origin mismatches in popup and floating health checks.
 - Makes the local WebSocket server tolerate TCP-fragmented and coalesced text frames.
 - Adds WebSocket frame parser coverage for partial, multiple, extended-length, masked, and server frames.
 

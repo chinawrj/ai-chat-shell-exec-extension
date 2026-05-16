@@ -114,10 +114,16 @@ async function checkShellServerHealth() {
       body = { raw: text };
     }
 
+    const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+    const originMatches = body?.allowUntrustedOrigins === true || body?.allowedOrigin === extensionOrigin;
+
     return {
-      ok: response.ok && body?.ok === true,
+      ok: response.ok && body?.ok === true && originMatches,
       status: response.status,
       url: SHELL_SERVER_HEALTH_URL,
+      extensionId: chrome.runtime.id,
+      extensionOrigin,
+      originMatches,
       ...body
     };
   } finally {
