@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.4";
+const CONTENT_SCRIPT_VERSION = "0.6.14";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -327,6 +327,14 @@ function extractShellCallCandidates(root) {
       });
     }
 
+    for (const block of extractDowngradedLanguageCodeEditorCalls(scanRoot)) {
+      candidates.push({
+        ...block,
+        index: index += 1,
+        source: "downgraded-code-editor"
+      });
+    }
+
     for (const block of extractLanguageLabelSiblingCalls(scanRoot)) {
       candidates.push({
         ...block,
@@ -480,11 +488,9 @@ function extractLabeledCodeBlockCalls(root) {
         return null;
       }
 
-      let languageIndex = lines.findIndex((line, index) =>
-        index < 4 &&
-        (TOOL_LANGS.has(line.toLowerCase()) || SHELL_LIKE_LANGS.has(line.toLowerCase()))
-      );
-      let language = languageIndex >= 0 ? lines[languageIndex].toLowerCase() : inferCodeBlockLanguage(node);
+      const languageMatch = findRenderedCodeLanguageLine(lines);
+      let languageIndex = languageMatch?.index ?? -1;
+      let language = languageMatch?.language || inferCodeBlockLanguage(node);
       if (!language) {
         return null;
       }
@@ -512,6 +518,112 @@ function extractLabeledCodeBlockCalls(root) {
       other.node !== candidate.node &&
       other.node.contains(candidate.node)
     ));
+}
+
+function extractDowngradedLanguageCodeEditorCalls(root) {
+  const selector = [
+    '[class*="code" i]',
+    '[data-testid*="code" i]',
+    '[aria-label*="code" i]'
+  ].join(",");
+
+  return Array.from(root.querySelectorAll(selector))
+    .filter((node) => !closestEditable(node))
+    .filter(isVisibleElement)
+    .map((node) => {
+      const markerText = normalizeCommand(node.innerText || node.textContent || "");
+      const language = detectDowngradedToolLanguage(markerText);
+      if (!language) {
+        return null;
+      }
+
+      const command = findNearbyDowngradedCodeCommand(node);
+      if (!command || command.length > 8000) {
+        return null;
+      }
+
+      return {
+        call: parseCallPayload(command),
+        node: closestMessageContainer(node)
+      };
+    })
+    .filter(Boolean);
+}
+
+function findNearbyDowngradedCodeCommand(markerNode) {
+  const message = closestMessageContainer(markerNode);
+  const selector = [
+    '[class*="code" i]',
+    '[data-testid*="code" i]',
+    '[aria-label*="code" i]',
+    '[aria-label*="editor" i]',
+    '[role="document"]'
+  ].join(",");
+
+  const codeNodes = Array.from(message.querySelectorAll(selector))
+    .filter((node) => node !== markerNode && !node.contains(markerNode))
+    .filter((node) => !closestEditable(node))
+    .filter(isVisibleElement)
+    .filter((node) => {
+      const position = markerNode.compareDocumentPosition(node);
+      return position & Node.DOCUMENT_POSITION_FOLLOWING;
+    });
+
+  for (const node of codeNodes) {
+    const command = cleanedRenderedCodeText(node);
+    if (command) {
+      return command;
+    }
+  }
+
+  return "";
+}
+
+function cleanedRenderedCodeText(node) {
+  const lines = normalizeCommand(node.innerText || node.textContent || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      return lower !== "copy code" &&
+        lower !== "copy to clipboard" &&
+        lower !== "display options" &&
+        lower !== "plain text" &&
+        !lower.startsWith("go to line") &&
+        !detectDowngradedToolLanguage(lower);
+    });
+
+  return trimCommandLines(lines).join("\n");
+}
+
+function findRenderedCodeLanguageLine(lines) {
+  for (let index = 0; index < Math.min(6, lines.length); index += 1) {
+    const line = lines[index].toLowerCase();
+    if (TOOL_LANGS.has(line) || SHELL_LIKE_LANGS.has(line)) {
+      return { index, language: line };
+    }
+
+    const downgradedLanguage = detectDowngradedToolLanguage(line);
+    if (downgradedLanguage) {
+      return { index, language: downgradedLanguage };
+    }
+  }
+
+  return null;
+}
+
+function detectDowngradedToolLanguage(line) {
+  const lower = String(line || "").toLowerCase();
+  const hasDowngradeSignal = lower.includes("not supported") ||
+    lower.includes("isn't fully supported") ||
+    lower.includes("unsupported") ||
+    lower.includes("plain text");
+  if (!hasDowngradeSignal) {
+    return "";
+  }
+
+  return Array.from(TOOL_LANGS).find((lang) => hasLanguageToken(lower, lang)) || "";
 }
 
 function inferCodeBlockLanguage(node) {
@@ -553,7 +665,9 @@ function trimCommandLines(lines) {
     const lower = line.toLowerCase();
     if (stopWords.has(lower) ||
       lower.startsWith("model:") ||
-      lower === "adaptive") {
+      lower === "adaptive" ||
+      lower.startsWith("message copilot") ||
+      lower.startsWith("ai-generated content may be incorrect")) {
       break;
     }
     commandLines.push(line);
@@ -749,7 +863,13 @@ function isSameCommandAsShellOutput(command, shellOutputText) {
 }
 
 function extractCommandFromShellOutput(text) {
-  const lines = normalizeCommand(text).split("\n");
+  const normalized = normalizeCommand(text);
+  const compactMatch = normalized.match(/\$\s+([\s\S]*?)(?:\s*cwd:|\s*exitCode:|\s*durationMs:|```|$)/);
+  if (compactMatch?.[1]) {
+    return compactMatch[1].trim();
+  }
+
+  const lines = normalized.split("\n");
   const commandLine = lines.find((line) => line.trim().startsWith("$ "));
   return commandLine ? commandLine.trim().slice(2).trim() : "";
 }
@@ -932,14 +1052,19 @@ async function insertReply(text) {
       data: text
     }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
-    return;
+    return input;
   }
 
   setContentEditableText(input, text);
+  return input;
 }
 
 function setContentEditableText(input, text) {
   input.focus();
+  if (insertContentEditableWithEditingCommand(input, text)) {
+    return;
+  }
+
   const selection = document.getSelection();
   selection?.removeAllRanges();
 
@@ -968,6 +1093,53 @@ function setContentEditableText(input, text) {
     data: text
   }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function insertContentEditableWithEditingCommand(input, text) {
+  if (typeof document.execCommand !== "function") {
+    return false;
+  }
+
+  input.focus();
+  const selection = document.getSelection();
+  if (!selection) {
+    return false;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(input);
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  let inserted = false;
+  try {
+    inserted = document.execCommand("insertText", false, text);
+  } catch {
+    inserted = false;
+  }
+
+  if (!inserted) {
+    return contentEditableHasText(input, text);
+  }
+
+  input.dispatchEvent(new InputEvent("input", {
+    bubbles: true,
+    composed: true,
+    inputType: "insertText",
+    data: null
+  }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+function contentEditableHasText(input, expected) {
+  const actual = normalizeCommand(input.innerText || input.textContent || "");
+  const normalizedExpected = normalizeCommand(expected);
+  const compactActual = actual.replace(/\s+/g, "");
+  const compactExpected = normalizedExpected.replace(/\s+/g, "");
+  return actual === normalizedExpected ||
+    actual.includes(normalizedExpected.slice(0, 80)) ||
+    (compactExpected.length > 0 && compactActual.includes(compactExpected.slice(0, Math.min(120, compactExpected.length))));
 }
 
 async function findReplyInput() {
@@ -1028,26 +1200,25 @@ function editableScore(node) {
   return score;
 }
 
-async function clickSendWhenReady() {
-  const composer = lastComposerElement || closestEditable(document.activeElement);
+async function clickSendWhenReady(composer = lastComposerElement || closestEditable(document.activeElement)) {
   const originalText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
 
   for (let attempt = 0; attempt < 80; attempt += 1) {
-    if (attempt === 0 && trySubmitForm(composer)) {
-      if (await waitForSubmitted(composer, originalText)) {
-        return true;
-      }
-    }
-
-    if (attempt === 1 && tryKeyboardSubmit(composer)) {
-      if (await waitForSubmitted(composer, originalText)) {
-        return true;
-      }
-    }
-
-    const sendButton = findSendButton(attempt < 20);
+    const sendButton = findSendButton(composer, attempt < 20);
     if (sendButton && !sendButton.disabled && sendButton.getAttribute("aria-disabled") !== "true") {
       sendButton.click();
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
+      }
+    }
+
+    if (attempt === 20 && trySubmitForm(composer)) {
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
+      }
+    }
+
+    if (attempt === 21 && tryKeyboardSubmit(composer)) {
       if (await waitForSubmitted(composer, originalText)) {
         return true;
       }
@@ -1101,17 +1272,21 @@ function tryKeyboardSubmit(composer) {
 }
 
 async function waitForSubmitted(composer, originalText) {
+  if (!originalText) {
+    return false;
+  }
+
   for (let i = 0; i < 8; i += 1) {
     await sleep(125);
     const currentText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
-    if (!currentText || (originalText && currentText !== originalText && !currentText.includes("Shell call"))) {
+    if (!currentText || (currentText !== originalText && !currentText.includes("Shell call"))) {
       return true;
     }
   }
   return false;
 }
 
-function findSendButton(preferBoundOnly = false) {
+function findSendButton(composer = lastComposerElement || closestEditable(document.activeElement), preferBoundOnly = false) {
   const bound = findBoundSendButton();
   if (bound) {
     return bound;
@@ -1120,7 +1295,6 @@ function findSendButton(preferBoundOnly = false) {
     return null;
   }
 
-  const composer = lastComposerElement || closestEditable(document.activeElement);
   const nearbyRoot = composer?.closest("form, footer, main, body") || document;
   const composerRect = composer?.getBoundingClientRect();
   const buttons = Array.from(nearbyRoot.querySelectorAll("button, [role='button']"))
@@ -1422,16 +1596,15 @@ async function runFullChainTest() {
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
   const prompt = [
-    "Extension full-chain self-test.",
-    "Reply with exactly one fenced code block and no prose.",
-    "The fence language must be shell-call.",
-    "Put only this command inside the code block:",
+    "Compatibility test.",
+    "Reply only with one markdown code block labeled shell-call.",
+    "The only line inside must be:",
     command
   ].join("\n");
 
   setStatus(`Starting full test: ${token}`, "running");
-  await insertReply(prompt);
-  const sent = await clickSendWhenReady();
+  const composer = await insertReply(prompt);
+  const sent = await clickSendWhenReady(composer);
   if (sent) {
     setStatus(`Waiting for shell-call test: ${token}`, "running");
   }
