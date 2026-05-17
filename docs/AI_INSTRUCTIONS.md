@@ -68,6 +68,7 @@ Use the code fence language shell.
 Put this marker as the first line inside the block:
 # local-shell
 Put only the command after that marker.
+If the chat product loses multi-line code block content, use the single-line form `# local-shell: <command>` instead.
 Wait for my shell-output reply before continuing.
 Do not repeat a command after shell-output is returned.
 
@@ -78,6 +79,7 @@ git status --short
 ````
 
 The extension strips `# local-shell` before execution. The marker is there so normal shell examples are not treated as tool calls.
+It also accepts `# local-shell: <command>` and runs only the command after the colon.
 
 ## Project Agent
 
@@ -142,5 +144,13 @@ printf ai-chat-shell-exec-ok
 ````
 
 The extension should run the command and post a `shell-output` reply containing `ai-chat-shell-exec-ok`.
+
+Single-line fallback for sites that collapse code block lines:
+
+````text
+```shell
+# local-shell: printf ai-chat-shell-exec-ok
+```
+````
 
 The floating panel's `Test` button performs a stricter version of this check with a generated token. During that self-test, the extension only runs the exact expected token command and only reports success when the returned stdout contains the token.

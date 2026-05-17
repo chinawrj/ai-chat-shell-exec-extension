@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.16";
+const CONTENT_SCRIPT_VERSION = "0.6.18";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -29,6 +29,7 @@ let lastPointerTarget = null;
 let savedSendSelector = "";
 let savedShellSelector = "";
 let pendingSelfTest = null;
+let initialThreadSettled = false;
 
 injectStatus();
 loadLocalProfiles();
@@ -213,8 +214,18 @@ async function scanForShellCall() {
 
   const candidate = getLastShellCallCandidate(thread);
   if (!candidate) {
+    initialThreadSettled = true;
+    expirePendingSelfTest();
     return;
   }
+
+  if (!initialThreadSettled) {
+    initialThreadSettled = true;
+    setStatus("Shell tool ready; existing history ignored", "idle");
+    return;
+  }
+
+  expirePendingSelfTest();
 
   const call = candidate.call;
   const callKey = stableHash([
@@ -233,8 +244,7 @@ async function scanForShellCall() {
   if (pendingSelfTest && !isExpectedSelfTestCall(call)) {
     processedCalls.add(callKey);
     const expected = pendingSelfTest.command;
-    pendingSelfTest = null;
-    setStatus(`Self-test blocked unexpected shell call; expected ${summarizeCommand(expected)}`, "error");
+    setStatus(`Self-test ignored unexpected shell call; waiting for ${summarizeCommand(expected)}`, "running");
     return;
   }
 
@@ -825,7 +835,9 @@ function stripShellToolDirective(text) {
     return normalizeCommand(text);
   }
 
-  return normalizeCommand(lines.filter((_, index) => index !== directiveIndex).join("\n"));
+  const directiveCommand = extractShellToolDirectiveCommand(lines[directiveIndex]);
+  const remaining = lines.filter((_, index) => index !== directiveIndex).join("\n");
+  return normalizeCommand([directiveCommand, remaining].filter(Boolean).join("\n"));
 }
 
 function getShellToolDirectiveIndex(lines) {
@@ -835,12 +847,29 @@ function getShellToolDirectiveIndex(lines) {
   }
 
   const line = lines[firstContentIndex];
-  const isDirective = (() => {
-    const normalized = line.trim().toLowerCase();
-    return /^(#|\/\/|;)\s*(shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)\s*$/.test(normalized);
-  })();
+  return isShellToolDirectiveLine(line) ? firstContentIndex : -1;
+}
 
-  return isDirective ? firstContentIndex : -1;
+function isShellToolDirectiveLine(line) {
+  const normalized = line.trim().toLowerCase();
+  return /^(#|\/\/|;)\s*(shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)(?:\s*:\s*.+)?$/.test(normalized);
+}
+
+function extractShellToolDirectiveCommand(line) {
+  const match = String(line || "").trim().match(/^(?:#|\/\/|;)\s*(?:shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)\s*:\s*([\s\S]+)$/i);
+  return match ? normalizeCommand(match[1]) : "";
+}
+
+function expirePendingSelfTest() {
+  if (!pendingSelfTest) {
+    return;
+  }
+
+  if (Date.now() - Number(pendingSelfTest.startedAt || 0) > 120000) {
+    const token = pendingSelfTest.token;
+    pendingSelfTest = null;
+    setStatus(`Self-test timed out: ${token}`, "error");
+  }
 }
 
 function resetChainForNewHumanPrompt() {
@@ -1669,9 +1698,8 @@ async function runFullChainTest() {
   const prompt = [
     "Compatibility test.",
     "Reply only with one markdown code block labeled shell.",
-    "The first line inside must be exactly: # local-shell",
-    "The second line inside must be exactly:",
-    command
+    "The only line inside must be exactly:",
+    `# local-shell: ${command}`
   ].join("\n");
 
   setStatus(`Starting full test: ${token}`, "running");

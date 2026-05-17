@@ -131,7 +131,7 @@ Accepted tool language tags are `shell-call`, `shell_call`, `tool:shell`, `tool-
 
 Some AI chat systems normalize unknown code block languages into ordinary `shell`, `bash`, `sh`, or `zsh` blocks. For those sites, the extension also accepts shell-like code blocks when either:
 
-- the first line inside the block is a tool marker such as `# local-shell`; or
+- the first line inside the block is a tool marker such as `# local-shell` or `# local-shell: git status --short`; or
 - the latest human prompt explicitly mentions one of the tool language tags above.
 
 The marker form keeps standard shell syntax highlighting while preserving an explicit tool boundary:
@@ -140,6 +140,14 @@ The marker form keeps standard shell syntax highlighting while preserving an exp
 ```shell
 # local-shell
 git status --short
+```
+````
+
+For chat systems that are unreliable with multi-line code blocks, use the single-line marker form:
+
+````text
+```shell
+# local-shell: git status --short
 ```
 ````
 
