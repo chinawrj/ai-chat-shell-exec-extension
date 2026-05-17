@@ -93,7 +93,7 @@ On a new chat site, click the chat input once. The content script remembers the 
 
 The floating status panel also has calibration controls for unknown chat systems:
 
-- `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a `shell-call`; the extension then executes that returned command and posts the resulting `shell-output`.
+- `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a one-line `shell-call`; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected self-test shell calls are blocked instead of being run.
 - `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.

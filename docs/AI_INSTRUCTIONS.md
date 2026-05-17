@@ -116,3 +116,5 @@ printf ai-chat-shell-exec-ok
 ````
 
 The extension should run the command and post a `shell-output` reply containing `ai-chat-shell-exec-ok`.
+
+The floating panel's `Test` button performs a stricter version of this check with a generated token. During that self-test, the extension only runs the exact expected token command and only reports success when the returned stdout contains the token.

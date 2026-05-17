@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.14";
+const CONTENT_SCRIPT_VERSION = "0.6.15";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -28,6 +28,7 @@ let bindingMode = "";
 let lastPointerTarget = null;
 let savedSendSelector = "";
 let savedShellSelector = "";
+let pendingSelfTest = null;
 
 injectStatus();
 loadLocalProfiles();
@@ -174,6 +175,8 @@ function scheduleScan() {
 }
 
 async function scanForShellCall() {
+  expirePendingSelfTest();
+
   if (!isSupportedPage() || activeCallId || isAssistantGenerating()) {
     scheduleScan();
     return;
@@ -224,6 +227,14 @@ async function scanForShellCall() {
     call.maxOutputChars || ""
   ].join("\n"));
   if (processedCalls.has(callKey)) {
+    return;
+  }
+
+  if (pendingSelfTest && !isExpectedSelfTestCall(call)) {
+    processedCalls.add(callKey);
+    const expected = pendingSelfTest.command;
+    pendingSelfTest = null;
+    setStatus(`Self-test blocked unexpected shell call; expected ${summarizeCommand(expected)}`, "error");
     return;
   }
 
@@ -982,7 +993,7 @@ async function runAndReply(callId, call) {
 
     const reply = formatShellOutput(call, response, startedAt);
     await insertReply(reply);
-    setStatus(response?.ok === false ? "Shell call failed" : "Shell call completed", response?.ok === false ? "error" : "ok");
+    setShellCompletionStatus(call, response);
 
     if (settings.autoSend !== false) {
       await clickSendWhenReady();
@@ -998,6 +1009,35 @@ async function runAndReply(callId, call) {
     }
   } finally {
     activeCallId = "";
+  }
+}
+
+function setShellCompletionStatus(call, response) {
+  if (pendingSelfTest && isExpectedSelfTestCall(call)) {
+    const token = pendingSelfTest.token;
+    pendingSelfTest = null;
+    const stdout = String(response?.stdout || "");
+    const passed = response?.ok !== false && response?.exitCode === 0 && stdout.includes(token);
+    setStatus(
+      passed ? `Self-test passed: ${token}` : `Self-test failed: ${token}`,
+      passed ? "ok" : "error"
+    );
+    return;
+  }
+
+  setStatus(response?.ok === false ? "Shell call failed" : "Shell call completed", response?.ok === false ? "error" : "ok");
+}
+
+function isExpectedSelfTestCall(call) {
+  return !!pendingSelfTest &&
+    normalizeCommand(call?.cmd || "") === pendingSelfTest.command &&
+    (!call?.cwd || normalizeCommand(call.cwd) === normalizeCommand(pendingSelfTest.cwd || ""));
+}
+
+function expirePendingSelfTest() {
+  if (pendingSelfTest && Date.now() - pendingSelfTest.startedAt > 120000) {
+    pendingSelfTest = null;
+    setStatus("Self-test expired before a matching shell-call appeared", "error");
   }
 }
 
@@ -1606,6 +1646,12 @@ async function runFullChainTest() {
   const composer = await insertReply(prompt);
   const sent = await clickSendWhenReady(composer);
   if (sent) {
+    pendingSelfTest = {
+      token,
+      command,
+      cwd: "",
+      startedAt: Date.now()
+    };
     setStatus(`Waiting for shell-call test: ${token}`, "running");
   }
 }
