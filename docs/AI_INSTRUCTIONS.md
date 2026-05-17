@@ -56,6 +56,29 @@ Rules:
 ```
 ````
 
+## Shell Syntax Highlighting Variant
+
+Use this when an AI chat product does not support the `shell-call` code fence label or downgrades it to plain text:
+
+````text
+You can request local shell execution through a browser extension.
+
+When a shell command is needed, reply with exactly one fenced code block and no prose.
+Use the code fence language shell.
+Put this marker as the first line inside the block:
+# local-shell
+Put only the command after that marker.
+Wait for my shell-output reply before continuing.
+Do not repeat a command after shell-output is returned.
+
+```shell
+# local-shell
+git status --short
+```
+````
+
+The extension strips `# local-shell` before execution. The marker is there so normal shell examples are not treated as tool calls.
+
 ## Project Agent
 
 Use this for coding agents that should iterate through commands:
@@ -101,16 +124,19 @@ For this conversation, you may request local shell execution by replying with ex
 If the floating panel is not available, paste this manually:
 
 ```text
-Reply with exactly one fenced code block and no prose.
-The fence language must be shell-call.
-Put only this command inside the code block:
+Reply with exactly one fenced markdown code block and no prose.
+Use the code fence language shell.
+Put this marker as the first line inside the block:
+# local-shell
+Put only this command after that marker:
 printf ai-chat-shell-exec-ok
 ```
 
 Expected AI response:
 
 ````text
-```shell-call
+```shell
+# local-shell
 printf ai-chat-shell-exec-ok
 ```
 ````

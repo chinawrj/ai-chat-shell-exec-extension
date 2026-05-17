@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.15";
+const CONTENT_SCRIPT_VERSION = "0.6.16";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -320,7 +320,7 @@ function extractShellCallCandidates(root) {
       }
 
       const language = detectCodeLanguage(pre, code);
-      if (TOOL_LANGS.has(language) || shouldTreatShellLikeCodeAsTool(language, pre)) {
+      if (TOOL_LANGS.has(language) || shouldTreatShellLikeCodeAsTool(language, pre, cmdText)) {
         candidates.push({
           call: parseCallPayload(cmdText),
           node: closestMessageContainer(pre),
@@ -436,13 +436,12 @@ function extractLanguageLabelSiblingCalls(root) {
   return labels
     .map((label) => {
       const language = normalizeText(label.innerText || label.textContent || "").toLowerCase();
-      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, label)) {
-        return null;
-      }
-
       const container = findLanguageLabelContainer(label, language);
       const command = extractCommandAfterLanguage(container, language);
       if (!command || command.length > 8000) {
+        return null;
+      }
+      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, label, command)) {
         return null;
       }
 
@@ -506,15 +505,14 @@ function extractLabeledCodeBlockCalls(root) {
         return null;
       }
 
-      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, node)) {
-        return null;
-      }
-
       if (languageIndex < 0) {
         languageIndex = -1;
       }
       const command = trimCommandLines(lines.slice(languageIndex + 1)).join("\n");
       if (!command) {
+        return null;
+      }
+      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, node, command)) {
         return null;
       }
 
@@ -769,7 +767,7 @@ function extractMarkdownFenceCalls(root) {
 
   while ((match = fence.exec(text))) {
     const lang = String(match[1] || "").trim().toLowerCase();
-    if (TOOL_LANGS.has(lang) || shouldTreatShellLikeCodeAsTool(lang, root)) {
+    if (TOOL_LANGS.has(lang) || shouldTreatShellLikeCodeAsTool(lang, root, match[2])) {
       calls.push(parseCallPayload(match[2]));
     }
   }
@@ -777,9 +775,13 @@ function extractMarkdownFenceCalls(root) {
   return calls;
 }
 
-function shouldTreatShellLikeCodeAsTool(language, node) {
+function shouldTreatShellLikeCodeAsTool(language, node, commandText = "") {
   if (!SHELL_LIKE_LANGS.has(String(language || "").toLowerCase())) {
     return false;
+  }
+
+  if (hasShellToolDirective(commandText)) {
+    return true;
   }
 
   const lastUserText = getLastUserMessageText().toLowerCase();
@@ -794,7 +796,7 @@ function shouldTreatShellLikeCodeAsTool(language, node) {
 }
 
 function parseCallPayload(text) {
-  const payload = normalizeCommand(text);
+  const payload = stripShellToolDirective(normalizeCommand(text));
   try {
     const parsed = JSON.parse(payload);
     if (parsed && typeof parsed === "object") {
@@ -810,6 +812,35 @@ function parseCallPayload(text) {
   }
 
   return { cmd: payload };
+}
+
+function hasShellToolDirective(text) {
+  return getShellToolDirectiveIndex(normalizeCommand(text).split("\n")) >= 0;
+}
+
+function stripShellToolDirective(text) {
+  const lines = normalizeCommand(text).split("\n");
+  const directiveIndex = getShellToolDirectiveIndex(lines);
+  if (directiveIndex < 0) {
+    return normalizeCommand(text);
+  }
+
+  return normalizeCommand(lines.filter((_, index) => index !== directiveIndex).join("\n"));
+}
+
+function getShellToolDirectiveIndex(lines) {
+  const firstContentIndex = lines.findIndex((line) => line.trim());
+  if (firstContentIndex < 0) {
+    return -1;
+  }
+
+  const line = lines[firstContentIndex];
+  const isDirective = (() => {
+    const normalized = line.trim().toLowerCase();
+    return /^(#|\/\/|;)\s*(shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)\s*$/.test(normalized);
+  })();
+
+  return isDirective ? firstContentIndex : -1;
 }
 
 function resetChainForNewHumanPrompt() {
@@ -1637,8 +1668,9 @@ async function runFullChainTest() {
   const command = `printf ${token}`;
   const prompt = [
     "Compatibility test.",
-    "Reply only with one markdown code block labeled shell-call.",
-    "The only line inside must be:",
+    "Reply only with one markdown code block labeled shell.",
+    "The first line inside must be exactly: # local-shell",
+    "The second line inside must be exactly:",
     command
   ].join("\n");
 

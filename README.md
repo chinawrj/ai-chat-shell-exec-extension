@@ -129,14 +129,26 @@ JSON command:
 
 Accepted tool language tags are `shell-call`, `shell_call`, `tool:shell`, `tool-shell`, and `local-shell`.
 
-Some AI chat systems normalize unknown code block languages into ordinary `shell`, `bash`, `sh`, or `zsh` blocks. For those sites, the extension also accepts shell-like code blocks when the latest human prompt explicitly mentions one of the tool language tags above. This keeps ordinary shell examples from running while still supporting black-box chat systems that rewrite the rendered language label.
+Some AI chat systems normalize unknown code block languages into ordinary `shell`, `bash`, `sh`, or `zsh` blocks. For those sites, the extension also accepts shell-like code blocks when either:
+
+- the first line inside the block is a tool marker such as `# local-shell`; or
+- the latest human prompt explicitly mentions one of the tool language tags above.
+
+The marker form keeps standard shell syntax highlighting while preserving an explicit tool boundary:
+
+````text
+```shell
+# local-shell
+git status --short
+```
+````
 
 ## Zero-Knowledge Site Strategy
 
 The extension does not hard-code a ChatGPT, Claude, or Copilot DOM contract. The default strategy is:
 
 - detect editable chat inputs from standard browser semantics such as `textarea`, `input`, `contenteditable`, and `role="textbox"`;
-- detect tool requests from explicit tool-language code blocks or shell-like blocks only when the latest prompt mentions a tool language;
+- detect tool requests from explicit tool-language code blocks or shell-like blocks with a `# local-shell` marker;
 - post results by writing into the remembered editable input;
 - submit first through generic form submission and synthetic Enter key events;
 - fall back to a saved user-bound send control, then broad send-button heuristics if needed.
@@ -145,7 +157,7 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 
 ## Safety Defaults
 
-- The extension runs explicit tool blocks. Ordinary `bash`, `sh`, `zsh`, and `shell` blocks are accepted only when the latest human prompt explicitly asked for one of the tool language tags and the block is part of that response.
+- The extension runs explicit tool blocks. Ordinary `bash`, `sh`, `zsh`, and `shell` blocks are accepted only when the block contains a `# local-shell` marker or the latest human prompt explicitly asked for one of the tool language tags.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained shell calls are capped by `maxChainCalls` in extension storage. New human prompts reset the chain count; tool result replies do not.
