@@ -73,6 +73,18 @@ h1 {
   gap: 2px;
 }
 
+.stack {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid #e5e7eb;
+}
+
+.stack span {
+  display: grid;
+  gap: 2px;
+}
+
 strong,
 .grid span,
 .portable strong {

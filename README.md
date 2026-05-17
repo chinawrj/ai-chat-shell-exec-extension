@@ -84,6 +84,7 @@ Then run the floating panel's `Test` button once on each AI chat site.
 The toolbar popup shows whether the local server is reachable and lets you change:
 
 - enabled/paused
+- auto-enabled sites
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -91,10 +92,13 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 On a new chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
 
+By default, shell scanning is auto-enabled only on `m365.cloud.microsoft`. Other sites stay paused until you open the site and click `Enable site` in the floating panel, or add the hostname to the popup's auto-enabled sites list.
+
 The floating status panel also has calibration controls for unknown chat systems:
 
-- `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a one-line `shell-call`; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected self-test shell calls are blocked instead of being run.
+- `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a one-line `shell-call`; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected self-test shell calls are ignored instead of being run.
 - `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
+- `Enable site` / `Disable site`: add or remove the current hostname from the auto-enabled sites list.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered shell-call/code block area.
@@ -166,6 +170,7 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 ## Safety Defaults
 
 - The extension runs explicit tool blocks. Ordinary `bash`, `sh`, `zsh`, and `shell` blocks are accepted only when the block contains a `# local-shell` marker or the latest human prompt explicitly asked for one of the tool language tags.
+- The default auto-enabled host list contains only `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained shell calls are capped by `maxChainCalls` in extension storage. New human prompts reset the chain count; tool result replies do not.

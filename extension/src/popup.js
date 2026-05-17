@@ -1,5 +1,6 @@
 const DEFAULTS = {
   enabled: true,
+  enabledHosts: ["m365.cloud.microsoft"],
   requireApproval: false,
   autoSend: true,
   defaultTimeoutMs: 30000,
@@ -17,6 +18,7 @@ const LOCAL_PROFILE_PREFIXES = [
 
 const fields = {
   enabled: document.getElementById("enabled"),
+  enabledHosts: document.getElementById("enabledHosts"),
   autoSend: document.getElementById("autoSend"),
   requireApproval: document.getElementById("requireApproval"),
   defaultTimeoutMs: document.getElementById("defaultTimeoutMs"),
@@ -46,6 +48,7 @@ async function loadSettings() {
   const settings = await chrome.storage.sync.get(Object.keys(DEFAULTS));
   const merged = { ...DEFAULTS, ...settings };
   fields.enabled.checked = merged.enabled !== false;
+  fields.enabledHosts.value = normalizeEnabledHosts(merged.enabledHosts).join("\n");
   fields.autoSend.checked = merged.autoSend !== false;
   fields.requireApproval.checked = merged.requireApproval === true;
   fields.defaultTimeoutMs.value = merged.defaultTimeoutMs;
@@ -57,6 +60,7 @@ async function saveSettings() {
   saveButton.disabled = true;
   await chrome.storage.sync.set({
     enabled: fields.enabled.checked,
+    enabledHosts: normalizeEnabledHosts(fields.enabledHosts.value.split(/\n|,/)),
     autoSend: fields.autoSend.checked,
     requireApproval: fields.requireApproval.checked,
     defaultTimeoutMs: clampNumber(fields.defaultTimeoutMs.value, 1000, 600000, DEFAULTS.defaultTimeoutMs),
@@ -157,12 +161,34 @@ async function importConfig() {
 function sanitizeSettings(input) {
   return {
     enabled: input.enabled !== false,
+    enabledHosts: normalizeEnabledHosts(input.enabledHosts),
     autoSend: input.autoSend !== false,
     requireApproval: input.requireApproval === true,
     defaultTimeoutMs: clampNumber(input.defaultTimeoutMs, 1000, 600000, DEFAULTS.defaultTimeoutMs),
     maxOutputChars: clampNumber(input.maxOutputChars, 1000, 200000, DEFAULTS.maxOutputChars),
     maxChainCalls: clampNumber(input.maxChainCalls, 1, 20, DEFAULTS.maxChainCalls)
   };
+}
+
+function normalizeEnabledHosts(input) {
+  const source = Array.isArray(input) ? input : DEFAULTS.enabledHosts;
+  const hosts = source
+    .map(normalizeHost)
+    .filter(Boolean);
+  return Array.from(new Set(hosts));
+}
+
+function normalizeHost(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    return new URL(text.includes("://") ? text : `https://${text}`).hostname;
+  } catch {
+    return text.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").split(/[/:?#]/)[0];
+  }
 }
 
 function sanitizeLocalProfiles(input) {

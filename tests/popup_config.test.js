@@ -22,6 +22,7 @@ function makeContext() {
   const elements = new Map();
   const ids = [
     "enabled",
+    "enabledHosts",
     "autoSend",
     "requireApproval",
     "defaultTimeoutMs",
@@ -41,6 +42,7 @@ function makeContext() {
 
   const syncStore = {
     enabled: true,
+    enabledHosts: ["m365.cloud.microsoft", "https://chatgpt.com/"],
     autoSend: false,
     requireApproval: true,
     defaultTimeoutMs: 45000,
@@ -121,6 +123,7 @@ function makeContext() {
   const exported = JSON.parse(elements.get("portableConfig").value);
   assert.equal(exported.schema, "ai-chat-shell-exec-config");
   assert.equal(exported.version, 1);
+  assert.deepEqual(exported.settings.enabledHosts, ["m365.cloud.microsoft", "chatgpt.com"]);
   assert.equal(exported.settings.autoSend, false);
   assert.equal(exported.localProfiles["composerProfile:https://chatgpt.com"].host, "chatgpt.com");
   assert.equal(exported.localProfiles["panelProfile:https://claude.ai"].left, 120);
@@ -131,6 +134,7 @@ function makeContext() {
     version: 1,
     settings: {
       enabled: false,
+      enabledHosts: ["m365.cloud.microsoft", "https://claude.ai/chat", "", "CLAUDE.AI"],
       autoSend: true,
       requireApproval: true,
       defaultTimeoutMs: 9999999,
@@ -155,6 +159,7 @@ function makeContext() {
   await context.importConfig();
   assert.equal(JSON.stringify(writes.sync), JSON.stringify({
     enabled: false,
+    enabledHosts: ["m365.cloud.microsoft", "claude.ai"],
     autoSend: true,
     requireApproval: true,
     defaultTimeoutMs: 600000,

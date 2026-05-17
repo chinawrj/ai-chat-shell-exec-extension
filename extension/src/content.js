@@ -9,11 +9,12 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.18";
+const CONTENT_SCRIPT_VERSION = "0.6.19";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
+const DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const processedCalls = new Set();
 let scanTimer = 0;
 let lastThreadText = "";
@@ -183,7 +184,7 @@ async function scanForShellCall() {
     return;
   }
 
-  const settings = await chrome.storage.sync.get(["enabled", "maxChainCalls"]);
+  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "maxChainCalls"]);
   if (settings.enabled === false) {
     const now = Date.now();
     if (now - lastDisabledStatusAt > 5000) {
@@ -193,6 +194,18 @@ async function scanForShellCall() {
     scheduleScan();
     return;
   }
+
+  if (!isCurrentHostEnabled(settings.enabledHosts)) {
+    const now = Date.now();
+    updateSiteActionButton(false);
+    if (now - lastDisabledStatusAt > 5000) {
+      setStatus(`Site disabled: ${location.hostname}. Click Enable site to allow shell calls.`, "idle");
+      lastDisabledStatusAt = now;
+    }
+    scheduleScan();
+    return;
+  }
+  updateSiteActionButton(true);
 
   const thread = getConversationRoot();
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
@@ -281,6 +294,31 @@ async function scanForShellCall() {
 
 function isSupportedPage() {
   return location.protocol === "https:" && !location.hostname.endsWith(".google.com");
+}
+
+function isCurrentHostEnabled(enabledHosts) {
+  return normalizeEnabledHosts(enabledHosts).includes(location.hostname.toLowerCase());
+}
+
+function normalizeEnabledHosts(value) {
+  const source = Array.isArray(value) ? value : DEFAULT_ENABLED_HOSTS;
+  const hosts = source
+    .map(normalizeHost)
+    .filter(Boolean);
+  return Array.from(new Set(hosts));
+}
+
+function normalizeHost(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    return new URL(text.includes("://") ? text : `https://${text}`).hostname;
+  } catch {
+    return text.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").split(/[/:?#]/)[0];
+  }
 }
 
 function getConversationRoot() {
@@ -1567,6 +1605,7 @@ function injectStatus() {
   for (const [mode, label] of [
     ["test", "Test"],
     ["check", "Check"],
+    ["site", "Enable site"],
     ["input", "Bind input"],
     ["send", "Bind send"],
     ["shell", "Bind shell"],
@@ -1615,6 +1654,9 @@ function injectStatus() {
   });
 
   document.documentElement.appendChild(panel);
+  chrome.storage.sync.get(["enabledHosts"]).then((settings) => {
+    updateSiteActionButton(isCurrentHostEnabled(settings.enabledHosts));
+  });
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
 }
@@ -1645,6 +1687,13 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "site") {
+    toggleCurrentSiteEnabled().catch((error) => {
+      setStatus(`Site update failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "check") {
     runHealthCheck().catch((error) => {
       setStatus(`Check failed: ${summarizeCommand(error.message || String(error))}`, "error");
@@ -1663,6 +1712,25 @@ function handlePanelAction(action) {
 
   bindingMode = action;
   setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function toggleCurrentSiteEnabled() {
+  const settings = await chrome.storage.sync.get(["enabledHosts"]);
+  const host = location.hostname.toLowerCase();
+  const hosts = normalizeEnabledHosts(settings.enabledHosts);
+  const enabled = hosts.includes(host);
+  const nextHosts = enabled ? hosts.filter((item) => item !== host) : [...hosts, host].sort();
+  await chrome.storage.sync.set({ enabledHosts: nextHosts });
+  updateSiteActionButton(!enabled);
+  setStatus(`${enabled ? "Disabled" : "Enabled"} this site: ${host}`, enabled ? "idle" : "ok");
+  scheduleScan();
+}
+
+function updateSiteActionButton(enabled) {
+  const button = document.querySelector(`#${STATUS_ID} [data-shell-tool-action="site"]`);
+  if (button) {
+    button.textContent = enabled ? "Disable site" : "Enable site";
+  }
 }
 
 async function runHealthCheck() {
@@ -1693,6 +1761,12 @@ async function runHealthCheck() {
 }
 
 async function runFullChainTest() {
+  const settings = await chrome.storage.sync.get(["enabledHosts"]);
+  if (!isCurrentHostEnabled(settings.enabledHosts)) {
+    setStatus(`Enable this site first: ${location.hostname}`, "error");
+    return;
+  }
+
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
   const prompt = [

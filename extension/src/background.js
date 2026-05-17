@@ -3,8 +3,10 @@ const SHELL_SERVER_HEALTH_URL = "http://127.0.0.1:17371/health";
 const CALL_LEDGER_KEY = "shellCallLedger:v1";
 const CALL_LEDGER_LIMIT = 500;
 const RUNNING_LOCK_GRACE_MS = 15000;
+const DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_SETTINGS = {
   enabled: true,
+  enabledHosts: DEFAULT_ENABLED_HOSTS,
   requireApproval: false,
   autoSend: true,
   defaultTimeoutMs: 30000,
