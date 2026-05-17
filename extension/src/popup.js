@@ -31,11 +31,16 @@ const saveButton = document.getElementById("save");
 const refreshHealthButton = document.getElementById("refreshHealth");
 const exportConfigButton = document.getElementById("exportConfig");
 const importConfigButton = document.getElementById("importConfig");
+const addCurrentSiteButton = document.getElementById("addCurrentSite");
+const removeCurrentSiteButton = document.getElementById("removeCurrentSite");
 const portableConfig = document.getElementById("portableConfig");
 const portableStatus = document.getElementById("portableStatus");
+const currentSiteStatus = document.getElementById("currentSiteStatus");
+let currentHost = "";
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadSettings();
+  await loadCurrentSite();
   await refreshHealth();
 });
 
@@ -43,6 +48,8 @@ saveButton.addEventListener("click", saveSettings);
 refreshHealthButton.addEventListener("click", refreshHealth);
 exportConfigButton.addEventListener("click", exportConfig);
 importConfigButton.addEventListener("click", importConfig);
+addCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(true));
+removeCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(false));
 
 async function loadSettings() {
   const settings = await chrome.storage.sync.get(Object.keys(DEFAULTS));
@@ -72,6 +79,51 @@ async function saveSettings() {
     saveButton.disabled = false;
     saveButton.textContent = "Save";
   }, 800);
+}
+
+async function loadCurrentSite() {
+  currentHost = await getCurrentTabHost();
+  if (!currentHost) {
+    addCurrentSiteButton.disabled = true;
+    removeCurrentSiteButton.disabled = true;
+    setCurrentSiteStatus("No supported current site", "error");
+    return;
+  }
+
+  refreshCurrentSiteStatus();
+}
+
+async function getCurrentTabHost() {
+  if (!chrome.tabs?.query) {
+    return "";
+  }
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return normalizeHost(tab?.url || "");
+}
+
+function refreshCurrentSiteStatus() {
+  if (!currentHost) {
+    return;
+  }
+
+  const hosts = normalizeEnabledHosts(fields.enabledHosts.value.split(/\n|,/));
+  const enabled = hosts.includes(currentHost);
+  addCurrentSiteButton.disabled = enabled;
+  removeCurrentSiteButton.disabled = !enabled;
+  setCurrentSiteStatus(`${currentHost}: ${enabled ? "enabled" : "disabled"}`, enabled ? "ok" : "idle");
+}
+
+async function updateCurrentSiteEnabled(enabled) {
+  if (!currentHost) {
+    return;
+  }
+
+  const hosts = normalizeEnabledHosts(fields.enabledHosts.value.split(/\n|,/));
+  const nextHosts = enabled ? [...hosts, currentHost] : hosts.filter((host) => host !== currentHost);
+  fields.enabledHosts.value = normalizeEnabledHosts(nextHosts).join("\n");
+  await saveSettings();
+  refreshCurrentSiteStatus();
 }
 
 async function refreshHealth() {
@@ -234,4 +286,9 @@ function isAllowedLocalProfileKey(key) {
 function setPortableStatus(message, state = "idle") {
   portableStatus.textContent = message;
   portableStatus.dataset.state = state;
+}
+
+function setCurrentSiteStatus(message, state = "idle") {
+  currentSiteStatus.textContent = message;
+  currentSiteStatus.dataset.state = state;
 }

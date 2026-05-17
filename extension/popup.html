@@ -26,9 +26,14 @@
       <label class="stack">
         <span>
           <strong>Auto-enabled sites</strong>
-          <small>One hostname per line. Other sites stay paused until enabled from their floating panel.</small>
+          <small>One hostname per line. Sites not listed do not show page UI or scan content.</small>
         </span>
         <textarea id="enabledHosts" spellcheck="false"></textarea>
+        <div id="currentSiteStatus" class="site-status" aria-live="polite"></div>
+        <div class="site-actions">
+          <button id="addCurrentSite" type="button">Enable current site</button>
+          <button id="removeCurrentSite" type="button">Disable current site</button>
+        </div>
       </label>
 
       <label class="row">

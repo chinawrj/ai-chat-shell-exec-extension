@@ -33,8 +33,11 @@ function makeContext() {
     "refreshHealth",
     "exportConfig",
     "importConfig",
+    "addCurrentSite",
+    "removeCurrentSite",
     "portableConfig",
-    "portableStatus"
+    "portableStatus",
+    "currentSiteStatus"
   ];
   for (const id of ids) {
     elements.set(id, makeElement());
@@ -78,6 +81,9 @@ function makeContext() {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
         sendMessage: async () => ({ ok: true, pid: 123 })
       },
+      tabs: {
+        query: async () => [{ url: "https://chatgpt.com/" }]
+      },
       storage: {
         sync: {
           get: async (keys) => Object.fromEntries(keys.map((key) => [key, syncStore[key]])),
@@ -118,6 +124,8 @@ function makeContext() {
 
 (async () => {
   const { context, elements, writes } = makeContext();
+  await context.loadSettings();
+  await context.loadCurrentSite();
 
   await context.exportConfig();
   const exported = JSON.parse(elements.get("portableConfig").value);
@@ -128,6 +136,7 @@ function makeContext() {
   assert.equal(exported.localProfiles["composerProfile:https://chatgpt.com"].host, "chatgpt.com");
   assert.equal(exported.localProfiles["panelProfile:https://claude.ai"].left, 120);
   assert.equal(exported.localProfiles["shellCallLedger:v1"], undefined);
+  assert.equal(elements.get("currentSiteStatus").textContent, "chatgpt.com: enabled");
 
   elements.get("portableConfig").value = JSON.stringify({
     schema: "ai-chat-shell-exec-config",
@@ -173,6 +182,10 @@ function makeContext() {
       savedAt: "2026-05-16T00:00:00.000Z"
     }
   }));
+
+  elements.get("enabledHosts").value = "m365.cloud.microsoft";
+  await context.updateCurrentSiteEnabled(true);
+  assert.equal(writes.sync.enabledHosts.includes("chatgpt.com"), true);
 
   console.log("popup config tests passed");
 })().catch((error) => {

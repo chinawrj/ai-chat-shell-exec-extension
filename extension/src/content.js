@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.19";
+const CONTENT_SCRIPT_VERSION = "0.6.20";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -31,13 +31,58 @@ let savedSendSelector = "";
 let savedShellSelector = "";
 let pendingSelfTest = null;
 let initialThreadSettled = false;
+let extensionActive = false;
+let threadObserver = null;
+let pageEventListenersInstalled = false;
 
-injectStatus();
-loadLocalProfiles();
-observeThread();
-observeComposerFocus();
-observeBindingTargets();
-scheduleScan();
+bootstrapActivation().catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "sync" && (changes.enabled || changes.enabledHosts)) {
+    refreshActivation().catch(() => {});
+  }
+});
+
+async function bootstrapActivation() {
+  await refreshActivation();
+}
+
+async function refreshActivation() {
+  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts"]);
+  if (!isSupportedPage() || settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
+    deactivateExtension();
+    return;
+  }
+
+  await activateExtension();
+}
+
+async function activateExtension() {
+  if (extensionActive) {
+    return;
+  }
+
+  extensionActive = true;
+  initialThreadSettled = false;
+  injectStatus();
+  await loadLocalProfiles();
+  observeThread();
+  installPageEventListeners();
+  scheduleScan();
+}
+
+function deactivateExtension() {
+  extensionActive = false;
+  activeCallId = "";
+  bindingMode = "";
+  pendingSelfTest = null;
+  lastPointerTarget = null;
+  clearTimeout(scanTimer);
+  threadObserver?.disconnect();
+  threadObserver = null;
+  removePageEventListeners();
+  document.getElementById(STATUS_ID)?.remove();
+}
 
 async function loadLocalProfiles() {
   const profiles = await chrome.storage.local.get([
@@ -49,50 +94,88 @@ async function loadLocalProfiles() {
 }
 
 function observeThread() {
-  const observer = new MutationObserver(() => {
+  if (threadObserver) {
+    return;
+  }
+
+  threadObserver = new MutationObserver(() => {
     scheduleScan();
   });
 
-  observer.observe(document.documentElement, {
+  threadObserver.observe(document.documentElement, {
     childList: true,
     subtree: true,
     characterData: true
   });
 }
 
-function observeComposerFocus() {
-  document.addEventListener("focusin", (event) => {
-    rememberComposer(event.target);
-  }, true);
+function installPageEventListeners() {
+  if (pageEventListenersInstalled) {
+    return;
+  }
 
-  document.addEventListener("click", (event) => {
-    rememberComposer(event.target);
-  }, true);
-
-  document.addEventListener("input", (event) => {
-    rememberComposer(event.target);
-  }, true);
+  document.addEventListener("focusin", handleComposerFocus, true);
+  document.addEventListener("click", handleComposerClick, true);
+  document.addEventListener("input", handleComposerInput, true);
+  document.addEventListener("pointerdown", handleBindingPointerDown, true);
+  document.addEventListener("click", handleBindingClick, true);
+  document.addEventListener("dragstart", handleBindingDragStart, true);
+  pageEventListenersInstalled = true;
 }
 
-function observeBindingTargets() {
-  document.addEventListener("pointerdown", (event) => {
+function removePageEventListeners() {
+  if (!pageEventListenersInstalled) {
+    return;
+  }
+
+  document.removeEventListener("focusin", handleComposerFocus, true);
+  document.removeEventListener("click", handleComposerClick, true);
+  document.removeEventListener("input", handleComposerInput, true);
+  document.removeEventListener("pointerdown", handleBindingPointerDown, true);
+  document.removeEventListener("click", handleBindingClick, true);
+  document.removeEventListener("dragstart", handleBindingDragStart, true);
+  pageEventListenersInstalled = false;
+}
+
+function handleComposerFocus(event) {
+  if (extensionActive) {
+    rememberComposer(event.target);
+  }
+}
+
+function handleComposerClick(event) {
+  if (extensionActive) {
+    rememberComposer(event.target);
+  }
+}
+
+function handleComposerInput(event) {
+  if (extensionActive) {
+    rememberComposer(event.target);
+  }
+}
+
+function handleBindingPointerDown(event) {
+  if (extensionActive) {
     lastPointerTarget = event.target;
-  }, true);
+  }
+}
 
-  document.addEventListener("click", (event) => {
-    if (!bindingMode || isInsideShellToolPanel(event.target)) {
-      return;
-    }
+function handleBindingClick(event) {
+  if (!extensionActive || !bindingMode || isInsideShellToolPanel(event.target)) {
+    return;
+  }
 
-    event.preventDefault();
-    event.stopPropagation();
-    bindElement(bindingMode, event.target);
-    bindingMode = "";
-  }, true);
+  event.preventDefault();
+  event.stopPropagation();
+  bindElement(bindingMode, event.target);
+  bindingMode = "";
+}
 
-  document.addEventListener("dragstart", (event) => {
+function handleBindingDragStart(event) {
+  if (extensionActive) {
     lastPointerTarget = event.target;
-  }, true);
+  }
 }
 
 function rememberComposer(target) {
@@ -167,6 +250,10 @@ function bindElement(mode, target) {
 }
 
 function scheduleScan() {
+  if (!extensionActive) {
+    return;
+  }
+
   clearTimeout(scanTimer);
   scanTimer = setTimeout(() => {
     scanForShellCall().catch((error) => {
@@ -177,32 +264,20 @@ function scheduleScan() {
 }
 
 async function scanForShellCall() {
+  if (!extensionActive) {
+    return;
+  }
+
   expirePendingSelfTest();
 
-  if (!isSupportedPage() || activeCallId || isAssistantGenerating()) {
+  if (activeCallId || isAssistantGenerating()) {
     scheduleScan();
     return;
   }
 
   const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "maxChainCalls"]);
-  if (settings.enabled === false) {
-    const now = Date.now();
-    if (now - lastDisabledStatusAt > 5000) {
-      setStatus("Shell tool paused", "idle");
-      lastDisabledStatusAt = now;
-    }
-    scheduleScan();
-    return;
-  }
-
-  if (!isCurrentHostEnabled(settings.enabledHosts)) {
-    const now = Date.now();
-    updateSiteActionButton(false);
-    if (now - lastDisabledStatusAt > 5000) {
-      setStatus(`Site disabled: ${location.hostname}. Click Enable site to allow shell calls.`, "idle");
-      lastDisabledStatusAt = now;
-    }
-    scheduleScan();
+  if (settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
+    deactivateExtension();
     return;
   }
   updateSiteActionButton(true);

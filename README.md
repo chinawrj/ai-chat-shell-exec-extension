@@ -90,15 +90,14 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 - timeout, output cap, and automatic chain limit
 - export/import settings and per-origin calibration bindings
 
-On a new chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
+On an enabled chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
 
-By default, shell scanning is auto-enabled only on `m365.cloud.microsoft`. Other sites stay paused until you open the site and click `Enable site` in the floating panel, or add the hostname to the popup's auto-enabled sites list.
+By default, shell scanning is auto-enabled only on `m365.cloud.microsoft`. On every other site, the extension does not inject page UI, scan content, or bind page events until you add the hostname in the toolbar popup.
 
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a one-line `shell-call`; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected self-test shell calls are ignored instead of being run.
 - `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
-- `Enable site` / `Disable site`: add or remove the current hostname from the auto-enabled sites list.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered shell-call/code block area.
