@@ -166,7 +166,7 @@ function makeContext() {
       requireApproval: true,
       defaultTimeoutMs: 9999999,
       maxOutputChars: "bad",
-      maxChainCalls: 0
+      maxChainCalls: 123456
     },
     localProfiles: {
       "sendProfile:https://copilot.microsoft.com": {
@@ -191,7 +191,7 @@ function makeContext() {
     requireApproval: true,
     defaultTimeoutMs: 600000,
     maxOutputChars: 20000,
-    maxChainCalls: 1
+    maxChainCalls: 123456
   }));
   assert.equal(JSON.stringify(writes.local), JSON.stringify({
     "sendProfile:https://copilot.microsoft.com": {

@@ -15,6 +15,7 @@ const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
+const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LOCAL_MANUAL_TEST_PORT = "17443";
 const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
 const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
@@ -395,7 +396,7 @@ async function scanForShellCall() {
     return;
   }
 
-  const maxChainCalls = Number(settings.maxChainCalls || 5);
+  const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
   if (chainCallCount >= maxChainCalls) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     await replyWithRejectedCall(call, `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`);

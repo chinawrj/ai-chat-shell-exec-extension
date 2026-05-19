@@ -5,6 +5,8 @@ const CALL_LEDGER_LIMIT = 500;
 const RUNNING_LOCK_GRACE_MS = 15000;
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
+const DEFAULT_MAX_CHAIN_CALLS = 100;
+const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -12,7 +14,7 @@ const DEFAULT_SETTINGS = {
   autoSend: true,
   defaultTimeoutMs: 30000,
   maxOutputChars: 20000,
-  maxChainCalls: 5
+  maxChainCalls: DEFAULT_MAX_CHAIN_CALLS
 };
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -158,6 +160,9 @@ function ensureDefaultSettings() {
 
     if (current.enabledHosts !== undefined && isLegacyDefaultEnabledHosts(current.enabledHosts)) {
       missing.enabledHosts = DEFAULT_ENABLED_HOSTS;
+    }
+    if (current.maxChainCalls === LEGACY_DEFAULT_MAX_CHAIN_CALLS) {
+      missing.maxChainCalls = DEFAULT_MAX_CHAIN_CALLS;
     }
 
     if (Object.keys(missing).length > 0) {

@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.2] - 2026-05-19
+
+- Raises the default automatic shell-call chain limit from 5 to 100.
+- Removes the popup's upper bound for `maxChainCalls`; only the minimum of 1 is enforced.
+- Migrates users still on the old default chain limit to the new default without changing custom values.
+
 ## [0.2.1] - 2026-05-19
 
 - Enables `chatgpt.com` by default so the floating panel appears on a fresh install.

@@ -5,7 +5,7 @@ const DEFAULTS = {
   autoSend: true,
   defaultTimeoutMs: 30000,
   maxOutputChars: 20000,
-  maxChainCalls: 5
+  maxChainCalls: 100
 };
 
 const CONFIG_VERSION = 1;
@@ -76,7 +76,7 @@ async function saveSettings() {
     requireApproval: fields.requireApproval.checked,
     defaultTimeoutMs: clampNumber(fields.defaultTimeoutMs.value, 1000, 600000, DEFAULTS.defaultTimeoutMs),
     maxOutputChars: clampNumber(fields.maxOutputChars.value, 1000, 200000, DEFAULTS.maxOutputChars),
-    maxChainCalls: clampNumber(fields.maxChainCalls.value, 1, 20, DEFAULTS.maxChainCalls)
+    maxChainCalls: clampMinNumber(fields.maxChainCalls.value, 1, DEFAULTS.maxChainCalls)
   });
   saveButton.textContent = "Saved";
   setTimeout(() => {
@@ -180,6 +180,14 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.floor(number)));
 }
 
+function clampMinNumber(value, min, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.max(min, Math.floor(number));
+}
+
 async function exportConfig() {
   setPortableStatus("Exporting config...", "checking");
   const [syncSettings, localStore] = await Promise.all([
@@ -241,7 +249,7 @@ function sanitizeSettings(input) {
     requireApproval: input.requireApproval === true,
     defaultTimeoutMs: clampNumber(input.defaultTimeoutMs, 1000, 600000, DEFAULTS.defaultTimeoutMs),
     maxOutputChars: clampNumber(input.maxOutputChars, 1000, 200000, DEFAULTS.maxOutputChars),
-    maxChainCalls: clampNumber(input.maxChainCalls, 1, 20, DEFAULTS.maxChainCalls)
+    maxChainCalls: clampMinNumber(input.maxChainCalls, 1, DEFAULTS.maxChainCalls)
   };
 }
 
