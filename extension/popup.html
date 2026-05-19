@@ -15,6 +15,17 @@
 
       <p class="hint">On a new AI chat site, click the chat input once. The extension remembers that composer for this origin.</p>
 
+      <section class="tmux">
+        <div>
+          <strong>tmux targets</strong>
+          <small>Copy a target into shell-call JSON, for example <code>{"target":"%24","cmd":"pwd"}</code>.</small>
+        </div>
+        <pre id="tmuxTargets" class="tmux-targets">Checking tmux...</pre>
+        <div class="tmux-actions">
+          <button id="refreshTmuxTargets" type="button">Refresh tmux</button>
+        </div>
+      </section>
+
       <label class="row">
         <span>
           <strong>Enabled</strong>

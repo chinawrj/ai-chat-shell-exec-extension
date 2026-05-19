@@ -33,15 +33,18 @@ const exportConfigButton = document.getElementById("exportConfig");
 const importConfigButton = document.getElementById("importConfig");
 const addCurrentSiteButton = document.getElementById("addCurrentSite");
 const removeCurrentSiteButton = document.getElementById("removeCurrentSite");
+const refreshTmuxTargetsButton = document.getElementById("refreshTmuxTargets");
 const portableConfig = document.getElementById("portableConfig");
 const portableStatus = document.getElementById("portableStatus");
 const currentSiteStatus = document.getElementById("currentSiteStatus");
+const tmuxTargets = document.getElementById("tmuxTargets");
 let currentHost = "";
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadSettings();
   await loadCurrentSite();
   await refreshHealth();
+  await refreshTmuxTargets();
 });
 
 saveButton.addEventListener("click", saveSettings);
@@ -50,6 +53,7 @@ exportConfigButton.addEventListener("click", exportConfig);
 importConfigButton.addEventListener("click", importConfig);
 addCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(true));
 removeCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(false));
+refreshTmuxTargetsButton.addEventListener("click", refreshTmuxTargets);
 
 async function loadSettings() {
   const settings = await chrome.storage.sync.get(Object.keys(DEFAULTS));
@@ -149,6 +153,25 @@ async function refreshHealth() {
   }
 }
 
+async function refreshTmuxTargets() {
+  tmuxTargets.dataset.state = "checking";
+  tmuxTargets.textContent = "Checking tmux...";
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "tmux-list" });
+    if (!response?.ok) {
+      tmuxTargets.dataset.state = "error";
+      tmuxTargets.textContent = response?.error || "tmux is not reachable";
+      return;
+    }
+
+    tmuxTargets.dataset.state = "ok";
+    tmuxTargets.textContent = formatTmuxTargets(response.panes);
+  } catch (error) {
+    tmuxTargets.dataset.state = "error";
+    tmuxTargets.textContent = error.message || String(error);
+  }
+}
+
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) {
@@ -220,6 +243,21 @@ function sanitizeSettings(input) {
     maxOutputChars: clampNumber(input.maxOutputChars, 1000, 200000, DEFAULTS.maxOutputChars),
     maxChainCalls: clampNumber(input.maxChainCalls, 1, 20, DEFAULTS.maxChainCalls)
   };
+}
+
+function formatTmuxTargets(panes) {
+  if (!Array.isArray(panes) || panes.length === 0) {
+    return "No tmux panes found.";
+  }
+
+  return panes.map((pane) => [
+    `target=${pane.id}`,
+    `address=${pane.address}`,
+    `window=${pane.windowName || "(unnamed)"}`,
+    `command=${pane.currentCommand || "unknown"}`,
+    pane.currentPath ? `cwd=${pane.currentPath}` : "",
+    pane.active ? "active=true" : "active=false"
+  ].filter(Boolean).join(" ")).join("\n");
 }
 
 function normalizeEnabledHosts(input) {

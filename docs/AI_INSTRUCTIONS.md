@@ -1,6 +1,6 @@
 # AI Instructions
 
-AI Chat Shell Exec works best when the AI chat system is told how to request shell execution. Add one of these templates to the system's custom instructions, project instructions, agent instructions, or the first message in a conversation.
+AI Chat Shell Exec works best when the AI chat system is told how to request terminal command output. Add one of these templates to the system's custom instructions, project instructions, agent instructions, or the first message in a conversation.
 
 After adding instructions, use the floating panel's `Test` button once on that site.
 
@@ -13,20 +13,20 @@ Use whichever persistent instruction surface your AI chat system provides:
 - Copilot-style systems: agent instructions, system prompt, project instructions, or the first message in a chat.
 - Unknown systems: paste the one-off prompt at the start of the conversation.
 
-The extension does not need to know which product you use. The instruction only needs to make the AI emit the `shell-call` block.
+The instruction only needs to make the AI emit a targeted `shell-call` block.
 
 ## Minimal
 
 Use this when you want the smallest possible instruction:
 
 ```text
-When you need to run a local shell command, reply with exactly one fenced code block using the language shell-call and no prose.
+When local terminal output would help, reply with exactly one fenced code block using the language shell-call and no prose.
 
-Put only the shell command inside the code block.
+Put only a JSON object inside the code block. It must include target and cmd, for example {"target":"%24","cmd":"pwd"}.
 
 After I send back shell-output, use that output to continue.
 
-Do not repeat the same shell-call after receiving shell-output.
+Do not repeat the same command after receiving shell-output.
 ```
 
 ## Recommended
@@ -34,26 +34,24 @@ Do not repeat the same shell-call after receiving shell-output.
 Use this as the default template for ChatGPT, Claude, and similar AI chat systems:
 
 ````text
-You can request local shell execution through a browser extension.
-
-When a shell command is needed, reply with exactly one fenced code block and no prose:
+When local terminal output would help, request one command by replying with exactly one fenced code block and no prose:
 
 ```shell-call
-command here
+{"target":"%24","cmd":"command here"}
 ```
 
 Rules:
-- Put only the command inside the shell-call block.
+- Put only a JSON object inside the shell-call block.
+- Always include `target` and `cmd`. Use the tmux target from the latest shell-output target list or from the user.
+- Target lists use lines like `target=%24 address=espcam:0.0 window=build command=zsh cwd=/path`. Pick the `target=` value for the desired `window=...`; do not put the window name itself in `target`.
+- Keep requests minimal by default: use only `target` and `cmd`.
+- `target` may be a pane id like `%24`, an address like `espcam:0.0`, or a unique window name like `build`.
 - Do not wrap shell-output, terminal output, markdown, explanations, or prompts inside shell-call.
 - Wait for my shell-output reply before interpreting results or requesting the next command.
-- Do not repeat a shell-call after receiving shell-output for that command.
+- Do not repeat a command after receiving shell-output for that command.
 - Prefer read-only commands first when inspecting a system or repository.
 - If a command is destructive, modifies many files, deletes data, installs software, changes credentials, or sends private data to a network service, ask for confirmation in prose instead of emitting shell-call.
-- If a working directory matters, use a JSON shell-call with cwd:
-
-```shell-call
-{"cmd":"git status --short","cwd":"~/path/to/project"}
-```
+- Only add optional fields such as `cwd`, `timeoutMs`, or `maxOutputChars` when the user or previous output clearly requires them.
 ````
 
 ## Shell Syntax Highlighting Variant
@@ -61,37 +59,35 @@ Rules:
 Use this when an AI chat product does not support the `shell-call` code fence label or downgrades it to plain text:
 
 ````text
-You can request local shell execution through a browser extension.
-
-When a shell command is needed, reply with exactly one fenced code block and no prose.
+When local terminal output would help, reply with exactly one fenced code block and no prose.
 Use the code fence language shell.
 Put this marker as the first line inside the block:
 # local-shell
-Put only the command after that marker.
-If the chat product loses multi-line code block content, use the single-line form `# local-shell: <command>` instead.
+Put only the JSON request after that marker.
+If the chat product loses multi-line code block content, use the single-line form `# local-shell: {"target":"%24","cmd":"command"}` instead.
 Wait for my shell-output reply before continuing.
 Do not repeat a command after shell-output is returned.
 
 ```shell
 # local-shell
-git status --short
+{"target":"%24","cmd":"git status --short"}
 ```
 ````
 
 The extension strips `# local-shell` before execution. The marker is there so normal shell examples are not treated as tool calls.
-It also accepts `# local-shell: <command>` and runs only the command after the colon.
+It also accepts `# local-shell: {"target":"%24","cmd":"git status --short"}` and runs only the JSON request after the colon.
 
 ## Project Agent
 
 Use this for coding agents that should iterate through commands:
 
 ````text
-You can use a local shell tool through AI Chat Shell Exec.
+You may request terminal command output with this format:
 
 Tool request format:
 
 ```shell-call
-command here
+{"target":"%24","cmd":"command here"}
 ```
 
 Use the tool when command output is needed to inspect files, run tests, check git state, or verify a change.
@@ -101,11 +97,15 @@ Workflow rules:
 - Emit no prose in a message that contains shell-call.
 - Wait for shell-output before making claims about command results.
 - Do not rerun the same command unless the user asks or the previous output clearly requires it.
-- Prefer explicit cwd with JSON when operating on a project:
+- Always include a tmux `target`. If shell-output says the target is missing, choose one of the listed panes and retry once.
+- In tmux target lists, choose by `window=build` or `window=monitor`. If the window name is unique, you may use it directly as `target`, for example `{"target":"build","cmd":"pwd"}`. If unsure, copy the matching `target=%...` value.
+- Keep the JSON minimal by default. Usually send only `target` and `cmd`:
 
 ```shell-call
-{"cmd":"npm test","cwd":"~/work/project","timeoutMs":120000,"maxOutputChars":40000}
+{"target":"%24","cmd":"npm test"}
 ```
+
+- Add `cwd`, `timeoutMs`, or `maxOutputChars` only when necessary, such as when the target pane is not already in the project directory or a test is expected to run for a long time.
 
 Safety rules:
 - Ask before destructive commands such as rm -rf, git reset --hard, force pushes, credential changes, package publishing, or broad permission changes.
@@ -118,7 +118,7 @@ Safety rules:
 Use this when you cannot set persistent instructions:
 
 ```text
-For this conversation, you may request local shell execution by replying with exactly one fenced code block whose language is shell-call. Put only the command inside the block and no prose. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
+For this conversation, when local terminal output would help, reply with exactly one fenced code block whose language is shell-call. Put only one JSON object inside the block, including target and cmd, for example {"target":"%24","cmd":"pwd"}. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt
@@ -130,8 +130,8 @@ Reply with exactly one fenced markdown code block and no prose.
 Use the code fence language shell.
 Put this marker as the first line inside the block:
 # local-shell
-Put only this command after that marker:
-printf ai-chat-shell-exec-ok
+Put only this JSON request after that marker, replacing %24 with a listed tmux target:
+{"target":"%24","cmd":"printf ai-chat-shell-exec-ok"}
 ```
 
 Expected AI response:
@@ -139,7 +139,7 @@ Expected AI response:
 ````text
 ```shell
 # local-shell
-printf ai-chat-shell-exec-ok
+{"target":"%24","cmd":"printf ai-chat-shell-exec-ok"}
 ```
 ````
 
@@ -149,7 +149,7 @@ Single-line fallback for sites that collapse code block lines:
 
 ````text
 ```shell
-# local-shell: printf ai-chat-shell-exec-ok
+# local-shell: {"target":"%24","cmd":"printf ai-chat-shell-exec-ok"}
 ```
 ````
 

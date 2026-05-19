@@ -9,13 +9,17 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.20";
+const CONTENT_SCRIPT_VERSION = "0.6.24";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
 const DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
+const LOCAL_MANUAL_TEST_PORT = "17443";
+const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
+const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const processedCalls = new Set();
+const processedSemanticCalls = new Set();
 let scanTimer = 0;
 let lastThreadText = "";
 let lastThreadTextAt = Date.now();
@@ -120,6 +124,9 @@ function installPageEventListeners() {
   document.addEventListener("pointerdown", handleBindingPointerDown, true);
   document.addEventListener("click", handleBindingClick, true);
   document.addEventListener("dragstart", handleBindingDragStart, true);
+  if (isLocalManualTestPage()) {
+    window.addEventListener("message", handleManualTmuxListRequest);
+  }
   pageEventListenersInstalled = true;
 }
 
@@ -134,7 +141,38 @@ function removePageEventListeners() {
   document.removeEventListener("pointerdown", handleBindingPointerDown, true);
   document.removeEventListener("click", handleBindingClick, true);
   document.removeEventListener("dragstart", handleBindingDragStart, true);
+  window.removeEventListener("message", handleManualTmuxListRequest);
   pageEventListenersInstalled = false;
+}
+
+async function handleManualTmuxListRequest(event) {
+  if (!isLocalManualTestPage() || event.source !== window || event.origin !== location.origin) {
+    return;
+  }
+
+  const data = event.data || {};
+  if (!data || data.type !== MANUAL_TMUX_LIST_REQUEST) {
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "tmux-list" });
+    window.postMessage({
+      type: MANUAL_TMUX_LIST_RESPONSE,
+      requestId: data.requestId || "",
+      ok: Boolean(response?.ok),
+      panes: Array.isArray(response?.panes) ? response.panes : [],
+      error: response?.error || ""
+    }, location.origin);
+  } catch (error) {
+    window.postMessage({
+      type: MANUAL_TMUX_LIST_RESPONSE,
+      requestId: data.requestId || "",
+      ok: false,
+      panes: [],
+      error: error?.message || String(error)
+    }, location.origin);
+  }
 }
 
 function handleComposerFocus(event) {
@@ -316,21 +354,16 @@ async function scanForShellCall() {
   expirePendingSelfTest();
 
   const call = candidate.call;
-  const callKey = stableHash([
-    location.origin,
-    location.pathname,
-    stableHash(getLastUserMessageText()),
-    call.cmd,
-    call.cwd || "",
-    call.timeoutMs || "",
-    call.maxOutputChars || ""
-  ].join("\n"));
-  if (processedCalls.has(callKey)) {
+  const semanticCallKey = buildSemanticCallKey(call);
+  const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+  if (processedCalls.has(callKey) ||
+    processedSemanticCalls.has(semanticCallKey) ||
+    candidate.node?.dataset?.aiChatShellSemanticKey === semanticCallKey) {
     return;
   }
 
   if (pendingSelfTest && !isExpectedSelfTestCall(call)) {
-    processedCalls.add(callKey);
+    markCallProcessed(candidate, callKey, semanticCallKey);
     const expected = pendingSelfTest.command;
     setStatus(`Self-test ignored unexpected shell call; waiting for ${summarizeCommand(expected)}`, "running");
     return;
@@ -340,14 +373,14 @@ async function scanForShellCall() {
   const lastPromptOrOutputText = getLastUserMessageText();
   if ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
     (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText))) {
-    processedCalls.add(callKey);
+    markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
   }
 
   const validation = validateShellCall(call);
   if (!validation.ok) {
-    processedCalls.add(callKey);
+    markCallProcessed(candidate, callKey, semanticCallKey);
     if (isCopiedOutputRejectionReason(validation.reason)) {
       setStatus(`Suppressed copied shell output: ${summarizeCommand(call.cmd)}`, "ok");
       return;
@@ -356,15 +389,50 @@ async function scanForShellCall() {
     return;
   }
 
+  if (!call.target) {
+    markCallProcessed(candidate, callKey, semanticCallKey);
+    await replyWithMissingTmuxTarget(call);
+    return;
+  }
+
   const maxChainCalls = Number(settings.maxChainCalls || 5);
   if (chainCallCount >= maxChainCalls) {
-    processedCalls.add(callKey);
+    markCallProcessed(candidate, callKey, semanticCallKey);
     await replyWithRejectedCall(call, `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`);
     return;
   }
 
-  processedCalls.add(callKey);
+  markCallProcessed(candidate, callKey, semanticCallKey);
   await runAndReply(callKey, call);
+}
+
+function buildSemanticCallKey(call) {
+  return stableHash([
+    location.origin,
+    normalizeCommand(call.target || ""),
+    normalizeCommand(call.cmd || ""),
+    normalizeCommand(call.cwd || ""),
+    call.timeoutMs || "",
+    call.maxOutputChars || ""
+  ].join("\n"));
+}
+
+function buildCandidateCallKey(candidate, semanticCallKey) {
+  return stableHash([
+    location.origin,
+    candidate.source || "",
+    candidate.index || "",
+    semanticCallKey
+  ].join("\n"));
+}
+
+function markCallProcessed(candidate, callKey, semanticCallKey) {
+  processedCalls.add(callKey);
+  processedSemanticCalls.add(semanticCallKey);
+  if (candidate.node?.dataset) {
+    candidate.node.dataset.aiChatShellCallKey = callKey;
+    candidate.node.dataset.aiChatShellSemanticKey = semanticCallKey;
+  }
 }
 
 function isSupportedPage() {
@@ -372,7 +440,12 @@ function isSupportedPage() {
 }
 
 function isCurrentHostEnabled(enabledHosts) {
-  return normalizeEnabledHosts(enabledHosts).includes(location.hostname.toLowerCase());
+  return isLocalManualTestPage() || normalizeEnabledHosts(enabledHosts).includes(location.hostname.toLowerCase());
+}
+
+function isLocalManualTestPage() {
+  return ["localhost", "127.0.0.1"].includes(location.hostname.toLowerCase()) &&
+    location.port === LOCAL_MANUAL_TEST_PORT;
 }
 
 function normalizeEnabledHosts(value) {
@@ -397,10 +470,26 @@ function normalizeHost(value) {
 }
 
 function getConversationRoot() {
+  const chatFeed = getCurrentChatFeed();
+  if (chatFeed) {
+    return chatFeed;
+  }
+
   return document.querySelector("#thread") ||
     document.querySelector("main") ||
     document.querySelector('[role="main"]') ||
     document.body;
+}
+
+function getCurrentChatFeed() {
+  const feeds = Array.from(document.querySelectorAll('[role="feed"]'))
+    .filter(isVisibleElement);
+  return feeds.find((feed) =>
+    /chat conversation|conversation|messages/i.test(feed.getAttribute("aria-label") || "")
+  ) || feeds.find((feed) => {
+    const text = normalizeText(feed.innerText || feed.textContent || "");
+    return text.includes("You said:") || text.includes("Copilot said:") || text.includes("ChatGPT");
+  }) || null;
 }
 
 function isAssistantGenerating() {
@@ -421,7 +510,10 @@ function getLastShellCallCandidate(root) {
     .filter((candidate) => !isShellOutputText(candidate.node?.innerText || candidate.node?.textContent || ""))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
-  return candidates.length > 0 ? candidates[candidates.length - 1] : null;
+  const runnableCandidates = candidates.filter(isRunnableAuthoredCandidate);
+  const assistantCandidates = runnableCandidates.filter(isAssistantAuthoredCandidate);
+  const scopedCandidates = assistantCandidates.length > 0 ? assistantCandidates : runnableCandidates;
+  return scopedCandidates.length > 0 ? scopedCandidates[scopedCandidates.length - 1] : null;
 }
 
 function extractShellCallCandidates(root) {
@@ -617,7 +709,7 @@ function extractLabeledCodeBlockCalls(root) {
         .map((line) => line.trim())
         .filter(Boolean)
         .filter((line) => line.toLowerCase() !== "copy to clipboard");
-      if (lines.length < 2 || lines.length > 80) {
+      if (lines.length < 1 || lines.length > 80) {
         return null;
       }
 
@@ -843,6 +935,39 @@ function closestMessageContainer(node) {
   return node.closest('[data-message-author-role], article, [role="article"], [data-testid], section, main > div') || node;
 }
 
+function isAssistantAuthoredCandidate(candidate) {
+  const role = getMessageAuthorRole(candidate.node);
+  return role === "assistant";
+}
+
+function isRunnableAuthoredCandidate(candidate) {
+  return getMessageAuthorRole(candidate.node) !== "user";
+}
+
+function getMessageAuthorRole(node) {
+  const container = node?.closest?.('[data-message-author-role], article, [role="article"]');
+  const explicit = container?.getAttribute?.("data-message-author-role") ||
+    node?.closest?.('[data-author-role]')?.getAttribute?.("data-author-role") ||
+    "";
+  const normalizedExplicit = explicit.toLowerCase();
+  if (normalizedExplicit === "assistant" || normalizedExplicit === "user") {
+    return normalizedExplicit;
+  }
+
+  const text = normalizeText(container?.innerText || container?.textContent || node?.innerText || node?.textContent || "")
+    .toLowerCase();
+  if (text.startsWith("you said:") || text.startsWith("user:")) {
+    return "user";
+  }
+  if (text.startsWith("copilot said:") ||
+    text.startsWith("assistant:") ||
+    text.startsWith("chatgpt said:") ||
+    text.startsWith("claude said:")) {
+    return "assistant";
+  }
+  return "";
+}
+
 function compareNodeOrder(a, b) {
   if (a === b) {
     return 0;
@@ -910,8 +1035,8 @@ function shouldTreatShellLikeCodeAsTool(language, node, commandText = "") {
   const lastUserText = getLastUserMessageText().toLowerCase();
   const nearbyText = normalizeText(
     [
-      node.previousElementSibling?.textContent || "",
-      node.parentElement?.textContent?.slice(0, 400) || ""
+      node?.previousElementSibling?.textContent || "",
+      node?.parentElement?.textContent?.slice(0, 400) || ""
     ].join(" ")
   ).toLowerCase();
 
@@ -925,6 +1050,7 @@ function parseCallPayload(text) {
     if (parsed && typeof parsed === "object") {
       return {
         cmd: normalizeCommand(parsed.cmd || parsed.command || ""),
+        target: normalizeCommand(parsed.target || parsed.tmuxTarget || parsed.pane || ""),
         cwd: normalizeCommand(parsed.cwd || ""),
         timeoutMs: Number(parsed.timeoutMs || parsed.timeout || 0) || undefined,
         maxOutputChars: Number(parsed.maxOutputChars || 0) || undefined
@@ -971,18 +1097,6 @@ function isShellToolDirectiveLine(line) {
 function extractShellToolDirectiveCommand(line) {
   const match = String(line || "").trim().match(/^(?:#|\/\/|;)\s*(?:shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)\s*:\s*([\s\S]+)$/i);
   return match ? normalizeCommand(match[1]) : "";
-}
-
-function expirePendingSelfTest() {
-  if (!pendingSelfTest) {
-    return;
-  }
-
-  if (Date.now() - Number(pendingSelfTest.startedAt || 0) > 120000) {
-    const token = pendingSelfTest.token;
-    pendingSelfTest = null;
-    setStatus(`Self-test timed out: ${token}`, "error");
-  }
 }
 
 function resetChainForNewHumanPrompt() {
@@ -1118,6 +1232,28 @@ async function replyWithRejectedCall(call, reason) {
   await clickSendWhenReady();
 }
 
+async function replyWithMissingTmuxTarget(call) {
+  chainCallCount += 1;
+  setStatus("Rejected shell call: missing tmux target", "error");
+  const response = await chrome.runtime.sendMessage({ type: "tmux-list" });
+  const panes = response?.panes || [];
+  const exampleTarget = panes[0]?.id || "%pane_id";
+  await insertReply([
+    "Shell call rejected:",
+    "",
+    "```shell-output",
+    `$ ${call.cmd}`,
+    "error: Missing tmux target. Use a JSON shell-call with target and cmd.",
+    "",
+    "tmux targets:",
+    formatTmuxPanesForShellOutput(panes, response?.error),
+    "",
+    `example: ${JSON.stringify({ target: exampleTarget, cmd: call.cmd || "pwd" })}`,
+    "```"
+  ].join("\n"));
+  await clickSendWhenReady();
+}
+
 async function runAndReply(callId, call) {
   if (!call.cmd) {
     return;
@@ -1129,6 +1265,7 @@ async function runAndReply(callId, call) {
       [
         "AI requested a local shell command.",
         "",
+        call.target ? `tmux target: ${call.target}` : "tmux target: missing",
         call.cwd ? `cwd: ${call.cwd}` : "cwd: shell server default",
         "",
         call.cmd,
@@ -1204,6 +1341,7 @@ function setShellCompletionStatus(call, response) {
 function isExpectedSelfTestCall(call) {
   return !!pendingSelfTest &&
     normalizeCommand(call?.cmd || "") === pendingSelfTest.command &&
+    normalizeCommand(call?.target || "") === normalizeCommand(pendingSelfTest.target || "") &&
     (!call?.cwd || normalizeCommand(call.cwd) === normalizeCommand(pendingSelfTest.cwd || ""));
 }
 
@@ -1221,16 +1359,21 @@ function formatShellOutput(call, response, startedAt) {
       "",
       "```shell-output",
       `$ ${call.cmd}`,
+      call.target ? `target: ${call.target}` : "",
       `startedAt: ${startedAt}`,
       `error: ${response?.error || "Unknown shell server error."}`,
+      response?.example ? `example: ${response.example}` : "",
+      response?.tmuxPanes ? "\ntmux targets:\n" + formatTmuxPanesForShellOutput(response.tmuxPanes) : "",
       "```"
-    ].join("\n");
+    ].filter((line) => line !== "").join("\n");
   }
 
   const stdout = response.stdout || "";
   const stderr = response.stderr || "";
   const meta = [
     `$ ${call.cmd}`,
+    `target: ${response.target || call.target || ""}`,
+    response.targetName ? `targetName: ${response.targetName}` : "",
     `cwd: ${response.cwd || call.cwd || ""}`,
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
@@ -1246,6 +1389,24 @@ function formatShellOutput(call, response, startedAt) {
     stderr ? "\nstderr:\n" + stderr : "",
     "```"
   ].join("\n");
+}
+
+function formatTmuxPanesForShellOutput(panes, error = "") {
+  if (error) {
+    return `tmux list failed: ${error}`;
+  }
+  if (!Array.isArray(panes) || panes.length === 0) {
+    return "No tmux panes found. Start tmux and open a shell pane first.";
+  }
+
+  return panes.map((pane) => [
+    `target=${pane.id}`,
+    `address=${pane.address}`,
+    `window=${pane.windowName || "(unnamed)"}`,
+    `command=${pane.currentCommand || "unknown"}`,
+    pane.currentPath ? `cwd=${pane.currentPath}` : "",
+    pane.active ? "active=true" : "active=false"
+  ].filter(Boolean).join(" ")).join("\n");
 }
 
 async function insertReply(text) {
@@ -1810,8 +1971,9 @@ function updateSiteActionButton(enabled) {
 
 async function runHealthCheck() {
   setStatus("Checking shell server and bindings", "running");
-  const [health, profiles] = await Promise.all([
+  const [health, tmux, profiles] = await Promise.all([
     chrome.runtime.sendMessage({ type: "shell-health" }),
+    chrome.runtime.sendMessage({ type: "tmux-list" }),
     chrome.storage.local.get([composerProfileKey(), sendProfileKey(), shellProfileKey()])
   ]);
   const bindings = [
@@ -1832,7 +1994,8 @@ async function runHealthCheck() {
 
   const boundText = bindings.length > 0 ? bindings.join("/") : "auto";
   const pidText = health.pid ? ` pid ${health.pid}` : "";
-  setStatus(`Server ok${pidText}; bindings ${boundText}`, "ok");
+  const paneText = tmux?.ok ? `; tmux panes ${tmux.panes?.length || 0}` : "; tmux unavailable";
+  setStatus(`Server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
 }
 
 async function runFullChainTest() {
@@ -1842,27 +2005,43 @@ async function runFullChainTest() {
     return;
   }
 
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-list" });
+  if (!tmux?.ok || !Array.isArray(tmux.panes) || tmux.panes.length === 0) {
+    setStatus(`Test failed: ${summarizeCommand(tmux?.error || "no tmux panes found")}`, "error");
+    return;
+  }
+
+  const pane = chooseSelfTestPane(tmux.panes);
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
+  const payload = JSON.stringify({ target: pane.id, cmd: command });
   const prompt = [
     "Compatibility test.",
     "Reply only with one markdown code block labeled shell.",
     "The only line inside must be exactly:",
-    `# local-shell: ${command}`
+    `# local-shell: ${payload}`
   ].join("\n");
 
-  setStatus(`Starting full test: ${token}`, "running");
+  setStatus(`Starting full test on ${pane.id}: ${token}`, "running");
   const composer = await insertReply(prompt);
   const sent = await clickSendWhenReady(composer);
   if (sent) {
     pendingSelfTest = {
       token,
       command,
+      target: pane.id,
       cwd: "",
       startedAt: Date.now()
     };
     setStatus(`Waiting for shell-call test: ${token}`, "running");
   }
+}
+
+function chooseSelfTestPane(panes) {
+  const shellNames = new Set(["bash", "dash", "fish", "ksh", "sh", "zsh"]);
+  return panes.find((pane) => pane.active && shellNames.has(String(pane.currentCommand || "").toLowerCase())) ||
+    panes.find((pane) => shellNames.has(String(pane.currentCommand || "").toLowerCase())) ||
+    panes[0];
 }
 
 async function restorePanelPosition(panel) {

@@ -15,9 +15,23 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const STATE_DIR = path.join(__dirname, "..", ".state");
+const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
+const TMUX_FIELD_SEPARATOR = "__AI_CHAT_SHELL_FIELD__";
+const TMUX_LIST_FORMAT = [
+  "#{pane_id}",
+  "#{session_name}",
+  "#{window_index}",
+  "#{window_name}",
+  "#{pane_index}",
+  "#{pane_active}",
+  "#{pane_current_path}",
+  "#{pane_current_command}"
+].join(TMUX_FIELD_SEPARATOR);
+const TMUX_CAPTURE_HISTORY_LINES = 20000;
+const TMUX_POLL_INTERVAL_MS = 250;
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
 let serverLedger = loadServerLedger();
 
@@ -27,11 +41,13 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       service: "ai-chat-shell-exec-server",
+      executionBackend: "tmux",
       pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
       allowedOrigin: ALLOWED_ORIGIN,
       allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
       stateDir: STATE_DIR,
+      tmuxSocket: getTmuxSocketPath() || null,
       ledgerEntries: Object.keys(serverLedger.calls || {}).length
     }));
     return;
@@ -154,7 +170,18 @@ function shutdown() {
 
 async function handleMessageText(text) {
   const message = JSON.parse(text);
-  if (!message || message.type !== "run") {
+  if (!message || !message.type) {
+    throw new Error("Unsupported message type.");
+  }
+
+  if (message.type === "tmux-list") {
+    return {
+      ok: true,
+      panes: await listTmuxPanes()
+    };
+  }
+
+  if (message.type !== "run") {
     throw new Error("Unsupported message type.");
   }
 
@@ -170,8 +197,20 @@ async function handleMessageText(text) {
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
-  const cwd = resolveCwd(message.cwd);
+  const panes = await listTmuxPanes();
+  const target = normalizeTmuxTarget(message.target || message.tmuxTarget || "");
+  if (!target) {
+    return buildMissingTargetResponse(message, cmd, panes);
+  }
+
+  const pane = resolveTmuxTarget(target, panes);
+  if (!pane) {
+    return buildInvalidTargetResponse(message, cmd, target, panes);
+  }
+
+  const cwd = resolveCwd(message.cwd, pane.currentPath);
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([
+    pane.id,
     cmd,
     cwd,
     timeoutMs,
@@ -181,6 +220,7 @@ async function handleMessageText(text) {
   const claim = claimServerShellCall(callKey, {
     cmd,
     cwd,
+    target: pane.id,
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
@@ -207,8 +247,14 @@ async function handleMessageText(text) {
     };
   }
 
-  console.log(`[run] callKey=${callKey} seq=${message.seq || ""} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
-  const result = await runShell(cmd, cwd, timeoutMs, maxOutputChars);
+  console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
+  const result = await runTmuxShell({
+    cmd,
+    cwd,
+    pane,
+    timeoutMs,
+    maxOutputChars
+  });
   console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
   const response = {
@@ -217,6 +263,8 @@ async function handleMessageText(text) {
     callKey,
     cmd,
     cwd,
+    target: pane.id,
+    targetName: pane.label,
     timeoutMs,
     durationMs: Date.now() - started,
     ...result
@@ -243,6 +291,7 @@ function claimServerShellCall(callKey, payload) {
     startedAt: now,
     cmdHash: hashText(payload.cmd),
     cwd: payload.cwd,
+    target: payload.target || "",
     seq: payload.seq || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
@@ -338,17 +387,272 @@ function validateCommand(cmd) {
   }
 }
 
-function runShell(cmd, cwd, timeoutMs, maxOutputChars) {
+async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
+  const runId = crypto.randomBytes(8).toString("hex");
+  const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
+  const doneMarker = `__AI_CHAT_SHELL_EXEC_DONE_${runId}__`;
+  const scriptPath = path.join(TMUX_SCRIPT_DIR, `${runId}.zsh`);
+  fs.mkdirSync(TMUX_SCRIPT_DIR, { recursive: true });
+  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }), { mode: 0o700 });
+
+  const started = Date.now();
+  let lastCapture = "";
+  try {
+    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", `/bin/zsh ${shellQuote(scriptPath)}`], { timeoutMs: 5000 });
+    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
+
+    while (Date.now() - started < timeoutMs) {
+      await sleep(TMUX_POLL_INTERVAL_MS);
+      lastCapture = await captureTmuxPane(pane.id);
+      const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+      if (extracted.foundDone) {
+        return {
+          exitCode: extracted.exitCode,
+          stdout: extracted.stdout,
+          stderr: "",
+          truncated: extracted.truncated,
+          timedOut: false,
+          target: pane.id,
+          targetName: pane.label
+        };
+      }
+    }
+
+    const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+    return {
+      exitCode: 124,
+      stdout: partial.stdout,
+      stderr: "Timed out waiting for tmux command completion marker. The command may still be running in the target pane.",
+      truncated: partial.truncated,
+      timedOut: true,
+      target: pane.id,
+      targetName: pane.label
+    };
+  } finally {
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch {
+      // Best-effort cleanup; stale files are harmless and remain under .state/.
+    }
+  }
+}
+
+function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }) {
+  return [
+    "#!/bin/zsh",
+    "set +e",
+    `printf '\\n%s\\n' ${shellQuote(startMarker)}`,
+    "(",
+    cwd ? `  cd -- ${shellQuote(cwd)} || exit $?` : "",
+    cmd,
+    ")",
+    "__ai_chat_shell_exec_status=$?",
+    `printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} \"$__ai_chat_shell_exec_status\"`,
+    "exit \"$__ai_chat_shell_exec_status\"",
+    ""
+  ].filter((line) => line !== "").join("\n");
+}
+
+async function listTmuxPanes() {
+  const result = await runTmuxCommand(["list-panes", "-a", "-F", TMUX_LIST_FORMAT], { timeoutMs: 5000 });
+  const panes = parseTmuxPanes(result.stdout);
+  console.log(`[tmux-list] socket=${getTmuxSocketPath() || "(default)"} panes=${panes.length} stdoutChars=${result.stdout.length}`);
+  return panes;
+}
+
+function parseTmuxPanes(output) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.includes(TMUX_FIELD_SEPARATOR)
+        ? line.split(TMUX_FIELD_SEPARATOR)
+        : line.split("\t");
+      const [
+        id,
+        session,
+        windowIndex,
+        windowName,
+        paneIndex,
+        active,
+        currentPath,
+        currentCommand
+      ] = parts;
+      const address = `${session}:${windowIndex}.${paneIndex}`;
+      return {
+        id,
+        session,
+        windowIndex,
+        windowName,
+        paneIndex,
+        active: active === "1",
+        currentPath: currentPath || "",
+        currentCommand: currentCommand || "",
+        address,
+        label: `${address} ${windowName || "(unnamed)"}`
+      };
+    })
+    .filter((pane) => pane.id && pane.session && pane.windowIndex !== undefined && pane.paneIndex !== undefined);
+}
+
+function normalizeTmuxTarget(value) {
+  return String(value || "").trim();
+}
+
+function resolveTmuxTarget(target, panes) {
+  const normalized = normalizeTmuxTarget(target);
+  if (!normalized) {
+    return null;
+  }
+
+  const exact = panes.find((pane) => pane.id === normalized || pane.address === normalized);
+  if (exact) {
+    return exact;
+  }
+
+  const byWindowName = panes.filter((pane) => pane.windowName === normalized);
+  return byWindowName.length === 1 ? byWindowName[0] : null;
+}
+
+function buildMissingTargetResponse(message, cmd, panes) {
+  return buildTargetErrorResponse({
+    message,
+    cmd,
+    panes,
+    error: "Missing tmux target. Use a JSON shell-call with target and cmd.",
+    targetRequired: true
+  });
+}
+
+function buildInvalidTargetResponse(message, cmd, target, panes) {
+  return buildTargetErrorResponse({
+    message,
+    cmd,
+    panes,
+    error: `Unknown or ambiguous tmux target: ${target}`,
+    targetRequired: true
+  });
+}
+
+function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }) {
+  return {
+    ok: false,
+    id: message.id,
+    callKey: message.callKey || message.id || "",
+    cmd,
+    targetRequired,
+    error,
+    tmuxPanes: panes,
+    example: buildTmuxTargetExample(panes, cmd)
+  };
+}
+
+function buildTmuxTargetExample(panes, cmd = "pwd") {
+  const target = panes[0]?.id || "%pane_id";
+  return JSON.stringify({ target, cmd: cmd || "pwd" });
+}
+
+async function captureTmuxPane(target) {
+  const result = await runTmuxCommand([
+    "capture-pane",
+    "-p",
+    "-J",
+    "-S",
+    `-${TMUX_CAPTURE_HISTORY_LINES}`,
+    "-t",
+    target
+  ], { timeoutMs: 5000 });
+  return result.stdout;
+}
+
+function runTmuxCommand(args, options) {
+  return runCommand("tmux", buildTmuxCommandArgs(args), options);
+}
+
+function buildTmuxCommandArgs(args, socketPath = getTmuxSocketPath()) {
+  return socketPath ? ["-S", socketPath, ...args] : args;
+}
+
+function getTmuxSocketPath() {
+  const configured = process.env.AI_CHAT_SHELL_TMUX_SOCKET;
+  if (configured) {
+    return configured;
+  }
+
+  const tmuxEnvSocket = getTmuxEnvSocketPath(process.env.TMUX);
+  if (tmuxEnvSocket) {
+    return tmuxEnvSocket;
+  }
+
+  return detectDefaultTmuxSocketPath();
+}
+
+function getTmuxEnvSocketPath(tmuxEnv) {
+  const socketPath = String(tmuxEnv || "").split(",")[0];
+  return socketPath && socketExists(socketPath) ? socketPath : "";
+}
+
+function detectDefaultTmuxSocketPath() {
+  if (typeof process.getuid !== "function") {
+    return "";
+  }
+
+  const uid = process.getuid();
+  const candidates = [
+    `/private/tmp/tmux-${uid}/default`,
+    `/tmp/tmux-${uid}/default`,
+    path.join(os.tmpdir(), `tmux-${uid}`, "default")
+  ];
+  return candidates.find(socketExists) || "";
+}
+
+function socketExists(socketPath) {
+  try {
+    return fs.existsSync(socketPath);
+  } catch {
+    return false;
+  }
+}
+
+function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars = DEFAULT_MAX_OUTPUT_CHARS) {
+  const lines = String(captured || "").split(/\r?\n/);
+  const startIndex = lines.findIndex((line) => line.includes(startMarker));
+  if (startIndex < 0) {
+    return {
+      foundStart: false,
+      foundDone: false,
+      exitCode: 124,
+      stdout: "",
+      truncated: false
+    };
+  }
+
+  const doneIndex = lines.findIndex((line, index) => index > startIndex && line.includes(doneMarker));
+  const endIndex = doneIndex >= 0 ? doneIndex : lines.length;
+  const output = lines.slice(startIndex + 1, endIndex).join("\n").replace(/\n+$/, "");
+  const stdout = appendLimited("", output, maxOutputChars);
+  const doneLine = doneIndex >= 0 ? lines[doneIndex] : "";
+  const exitMatch = doneLine.match(new RegExp(`${escapeRegExp(doneMarker)}:(\\d+)`));
+
+  return {
+    foundStart: true,
+    foundDone: doneIndex >= 0,
+    exitCode: exitMatch ? Number(exitMatch[1]) : 124,
+    stdout,
+    truncated: output.length > stdout.length
+  };
+}
+
+function runCommand(command, args, { timeoutMs = 5000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn("/bin/zsh", ["-lc", cmd], {
-      cwd,
+    const child = spawn(command, args, {
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
 
     let stdout = "";
     let stderr = "";
-    let truncated = false;
     let timedOut = false;
 
     const timer = setTimeout(() => {
@@ -358,38 +662,43 @@ function runShell(cmd, cwd, timeoutMs, maxOutputChars) {
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk.toString("utf8"), maxOutputChars);
-      truncated = truncated || stdout.length >= maxOutputChars;
+      stdout = appendLimited(stdout, chunk.toString("utf8"), 1000000);
     });
 
     child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk.toString("utf8"), maxOutputChars);
-      truncated = truncated || stderr.length >= maxOutputChars;
+      stderr = appendLimited(stderr, chunk.toString("utf8"), 1000000);
     });
 
     child.on("error", (error) => {
       clearTimeout(timer);
-      resolve({
-        exitCode: 127,
-        stdout,
-        stderr: `${stderr}${stderr ? "\n" : ""}${error.message}`,
-        truncated,
-        timedOut
-      });
+      const message = `${stderr}${stderr ? "\n" : ""}${error.message}`;
+      resolve({ ok: false, stdout, stderr: message, exitCode: 127, timedOut });
     });
 
     child.on("close", (code, signal) => {
       clearTimeout(timer);
-      resolve({
-        exitCode: Number.isInteger(code) ? code : 128,
-        signal,
-        stdout,
-        stderr,
-        truncated,
-        timedOut
-      });
+      const exitCode = Number.isInteger(code) ? code : 128;
+      resolve({ ok: exitCode === 0 && !timedOut, stdout, stderr, exitCode, signal, timedOut });
     });
+  }).then((result) => {
+    if (!result.ok) {
+      const detail = result.stderr || `${command} ${args.join(" ")} exited with ${result.exitCode}`;
+      throw new Error(detail.trim());
+    }
+    return result;
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shellQuote(value) {
+  return `'${String(value || "").replace(/'/g, "'\\''")}'`;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function decodeTextFrames(buffer) {
@@ -521,9 +830,9 @@ function hashText(input) {
     .slice(0, 32);
 }
 
-function resolveCwd(rawCwd) {
+function resolveCwd(rawCwd, fallbackCwd = "") {
   if (!rawCwd) {
-    return os.homedir();
+    return fallbackCwd || os.homedir();
   }
 
   const expanded = String(rawCwd).replace(/^~(?=$|\/)/, os.homedir());
@@ -536,7 +845,17 @@ function resolveCwd(rawCwd) {
 }
 
 module.exports = {
+  buildTmuxCommandArgs,
+  buildMissingTargetResponse,
   decodeTextFrames,
+  detectDefaultTmuxSocketPath,
   encodeTextFrame,
+  extractTmuxRunOutput,
+  getTmuxEnvSocketPath,
+  getTmuxSocketPath,
+  listTmuxPanes,
+  parseTmuxPanes,
+  resolveTmuxTarget,
+  runTmuxShell,
   startServer
 };

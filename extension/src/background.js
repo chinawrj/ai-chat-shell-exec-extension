@@ -39,6 +39,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "tmux-list") {
+    listTmuxTargets()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error),
+        panes: []
+      }));
+    return true;
+  }
+
   if (message.type !== "run-shell") {
     return false;
   }
@@ -63,6 +74,7 @@ async function handleRunShellMessage(message) {
     id: message.id,
     callKey,
     cmd: message.cmd,
+    target: message.target,
     cwd: message.cwd,
     timeoutMs,
     maxOutputChars,
@@ -88,7 +100,8 @@ async function handleRunShellMessage(message) {
       exitCode: response?.exitCode,
       durationMs: response?.durationMs,
       duplicate: response?.duplicate === true,
-      skipped: response?.skipped === true
+      skipped: response?.skipped === true,
+      target: response?.target || payload.target || ""
     });
     return response;
   } catch (error) {
@@ -174,6 +187,7 @@ async function claimShellCall(callKey, payload) {
     seq,
     claimedAt: now,
     cmdHash: hashText(payload.cmd || ""),
+    target: payload.target || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
     promptHash: payload.callMeta?.promptHash || ""
@@ -240,6 +254,10 @@ function hashText(input) {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16);
+}
+
+function listTmuxTargets() {
+  return runShellViaWebSocket({ type: "tmux-list", timeoutMs: 5000 });
 }
 
 function runShellViaWebSocket(payload) {

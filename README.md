@@ -1,29 +1,29 @@
 # AI Chat Shell Exec
 
-Chrome extension for explicit local shell execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`.
+Chrome extension for explicit local command execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`, routed through a selected tmux pane.
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-An AI chat page can request a shell command by returning a fenced code block with the language `shell-call`:
+An AI chat page can request a command by returning a fenced code block with the language `shell-call`. Each request must specify a tmux target:
 
 ````
 ```shell-call
-pwd && ls -la
+{"target":"%24","cmd":"pwd && ls -la"}
 ```
 ````
 
-The content script waits until the assistant stops streaming, sends the command through the extension background worker to a local WebSocket shell server, then posts the output back into the chat composer as a `shell-output` block.
+The content script waits until the assistant stops streaming, sends the command through the extension background worker to a local WebSocket server, the server sends it into the selected tmux pane, then the content script posts the captured pane output back into the chat composer as a `shell-output` block.
 
 ## Architecture
 
 Chrome extensions cannot directly execute local shell commands. This project uses:
 
 - `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. The execution trigger is still limited to explicit `shell-call` blocks.
-- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that runs `/bin/zsh -lc <command>`.
+- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that lists tmux panes, sends commands into a selected pane, and captures output between completion markers.
 
 Flow:
 
-`AI chat page -> content script -> extension background -> ws://127.0.0.1:17371/shell -> local zsh -> shell-output reply`
+`AI chat page -> content script -> extension background -> ws://127.0.0.1:17371/shell -> tmux pane -> shell-output reply`
 
 ## Install
 
@@ -32,6 +32,7 @@ Prerequisites:
 - macOS
 - Chrome or another Chromium browser with unpacked extensions enabled
 - Node.js available on `PATH`
+- tmux available on `PATH`
 
 Download the latest release from:
 
@@ -53,7 +54,7 @@ If you use the release source archive, unzip it and run the commands below from 
    ./scripts/install_shell_server_agent.sh
    ```
 
-   This creates `~/Library/LaunchAgents/com.local.ai-chat-shell-exec-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`.
+   This creates `~/Library/LaunchAgents/com.local.ai-chat-shell-exec-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`. The installer also sets `AI_CHAT_SHELL_TMUX_SOCKET` to the default user tmux socket; override it before running the installer if you use a named tmux socket.
 
    For a temporary foreground server during development, use:
 
@@ -76,7 +77,7 @@ Start with:
 The short version is:
 
 ```text
-When you need to run a local shell command, reply with exactly one fenced code block using the language shell-call and no prose. Put only the command inside the block. After I send back shell-output, use that output to continue. Do not repeat the same shell-call after receiving shell-output.
+When local terminal output would help, reply with exactly one fenced code block using the language shell-call and no prose. Put only a JSON object inside with target and cmd, for example {"target":"%24","cmd":"pwd"}. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
 ```
 
 Then run the floating panel's `Test` button once on each AI chat site.
@@ -85,6 +86,7 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 - enabled/paused
 - auto-enabled sites
+- available tmux targets to copy into `shell-call` JSON
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -109,32 +111,41 @@ Use the popup's portable config area to move settings and bindings to another Ch
 
 ## Tool Call Format
 
-Plain command:
+Plain command blocks are rejected because the server no longer chooses a shell by itself. Use JSON with a `target` and `cmd`:
 
 ````
 ```shell-call
-uname -a
+{"target":"%24","cmd":"uname -a"}
 ```
 ````
 
-JSON command:
+`target` can be a tmux pane id such as `%24`, a `session:window.pane` address such as `espcam:0.0`, or a unique window name such as `build`.
+
+When the extension returns a target list, each line is formatted for the AI to read, for example `target=%24 address=espcam:0.0 window=build command=zsh cwd=/path active=true`. Choose the `target=` value that matches the desired `window=...`.
+
+Keep AI requests minimal by default:
 
 ````
 ```shell-call
-{
-  "cmd": "git status --short",
-  "cwd": "~/work/project",
-  "timeoutMs": 30000,
-  "maxOutputChars": 20000
-}
+{"target":"%24","cmd":"git status --short"}
 ```
 ````
+
+If the desired window name is unique, this also works:
+
+````
+```shell-call
+{"target":"build","cmd":"git status --short"}
+```
+````
+
+Optional fields such as `cwd`, `timeoutMs`, and `maxOutputChars` are supported, but should be added only when needed.
 
 Accepted tool language tags are `shell-call`, `shell_call`, `tool:shell`, `tool-shell`, and `local-shell`.
 
 Some AI chat systems normalize unknown code block languages into ordinary `shell`, `bash`, `sh`, or `zsh` blocks. For those sites, the extension also accepts shell-like code blocks when either:
 
-- the first line inside the block is a tool marker such as `# local-shell` or `# local-shell: git status --short`; or
+- the first line inside the block is a tool marker such as `# local-shell` or `# local-shell: {"target":"%24","cmd":"git status --short"}`; or
 - the latest human prompt explicitly mentions one of the tool language tags above.
 
 The marker form keeps standard shell syntax highlighting while preserving an explicit tool boundary:
@@ -142,7 +153,7 @@ The marker form keeps standard shell syntax highlighting while preserving an exp
 ````text
 ```shell
 # local-shell
-git status --short
+{"target":"%24","cmd":"git status --short"}
 ```
 ````
 
@@ -150,7 +161,7 @@ For chat systems that are unreliable with multi-line code blocks, use the single
 
 ````text
 ```shell
-# local-shell: git status --short
+# local-shell: {"target":"%24","cmd":"git status --short"}
 ```
 ````
 
@@ -169,13 +180,14 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 ## Safety Defaults
 
 - The extension runs explicit tool blocks. Ordinary `bash`, `sh`, `zsh`, and `shell` blocks are accepted only when the block contains a `# local-shell` marker or the latest human prompt explicitly asked for one of the tool language tags.
+- Every command must name a tmux target. Missing or unknown targets are rejected and the reply lists available panes.
 - The default auto-enabled host list contains only `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained shell calls are capped by `maxChainCalls` in extension storage. New human prompts reset the chain count; tool result replies do not.
-- Duplicate execution is blocked before the command reaches the shell server. The content script generates a stable call key from the site, latest human intent, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in `.state/shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
+- Duplicate execution is blocked before the command reaches the local server. The content script generates a stable call key from the site, latest human intent, tmux target, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in `.state/shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
 - The WebSocket server only accepts Chrome extension requests by default. Set `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
-- The shell server clamps timeout to 1 second through 10 minutes.
+- The local server clamps timeout to 1 second through 10 minutes. When a tmux command times out, the server stops waiting and reports that the command may still be running in the pane.
 - Commands longer than 8000 characters are rejected before execution.
 - Output is capped to avoid flooding the page.
 - Repeated shell-call output loops are suppressed when the assistant repeats the same command after receiving a shell-output reply.
@@ -212,6 +224,22 @@ Health check:
 curl http://127.0.0.1:17371/health
 ```
 
+Manual tmux test page:
+
+```sh
+node scripts/start_tmux_test_page_https.js
+```
+
+Open `https://localhost:17443/tmux-test-page.html`, accept the local certificate warning, reload the unpacked extension, copy a tmux target from the popup, click the page composer once, then insert a targeted `shell-call`. This local test port is auto-enabled by the development content script.
+
+To launch an isolated Chromium-family test profile with this unpacked extension already loaded:
+
+```sh
+./scripts/open_tmux_test_chrome.sh
+```
+
+The helper prefers Chrome for Testing, Chromium, then Microsoft Edge before Google Chrome. Recent Google Chrome builds can ignore `--load-extension` for local unpacked extensions; in that case load `extension/` manually from `chrome://extensions` or set `AI_SHELL_TEST_BROWSER_APP`.
+
 Installation diagnostics:
 
 ```sh
@@ -223,7 +251,11 @@ Local checks:
 ```sh
 node --check extension/src/content.js
 node --check extension/src/background.js
+node --check extension/src/popup.js
 node --check server/shell_server.js
+node --check scripts/start_tmux_test_page_https.js
+node tests/manifest_consistency.test.js
+node tests/tmux_helpers.test.js
 node tests/server_websocket_frames.test.js
 node tests/popup_config.test.js
 bash -n scripts/*.sh

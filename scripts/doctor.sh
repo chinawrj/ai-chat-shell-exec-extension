@@ -31,6 +31,19 @@ else
   fail "Node.js was not found on PATH"
 fi
 
+if command -v tmux >/dev/null 2>&1; then
+  pass "tmux found: $(command -v tmux) ($(tmux -V))"
+  panes="$(tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{window_name} #{pane_current_command}' 2>/dev/null || true)"
+  if [[ -n "$panes" ]]; then
+    pass "tmux panes are visible"
+    printf '%s\n' "$panes" | sed 's/^/info: tmux pane /'
+  else
+    fail "No tmux panes are visible. Start tmux and open a shell pane before using shell-call."
+  fi
+else
+  fail "tmux was not found on PATH"
+fi
+
 if [[ -r "$MANIFEST_PATH" ]]; then
   pass "Extension manifest is readable: $MANIFEST_PATH"
 else

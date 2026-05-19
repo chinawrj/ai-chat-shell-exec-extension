@@ -10,6 +10,7 @@ PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$LABEL.plist"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
 PATH_VALUE="${PATH:-/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+TMUX_SOCKET_PATH="${AI_CHAT_SHELL_TMUX_SOCKET:-/private/tmp/tmux-$(id -u)/default}"
 
 if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
   echo "Could not find an executable node binary. Install Node.js or set NODE_BIN=/path/to/node." >&2
@@ -36,6 +37,8 @@ cat > "$PLIST_PATH" <<PLIST
   <dict>
     <key>PATH</key>
     <string>$PATH_VALUE</string>
+    <key>AI_CHAT_SHELL_TMUX_SOCKET</key>
+    <string>$TMUX_SOCKET_PATH</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

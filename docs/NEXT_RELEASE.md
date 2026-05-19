@@ -1,21 +1,20 @@
-# Next Release Target: v0.2.0
+# Next Release Target: v0.2.1
 
-Target date: after the next full ChatGPT and Claude regression pass.
+Target date: after the next maintenance or compatibility fix.
 
 ## Theme
 
-Make the extension easier to install, diagnose, and carry across unknown AI chat sites.
+Polish the tmux-backed release based on real user feedback.
 
 ## Goals
 
-1. Installation diagnostics
-   - Keep `scripts/doctor.sh` as the first-line support command.
-   - Surface extension/server origin mismatches in the popup and floating panel.
+1. Compatibility follow-up
+   - Track chat products that downgrade or reformat `shell-call` code fences.
+   - Keep AI-facing instructions neutral and focused on terminal output requests.
 
-2. Portable calibration
-   - Let users export settings and per-origin bindings from the popup.
-   - Let users import those settings on another Chrome profile or machine.
-   - Do not export shell call ledgers or command history.
+2. Diagnostics
+   - Keep `scripts/doctor.sh` current with release packaging and LaunchAgent behavior.
+   - Improve user-facing errors for missing tmux sessions or inactive panes.
 
 3. Zero-knowledge site hardening
    - Preserve the no site-specific DOM contract.
@@ -26,8 +25,7 @@ Make the extension easier to install, diagnose, and carry across unknown AI chat
    - Shell scripts pass `bash -n`.
    - `scripts/doctor.sh` passes.
    - WebSocket frame tests pass.
-   - ChatGPT full-chain test passes.
-   - Claude full-chain test passes.
+   - At least one real AI chat full-chain test passes.
 
 ## Non-Goals
 

@@ -2,10 +2,20 @@
 
 ## Unreleased
 
-- Defines the `v0.2.0` release target around diagnostics, portable calibration, and zero-knowledge hardening.
+- Nothing yet.
+
+## [0.2.0] - 2026-05-19
+
+- Defines the release around tmux-backed execution, diagnostics, portable calibration, and zero-knowledge hardening.
 - Adds popup export/import for settings and per-origin calibration bindings.
+- Routes shell-call execution through explicit tmux pane targets instead of spawning a new server-side shell.
+- Lists tmux panes in the popup and in missing-target shell-output replies.
+- Resolves the user tmux socket from LaunchAgent environments so background server calls can see interactive tmux panes.
+- Adds a local HTTPS manual test page for exercising tmux-backed shell-call flows.
+- Adds a helper to launch an isolated Chromium-family profile with the unpacked extension loaded for local testing.
 - Adds an install doctor script for Node.js, manifest ID, shell server health, and origin-policy checks.
 - Shows extension/server origin mismatches in popup and floating health checks.
+- Keeps the root and `extension/` manifests aligned so either unpacked load path has the same version and permissions.
 - Makes the local WebSocket server tolerate TCP-fragmented and coalesced text frames.
 - Adds WebSocket frame parser coverage for partial, multiple, extended-length, masked, and server frames.
 

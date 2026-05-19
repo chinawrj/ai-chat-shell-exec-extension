@@ -1,6 +1,6 @@
 # Security Policy
 
-AI Chat Shell Exec intentionally lets an AI chat page request local shell commands. That makes it remote-code execution on the machine where the local server is running.
+AI Chat Shell Exec intentionally lets an AI chat page request local commands that are sent into a selected tmux pane. That makes it remote-code execution on the machine where the local server is running.
 
 ## Supported Version
 
@@ -10,6 +10,7 @@ Security fixes are currently made against the latest public release only.
 
 - The extension only executes explicit tool blocks such as `shell-call`.
 - Browser confirmation can be enabled from the extension popup.
+- Commands must name an existing tmux target; missing or unknown targets are rejected.
 - The local server listens only on `127.0.0.1:17371`.
 - The local server accepts the pinned Chrome extension origin by default.
 - Duplicate calls are blocked in both browser storage and the server ledger.

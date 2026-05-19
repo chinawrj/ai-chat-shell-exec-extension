@@ -35,9 +35,11 @@ function makeContext() {
     "importConfig",
     "addCurrentSite",
     "removeCurrentSite",
+    "refreshTmuxTargets",
     "portableConfig",
     "portableStatus",
-    "currentSiteStatus"
+    "currentSiteStatus",
+    "tmuxTargets"
   ];
   for (const id of ids) {
     elements.set(id, makeElement());
@@ -79,7 +81,21 @@ function makeContext() {
     chrome: {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-        sendMessage: async () => ({ ok: true, pid: 123 })
+        sendMessage: async (message) => {
+          if (message?.type === "tmux-list") {
+            return {
+              ok: true,
+              panes: [{
+                id: "%24",
+                address: "espcam:0.0",
+                windowName: "build",
+                currentCommand: "zsh",
+                currentPath: "/tmp/project"
+              }]
+            };
+          }
+          return { ok: true, pid: 123 };
+        }
       },
       tabs: {
         query: async () => [{ url: "https://chatgpt.com/" }]
@@ -126,6 +142,8 @@ function makeContext() {
   const { context, elements, writes } = makeContext();
   await context.loadSettings();
   await context.loadCurrentSite();
+  await context.refreshTmuxTargets();
+  assert.equal(elements.get("tmuxTargets").textContent.includes("target=%24 address=espcam:0.0 window=build command=zsh cwd=/tmp/project active=false"), true);
 
   await context.exportConfig();
   const exported = JSON.parse(elements.get("portableConfig").value);

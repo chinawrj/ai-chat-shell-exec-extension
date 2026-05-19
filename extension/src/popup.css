@@ -38,6 +38,42 @@ h1 {
   background: #eef2ff;
 }
 
+.tmux {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid #e5e7eb;
+}
+
+.tmux > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.tmux code {
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tmux-targets {
+  box-sizing: border-box;
+  min-height: 54px;
+  max-height: 120px;
+  overflow: auto;
+  margin: 0;
+  padding: 7px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.35;
+  background: #fff;
+  color: #111827;
+}
+
+.tmux-targets[data-state="error"] {
+  color: #b91c1c;
+}
+
 .health {
   max-width: 170px;
   padding: 4px 7px;
@@ -173,6 +209,7 @@ textarea {
 }
 
 .portable-actions,
+.tmux-actions,
 .site-actions {
   display: flex;
   justify-content: flex-end;

@@ -6,8 +6,14 @@
    ```sh
    node --check extension/src/content.js
    node --check extension/src/background.js
+   node --check extension/src/popup.js
    node --check server/shell_server.js
-   bash -n scripts/install_shell_server_agent.sh scripts/uninstall_shell_server_agent.sh scripts/start_shell_server.sh scripts/package_release.sh
+   node --check scripts/start_tmux_test_page_https.js
+   node tests/manifest_consistency.test.js
+   node tests/tmux_helpers.test.js
+   node tests/server_websocket_frames.test.js
+   node tests/popup_config.test.js
+   bash -n scripts/install_shell_server_agent.sh scripts/uninstall_shell_server_agent.sh scripts/start_shell_server.sh scripts/package_release.sh scripts/open_tmux_test_chrome.sh
    git diff --check
    ```
 
