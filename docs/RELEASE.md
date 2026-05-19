@@ -10,6 +10,7 @@
    node --check server/shell_server.js
    node --check scripts/start_tmux_test_page_https.js
    node tests/manifest_consistency.test.js
+   node tests/default_enabled_hosts.test.js
    node tests/tmux_helpers.test.js
    node tests/server_websocket_frames.test.js
    node tests/popup_config.test.js

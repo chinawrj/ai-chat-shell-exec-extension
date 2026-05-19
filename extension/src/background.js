@@ -3,7 +3,8 @@ const SHELL_SERVER_HEALTH_URL = "http://127.0.0.1:17371/health";
 const CALL_LEDGER_KEY = "shellCallLedger:v1";
 const CALL_LEDGER_LIMIT = 500;
 const RUNNING_LOCK_GRACE_MS = 15000;
-const DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
+const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
+const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -155,10 +156,41 @@ function ensureDefaultSettings() {
       }
     }
 
+    if (current.enabledHosts !== undefined && isLegacyDefaultEnabledHosts(current.enabledHosts)) {
+      missing.enabledHosts = DEFAULT_ENABLED_HOSTS;
+    }
+
     if (Object.keys(missing).length > 0) {
       chrome.storage.sync.set(missing);
     }
   });
+}
+
+function isLegacyDefaultEnabledHosts(value) {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  const hosts = normalizeHosts(value);
+  const legacyHosts = normalizeHosts(LEGACY_DEFAULT_ENABLED_HOSTS);
+  return hosts.length === legacyHosts.length && hosts.every((host, index) => host === legacyHosts[index]);
+}
+
+function normalizeHosts(value) {
+  return Array.from(new Set(value.map(normalizeHost).filter(Boolean))).sort();
+}
+
+function normalizeHost(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    return new URL(text.includes("://") ? text : `https://${text}`).hostname;
+  } catch {
+    return text.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").split(/[/:?#]/)[0];
+  }
 }
 
 async function claimShellCall(callKey, payload) {

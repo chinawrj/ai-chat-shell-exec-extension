@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.1] - 2026-05-19
+
+- Enables `chatgpt.com` by default so the floating panel appears on a fresh install.
+- Migrates users who still have the old default enabled-site list to the new default list without overwriting custom site lists.
+- Adds coverage to keep default enabled hosts aligned across background, content, and popup code.
+
 ## [0.2.0] - 2026-05-19
 
 - Defines the release around tmux-backed execution, diagnostics, portable calibration, and zero-knowledge hardening.

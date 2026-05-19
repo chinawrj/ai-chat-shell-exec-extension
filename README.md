@@ -94,7 +94,7 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 On an enabled chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
 
-By default, shell scanning is auto-enabled only on `m365.cloud.microsoft`. On every other site, the extension does not inject page UI, scan content, or bind page events until you add the hostname in the toolbar popup.
+By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.microsoft`. On every other site, the extension does not inject page UI, scan content, or bind page events until you add the hostname in the toolbar popup.
 
 The floating status panel also has calibration controls for unknown chat systems:
 
@@ -181,7 +181,7 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 
 - The extension runs explicit tool blocks. Ordinary `bash`, `sh`, `zsh`, and `shell` blocks are accepted only when the block contains a `# local-shell` marker or the latest human prompt explicitly asked for one of the tool language tags.
 - Every command must name a tmux target. Missing or unknown targets are rejected and the reply lists available panes.
-- The default auto-enabled host list contains only `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
+- The default auto-enabled host list contains `chatgpt.com` and `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained shell calls are capped by `maxChainCalls` in extension storage. New human prompts reset the chain count; tool result replies do not.

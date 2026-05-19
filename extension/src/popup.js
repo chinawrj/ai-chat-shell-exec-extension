@@ -1,6 +1,6 @@
 const DEFAULTS = {
   enabled: true,
-  enabledHosts: ["m365.cloud.microsoft"],
+  enabledHosts: ["chatgpt.com", "m365.cloud.microsoft"],
   requireApproval: false,
   autoSend: true,
   defaultTimeoutMs: 30000,
