@@ -4,6 +4,11 @@
 
 - Nothing yet.
 
+## [0.2.6] - 2026-05-22
+
+- Releases the active shell-call lock once output has been inserted, so `Run latest` is not blocked by slow auto-send confirmation.
+- Keeps the forced retry queue from v0.2.5 for clicks that happen while the previous command is still finishing.
+
 ## [0.2.5] - 2026-05-22
 
 - Makes `Run latest` keep its forced retry semantics when clicked while a previous shell call is still clearing.

@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.27";
+const CONTENT_SCRIPT_VERSION = "0.6.28";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -1345,6 +1345,7 @@ async function runAndReply(callId, call, options = {}) {
     const reply = formatShellOutput(call, response, startedAt);
     await insertReply(reply);
     setShellCompletionStatus(call, response);
+    activeCallId = "";
 
     if (settings.autoSend !== false) {
       await clickSendWhenReady();
@@ -1355,6 +1356,7 @@ async function runAndReply(callId, call, options = {}) {
       ok: false,
       error: error.message || String(error)
     }, startedAt));
+    activeCallId = "";
     if (settings.autoSend !== false) {
       await clickSendWhenReady();
     }
