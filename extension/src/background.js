@@ -7,6 +7,8 @@ const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
+const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
+const SETTINGS_MIGRATION_VERSION = 2;
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -150,7 +152,7 @@ async function checkShellServerHealth() {
 }
 
 function ensureDefaultSettings() {
-  chrome.storage.sync.get(Object.keys(DEFAULT_SETTINGS), (current) => {
+  chrome.storage.sync.get([...Object.keys(DEFAULT_SETTINGS), SETTINGS_MIGRATION_VERSION_KEY], (current) => {
     const missing = {};
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
       if (current[key] === undefined) {
@@ -158,11 +160,15 @@ function ensureDefaultSettings() {
       }
     }
 
-    if (current.enabledHosts !== undefined && isLegacyDefaultEnabledHosts(current.enabledHosts)) {
-      missing.enabledHosts = DEFAULT_ENABLED_HOSTS;
-    }
-    if (current.maxChainCalls === LEGACY_DEFAULT_MAX_CHAIN_CALLS) {
-      missing.maxChainCalls = DEFAULT_MAX_CHAIN_CALLS;
+    const migrationVersion = Number(current[SETTINGS_MIGRATION_VERSION_KEY] || 0);
+    if (migrationVersion < SETTINGS_MIGRATION_VERSION) {
+      if (current.enabledHosts !== undefined && isLegacyDefaultEnabledHosts(current.enabledHosts)) {
+        missing.enabledHosts = DEFAULT_ENABLED_HOSTS;
+      }
+      if (current.maxChainCalls !== undefined && isLegacyDefaultMaxChainCalls(current.maxChainCalls)) {
+        missing.maxChainCalls = DEFAULT_MAX_CHAIN_CALLS;
+      }
+      missing[SETTINGS_MIGRATION_VERSION_KEY] = SETTINGS_MIGRATION_VERSION;
     }
 
     if (Object.keys(missing).length > 0) {
@@ -179,6 +185,11 @@ function isLegacyDefaultEnabledHosts(value) {
   const hosts = normalizeHosts(value);
   const legacyHosts = normalizeHosts(LEGACY_DEFAULT_ENABLED_HOSTS);
   return hosts.length === legacyHosts.length && hosts.every((host, index) => host === legacyHosts[index]);
+}
+
+function isLegacyDefaultMaxChainCalls(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed === LEGACY_DEFAULT_MAX_CHAIN_CALLS;
 }
 
 function normalizeHosts(value) {

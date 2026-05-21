@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.4] - 2026-05-22
+
+- Fixes legacy chain-limit migration when Chrome sync storage preserved the old default as the string `"5"`.
+- Makes the legacy chain-limit migration one-time so users can still choose lower custom limits after upgrading.
+- Adds coverage for background settings migration.
+
 ## [0.2.3] - 2026-05-22
 
 - Adds a floating-panel `Run latest` button that manually rechecks the latest `shell-call` and executes it.

@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.25";
+const CONTENT_SCRIPT_VERSION = "0.6.26";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
