@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.5] - 2026-05-22
+
+- Makes `Run latest` keep its forced retry semantics when clicked while a previous shell call is still clearing.
+- Shows a clear `No shell-call found on this page` status when a manual scan finds nothing runnable.
+- Adds coverage for the forced retry handoff state.
+
 ## [0.2.4] - 2026-05-22
 
 - Fixes legacy chain-limit migration when Chrome sync storage preserved the old default as the string `"5"`.

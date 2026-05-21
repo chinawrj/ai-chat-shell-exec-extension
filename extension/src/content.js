@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.26";
+const CONTENT_SCRIPT_VERSION = "0.6.27";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -304,6 +304,7 @@ function scheduleScan() {
 
 async function scanForShellCall(options = {}) {
   const force = options.force === true;
+  const forceAttempts = Number(options.forceAttempts || 0);
   if (!extensionActive) {
     return;
   }
@@ -312,7 +313,23 @@ async function scanForShellCall(options = {}) {
     expirePendingSelfTest();
   }
 
-  if (activeCallId || (!force && isAssistantGenerating())) {
+  if (activeCallId) {
+    if (force && forceAttempts < 20) {
+      setStatus("Waiting for current shell call, then running latest", "running");
+      clearTimeout(scanTimer);
+      scanTimer = setTimeout(() => {
+        scanForShellCall({ force: true, forceAttempts: forceAttempts + 1 }).catch((error) => {
+          setStatus(`Run latest failed: ${summarizeCommand(error.message || String(error))}`, "error");
+        });
+      }, 500);
+      return;
+    }
+
+    scheduleScan();
+    return;
+  }
+
+  if (!force && isAssistantGenerating()) {
     scheduleScan();
     return;
   }
@@ -346,6 +363,9 @@ async function scanForShellCall(options = {}) {
   if (!candidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
+    if (force) {
+      setStatus("No shell-call found on this page", "idle");
+    }
     return;
   }
 
