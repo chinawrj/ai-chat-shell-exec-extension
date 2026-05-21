@@ -9,7 +9,8 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.28";
+const CONTENT_SCRIPT_VERSION = "0.6.30";
+const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -1195,13 +1196,24 @@ function isShellOutputText(text) {
 }
 
 function isSameCommandAsShellOutput(command, shellOutputText) {
+  const previousCommandHash = extractCommandHashFromShellOutput(shellOutputText);
+  if (previousCommandHash) {
+    return stableHash(normalizeCommand(command)) === previousCommandHash;
+  }
+
   const previousCommand = extractCommandFromShellOutput(shellOutputText);
   return previousCommand && normalizeCommand(command) === previousCommand;
 }
 
+function extractCommandHashFromShellOutput(text) {
+  const normalized = normalizeCommand(text);
+  const match = normalized.match(/^cmdHash:\s*([a-f0-9]+)\s*$/im);
+  return match?.[1] || "";
+}
+
 function extractCommandFromShellOutput(text) {
   const normalized = normalizeCommand(text);
-  const compactMatch = normalized.match(/\$\s+([\s\S]*?)(?:\s*cwd:|\s*exitCode:|\s*durationMs:|```|$)/);
+  const compactMatch = normalized.match(/\$\s+([\s\S]*?)(?:\s*cmdHash:|\s*target:|\s*cwd:|\s*exitCode:|\s*durationMs:|```|$)/);
   if (compactMatch?.[1]) {
     return compactMatch[1].trim();
   }
@@ -1396,12 +1408,14 @@ function expirePendingSelfTest() {
 }
 
 function formatShellOutput(call, response, startedAt) {
+  const commandDisplay = formatShellOutputCommand(call.cmd);
   if (!response || response.ok === false) {
     return [
       "Shell call failed:",
       "",
       "```shell-output",
-      `$ ${call.cmd}`,
+      `$ ${commandDisplay.text}`,
+      commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
       call.target ? `target: ${call.target}` : "",
       `startedAt: ${startedAt}`,
       `error: ${response?.error || "Unknown shell server error."}`,
@@ -1414,7 +1428,8 @@ function formatShellOutput(call, response, startedAt) {
   const stdout = response.stdout || "";
   const stderr = response.stderr || "";
   const meta = [
-    `$ ${call.cmd}`,
+    `$ ${commandDisplay.text}`,
+    commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
     `target: ${response.target || call.target || ""}`,
     response.targetName ? `targetName: ${response.targetName}` : "",
     `cwd: ${response.cwd || call.cwd || ""}`,
@@ -1432,6 +1447,27 @@ function formatShellOutput(call, response, startedAt) {
     stderr ? "\nstderr:\n" + stderr : "",
     "```"
   ].join("\n");
+}
+
+function formatShellOutputCommand(command) {
+  const normalized = normalizeCommand(command);
+  const displaySource = normalizeText(normalized);
+  if (displaySource.length <= SHELL_OUTPUT_COMMAND_DISPLAY_CHARS && displaySource === normalized) {
+    return {
+      text: displaySource,
+      truncated: false,
+      hash: ""
+    };
+  }
+
+  const displayText = displaySource.length <= SHELL_OUTPUT_COMMAND_DISPLAY_CHARS ?
+    displaySource :
+    `${displaySource.slice(0, SHELL_OUTPUT_COMMAND_DISPLAY_CHARS - 3)}...`;
+  return {
+    text: displayText,
+    truncated: true,
+    hash: stableHash(normalized)
+  };
 }
 
 function formatTmuxPanesForShellOutput(panes, error = "") {

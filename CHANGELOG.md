@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.7] - 2026-05-22
+
+- Shortens displayed commands in `shell-output` blocks to 64 characters.
+- Adds `cmdHash` when the displayed command is abbreviated or normalized so duplicate suppression still works.
+- Adds coverage for long, short, and multiline shell-output command formatting.
+
 ## [0.2.6] - 2026-05-22
 
 - Releases the active shell-call lock once output has been inserted, so `Run latest` is not blocked by slow auto-send confirmation.
