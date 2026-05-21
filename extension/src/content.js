@@ -9,7 +9,7 @@ const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.24";
+const CONTENT_SCRIPT_VERSION = "0.6.25";
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
@@ -302,14 +302,17 @@ function scheduleScan() {
   }, 900);
 }
 
-async function scanForShellCall() {
+async function scanForShellCall(options = {}) {
+  const force = options.force === true;
   if (!extensionActive) {
     return;
   }
 
-  expirePendingSelfTest();
+  if (!force) {
+    expirePendingSelfTest();
+  }
 
-  if (activeCallId || isAssistantGenerating()) {
+  if (activeCallId || (!force && isAssistantGenerating())) {
     scheduleScan();
     return;
   }
@@ -325,14 +328,14 @@ async function scanForShellCall() {
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
   const now = Date.now();
 
-  if (threadText !== lastThreadText) {
+  if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
     lastThreadTextAt = now;
     scheduleScan();
     return;
   }
 
-  if (now - lastThreadTextAt < 1200) {
+  if (!force && now - lastThreadTextAt < 1200) {
     scheduleScan();
     return;
   }
@@ -346,24 +349,26 @@ async function scanForShellCall() {
     return;
   }
 
-  if (!initialThreadSettled) {
+  if (!force && !initialThreadSettled) {
     initialThreadSettled = true;
     setStatus("Shell tool ready; existing history ignored", "idle");
     return;
   }
 
-  expirePendingSelfTest();
+  if (!force) {
+    expirePendingSelfTest();
+  }
 
   const call = candidate.call;
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
-  if (processedCalls.has(callKey) ||
+  if (!force && (processedCalls.has(callKey) ||
     processedSemanticCalls.has(semanticCallKey) ||
-    candidate.node?.dataset?.aiChatShellSemanticKey === semanticCallKey) {
+    candidate.node?.dataset?.aiChatShellSemanticKey === semanticCallKey)) {
     return;
   }
 
-  if (pendingSelfTest && !isExpectedSelfTestCall(call)) {
+  if (!force && pendingSelfTest && !isExpectedSelfTestCall(call)) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     const expected = pendingSelfTest.command;
     setStatus(`Self-test ignored unexpected shell call; waiting for ${summarizeCommand(expected)}`, "running");
@@ -372,8 +377,8 @@ async function scanForShellCall() {
 
   const lastShellOutputText = getLastShellOutputText();
   const lastPromptOrOutputText = getLastUserMessageText();
-  if ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
-    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText))) {
+  if (!force && ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
+    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText)))) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
@@ -397,14 +402,17 @@ async function scanForShellCall() {
   }
 
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
-  if (chainCallCount >= maxChainCalls) {
+  if (!force && chainCallCount >= maxChainCalls) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     await replyWithRejectedCall(call, `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`);
     return;
   }
 
-  markCallProcessed(candidate, callKey, semanticCallKey);
-  await runAndReply(callKey, call);
+  const executionCallKey = force ? buildForceCallKey(semanticCallKey) : callKey;
+  if (!force) {
+    markCallProcessed(candidate, callKey, semanticCallKey);
+  }
+  await runAndReply(executionCallKey, call, { force });
 }
 
 function buildSemanticCallKey(call) {
@@ -424,6 +432,16 @@ function buildCandidateCallKey(candidate, semanticCallKey) {
     candidate.source || "",
     candidate.index || "",
     semanticCallKey
+  ].join("\n"));
+}
+
+function buildForceCallKey(semanticCallKey) {
+  return stableHash([
+    location.origin,
+    "force",
+    semanticCallKey,
+    Date.now(),
+    Math.random()
   ].join("\n"));
 }
 
@@ -1255,13 +1273,14 @@ async function replyWithMissingTmuxTarget(call) {
   await clickSendWhenReady();
 }
 
-async function runAndReply(callId, call) {
+async function runAndReply(callId, call, options = {}) {
   if (!call.cmd) {
     return;
   }
 
+  const force = options.force === true;
   const settings = await chrome.storage.sync.get(["requireApproval", "autoSend"]);
-  if (settings.requireApproval === true) {
+  if (!force && settings.requireApproval === true) {
     const approved = window.confirm(
       [
         "AI requested a local shell command.",
@@ -1282,7 +1301,7 @@ async function runAndReply(callId, call) {
 
   activeCallId = callId;
   chainCallCount += 1;
-  setStatus(`Running: ${summarizeCommand(call.cmd)}`, "running");
+  setStatus(`${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`, "running");
   const startedAt = new Date().toISOString();
   try {
     const response = await chrome.runtime.sendMessage({
@@ -1292,13 +1311,14 @@ async function runAndReply(callId, call) {
       callMeta: {
         origin: location.origin,
         pathname: location.pathname,
-        promptHash: stableHash(getLastUserMessageText())
+        promptHash: stableHash(getLastUserMessageText()),
+        force
       },
       ...call
     });
 
     if (response?.duplicate === true && response?.skipped === true) {
-      setStatus("Skipped duplicate shell call", "ok");
+      setStatus(force ? "Force run skipped by server" : "Skipped duplicate shell call", "ok");
       return;
     }
 
@@ -1842,6 +1862,7 @@ function injectStatus() {
   for (const [mode, label] of [
     ["test", "Test"],
     ["check", "Check"],
+    ["force", "Run latest"],
     ["site", "Enable site"],
     ["input", "Bind input"],
     ["send", "Bind send"],
@@ -1938,6 +1959,13 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "force") {
+    forceRunLatestShellCall().catch((error) => {
+      setStatus(`Run latest failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
@@ -1949,6 +1977,12 @@ function handlePanelAction(action) {
 
   bindingMode = action;
   setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function forceRunLatestShellCall() {
+  pendingSelfTest = null;
+  setStatus("Checking latest shell-call once", "running");
+  await scanForShellCall({ force: true });
 }
 
 async function toggleCurrentSiteEnabled() {

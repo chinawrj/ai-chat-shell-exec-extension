@@ -100,6 +100,7 @@ The floating status panel also has calibration controls for unknown chat systems
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return a one-line `shell-call`; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected self-test shell calls are ignored instead of being run.
 - `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
+- `Run latest`: manually recheck the current page once and execute the latest `shell-call`, ignoring automatic scan limits and duplicate suppression.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered shell-call/code block area.

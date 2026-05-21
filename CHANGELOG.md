@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.2.3] - 2026-05-22
+
+- Adds a floating-panel `Run latest` button that manually rechecks the latest `shell-call` and executes it.
+- Manual `Run latest` ignores automatic scan limits, duplicate suppression, self-test waiting, and the chain limit.
+- Manual forced runs use a one-time execution key so completed-call ledgers do not suppress the retry.
+
 ## [0.2.2] - 2026-05-19
 
 - Raises the default automatic shell-call chain limit from 5 to 100.

@@ -9,6 +9,7 @@
    node --check extension/src/popup.js
    node --check server/shell_server.js
    node --check scripts/start_tmux_test_page_https.js
+   node tests/content_force_run.test.js
    node tests/manifest_consistency.test.js
    node tests/default_enabled_hosts.test.js
    node tests/tmux_helpers.test.js
