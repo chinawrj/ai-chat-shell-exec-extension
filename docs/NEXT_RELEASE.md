@@ -1,4 +1,4 @@
-# Next Release Target: v0.2.9
+# Next Release Target: v0.2.10
 
 Target date: after the next maintenance or compatibility fix.
 

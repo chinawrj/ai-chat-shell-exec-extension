@@ -4,6 +4,10 @@
 
 - Nothing yet.
 
+## [0.2.9] - 2026-05-29
+
+- Updates the README short AI instruction to include the `ai-helper-file-start` / `ai-helper-file-end` file helper format alongside shell helpers.
+
 ## [0.2.8] - 2026-05-29
 
 - Replaces JSON `shell-call` requests with plain text `ai-helper-shell-start` / target / command / `ai-helper-shell-end` blocks.

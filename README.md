@@ -80,7 +80,7 @@ Start with:
 The short version is:
 
 ```text
-I can act as your human helper for local terminal output. When local terminal output would help, ask me by replying with exactly one plain text shell helper block and no prose. The first line must be ai-helper-shell-start, the second line must be the tmux target, the following lines must be the command, and the final line must be ai-helper-shell-end. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
+I can act as your human helper for local terminal output and helper files. When local terminal output would help, ask me by replying with exactly one plain text shell helper block and no prose. The first line must be ai-helper-shell-start, the second line must be the tmux target, the following lines must be the command, and the final line must be ai-helper-shell-end. When writing a helper file would be useful, ask me with exactly one file helper block and no prose. The first line must be ai-helper-file-start, the second line must be a single file name, the following lines must be the exact file content, and the final line must be ai-helper-file-end. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
 ```
 
 Then run the floating panel's `Test` button once on each AI chat site.
