@@ -258,23 +258,15 @@ Installation diagnostics:
 ./scripts/doctor.sh
 ```
 
-Local checks:
+Full automated checks, including the Chrome extension e2e test:
 
 ```sh
-node --check extension/src/content.js
-node --check extension/src/background.js
-node --check extension/src/popup.js
-node --check server/shell_server.js
-node --check scripts/start_tmux_test_page_https.js
-node tests/chrome_extension_e2e.test.js
-node tests/manifest_consistency.test.js
-node tests/tmux_helpers.test.js
-node tests/server_websocket_frames.test.js
-node tests/popup_config.test.js
-bash -n scripts/*.sh
+./scripts/test_all.sh
 ```
 
 The Chrome extension e2e test launches a real Chromium-family browser with the unpacked extension, starts the local tmux test page and shell server when needed, inserts an ai-helper block, and verifies the returned `shell-output`. It works on macOS with Chrome for Testing/Chromium/Chrome and on Ubuntu with a display, Xvfb, or a cached Playwright Chromium browser under `~/.cache/ms-playwright`. Set `CHROME_BIN` to force a browser binary.
+
+Feature and test coverage is tracked in `docs/FEATURE_TEST_MATRIX.md`. Add or update a row there whenever a feature or test case changes.
 
 Uninstall the LaunchAgent:
 

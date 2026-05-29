@@ -22,16 +22,17 @@ Treat this project as security-sensitive local remote-code execution.
 - `scripts/`: macOS LaunchAgent helpers plus cross-platform dev/test/release helpers.
 - `tests/`: standalone Node.js tests. There is no `package.json` or central test runner.
 - `docs/AI_INSTRUCTIONS.md`: instructions for chat models to emit ai-helper blocks; this is not a coding-agent guide.
+- `docs/FEATURE_TEST_MATRIX.md`: required feature-to-test table. Update it whenever a feature, invariant, or `tests/*.test.js` case changes.
 
 ## Common Commands
 
 Run all automated tests:
 
 ```sh
-for f in tests/*.test.js; do node "$f"; done
+./scripts/test_all.sh
 ```
 
-The test loop includes `tests/chrome_extension_e2e.test.js`, which launches a real Chromium-family browser with the unpacked extension and drives the local tmux test page. On Ubuntu it needs `DISPLAY`, Xvfb, or a cached Playwright Chromium browser; on macOS it can use Chrome for Testing, Chromium, Microsoft Edge, or Google Chrome. Set `CHROME_BIN` to force the browser binary.
+The full test runner includes static checks, shell syntax checks, `git diff --check`, every `tests/*.test.js` file, and `tests/chrome_extension_e2e.test.js`, which launches a real Chromium-family browser with the unpacked extension and drives the local tmux test page. On Ubuntu it needs `DISPLAY`, Xvfb, or a cached Playwright Chromium browser; on macOS it can use Chrome for Testing, Chromium, Microsoft Edge, or Google Chrome. Set `CHROME_BIN` to force the browser binary.
 
 Run a single test:
 
@@ -89,6 +90,7 @@ Package a release:
 - `server/shell_server.js` exports helper functions used directly by tests. Preserve exports when changing tmux or WebSocket logic.
 - Shell-output formatting uses `cmdHash` for long or multiline commands; duplicate suppression depends on this.
 - The server writes transient tmux scripts under `.state/tmux-runs` and removes them best-effort.
+- `docs/FEATURE_TEST_MATRIX.md` must list every product feature or invariant and every `tests/*.test.js` case. Keep the table current in the same change as code or test edits; `tests/feature_test_matrix.test.js` enforces that every test file appears there.
 
 ## Development Notes
 
@@ -100,8 +102,8 @@ Package a release:
 
 ## Verified Baseline
 
-During repo exploration, all standalone tests passed with:
+During repo exploration, the full suite passed with:
 
 ```sh
-for f in tests/*.test.js; do node "$f"; done
+./scripts/test_all.sh
 ```

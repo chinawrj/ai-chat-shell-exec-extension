@@ -24,11 +24,9 @@ Follow up on real-world helper identity, browser, and platform feedback.
    - Improve fallback behavior only through browser semantics, user calibration, or generic diagnostics.
 
 4. Release quality gate
-   - Static JavaScript checks pass.
-   - Shell scripts pass `bash -n`.
+   - `./scripts/test_all.sh` passes.
+   - `docs/FEATURE_TEST_MATRIX.md` includes every product feature or invariant and every `tests/*.test.js` case.
    - `scripts/doctor.sh` passes.
-   - WebSocket frame tests pass.
-   - Chrome extension e2e test passes with a real unpacked extension browser run.
    - At least one real AI chat full-chain test passes.
 
 ## Non-Goals
