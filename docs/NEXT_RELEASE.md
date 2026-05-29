@@ -1,4 +1,4 @@
-# Next Release Target: v0.2.8
+# Next Release Target: v0.2.9
 
 Target date: after the next maintenance or compatibility fix.
 
@@ -9,7 +9,7 @@ Polish the tmux-backed release based on real user feedback.
 ## Goals
 
 1. Compatibility follow-up
-   - Track chat products that downgrade or reformat `shell-call` code fences.
+   - Track chat products that insert extra prose or formatting around plain text helper blocks.
    - Keep AI-facing instructions neutral and focused on terminal output requests.
 
 2. Diagnostics
@@ -25,6 +25,7 @@ Polish the tmux-backed release based on real user feedback.
    - Shell scripts pass `bash -n`.
    - `scripts/doctor.sh` passes.
    - WebSocket frame tests pass.
+   - Chrome extension e2e test passes with a real unpacked extension browser run.
    - At least one real AI chat full-chain test passes.
 
 ## Non-Goals

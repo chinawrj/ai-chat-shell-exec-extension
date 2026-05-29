@@ -4,6 +4,17 @@
 
 - Nothing yet.
 
+## [0.2.8] - 2026-05-29
+
+- Replaces JSON `shell-call` requests with plain text `ai-helper-shell-start` / target / command / `ai-helper-shell-end` blocks.
+- Adds `ai-helper-file-start` / filename / content / `ai-helper-file-end` blocks that write files under `$HOME/Downloads`.
+- Removes JSON shell-call parsing so commands and file contents no longer need JSON string escaping.
+- Removes the old `ai-helper-start-shell` / `ai-helper-end-shell` shell helper aliases.
+- Updates AI instructions to present helper blocks as requests served by a human helper, not as an automatic script interface.
+- Updates manual test helpers, missing-target examples, and parser coverage for the new helper formats.
+- Adds an automated Chrome extension e2e test that loads the unpacked extension, drives the tmux test page, and verifies returned `shell-output`.
+- Adds release screenshots for shell and file helper result replies.
+
 ## [0.2.7] - 2026-05-22
 
 - Shortens displayed commands in `shell-output` blocks to 64 characters.

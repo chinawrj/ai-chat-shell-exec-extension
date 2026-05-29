@@ -8,7 +8,7 @@ Security fixes are currently made against the latest public release only.
 
 ## Safety Model
 
-- The extension only executes explicit tool blocks such as `shell-call`.
+- The extension only executes explicit helper blocks such as `ai-helper-shell-start` / `ai-helper-shell-end`.
 - Browser confirmation can be enabled from the extension popup.
 - Commands must name an existing tmux target; missing or unknown targets are rejected.
 - The local server listens only on `127.0.0.1:17371`.

@@ -10,7 +10,9 @@ const {
   extractTmuxRunOutput,
   getTmuxEnvSocketPath,
   parseTmuxPanes,
-  resolveTmuxTarget
+  resolveDownloadsFilePath,
+  resolveTmuxTarget,
+  writeDownloadsFile
 } = require("../server/shell_server.js");
 
 const panes = parseTmuxPanes([
@@ -114,7 +116,24 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.equal(response.targetRequired, true);
   assert.equal(response.error.includes("Missing tmux target"), true);
   assert.equal(response.tmuxPanes.length, 2);
-  assert.equal(response.example, "{\"target\":\"%24\",\"cmd\":\"pwd\"}");
+  assert.equal(response.example, "ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+}
+
+{
+  const downloadsDir = path.join(os.tmpdir(), "ai-helper-downloads");
+  assert.equal(
+    resolveDownloadsFilePath("hello.txt", downloadsDir),
+    path.join(downloadsDir, "hello.txt")
+  );
+  assert.throws(() => resolveDownloadsFilePath("../bad.txt", downloadsDir), /single file name/);
+  assert.throws(() => resolveDownloadsFilePath("nested/bad.txt", downloadsDir), /single file name/);
+  assert.throws(() => resolveDownloadsFilePath("", downloadsDir), /Missing filename/);
+
+  const written = writeDownloadsFile("hello.txt", "alpha\nbeta", downloadsDir);
+  assert.equal(written.path, path.join(downloadsDir, "hello.txt"));
+  assert.equal(written.bytes, Buffer.byteLength("alpha\nbeta", "utf8"));
+  assert.equal(fs.readFileSync(written.path, "utf8"), "alpha\nbeta");
+  fs.rmSync(downloadsDir, { recursive: true, force: true });
 }
 
 console.log("tmux helper tests passed");

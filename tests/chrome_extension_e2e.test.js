@@ -1,0 +1,621 @@
+#!/usr/bin/env node
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const http = require("node:http");
+const https = require("node:https");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn, spawnSync } = require("node:child_process");
+
+const ROOT_DIR = path.join(__dirname, "..");
+const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
+const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
+const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
+const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
+const E2E_TIMEOUT_MS = 45000;
+const FORCE_HEADLESS = process.env.AI_SHELL_E2E_HEADLESS === "1";
+const STARTUP_SETTLE_MS = 4200;
+const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
+
+const cleanup = [];
+
+main()
+  .then(() => {
+    console.log("chrome extension e2e test passed");
+  })
+  .catch((error) => {
+    console.error(error.stack || error.message || String(error));
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    while (cleanup.length > 0) {
+      const fn = cleanup.pop();
+      try {
+        await fn();
+      } catch {
+        // Best-effort cleanup for browser, server, tmux, and temp directories.
+      }
+    }
+  });
+
+async function main() {
+  const chromePath = findChrome();
+  assert.ok(chromePath, "Chrome e2e requires google-chrome, google-chrome-stable, chromium, or chromium-browser on PATH.");
+  assert.ok(commandExists("tmux"), "Chrome e2e requires tmux on PATH.");
+  assert.ok(fs.existsSync(EXTENSION_DIR), `Missing extension directory: ${EXTENSION_DIR}`);
+  const browserEnv = await setupBrowserEnvironment(chromePath);
+
+  const serverHealth = await getShellServerHealth().catch(() => null);
+  const socketPath = serverHealth?.ok ? String(serverHealth.tmuxSocket || "") : createTempTmuxSocketPath();
+  if (serverHealth?.ok) {
+    assert.ok(
+      serverHealth.allowUntrustedOrigins === true || serverHealth.allowedOrigin === EXPECTED_EXTENSION_ORIGIN,
+      `Existing shell server has unexpected allowed origin: ${serverHealth.allowedOrigin || "(unknown)"}`
+    );
+  }
+
+  const sessionName = `ai_chat_shell_e2e_${process.pid}_${Date.now()}`;
+  const paneId = startTmuxSession(socketPath, sessionName);
+  cleanup.push(() => killTmuxSession(socketPath, sessionName));
+
+  if (!serverHealth?.ok) {
+    const server = spawnNode(["server/shell_server.js"], {
+      AI_CHAT_SHELL_TMUX_SOCKET: socketPath,
+      AI_CHAT_SHELL_RUNNER: fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh",
+      AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS: "1"
+    });
+    cleanup.push(() => stopProcess(server));
+    await waitForShellServer();
+  }
+
+  const existingPage = await fetchHttpsText(TEST_PAGE_URL).catch(() => "");
+  if (existingPage) {
+    assert.ok(existingPage.includes("tmux ai-helper test"), `${TEST_PAGE_URL} is reachable but is not the repo tmux test page.`);
+  } else {
+    const pageServer = spawnNode(["scripts/start_tmux_test_page_https.js"], { TEST_PAGE_PORT: "17443" });
+    cleanup.push(() => stopProcess(pageServer));
+    await waitFor(async () => {
+      const text = await fetchHttpsText(TEST_PAGE_URL).catch(() => "");
+      return text.includes("tmux ai-helper test");
+    }, "tmux HTTPS test page to start");
+  }
+
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-chrome-e2e-"));
+  cleanup.push(() => fs.rmSync(profileDir, { recursive: true, force: true }));
+
+  const chromeArgs = [
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--test-type",
+    "--enable-automation",
+    "--disable-features=DisableLoadExtensionCommandLineSwitch",
+    `--user-data-dir=${profileDir}`,
+    `--disable-extensions-except=${EXTENSION_DIR}`,
+    `--load-extension=${EXTENSION_DIR}`,
+    "--allow-insecure-localhost",
+    "--ignore-certificate-errors",
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--window-size=1280,900",
+    "about:blank"
+  ];
+  if (browserEnv.headless) {
+    chromeArgs.unshift("--headless=new");
+  }
+
+  const chrome = spawn(chromePath, chromeArgs, {
+    cwd: ROOT_DIR,
+    env: browserEnv.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  captureProcessOutput(chrome, "chrome");
+  cleanup.push(() => stopProcess(chrome));
+
+  const debugPort = await waitForChromeDebugPort(profileDir);
+  await waitForExtensionTarget(debugPort);
+  const pageWsUrl = await waitForChromePageWebSocket(debugPort, "about:blank");
+  const page = await CdpClient.connect(pageWsUrl);
+  cleanup.push(() => page.close());
+
+  await page.send("Page.enable");
+  await page.send("Runtime.enable");
+  await page.send("Page.navigate", { url: TEST_PAGE_URL });
+  await waitForEvaluate(page, "document.readyState === 'complete'", "test page load");
+  await waitForEvaluate(page, "document.body.innerText.includes('tmux ai-helper test')", "tmux test page content");
+  await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status panel");
+  await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
+
+  const token = `ai-chat-shell-e2e-${Date.now()}`;
+  const command = `printf ${token}`;
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    document.getElementById("target").value = ${JSON.stringify(paneId)};
+    document.getElementById("command").value = ${JSON.stringify(command)};
+    document.getElementById("insertCall").click();
+    return true;
+  })()`);
+
+  let finalText = "";
+  try {
+    finalText = await waitForEvaluateValue(page, `(() => {
+      const text = document.body.innerText || "";
+      return text.includes("Shell call result:") &&
+        text.includes("exitCode: 0") &&
+        text.includes(${JSON.stringify(`stdout:\n${token}`)}) ? text : "";
+    })()`, "shell-output from extension");
+  } catch (error) {
+    const diagnostics = await collectDiagnostics(page, debugPort, {
+      chrome,
+      token,
+      paneId,
+      command,
+      sessionName
+    });
+    throw new Error(`${error.message}\n\n${diagnostics}`);
+  }
+
+  assert.match(finalText, /Shell call result:/);
+  assert.match(finalText, /```shell-output/);
+  assert.match(finalText, new RegExp(escapeRegExp(`stdout:\n${token}`)));
+
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "shell-helper-result.png"));
+  }
+
+  const fileToken = `ai-chat-shell-file-e2e-${Date.now()}`;
+  const filename = `${fileToken}.txt`;
+  const fileContent = `file helper wrote ${fileToken}`;
+  cleanup.push(() => {
+    fs.rmSync(path.join(os.homedir(), "Downloads", filename), { force: true });
+  });
+
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    appendAssistantToolCall([
+      "ai-helper-file-start",
+      ${JSON.stringify(filename)},
+      ${JSON.stringify(fileContent)},
+      "ai-helper-file-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+
+  let fileText = "";
+  try {
+    fileText = await waitForEvaluateValue(page, `(() => {
+      const text = document.body.innerText || "";
+      return text.includes("File write result:") &&
+        text.includes(${JSON.stringify(`file: ${filename}`)}) &&
+        text.includes("bytes:") ? text : "";
+    })()`, "file helper shell-output from extension");
+  } catch (error) {
+    const diagnostics = await collectDiagnostics(page, debugPort, {
+      chrome,
+      token: fileToken,
+      paneId,
+      command: `write ${filename}`,
+      sessionName
+    });
+    throw new Error(`${error.message}\n\n${diagnostics}`);
+  }
+
+  assert.match(fileText, /File write result:/);
+  assert.match(fileText, new RegExp(escapeRegExp(`file: ${filename}`)));
+  assert.equal(fs.readFileSync(path.join(os.homedir(), "Downloads", filename), "utf8"), fileContent);
+
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
+  }
+}
+
+function findChrome() {
+  const envPath = process.env.CHROME_BIN || process.env.GOOGLE_CHROME_BIN;
+  if (envPath && fs.existsSync(envPath)) {
+    return envPath;
+  }
+  const playwrightChromium = findPlaywrightChromium();
+  if (playwrightChromium) {
+    return playwrightChromium;
+  }
+  for (const command of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]) {
+    const result = spawnSync("which", [command], { encoding: "utf8" });
+    if (result.status === 0 && result.stdout.trim()) {
+      return result.stdout.trim();
+    }
+  }
+  for (const appPath of [
+    "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  ]) {
+    if (fs.existsSync(appPath)) {
+      return appPath;
+    }
+  }
+  return "";
+}
+
+function findPlaywrightChromium() {
+  const cacheRoot = path.join(os.homedir(), ".cache", "ms-playwright");
+  if (!fs.existsSync(cacheRoot)) {
+    return "";
+  }
+
+  const candidates = [];
+  for (const entry of fs.readdirSync(cacheRoot)) {
+    if (!entry.startsWith("chromium-")) {
+      continue;
+    }
+    candidates.push(
+      path.join(cacheRoot, entry, "chrome-linux64", "chrome"),
+      path.join(cacheRoot, entry, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+      path.join(cacheRoot, entry, "chrome-mac-arm64", "Chromium.app", "Contents", "MacOS", "Chromium")
+    );
+  }
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "";
+}
+
+function commandExists(command) {
+  return spawnSync("which", [command], { encoding: "utf8" }).status === 0;
+}
+
+async function setupBrowserEnvironment(chromePath) {
+  const env = { ...process.env };
+  if (FORCE_HEADLESS) {
+    return { env, headless: true };
+  }
+  if (process.platform !== "linux" || env.DISPLAY) {
+    return { env, headless: false };
+  }
+
+  const defaultDisplay = detectDefaultDisplay();
+  if (defaultDisplay) {
+    env.DISPLAY = defaultDisplay;
+    return { env, headless: false };
+  }
+
+  if (chromePath.includes(`${path.sep}.cache${path.sep}ms-playwright${path.sep}`)) {
+    return { env, headless: true };
+  }
+
+  const xvfbPath = findExecutable("Xvfb");
+  assert.ok(
+    xvfbPath,
+    "Chrome extension e2e on Ubuntu/Linux requires DISPLAY or Xvfb. Install xvfb, run under xvfb-run, or set AI_SHELL_E2E_HEADLESS=1 to try Chrome headless."
+  );
+
+  const display = `:${90 + (process.pid % 1000)}`;
+  const xvfb = spawn(xvfbPath, [
+    display,
+    "-screen",
+    "0",
+    "1280x900x24",
+    "-nolisten",
+    "tcp"
+  ], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  captureProcessOutput(xvfb, "Xvfb");
+  cleanup.push(() => stopProcess(xvfb));
+  env.DISPLAY = display;
+  await sleep(500);
+  return { env, headless: false };
+}
+
+function findExecutable(command) {
+  const result = spawnSync("which", [command], { encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : "";
+}
+
+function detectDefaultDisplay() {
+  const socketDir = "/tmp/.X11-unix";
+  if (!fs.existsSync(socketDir)) {
+    return "";
+  }
+  const socket = fs.readdirSync(socketDir).find((entry) => /^X\d+$/.test(entry));
+  return socket ? `:${socket.slice(1)}` : "";
+}
+
+function createTempTmuxSocketPath() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-tmux-e2e-"));
+  cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return path.join(dir, "tmux.sock");
+}
+
+function startTmuxSession(socketPath, sessionName) {
+  runTmux(socketPath, ["new-session", "-d", "-s", sessionName, "-n", "build", "/bin/sh"]);
+  const result = runTmux(socketPath, ["list-panes", "-t", sessionName, "-F", "#{pane_id}"]);
+  const [paneId] = result.stdout.trim().split(/\r?\n/);
+  assert.ok(paneId, "Could not determine e2e tmux pane id.");
+  return paneId;
+}
+
+function killTmuxSession(socketPath, sessionName) {
+  spawnSync("tmux", [...tmuxSocketArgs(socketPath), "kill-session", "-t", sessionName], { encoding: "utf8" });
+}
+
+function runTmux(socketPath, args) {
+  const result = spawnSync("tmux", [...tmuxSocketArgs(socketPath), ...args], {
+    cwd: ROOT_DIR,
+    encoding: "utf8"
+  });
+  assert.equal(result.status, 0, `tmux ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
+  return result;
+}
+
+function tmuxSocketArgs(socketPath) {
+  return socketPath ? ["-S", socketPath] : [];
+}
+
+function spawnNode(args, extraEnv) {
+  const child = spawn(process.execPath, args, {
+    cwd: ROOT_DIR,
+    env: {
+      ...process.env,
+      ...extraEnv
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  captureProcessOutput(child, args[0]);
+  return child;
+}
+
+function captureProcessOutput(child, label) {
+  child.stdoutText = "";
+  child.stderrText = "";
+  child.stdout?.on("data", (chunk) => {
+    child.stdoutText += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk) => {
+    child.stderrText += chunk.toString();
+  });
+  child.on("exit", (code, signal) => {
+    child.exitSummary = `${label} exited code=${code} signal=${signal || ""}\n${child.stdoutText}${child.stderrText}`;
+  });
+}
+
+async function stopProcess(child) {
+  if (!child || child.exitCode !== null || child.killed) {
+    return;
+  }
+  child.kill("SIGTERM");
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    sleep(2000).then(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    })
+  ]);
+}
+
+async function waitForShellServer() {
+  await waitFor(async () => {
+    const health = await getShellServerHealth().catch(() => null);
+    return health?.ok === true;
+  }, "shell server health");
+}
+
+function getShellServerHealth() {
+  return fetchHttpJson("http://127.0.0.1:17371/health");
+}
+
+function fetchHttpJson(url) {
+  return new Promise((resolve, reject) => {
+    http.get(url, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        text += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(text));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+function fetchHttpsText(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { rejectUnauthorized: false }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        text += chunk;
+      });
+      res.on("end", () => resolve(text));
+    }).on("error", reject);
+  });
+}
+
+async function waitForChromeDebugPort(profileDir) {
+  const portFile = path.join(profileDir, "DevToolsActivePort");
+  await waitFor(() => fs.existsSync(portFile), "Chrome DevToolsActivePort");
+  const [port] = fs.readFileSync(portFile, "utf8").trim().split(/\r?\n/);
+  assert.ok(port, "Chrome did not write a remote debugging port.");
+  return Number(port);
+}
+
+async function waitForExtensionTarget(debugPort) {
+  await waitForValue(async () => {
+    const targets = await fetchHttpJson(`http://127.0.0.1:${debugPort}/json/list`).catch(() => []);
+    const target = targets.find((item) =>
+      item.url?.startsWith("chrome-extension://") &&
+      (item.url.includes("/src/background.js") ||
+        item.url.endsWith("/service_worker.js") ||
+        item.title?.includes("AI Chat Shell Exec"))
+    );
+    return target?.url || "";
+  }, "AI Chat Shell Exec extension target");
+}
+
+async function collectDiagnostics(page, debugPort, details) {
+  const bodyText = await page.evaluate("(document.body && document.body.innerText || '').slice(0, 6000)").catch((error) => `body unavailable: ${error.message}`);
+  const statusText = await page.evaluate(`document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || ""`).catch((error) => `status unavailable: ${error.message}`);
+  const targets = await fetchHttpJson(`http://127.0.0.1:${debugPort}/json/list`).catch((error) => [{ error: error.message }]);
+  const health = await getShellServerHealth().catch((error) => ({ error: error.message }));
+  const tmuxPanes = runTmuxBestEffort(["list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{window_name} #{pane_current_command}"]);
+  const targetUrls = Array.isArray(targets) ? targets.map((target) => `${target.type || "?"} ${target.url || target.error || ""}`).join("\n") : String(targets);
+  return [
+    "Chrome extension e2e diagnostics:",
+    `token: ${details.token}`,
+    `paneId: ${details.paneId}`,
+    `command: ${details.command}`,
+    `session: ${details.sessionName}`,
+    `extension status: ${statusText || "(empty)"}`,
+    `shell server health: ${JSON.stringify(health)}`,
+    `tmux panes:\n${tmuxPanes || "(unavailable)"}`,
+    `chrome targets:\n${targetUrls}`,
+    `chrome stdout:\n${details.chrome.stdoutText || "(empty)"}`,
+    `chrome stderr:\n${details.chrome.stderrText || "(empty)"}`,
+    `page text:\n${bodyText}`
+  ].join("\n\n");
+}
+
+function runTmuxBestEffort(args) {
+  const result = spawnSync("tmux", args, { encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : (result.stderr || result.stdout || "").trim();
+}
+
+async function waitForChromePageWebSocket(debugPort, url) {
+  return waitForValue(async () => {
+    const targets = await fetchHttpJson(`http://127.0.0.1:${debugPort}/json/list`).catch(() => []);
+    const page = targets.find((target) => target.type === "page" && target.url === url);
+    return page?.webSocketDebuggerUrl || "";
+  }, "Chrome page websocket");
+}
+
+async function saveScreenshot(page, filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  await page.evaluate(`(() => {
+    const thread = document.getElementById("thread");
+    if (thread) {
+      thread.scrollTop = thread.scrollHeight;
+    }
+  })()`);
+  await sleep(300);
+  const result = await page.send("Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: false
+  });
+  fs.writeFileSync(filePath, Buffer.from(result.data || "", "base64"));
+  assert.ok(fs.statSync(filePath).size > 1000, `Screenshot was not written: ${filePath}`);
+}
+
+async function waitForEvaluate(page, expression, label) {
+  await waitFor(async () => Boolean(await page.evaluate(expression)), label);
+}
+
+async function waitForEvaluateValue(page, expression, label) {
+  return waitForValue(() => page.evaluate(expression), label);
+}
+
+async function waitFor(check, label, timeoutMs = E2E_TIMEOUT_MS) {
+  const value = await waitForValue(async () => (await check()) ? true : undefined, label, timeoutMs);
+  return value === true;
+}
+
+async function waitForValue(check, label, timeoutMs = E2E_TIMEOUT_MS) {
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const value = await check();
+      if (value) {
+        return value;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(250);
+  }
+  throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+class CdpClient {
+  constructor(ws) {
+    this.ws = ws;
+    this.nextId = 1;
+    this.pending = new Map();
+    ws.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (!message.id) {
+        return;
+      }
+      const pending = this.pending.get(message.id);
+      if (!pending) {
+        return;
+      }
+      this.pending.delete(message.id);
+      if (message.error) {
+        pending.reject(new Error(`${message.error.message || "CDP error"} (${message.error.code || "unknown"})`));
+      } else {
+        pending.resolve(message.result || {});
+      }
+    });
+    ws.addEventListener("close", () => {
+      for (const pending of this.pending.values()) {
+        pending.reject(new Error("CDP websocket closed"));
+      }
+      this.pending.clear();
+    });
+  }
+
+  static async connect(wsUrl) {
+    const ws = new WebSocket(wsUrl);
+    await new Promise((resolve, reject) => {
+      ws.addEventListener("open", resolve, { once: true });
+      ws.addEventListener("error", reject, { once: true });
+    });
+    return new CdpClient(ws);
+  }
+
+  send(method, params = {}) {
+    const id = this.nextId;
+    this.nextId += 1;
+    const payload = JSON.stringify({ id, method, params });
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(payload);
+    });
+  }
+
+  async evaluate(expression) {
+    const result = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");
+    }
+    return result.result?.value;
+  }
+
+  close() {
+    this.ws.close();
+  }
+}

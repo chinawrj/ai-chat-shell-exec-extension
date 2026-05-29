@@ -270,7 +270,7 @@
   <body>
     <div class="app">
       <aside>
-        <h1>tmux shell-call test</h1>
+        <h1>tmux ai-helper test</h1>
         <p>This page mimics a chat surface so the extension can scan assistant messages and post shell-output back into the composer.</p>
 
         <h2>Setup</h2>
@@ -301,7 +301,7 @@
         </label>
 
         <div class="button-row">
-          <button id="insertCall" class="primary" type="button">Insert targeted shell-call</button>
+          <button id="insertCall" class="primary" type="button">Insert targeted helper</button>
           <button id="insertMissingTarget" type="button">Insert missing-target call</button>
           <button id="clearThread" type="button">Clear thread</button>
         </div>
@@ -313,7 +313,7 @@
         <section id="thread" class="thread" aria-label="Conversation thread">
           <article class="message" data-message-author-role="user">
             <div class="role">User</div>
-            <div>Manual test page loaded. Click the composer once, then insert a shell-call.</div>
+            <div>Manual test page loaded. Click the composer once, then insert an ai-helper block.</div>
           </article>
         </section>
 
@@ -339,20 +339,19 @@
       let tmuxRefreshTimer = 0;
 
       document.getElementById("insertCall").addEventListener("click", () => {
-        const payload = {
-          target: target.value.trim(),
-          cmd: command.value.trim() || "pwd"
-        };
-        appendAssistantToolCall(JSON.stringify(payload), "shell-call");
+        appendAssistantToolCall(formatPlainTextShellCall(
+          target.value.trim(),
+          command.value.trim() || "pwd"
+        ), "text");
       });
 
       document.getElementById("insertMissingTarget").addEventListener("click", () => {
-        appendAssistantToolCall(command.value.trim() || "pwd", "shell-call");
+        appendAssistantToolCall(formatPlainTextShellCall("", command.value.trim() || "pwd"), "text");
       });
 
       document.getElementById("clearThread").addEventListener("click", () => {
         thread.innerHTML = "";
-        setStatus("Thread cleared. Insert a new shell-call after the extension status says it is ready.");
+        setStatus("Thread cleared. Insert a new ai-helper block after the extension status says it is ready.");
       });
 
       form.addEventListener("submit", (event) => {
@@ -489,6 +488,15 @@
         thread.appendChild(article);
         article.scrollIntoView({ block: "end", behavior: "smooth" });
         setStatus("Inserted assistant tool call. The extension should run it after the page settles.");
+      }
+
+      function formatPlainTextShellCall(targetValue, commandValue) {
+        return [
+          "ai-helper-shell-start",
+          targetValue,
+          commandValue,
+          "ai-helper-shell-end"
+        ].join("\n");
       }
 
       function appendMessage(role, text) {

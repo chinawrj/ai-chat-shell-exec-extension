@@ -1,11 +1,8 @@
-const TOOL_LANGS = new Set([
-  "shell-call",
-  "shell_call",
-  "tool:shell",
-  "tool-shell",
-  "local-shell"
-]);
-const SHELL_LIKE_LANGS = new Set(["shell", "bash", "sh", "zsh"]);
+const HELPER_SHELL_START = "ai-helper-shell-start";
+const HELPER_SHELL_END = "ai-helper-shell-end";
+const HELPER_FILE_START = "ai-helper-file-start";
+const HELPER_FILE_END = "ai-helper-file-end";
+const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
@@ -285,7 +282,7 @@ function bindElement(mode, target) {
         savedAt: new Date().toISOString()
       }
     });
-    setStatus("Bound shell-call display area for this origin", "ok");
+    setStatus("Bound helper block display area for this origin", "ok");
   }
 }
 
@@ -316,7 +313,7 @@ async function scanForShellCall(options = {}) {
 
   if (activeCallId) {
     if (force && forceAttempts < 20) {
-      setStatus("Waiting for current shell call, then running latest", "running");
+      setStatus("Waiting for current helper call, then running latest", "running");
       clearTimeout(scanTimer);
       scanTimer = setTimeout(() => {
         scanForShellCall({ force: true, forceAttempts: forceAttempts + 1 }).catch((error) => {
@@ -365,7 +362,7 @@ async function scanForShellCall(options = {}) {
     initialThreadSettled = true;
     expirePendingSelfTest();
     if (force) {
-      setStatus("No shell-call found on this page", "idle");
+      setStatus("No helper block found on this page", "idle");
     }
     return;
   }
@@ -398,14 +395,15 @@ async function scanForShellCall(options = {}) {
 
   const lastShellOutputText = getLastShellOutputText();
   const lastPromptOrOutputText = getLastUserMessageText();
-  if (!force && ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
-    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText)))) {
+  if (!force && isShellHelperCall(call) &&
+    ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
+      (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText)))) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
   }
 
-  const validation = validateShellCall(call);
+  const validation = validateHelperCall(call);
   if (!validation.ok) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     if (isCopiedOutputRejectionReason(validation.reason)) {
@@ -416,7 +414,7 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
-  if (!call.target) {
+  if (isShellHelperCall(call) && !call.target) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     await replyWithMissingTmuxTarget(call);
     return;
@@ -439,8 +437,11 @@ async function scanForShellCall(options = {}) {
 function buildSemanticCallKey(call) {
   return stableHash([
     location.origin,
+    normalizeCommand(call.kind || "shell"),
     normalizeCommand(call.target || ""),
     normalizeCommand(call.cmd || ""),
+    normalizeCommand(call.filename || ""),
+    normalizeCommand(call.content || ""),
     normalizeCommand(call.cwd || ""),
     call.timeoutMs || "",
     call.maxOutputChars || ""
@@ -546,7 +547,7 @@ function isAssistantGenerating() {
 
 function getLastShellCallCandidate(root) {
   const candidates = extractShellCallCandidates(root)
-    .filter((candidate) => candidate.call?.cmd)
+    .filter((candidate) => isRunnableHelperCall(candidate.call))
     .filter((candidate) => !isShellOutputText(candidate.node?.innerText || candidate.node?.textContent || ""))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
@@ -563,71 +564,24 @@ function extractShellCallCandidates(root) {
     .filter((node, nodeIndex, all) => all.indexOf(node) === nodeIndex);
 
   for (const scanRoot of roots) {
-    for (const pre of Array.from(scanRoot.querySelectorAll("pre"))) {
-      if (closestEditable(pre) || !isVisibleElement(pre)) {
-        continue;
-      }
+    const textRoots = [
+      scanRoot !== root ? scanRoot : null,
+      ...getTextScanRoots(scanRoot)
+    ]
+      .filter(Boolean)
+      .filter((node, nodeIndex, all) => all.indexOf(node) === nodeIndex)
+      .filter((node) => containsToolLanguageHint(node.innerText || node.textContent || ""));
 
-      const code = pre.querySelector("code") || pre;
-      const cmdText = normalizeCommand(code.innerText || code.textContent || "");
-      if (!cmdText) {
-        continue;
-      }
-
-      const language = detectCodeLanguage(pre, code);
-      if (TOOL_LANGS.has(language) || shouldTreatShellLikeCodeAsTool(language, pre, cmdText)) {
-        candidates.push({
-          call: parseCallPayload(cmdText),
-          node: closestMessageContainer(pre),
-          index: index += 1,
-          source: "rendered-code"
-        });
-      }
-    }
-
-    for (const block of extractLabeledCodeBlockCalls(scanRoot)) {
-      candidates.push({
-        ...block,
-        index: index += 1,
-        source: "labeled-code"
-      });
-    }
-
-    for (const block of extractDowngradedLanguageCodeEditorCalls(scanRoot)) {
-      candidates.push({
-        ...block,
-        index: index += 1,
-        source: "downgraded-code-editor"
-      });
-    }
-
-    for (const block of extractLanguageLabelSiblingCalls(scanRoot)) {
-      candidates.push({
-        ...block,
-        index: index += 1,
-        source: "language-label"
-      });
-    }
-
-    for (const block of extractPlainTextLanguageSections(scanRoot)) {
-      candidates.push({
-        ...block,
-        index: index += 1,
-        source: "plain-text-language"
-      });
-    }
-
-    for (const textRoot of getTextScanRoots(scanRoot)) {
+    for (const textRoot of textRoots) {
       if (closestEditable(textRoot) || !isVisibleElement(textRoot)) {
         continue;
       }
 
-      for (const call of extractMarkdownFenceCalls(textRoot)) {
+      for (const block of extractPlainTextShellCallBlocks(textRoot)) {
         candidates.push({
-          call,
-          node: closestMessageContainer(textRoot),
+          ...block,
           index: index += 1,
-          source: "markdown-text"
+          source: "plain-text-block"
         });
       }
     }
@@ -645,299 +599,6 @@ function getBoundShellRoots(root) {
   return Array.from(document.querySelectorAll(savedShellSelector))
     .filter((node) => root === node || root.contains(node))
     .filter(isVisibleElement);
-}
-
-function extractPlainTextLanguageSections(root) {
-  const lastUserText = getLastUserMessageText().toLowerCase();
-  if (!containsToolLanguageHint(lastUserText)) {
-    return [];
-  }
-
-  const lines = normalizeCommand(root.innerText || root.textContent || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const results = [];
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const language = lines[i].toLowerCase();
-    if (!SHELL_LIKE_LANGS.has(language)) {
-      continue;
-    }
-
-    const commandLines = trimCommandLines(lines.slice(i + 1, Math.min(lines.length, i + 12)));
-
-    const command = commandLines.join("\n");
-    if (command && command.length <= 8000) {
-      results.push({
-        call: parseCallPayload(command),
-        node: root
-      });
-    }
-  }
-
-  return results;
-}
-
-function extractLanguageLabelSiblingCalls(root) {
-  const labels = Array.from(root.querySelectorAll("span, div, p, code"))
-    .filter((node) => !closestEditable(node))
-    .filter(isVisibleElement)
-    .filter((node) => {
-      const text = normalizeText(node.innerText || node.textContent || "").toLowerCase();
-      return TOOL_LANGS.has(text) || SHELL_LIKE_LANGS.has(text);
-    });
-
-  return labels
-    .map((label) => {
-      const language = normalizeText(label.innerText || label.textContent || "").toLowerCase();
-      const container = findLanguageLabelContainer(label, language);
-      const command = extractCommandAfterLanguage(container, language);
-      if (!command || command.length > 8000) {
-        return null;
-      }
-      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, label, command)) {
-        return null;
-      }
-
-      return {
-        call: parseCallPayload(command),
-        node: closestMessageContainer(container || label)
-      };
-    })
-    .filter(Boolean);
-}
-
-function findLanguageLabelContainer(label, language) {
-  let current = label.parentElement;
-  for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
-    const command = extractCommandAfterLanguage(current, language);
-    if (command) {
-      return current;
-    }
-  }
-  return label.parentElement;
-}
-
-function extractCommandAfterLanguage(container, language) {
-  const lines = normalizeCommand(container?.innerText || container?.textContent || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => line.toLowerCase() !== "copy to clipboard");
-  const languageIndex = lines.findIndex((line) => line.toLowerCase() === language);
-  if (languageIndex < 0) {
-    return "";
-  }
-  return trimCommandLines(lines.slice(languageIndex + 1)).join("\n");
-}
-
-function extractLabeledCodeBlockCalls(root) {
-  const selector = [
-    '[class*="code" i]',
-    '[data-testid*="code" i]',
-    '[aria-label*="code" i]'
-  ].join(",");
-
-  return Array.from(root.querySelectorAll(selector))
-    .filter((node) => !node.querySelector("pre"))
-    .filter((node) => !closestEditable(node))
-    .filter(isVisibleElement)
-    .map((node) => {
-      const lines = normalizeCommand(node.innerText || node.textContent || "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .filter((line) => line.toLowerCase() !== "copy to clipboard");
-      if (lines.length < 1 || lines.length > 80) {
-        return null;
-      }
-
-      const languageMatch = findRenderedCodeLanguageLine(lines);
-      let languageIndex = languageMatch?.index ?? -1;
-      let language = languageMatch?.language || inferCodeBlockLanguage(node);
-      if (!language) {
-        return null;
-      }
-
-      if (languageIndex < 0) {
-        languageIndex = -1;
-      }
-      const command = trimCommandLines(lines.slice(languageIndex + 1)).join("\n");
-      if (!command) {
-        return null;
-      }
-      if (!TOOL_LANGS.has(language) && !shouldTreatShellLikeCodeAsTool(language, node, command)) {
-        return null;
-      }
-
-      return {
-        call: parseCallPayload(command),
-        node: closestMessageContainer(node)
-      };
-    })
-    .filter(Boolean)
-    .filter((candidate, index, all) => !all.some((other, otherIndex) =>
-      otherIndex > index &&
-      other.node !== candidate.node &&
-      other.node.contains(candidate.node)
-    ));
-}
-
-function extractDowngradedLanguageCodeEditorCalls(root) {
-  const selector = [
-    '[class*="code" i]',
-    '[data-testid*="code" i]',
-    '[aria-label*="code" i]'
-  ].join(",");
-
-  return Array.from(root.querySelectorAll(selector))
-    .filter((node) => !closestEditable(node))
-    .filter(isVisibleElement)
-    .map((node) => {
-      const markerText = normalizeCommand(node.innerText || node.textContent || "");
-      const language = detectDowngradedToolLanguage(markerText);
-      if (!language) {
-        return null;
-      }
-
-      const command = findNearbyDowngradedCodeCommand(node);
-      if (!command || command.length > 8000) {
-        return null;
-      }
-
-      return {
-        call: parseCallPayload(command),
-        node: closestMessageContainer(node)
-      };
-    })
-    .filter(Boolean);
-}
-
-function findNearbyDowngradedCodeCommand(markerNode) {
-  const message = closestMessageContainer(markerNode);
-  const selector = [
-    '[class*="code" i]',
-    '[data-testid*="code" i]',
-    '[aria-label*="code" i]',
-    '[aria-label*="editor" i]',
-    '[role="document"]'
-  ].join(",");
-
-  const codeNodes = Array.from(message.querySelectorAll(selector))
-    .filter((node) => node !== markerNode && !node.contains(markerNode))
-    .filter((node) => !closestEditable(node))
-    .filter(isVisibleElement)
-    .filter((node) => {
-      const position = markerNode.compareDocumentPosition(node);
-      return position & Node.DOCUMENT_POSITION_FOLLOWING;
-    });
-
-  for (const node of codeNodes) {
-    const command = cleanedRenderedCodeText(node);
-    if (command) {
-      return command;
-    }
-  }
-
-  return "";
-}
-
-function cleanedRenderedCodeText(node) {
-  const lines = normalizeCommand(node.innerText || node.textContent || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => {
-      const lower = line.toLowerCase();
-      return lower !== "copy code" &&
-        lower !== "copy to clipboard" &&
-        lower !== "display options" &&
-        lower !== "plain text" &&
-        !lower.startsWith("go to line") &&
-        !detectDowngradedToolLanguage(lower);
-    });
-
-  return trimCommandLines(lines).join("\n");
-}
-
-function findRenderedCodeLanguageLine(lines) {
-  for (let index = 0; index < Math.min(6, lines.length); index += 1) {
-    const line = lines[index].toLowerCase();
-    if (TOOL_LANGS.has(line) || SHELL_LIKE_LANGS.has(line)) {
-      return { index, language: line };
-    }
-
-    const downgradedLanguage = detectDowngradedToolLanguage(line);
-    if (downgradedLanguage) {
-      return { index, language: downgradedLanguage };
-    }
-  }
-
-  return null;
-}
-
-function detectDowngradedToolLanguage(line) {
-  const lower = String(line || "").toLowerCase();
-  const hasDowngradeSignal = lower.includes("not supported") ||
-    lower.includes("isn't fully supported") ||
-    lower.includes("unsupported") ||
-    lower.includes("plain text");
-  if (!hasDowngradeSignal) {
-    return "";
-  }
-
-  return Array.from(TOOL_LANGS).find((lang) => hasLanguageToken(lower, lang)) || "";
-}
-
-function inferCodeBlockLanguage(node) {
-  const attrText = normalizeText([
-    node.getAttribute("aria-label") || "",
-    node.getAttribute("data-language") || "",
-    node.className || "",
-    node.previousElementSibling?.textContent || "",
-    node.parentElement?.getAttribute("aria-label") || "",
-    node.parentElement?.getAttribute("data-language") || "",
-    node.parentElement?.className || ""
-  ].join(" ")).toLowerCase();
-
-  for (const lang of [...TOOL_LANGS, ...SHELL_LIKE_LANGS]) {
-    if (hasLanguageToken(attrText, lang)) {
-      return lang;
-    }
-  }
-  return "";
-}
-
-function hasLanguageToken(text, language) {
-  const escaped = escapeRegExp(language);
-  return new RegExp(`(^|[^a-z0-9_:-])(?:language-|lang-|code-)?${escaped}(?:\\s+code)?($|[^a-z0-9_:-])`, "i").test(text);
-}
-
-function trimCommandLines(lines) {
-  const stopWords = new Set([
-    "copy",
-    "retry",
-    "edit",
-    "message actions",
-    "write a message...",
-    "write a message"
-  ]);
-  const commandLines = [];
-
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-    if (stopWords.has(lower) ||
-      lower.startsWith("model:") ||
-      lower === "adaptive" ||
-      lower.startsWith("message copilot") ||
-      lower.startsWith("ai-generated content may be incorrect")) {
-      break;
-    }
-    commandLines.push(line);
-  }
-
-  return commandLines;
 }
 
 function getTextScanRoots(root) {
@@ -968,7 +629,8 @@ function getTextScanRoots(root) {
 
 function containsToolLanguageHint(text) {
   const lower = String(text || "").toLowerCase();
-  return Array.from(TOOL_LANGS).some((lang) => lower.includes(lang));
+  return lower.includes(HELPER_SHELL_START) ||
+    lower.includes(HELPER_FILE_START);
 }
 
 function closestMessageContainer(node) {
@@ -1022,121 +684,118 @@ function compareNodeOrder(a, b) {
   return 0;
 }
 
-function detectCodeLanguage(pre, code) {
-  const className = `${pre.className || ""} ${code.className || ""}`.toLowerCase();
-  for (const lang of [...TOOL_LANGS, ...SHELL_LIKE_LANGS]) {
-    if (hasLanguageToken(className, lang)) {
-      return lang;
-    }
-  }
-
-  const headerText = normalizeText(
-    [
-      pre.previousElementSibling?.textContent || "",
-      pre.parentElement?.querySelector("[data-language]")?.getAttribute("data-language") || "",
-      pre.parentElement?.textContent?.slice(0, 100) || ""
-    ].join(" ")
-  ).toLowerCase();
-
-  for (const lang of [...TOOL_LANGS, ...SHELL_LIKE_LANGS]) {
-    if (hasLanguageToken(headerText, lang)) {
-      return lang;
-    }
-  }
-
-  return "";
+function extractPlainTextShellCallBlocks(root) {
+  const text = root.innerText || root.textContent || "";
+  const blocks = parsePlainTextHelperBlocks(text);
+  return blocks.map((call) => ({
+    call,
+    node: closestMessageContainer(root)
+  }));
 }
 
-function extractMarkdownFenceCalls(root) {
-  const text = root.innerText || root.textContent || "";
+function parsePlainTextHelperBlocks(text) {
+  const lines = splitShellCallLines(text);
   const calls = [];
-  const fence = /```([a-zA-Z0-9_:-]+)\s*\n([\s\S]*?)```/g;
-  let match;
 
-  while ((match = fence.exec(text))) {
-    const lang = String(match[1] || "").trim().toLowerCase();
-    if (TOOL_LANGS.has(lang) || shouldTreatShellLikeCodeAsTool(lang, root, match[2])) {
-      calls.push(parseCallPayload(match[2]));
+  for (let index = 0; index < lines.length; index += 1) {
+    const marker = lines[index];
+    const kind = getHelperStartKind(marker);
+    if (!kind) {
+      continue;
     }
+
+    const valueLineIndex = index + 1;
+    if (valueLineIndex >= lines.length) {
+      break;
+    }
+
+    const endIndex = lines.findIndex((line, lineIndex) =>
+      lineIndex > valueLineIndex && isHelperEndForKind(kind, line)
+    );
+    if (endIndex < 0) {
+      break;
+    }
+
+    if (kind === "file") {
+      calls.push({
+        kind,
+        filename: normalizeCommand(lines[valueLineIndex]),
+        content: lines.slice(valueLineIndex + 1, endIndex).join("\n")
+      });
+    } else {
+      calls.push({
+        kind,
+        target: normalizeCommand(lines[valueLineIndex]),
+        cmd: normalizeCommand(lines.slice(valueLineIndex + 1, endIndex).join("\n"))
+      });
+    }
+    index = endIndex;
   }
 
   return calls;
 }
 
-function shouldTreatShellLikeCodeAsTool(language, node, commandText = "") {
-  if (!SHELL_LIKE_LANGS.has(String(language || "").toLowerCase())) {
-    return false;
+function parsePlainTextHelperPayload(text) {
+  const blocks = parsePlainTextHelperBlocks(text);
+  if (blocks.length !== 1) {
+    return null;
   }
 
-  if (hasShellToolDirective(commandText)) {
-    return true;
+  const lines = splitShellCallLines(text);
+  const kind = getHelperStartKind(lines[0]);
+  if (!kind || !isHelperEndForKind(kind, lines[lines.length - 1])) {
+    return null;
   }
 
-  const lastUserText = getLastUserMessageText().toLowerCase();
-  const nearbyText = normalizeText(
-    [
-      node?.previousElementSibling?.textContent || "",
-      node?.parentElement?.textContent?.slice(0, 400) || ""
-    ].join(" ")
-  ).toLowerCase();
+  return blocks[0];
+}
 
-  return containsToolLanguageHint(lastUserText) || containsToolLanguageHint(nearbyText);
+function getHelperStartKind(line) {
+  if (line === HELPER_SHELL_START) {
+    return "shell";
+  }
+  if (line === HELPER_FILE_START) {
+    return "file";
+  }
+  return "";
+}
+
+function isHelperEndForKind(kind, line) {
+  if (kind === "shell") {
+    return line === HELPER_SHELL_END;
+  }
+  if (kind === "file") {
+    return line === HELPER_FILE_END;
+  }
+  return false;
+}
+
+function splitShellCallLines(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  while (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
 }
 
 function parseCallPayload(text) {
-  const payload = stripShellToolDirective(normalizeCommand(text));
-  try {
-    const parsed = JSON.parse(payload);
-    if (parsed && typeof parsed === "object") {
-      return {
-        cmd: normalizeCommand(parsed.cmd || parsed.command || ""),
-        target: normalizeCommand(parsed.target || parsed.tmuxTarget || parsed.pane || ""),
-        cwd: normalizeCommand(parsed.cwd || ""),
-        timeoutMs: Number(parsed.timeoutMs || parsed.timeout || 0) || undefined,
-        maxOutputChars: Number(parsed.maxOutputChars || 0) || undefined
-      };
-    }
-  } catch {
-    // Plain command payloads are intentionally supported.
+  const plainTextHelper = parsePlainTextHelperPayload(text);
+  if (plainTextHelper) {
+    return plainTextHelper;
   }
-
-  return { cmd: payload };
+  return { cmd: "" };
 }
 
-function hasShellToolDirective(text) {
-  return getShellToolDirectiveIndex(normalizeCommand(text).split("\n")) >= 0;
+function isShellHelperCall(call) {
+  return !call?.kind || call.kind === "shell";
 }
 
-function stripShellToolDirective(text) {
-  const lines = normalizeCommand(text).split("\n");
-  const directiveIndex = getShellToolDirectiveIndex(lines);
-  if (directiveIndex < 0) {
-    return normalizeCommand(text);
-  }
-
-  const directiveCommand = extractShellToolDirectiveCommand(lines[directiveIndex]);
-  const remaining = lines.filter((_, index) => index !== directiveIndex).join("\n");
-  return normalizeCommand([directiveCommand, remaining].filter(Boolean).join("\n"));
+function isFileHelperCall(call) {
+  return call?.kind === "file";
 }
 
-function getShellToolDirectiveIndex(lines) {
-  const firstContentIndex = lines.findIndex((line) => line.trim());
-  if (firstContentIndex < 0) {
-    return -1;
-  }
-
-  const line = lines[firstContentIndex];
-  return isShellToolDirectiveLine(line) ? firstContentIndex : -1;
-}
-
-function isShellToolDirectiveLine(line) {
-  const normalized = line.trim().toLowerCase();
-  return /^(#|\/\/|;)\s*(shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)(?:\s*:\s*.+)?$/.test(normalized);
-}
-
-function extractShellToolDirectiveCommand(line) {
-  const match = String(line || "").trim().match(/^(?:#|\/\/|;)\s*(?:shell-call|shell_call|tool:shell|tool-shell|local-shell|ai-chat-shell-exec)\s*:\s*([\s\S]+)$/i);
-  return match ? normalizeCommand(match[1]) : "";
+function isRunnableHelperCall(call) {
+  return isFileHelperCall(call) ? call.filename !== undefined : Boolean(call?.cmd);
 }
 
 function resetChainForNewHumanPrompt() {
@@ -1223,6 +882,27 @@ function extractCommandFromShellOutput(text) {
   return commandLine ? commandLine.trim().slice(2).trim() : "";
 }
 
+function validateHelperCall(call) {
+  if (isFileHelperCall(call)) {
+    return validateFileHelperCall(call);
+  }
+  return validateShellCall(call);
+}
+
+function validateFileHelperCall(call) {
+  const filename = normalizeCommand(call.filename || "");
+  if (!filename) {
+    return { ok: false, reason: "Filename is empty." };
+  }
+  if (filename.includes("/") || filename.includes("\\") || filename === "." || filename === "..") {
+    return { ok: false, reason: "Filename must be a single file name under Downloads." };
+  }
+  if (filename.includes("\0")) {
+    return { ok: false, reason: "Filename contains an invalid null byte." };
+  }
+  return { ok: true };
+}
+
 function validateShellCall(call) {
   const cmd = normalizeCommand(call.cmd);
   if (!cmd) {
@@ -1235,6 +915,10 @@ function validateShellCall(call) {
     line === "$" ||
     line.startsWith("$ ") ||
     line === "shell-output" ||
+    getHelperStartKind(line) ||
+    isHelperEndForKind("shell", line) ||
+    isHelperEndForKind("file", line) ||
+    UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
     line === "native messaging" ||
@@ -1271,16 +955,24 @@ function isCopiedOutputRejectionReason(reason) {
 
 async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
-  setStatus(`Rejected shell call: ${reason}`, "error");
+  const helperName = isFileHelperCall(call) ? "file helper" : "shell call";
+  setStatus(`Rejected ${helperName}: ${reason}`, "error");
   await insertReply([
-    "Shell call rejected:",
+    isFileHelperCall(call) ? "File helper rejected:" : "Shell call rejected:",
     "",
     "```shell-output",
-    `$ ${call.cmd}`,
+    formatRejectedCallSubject(call),
     `error: ${reason}`,
     "```"
   ].join("\n"));
   await clickSendWhenReady();
+}
+
+function formatRejectedCallSubject(call) {
+  if (isFileHelperCall(call)) {
+    return `file: ${call.filename || ""}`;
+  }
+  return `$ ${call.cmd || ""}`;
 }
 
 async function replyWithMissingTmuxTarget(call) {
@@ -1294,26 +986,36 @@ async function replyWithMissingTmuxTarget(call) {
     "",
     "```shell-output",
     `$ ${call.cmd}`,
-    "error: Missing tmux target. Use a JSON shell-call with target and cmd.",
+    "error: Missing tmux target. Use an ai-helper shell block with target and command.",
     "",
     "tmux targets:",
     formatTmuxPanesForShellOutput(panes, response?.error),
     "",
-    `example: ${JSON.stringify({ target: exampleTarget, cmd: call.cmd || "pwd" })}`,
+    "example:",
+    formatPlainTextShellCallExample(exampleTarget, call.cmd || "pwd"),
     "```"
   ].join("\n"));
   await clickSendWhenReady();
 }
 
 async function runAndReply(callId, call, options = {}) {
-  if (!call.cmd) {
+  if (!isRunnableHelperCall(call)) {
     return;
   }
 
   const force = options.force === true;
   const settings = await chrome.storage.sync.get(["requireApproval", "autoSend"]);
   if (!force && settings.requireApproval === true) {
-    const approved = window.confirm(
+    const prompt = isFileHelperCall(call) ?
+      [
+        "AI requested a local file write.",
+        "",
+        `Downloads file: ${call.filename || ""}`,
+        "",
+        summarizeCommand(call.content || ""),
+        "",
+        "Write this file and post the result back to this chat?"
+      ] :
       [
         "AI requested a local shell command.",
         "",
@@ -1323,7 +1025,9 @@ async function runAndReply(callId, call, options = {}) {
         call.cmd,
         "",
         "Run this command and post the output back to this chat?"
-      ].join("\n")
+      ];
+    const approved = window.confirm(
+      prompt.join("\n")
     );
 
     if (!approved) {
@@ -1333,41 +1037,37 @@ async function runAndReply(callId, call, options = {}) {
 
   activeCallId = callId;
   chainCallCount += 1;
-  setStatus(`${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`, "running");
+  setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
   try {
-    const response = await chrome.runtime.sendMessage({
-      type: "run-shell",
-      id: callId,
-      callKey: callId,
-      callMeta: {
-        origin: location.origin,
-        pathname: location.pathname,
-        promptHash: stableHash(getLastUserMessageText()),
-        force
-      },
-      ...call
-    });
+    const response = isFileHelperCall(call) ?
+      await sendWriteFileMessage(callId, call, force) :
+      await sendRunShellMessage(callId, call, force);
 
     if (response?.duplicate === true && response?.skipped === true) {
-      setStatus(force ? "Force run skipped by server" : "Skipped duplicate shell call", "ok");
+      setStatus(force ? "Force run skipped by server" : "Skipped duplicate helper call", "ok");
       return;
     }
 
-    const reply = formatShellOutput(call, response, startedAt);
+    const reply = isFileHelperCall(call) ?
+      formatFileOutput(call, response, startedAt) :
+      formatShellOutput(call, response, startedAt);
     await insertReply(reply);
-    setShellCompletionStatus(call, response);
+    setHelperCompletionStatus(call, response);
     activeCallId = "";
 
     if (settings.autoSend !== false) {
       await clickSendWhenReady();
     }
   } catch (error) {
-    setStatus(`Shell call failed: ${error.message || String(error)}`, "error");
-    await insertReply(formatShellOutput(call, {
+    setStatus(`${isFileHelperCall(call) ? "File helper" : "Shell call"} failed: ${error.message || String(error)}`, "error");
+    const failedResponse = {
       ok: false,
       error: error.message || String(error)
-    }, startedAt));
+    };
+    await insertReply(isFileHelperCall(call) ?
+      formatFileOutput(call, failedResponse, startedAt) :
+      formatShellOutput(call, failedResponse, startedAt));
     activeCallId = "";
     if (settings.autoSend !== false) {
       await clickSendWhenReady();
@@ -1377,7 +1077,45 @@ async function runAndReply(callId, call, options = {}) {
   }
 }
 
-function setShellCompletionStatus(call, response) {
+function buildRunningStatus(call, force) {
+  if (isFileHelperCall(call)) {
+    return `${force ? "Force writing" : "Writing"} file: ${summarizeCommand(call.filename || "")}`;
+  }
+  return `${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`;
+}
+
+function sendRunShellMessage(callId, call, force) {
+  return chrome.runtime.sendMessage({
+    type: "run-shell",
+    id: callId,
+    callKey: callId,
+    callMeta: {
+      origin: location.origin,
+      pathname: location.pathname,
+      promptHash: stableHash(getLastUserMessageText()),
+      force
+    },
+    ...call
+  });
+}
+
+function sendWriteFileMessage(callId, call, force) {
+  return chrome.runtime.sendMessage({
+    type: "write-file",
+    id: callId,
+    callKey: callId,
+    filename: call.filename,
+    content: call.content || "",
+    callMeta: {
+      origin: location.origin,
+      pathname: location.pathname,
+      promptHash: stableHash(getLastUserMessageText()),
+      force
+    }
+  });
+}
+
+function setHelperCompletionStatus(call, response) {
   if (pendingSelfTest && isExpectedSelfTestCall(call)) {
     const token = pendingSelfTest.token;
     pendingSelfTest = null;
@@ -1390,7 +1128,12 @@ function setShellCompletionStatus(call, response) {
     return;
   }
 
-  setStatus(response?.ok === false ? "Shell call failed" : "Shell call completed", response?.ok === false ? "error" : "ok");
+  if (isFileHelperCall(call)) {
+    setStatus(response?.ok === false ? "File write failed" : "File write completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
+  setStatus(response?.ok === false ? "Shell helper failed" : "Shell helper completed", response?.ok === false ? "error" : "ok");
 }
 
 function isExpectedSelfTestCall(call) {
@@ -1403,7 +1146,7 @@ function isExpectedSelfTestCall(call) {
 function expirePendingSelfTest() {
   if (pendingSelfTest && Date.now() - pendingSelfTest.startedAt > 120000) {
     pendingSelfTest = null;
-    setStatus("Self-test expired before a matching shell-call appeared", "error");
+    setStatus("Self-test expired before a matching helper block appeared", "error");
   }
 }
 
@@ -1419,7 +1162,7 @@ function formatShellOutput(call, response, startedAt) {
       call.target ? `target: ${call.target}` : "",
       `startedAt: ${startedAt}`,
       `error: ${response?.error || "Unknown shell server error."}`,
-      response?.example ? `example: ${response.example}` : "",
+      response?.example ? "\nexample:\n" + response.example : "",
       response?.tmuxPanes ? "\ntmux targets:\n" + formatTmuxPanesForShellOutput(response.tmuxPanes) : "",
       "```"
     ].filter((line) => line !== "").join("\n");
@@ -1447,6 +1190,31 @@ function formatShellOutput(call, response, startedAt) {
     stderr ? "\nstderr:\n" + stderr : "",
     "```"
   ].join("\n");
+}
+
+function formatFileOutput(call, response, startedAt) {
+  if (!response || response.ok === false) {
+    return [
+      "File write failed:",
+      "",
+      "```shell-output",
+      `file: ${call.filename || ""}`,
+      `startedAt: ${startedAt}`,
+      `error: ${response?.error || "Unknown file write error."}`,
+      "```"
+    ].join("\n");
+  }
+
+  return [
+    "File write result:",
+    "",
+    "```shell-output",
+    `file: ${response.filename || call.filename || ""}`,
+    response.path ? `path: ${response.path}` : "",
+    `bytes: ${response.bytes}`,
+    `durationMs: ${response.durationMs}`,
+    "```"
+  ].filter((line) => line !== "").join("\n");
 }
 
 function formatShellOutputCommand(command) {
@@ -1488,10 +1256,19 @@ function formatTmuxPanesForShellOutput(panes, error = "") {
   ].filter(Boolean).join(" ")).join("\n");
 }
 
+function formatPlainTextShellCallExample(target, cmd) {
+  return [
+    HELPER_SHELL_START,
+    target || "%pane_id",
+    cmd || "pwd",
+    HELPER_SHELL_END
+  ].join("\n");
+}
+
 async function insertReply(text) {
   const input = await findReplyInput();
   if (!input) {
-    throw new Error("Could not find a chat composer. Click the chat input once, then ask the AI for a shell-call again.");
+    throw new Error("Could not find a chat composer. Click the chat input once, then ask the AI for a helper block again.");
   }
 
   rememberComposer(input);
@@ -2039,7 +1816,7 @@ function handlePanelAction(action) {
 
 async function forceRunLatestShellCall() {
   pendingSelfTest = null;
-  setStatus("Checking latest shell-call once", "running");
+  setStatus("Checking latest helper block once", "running");
   await scanForShellCall({ force: true });
 }
 
@@ -2107,12 +1884,13 @@ async function runFullChainTest() {
   const pane = chooseSelfTestPane(tmux.panes);
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
-  const payload = JSON.stringify({ target: pane.id, cmd: command });
   const prompt = [
     "Compatibility test.",
-    "Reply only with one markdown code block labeled shell.",
-    "The only line inside must be exactly:",
-    `# local-shell: ${payload}`
+    "Reply only with these lines and no prose:",
+    HELPER_SHELL_START,
+    pane.id,
+    command,
+    HELPER_SHELL_END
   ].join("\n");
 
   setStatus(`Starting full test on ${pane.id}: ${token}`, "running");
@@ -2126,7 +1904,7 @@ async function runFullChainTest() {
       cwd: "",
       startedAt: Date.now()
     };
-    setStatus(`Waiting for shell-call test: ${token}`, "running");
+    setStatus(`Waiting for helper block test: ${token}`, "running");
   }
 }
 

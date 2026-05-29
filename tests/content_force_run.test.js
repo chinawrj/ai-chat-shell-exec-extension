@@ -10,10 +10,10 @@ assert.match(source, /\["force",\s*"Run latest"\]/);
 assert.match(source, /async function forceRunLatestShellCall\(\)/);
 assert.match(source, /scanForShellCall\(\{\s*force:\s*true\s*\}\)/);
 assert.match(source, /forceAttempts/);
-assert.match(source, /Waiting for current shell call, then running latest/);
+assert.match(source, /Waiting for current helper call, then running latest/);
 assert.match(source, /function buildForceCallKey\(semanticCallKey\)/);
 assert.match(source, /runAndReply\(executionCallKey,\s*call,\s*\{\s*force\s*\}\)/);
-assert.match(source, /No shell-call found on this page/);
-assert.match(source, /setShellCompletionStatus\(call,\s*response\);\s*activeCallId = "";/);
+assert.match(source, /No helper block found on this page/);
+assert.match(source, /setHelperCompletionStatus\(call,\s*response\);\s*activeCallId = "";/);
 
 console.log("content force-run tests passed");

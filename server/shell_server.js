@@ -32,6 +32,12 @@ const TMUX_LIST_FORMAT = [
 ].join(TMUX_FIELD_SEPARATOR);
 const TMUX_CAPTURE_HISTORY_LINES = 20000;
 const TMUX_POLL_INTERVAL_MS = 250;
+const HELPER_SHELL_START = "ai-helper-shell-start";
+const HELPER_SHELL_END = "ai-helper-shell-end";
+const HELPER_FILE_START = "ai-helper-file-start";
+const HELPER_FILE_END = "ai-helper-file-end";
+const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
+const SHELL_RUNNER = process.env.AI_CHAT_SHELL_RUNNER || (fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh");
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
 let serverLedger = loadServerLedger();
 
@@ -181,6 +187,10 @@ async function handleMessageText(text) {
     };
   }
 
+  if (message.type === "write-file") {
+    return handleWriteFileMessage(message);
+  }
+
   if (message.type !== "run") {
     throw new Error("Unsupported message type.");
   }
@@ -271,6 +281,89 @@ async function handleMessageText(text) {
   };
   completeServerShellCall(callKey, response);
   return response;
+}
+
+function handleWriteFileMessage(message) {
+  const started = Date.now();
+  const filename = String(message.filename || "");
+  const content = String(message.content || "");
+  const downloadsDir = path.join(os.homedir(), "Downloads");
+  const filePath = resolveDownloadsFilePath(filename, downloadsDir);
+  const callKey = normalizeCallKey(message.callKey || message.id || hashText([filename, content].join("\n")));
+  const claim = claimServerShellCall(callKey, {
+    cmd: content,
+    cwd: downloadsDir,
+    target: filePath,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    seq: message.seq,
+    callMeta: message.callMeta || {}
+  });
+  if (claim.action === "skip") {
+    console.log(`[skip] reason=${claim.reason} callKey=${callKey} file=${JSON.stringify(filename)}`);
+    return {
+      ok: true,
+      id: message.id,
+      callKey,
+      duplicate: true,
+      skipped: true,
+      reason: claim.reason,
+      filename,
+      path: filePath,
+      bytes: 0,
+      durationMs: 0
+    };
+  }
+
+  const written = writeDownloadsFile(filename, content, downloadsDir);
+  const bytes = written.bytes;
+  console.log(`[write-file] path=${filePath} bytes=${bytes}`);
+  const response = {
+    ok: true,
+    id: message.id,
+    callKey,
+    filename: path.basename(filePath),
+    path: filePath,
+    bytes,
+    durationMs: Date.now() - started
+  };
+  completeServerShellCall(callKey, {
+    ...response,
+    exitCode: 0,
+    timedOut: false,
+    truncated: false
+  });
+  return response;
+}
+
+function writeDownloadsFile(filename, content, downloadsDir = path.join(os.homedir(), "Downloads")) {
+  const filePath = resolveDownloadsFilePath(filename, downloadsDir);
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  fs.writeFileSync(filePath, String(content || ""), "utf8");
+  return {
+    path: filePath,
+    filename: path.basename(filePath),
+    bytes: Buffer.byteLength(String(content || ""), "utf8")
+  };
+}
+
+function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(), "Downloads")) {
+  const raw = String(filename || "");
+  if (!raw.trim()) {
+    throw new Error("Missing filename.");
+  }
+  if (raw.includes("\0")) {
+    throw new Error("Filename contains an invalid null byte.");
+  }
+  if (raw.includes("/") || raw.includes("\\") || raw === "." || raw === "..") {
+    throw new Error("Filename must be a single file name under Downloads.");
+  }
+
+  const resolved = path.resolve(downloadsDir, raw);
+  const root = path.resolve(downloadsDir);
+  if (path.dirname(resolved) !== root) {
+    throw new Error("Filename must resolve directly under Downloads.");
+  }
+  return resolved;
 }
 
 function claimServerShellCall(callKey, payload) {
@@ -372,6 +465,11 @@ function validateCommand(cmd) {
     line === "$" ||
     line.startsWith("$ ") ||
     line === "shell-output" ||
+    line === HELPER_SHELL_START ||
+    line === HELPER_SHELL_END ||
+    line === HELPER_FILE_START ||
+    line === HELPER_FILE_END ||
+    UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
     line === "native messaging" ||
@@ -398,7 +496,7 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   const started = Date.now();
   let lastCapture = "";
   try {
-    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", `/bin/zsh ${shellQuote(scriptPath)}`], { timeoutMs: 5000 });
+    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", `${SHELL_RUNNER} ${shellQuote(scriptPath)}`], { timeoutMs: 5000 });
     await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
 
     while (Date.now() - started < timeoutMs) {
@@ -439,7 +537,7 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
 
 function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }) {
   return [
-    "#!/bin/zsh",
+    `#!${SHELL_RUNNER}`,
     "set +e",
     `printf '\\n%s\\n' ${shellQuote(startMarker)}`,
     "(",
@@ -520,7 +618,7 @@ function buildMissingTargetResponse(message, cmd, panes) {
     message,
     cmd,
     panes,
-    error: "Missing tmux target. Use a JSON shell-call with target and cmd.",
+    error: "Missing tmux target. Use an ai-helper shell block with target and command.",
     targetRequired: true
   });
 }
@@ -550,7 +648,12 @@ function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }
 
 function buildTmuxTargetExample(panes, cmd = "pwd") {
   const target = panes[0]?.id || "%pane_id";
-  return JSON.stringify({ target, cmd: cmd || "pwd" });
+  return [
+    HELPER_SHELL_START,
+    target,
+    cmd || "pwd",
+    HELPER_SHELL_END
+  ].join("\n");
 }
 
 async function captureTmuxPane(target) {
@@ -855,7 +958,9 @@ module.exports = {
   getTmuxSocketPath,
   listTmuxPanes,
   parseTmuxPanes,
+  resolveDownloadsFilePath,
   resolveTmuxTarget,
   runTmuxShell,
-  startServer
+  startServer,
+  writeDownloadsFile
 };

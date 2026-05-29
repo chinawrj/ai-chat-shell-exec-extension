@@ -1,0 +1,106 @@
+# Agent Guide
+
+## Purpose
+
+AI Chat Shell Exec is a no-build Chrome/Chromium Manifest V3 extension plus a local Node.js server. It lets AI chat pages run explicit ai-helper shell blocks through a selected tmux pane or ai-helper file blocks into Downloads, then posts results back into the chat as `shell-output`.
+
+Flow:
+
+```text
+AI chat page -> extension/src/content.js -> extension/src/background.js -> ws://127.0.0.1:17371/shell -> server/shell_server.js -> tmux pane
+```
+
+Treat this project as security-sensitive local remote-code execution.
+
+## Repo Layout
+
+- `extension/`: unpacked Chrome extension files.
+- `extension/src/content.js`: page activation, helper block scanning/parsing, duplicate suppression, composer insertion, floating panel, per-origin binding.
+- `extension/src/background.js`: settings defaults and migrations, health checks, browser-side call ledger, WebSocket forwarding.
+- `extension/src/popup.js`: popup settings UI, tmux target display, config export/import.
+- `server/shell_server.js`: local health/WebSocket server, tmux pane listing, target resolution, tmux command execution, persistent server ledger.
+- `scripts/`: macOS install/dev/release helpers.
+- `tests/`: standalone Node.js tests. There is no `package.json` or central test runner.
+- `docs/AI_INSTRUCTIONS.md`: instructions for chat models to emit ai-helper blocks; this is not a coding-agent guide.
+
+## Common Commands
+
+Run all automated tests:
+
+```sh
+for f in tests/*.test.js; do node "$f"; done
+```
+
+The test loop includes `tests/chrome_extension_e2e.test.js`, which launches a real Chromium-family browser with the unpacked extension and drives the local tmux test page. On Ubuntu it needs `DISPLAY`, Xvfb, or a cached Playwright Chromium browser; on macOS it can use Chrome for Testing, Chromium, Microsoft Edge, or Google Chrome. Set `CHROME_BIN` to force the browser binary.
+
+Run a single test:
+
+```sh
+node tests/manifest_consistency.test.js
+```
+
+Run the shell server in the foreground:
+
+```sh
+./scripts/start_shell_server.sh
+```
+
+Run environment diagnostics:
+
+```sh
+./scripts/doctor.sh
+```
+
+Manual browser test flow:
+
+```sh
+node scripts/start_tmux_test_page_https.js
+./scripts/open_tmux_test_chrome.sh
+```
+
+Install or restart the macOS LaunchAgent server:
+
+```sh
+./scripts/install_shell_server_agent.sh
+```
+
+Package a release:
+
+```sh
+./scripts/package_release.sh
+```
+
+`scripts/package_release.sh` refuses dirty worktrees unless `ALLOW_DIRTY=1`.
+
+## Important Invariants
+
+- There are two manifests: `manifest.json` at the repo root and `extension/manifest.json`. Keep them behaviorally aligned; `tests/manifest_consistency.test.js` enforces this.
+- The extension ID is pinned by the manifest key: `lkmeogidbglhedgekjgbpbfjkpapnhke`.
+- The local server accepts only `chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke` by default. `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` is only for local development tests.
+- The WebSocket server is fixed at `127.0.0.1:17371`; the manual HTTPS test page defaults to `https://localhost:17443/tmux-test-page.html`.
+- Default enabled hosts and chain limit are duplicated in `extension/src/background.js`, `extension/src/content.js`, and `extension/src/popup.js`. Current defaults are `["chatgpt.com", "m365.cloud.microsoft"]` and `maxChainCalls = 100`; `tests/default_enabled_hosts.test.js` enforces this.
+- Shell helpers must use the plain text block format: first line `ai-helper-shell-start`, second line target, command body, final line `ai-helper-shell-end`. JSON `shell-call` code blocks and `ai-helper-start-shell` aliases are intentionally not supported.
+- File helpers use `ai-helper-file-start`, a second-line file name, exact file content, and `ai-helper-file-end`; the server writes only a single file name directly under `$HOME/Downloads`.
+- Tmux target resolution accepts pane id, `session:window.pane` address, or a unique window name. Ambiguous window names must not resolve.
+- Duplicate execution protection exists in two places: Chrome local storage key `shellCallLedger:v1` and server file `.state/shell-ledger.json`.
+- Do not weaken safeguards that reject copied `shell-output`, markdown wrappers, terminal prompts such as `$ ...`, or repeated command loops.
+- `content.js` has tests that match specific function names and source text for force-run behavior. Rename/refactor those areas carefully.
+- `server/shell_server.js` exports helper functions used directly by tests. Preserve exports when changing tmux or WebSocket logic.
+- Shell-output formatting uses `cmdHash` for long or multiline commands; duplicate suppression depends on this.
+- The server writes transient tmux scripts under `.state/tmux-runs` and removes them best-effort.
+
+## Development Notes
+
+- After changing extension files, reload the unpacked extension in `chrome://extensions` and refresh any affected chat tabs.
+- After changing server files while the LaunchAgent is installed, rerun `./scripts/install_shell_server_agent.sh` or restart the foreground server.
+- The installer and uninstaller are macOS-specific and use `launchctl`.
+- `.state/`, `dist/`, `build/`, logs, and `node_modules/` are ignored.
+- Prefer small, focused tests that exercise the standalone Node modules or VM-loaded extension scripts.
+
+## Verified Baseline
+
+During repo exploration, all standalone tests passed with:
+
+```sh
+for f in tests/*.test.js; do node "$f"; done
+```

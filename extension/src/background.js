@@ -55,6 +55,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "write-file") {
+    handleWriteFileMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
   if (message.type !== "run-shell") {
     return false;
   }
@@ -68,6 +78,52 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+
+async function handleWriteFileMessage(message) {
+  const callKey = message.callKey || message.id || "";
+  const payload = {
+    type: "write-file",
+    id: message.id,
+    callKey,
+    filename: message.filename,
+    content: message.content || "",
+    callMeta: message.callMeta || {}
+  };
+
+  const claim = await claimShellCall(callKey, {
+    ...payload,
+    cmd: `${payload.filename || ""}\n${payload.content || ""}`,
+    target: "Downloads"
+  });
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      duplicate: true,
+      skipped: true,
+      callKey,
+      reason: claim.reason
+    };
+  }
+
+  payload.seq = claim.seq;
+  try {
+    const response = await runShellViaWebSocket(payload);
+    await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
+      completedAt: Date.now(),
+      durationMs: response?.durationMs,
+      duplicate: response?.duplicate === true,
+      skipped: response?.skipped === true,
+      target: response?.path || payload.filename || ""
+    });
+    return response;
+  } catch (error) {
+    await markShellCall(callKey, "failed", {
+      completedAt: Date.now(),
+      error: error.message || String(error)
+    });
+    throw error;
+  }
+}
 
 async function handleRunShellMessage(message) {
   const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);

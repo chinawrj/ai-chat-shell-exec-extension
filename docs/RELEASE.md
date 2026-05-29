@@ -9,6 +9,7 @@
    node --check extension/src/popup.js
    node --check server/shell_server.js
    node --check scripts/start_tmux_test_page_https.js
+   node tests/chrome_extension_e2e.test.js
    node tests/background_settings_migration.test.js
    node tests/content_force_run.test.js
    node tests/content_shell_output_format.test.js
@@ -27,11 +28,17 @@
    ./scripts/package_release.sh
    ```
 
-4. Create and push the tag:
+4. For releases that need screenshots, run the e2e test with `AI_SHELL_E2E_SCREENSHOT_DIR`, then include the generated PNGs in the release assets:
+
+   ```sh
+   AI_SHELL_E2E_SCREENSHOT_DIR=docs/release-assets/vX.Y.Z node tests/chrome_extension_e2e.test.js
+   ```
+
+5. Create and push the tag:
 
    ```sh
    git tag vX.Y.Z
    git push origin main vX.Y.Z
    ```
 
-5. Create the GitHub release with the generated archives and `SHA256SUMS.txt`.
+6. Create the GitHub release with the generated archives, `SHA256SUMS.txt`, and any screenshot PNGs.
