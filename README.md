@@ -17,6 +17,16 @@ It can also ask the human helper to write a file under `$HOME/Downloads`. The fi
 
 The content script waits until the assistant stops streaming, sends the command through the extension background worker to a local WebSocket server, the server sends it into the selected tmux pane, then the content script posts the captured pane output back into the chat composer as a `shell-output` block.
 
+## Latest Screenshots
+
+Shell helper result reply:
+
+![Shell helper result reply](docs/release-assets/v0.2.8/shell-helper-result.png)
+
+File helper result reply:
+
+![File helper result reply](docs/release-assets/v0.2.8/file-helper-result.png)
+
 ## Architecture
 
 Chrome extensions cannot directly execute local shell commands. This project uses:
