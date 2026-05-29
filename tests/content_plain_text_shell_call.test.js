@@ -69,6 +69,11 @@ assert.equal(extracted.cmd, command);
 assert.equal(context.validateHelperCall(parsed).ok, true);
 assert.equal(context.validateShellCall({ cmd: block }).ok, false);
 
+const [fencedExtracted] = context.parsePlainTextHelperBlocks(`\`\`\`text\n${block}\n\`\`\``);
+assert.equal(fencedExtracted.target, "%24");
+assert.equal(fencedExtracted.cmd, command);
+assert.equal(context.validateHelperCall(fencedExtracted).ok, true);
+
 const emptyTarget = [
   "ai-helper-shell-start",
   "",
@@ -99,6 +104,10 @@ const repeatedUnsuffixedB = context.parseCallPayload("ai-helper-shell-start\n%24
 assert.equal(repeatedUnsuffixedA.helperIdSource, "payload-hash");
 assert.equal(repeatedUnsuffixedA.helperId, repeatedUnsuffixedB.helperId);
 assert.equal(context.buildSemanticCallKey(repeatedUnsuffixedA), context.buildSemanticCallKey(repeatedUnsuffixedB));
+
+const previousPwdOutput = "Shell call result:\n\n```shell-output\n$ pwd\ntarget: %24\nexitCode: 0\n```";
+assert.equal(context.shouldSuppressShellCallEcho(repeatedUnsuffixedA, previousPwdOutput, ""), true);
+assert.equal(context.shouldSuppressShellCallEcho(suffixedShellA, previousPwdOutput, ""), false);
 
 const malformedSuffixedShell = context.parseCallPayload("ai-helper-shell-start:not valid\n%24\npwd\nai-helper-shell-end");
 assert.equal(malformedSuffixedShell.kind, "shell");

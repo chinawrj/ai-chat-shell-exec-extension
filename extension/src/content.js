@@ -396,9 +396,7 @@ async function scanForShellCall(options = {}) {
 
   const lastShellOutputText = getLastShellOutputText();
   const lastPromptOrOutputText = getLastUserMessageText();
-  if (!force && isShellHelperCall(call) &&
-    ((isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
-      (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText)))) {
+  if (!force && shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText)) {
     markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
@@ -904,6 +902,20 @@ function isShellOutputText(text) {
     lower.includes("shell call rejected:") ||
     lower.includes("```shell-output") ||
     lower.includes("shell-output");
+}
+
+function hasExplicitHelperIdentity(call) {
+  return normalizeCommand(call?.helperIdSource || "") === "marker" &&
+    Boolean(normalizeCommand(call?.helperId || ""));
+}
+
+function shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText) {
+  if (!isShellHelperCall(call) || hasExplicitHelperIdentity(call)) {
+    return false;
+  }
+
+  return (isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
+    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText));
 }
 
 function isSameCommandAsShellOutput(command, shellOutputText) {
