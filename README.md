@@ -4,7 +4,7 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper for local terminal output by returning an explicit plain text block. The first line must be exactly `ai-helper-shell-start`, the second line is the tmux target, the following lines are the command, and the block ends with `ai-helper-shell-end`:
+With the AI-facing instructions in this repo, the AI asks its human helper for local terminal output by returning an explicit plain text block. The first line is `ai-helper-shell-start`, the second line is the tmux target, the following lines are the command, and the block ends with `ai-helper-shell-end`:
 
 ```text
 ai-helper-shell-start
@@ -13,7 +13,9 @@ pwd && ls -la
 ai-helper-shell-end
 ```
 
-It can also ask the human helper to write a file under `$HOME/Downloads`. The first line must be exactly `ai-helper-file-start`, the second line is the file name, the following lines are the exact file content, and the block ends with `ai-helper-file-end`. The end marker is not written into the file.
+It can also ask the human helper to write a file under `$HOME/Downloads`. The first line is `ai-helper-file-start`, the second line is the file name, the following lines are the exact file content, and the block ends with `ai-helper-file-end`. The end marker is not written into the file.
+
+For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2` or `ai-helper-file-start:2`.
 
 The content script waits until the assistant stops streaming, sends the command through the extension background worker to a local WebSocket server, the server sends it into the selected tmux pane, then the content script posts the captured pane output back into the chat composer as a `shell-output` block.
 
@@ -21,11 +23,11 @@ The content script waits until the assistant stops streaming, sends the command 
 
 Shell helper result reply:
 
-![Shell helper result reply](docs/release-assets/v0.2.8/shell-helper-result.png)
+![Shell helper result reply](docs/release-assets/v0.2.10/shell-helper-result.png)
 
 File helper result reply:
 
-![File helper result reply](docs/release-assets/v0.2.8/file-helper-result.png)
+![File helper result reply](docs/release-assets/v0.2.10/file-helper-result.png)
 
 ## Architecture
 
@@ -42,7 +44,7 @@ Flow:
 
 Prerequisites:
 
-- macOS
+- macOS or Ubuntu
 - Chrome or another Chromium browser with unpacked extensions enabled
 - Node.js available on `PATH`
 - tmux available on `PATH`
@@ -61,7 +63,9 @@ If you use the release source archive, unzip it and run the commands below from 
 
    `lkmeogidbglhedgekjgbpbfjkpapnhke`
 
-5. Install and start the local shell server LaunchAgent:
+5. Start the local shell server.
+
+   On macOS, install and start the LaunchAgent:
 
    ```sh
    ./scripts/install_shell_server_agent.sh
@@ -69,7 +73,7 @@ If you use the release source archive, unzip it and run the commands below from 
 
    This creates `~/Library/LaunchAgents/com.local.ai-chat-shell-exec-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`. The installer also sets `AI_CHAT_SHELL_TMUX_SOCKET` to the default user tmux socket; override it before running the installer if you use a named tmux socket.
 
-   For a temporary foreground server during development, use:
+   On Ubuntu, or for a temporary foreground server during development, use:
 
    ```sh
    ./scripts/start_shell_server.sh
@@ -90,7 +94,7 @@ Start with:
 The short version is:
 
 ```text
-I can act as your human helper for local terminal output and helper files. When local terminal output would help, ask me by replying with exactly one plain text shell helper block and no prose. The first line must be ai-helper-shell-start, the second line must be the tmux target, the following lines must be the command, and the final line must be ai-helper-shell-end. When writing a helper file would be useful, ask me with exactly one file helper block and no prose. The first line must be ai-helper-file-start, the second line must be a single file name, the following lines must be the exact file content, and the final line must be ai-helper-file-end. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
+I can act as your human helper for local terminal output and helper files. When local terminal output would help, ask me by replying with exactly one plain text shell helper block and no prose. The first line must be ai-helper-shell-start, the second line must be the tmux target, the following lines must be the command, and the final line must be ai-helper-shell-end. When writing a helper file would be useful, ask me with exactly one file helper block and no prose. The first line must be ai-helper-file-start, the second line must be a single file name, the following lines must be the exact file content, and the final line must be ai-helper-file-end. If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as ai-helper-shell-start:2 or ai-helper-file-start:2. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
 ```
 
 Then run the floating panel's `Test` button once on each AI chat site.
@@ -125,7 +129,7 @@ Use the popup's portable config area to move settings and bindings to another Ch
 
 ## Tool Call Format
 
-Plain command blocks are rejected because the server no longer chooses a shell by itself. The AI-facing format is a request to the human helper, and the extension recognizes only this exact shell helper block shape:
+Plain command blocks are rejected because the server no longer chooses a shell by itself. The AI-facing format is a request to the human helper, and the extension recognizes only this shell helper block shape:
 
 ```text
 ai-helper-shell-start
@@ -157,6 +161,8 @@ ai-helper-shell-end
 ```
 
 The shell helper format maps only the second line to `target` and the remaining body to `cmd`. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
+
+The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1` or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
 
 To write a file under `$HOME/Downloads`, use:
 

@@ -3,6 +3,7 @@ const HELPER_SHELL_END = "ai-helper-shell-end";
 const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
+const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
@@ -438,6 +439,7 @@ function buildSemanticCallKey(call) {
   return stableHash([
     location.origin,
     normalizeCommand(call.kind || "shell"),
+    normalizeCommand(call.helperId || ""),
     normalizeCommand(call.target || ""),
     normalizeCommand(call.cmd || ""),
     normalizeCommand(call.filename || ""),
@@ -699,8 +701,8 @@ function parsePlainTextHelperBlocks(text) {
 
   for (let index = 0; index < lines.length; index += 1) {
     const marker = lines[index];
-    const kind = getHelperStartKind(marker);
-    if (!kind) {
+    const start = parseHelperStartMarker(marker);
+    if (!start.kind) {
       continue;
     }
 
@@ -710,21 +712,35 @@ function parsePlainTextHelperBlocks(text) {
     }
 
     const endIndex = lines.findIndex((line, lineIndex) =>
-      lineIndex > valueLineIndex && isHelperEndForKind(kind, line)
+      lineIndex > valueLineIndex && isHelperEndForKind(start.kind, line)
     );
     if (endIndex < 0) {
       break;
     }
 
-    if (kind === "file") {
+    const helperId = start.helperId || buildPlainTextHelperPayloadHash({
+      kind: start.kind,
+      marker,
+      value: lines[valueLineIndex],
+      bodyLines: lines.slice(valueLineIndex + 1, endIndex),
+      endMarker: lines[endIndex]
+    });
+
+    if (start.kind === "file") {
       calls.push({
-        kind,
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
         filename: normalizeCommand(lines[valueLineIndex]),
         content: lines.slice(valueLineIndex + 1, endIndex).join("\n")
       });
     } else {
       calls.push({
-        kind,
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
         target: normalizeCommand(lines[valueLineIndex]),
         cmd: normalizeCommand(lines.slice(valueLineIndex + 1, endIndex).join("\n"))
       });
@@ -742,8 +758,8 @@ function parsePlainTextHelperPayload(text) {
   }
 
   const lines = splitShellCallLines(text);
-  const kind = getHelperStartKind(lines[0]);
-  if (!kind || !isHelperEndForKind(kind, lines[lines.length - 1])) {
+  const start = parseHelperStartMarker(lines[0]);
+  if (!start.kind || !isHelperEndForKind(start.kind, lines[lines.length - 1])) {
     return null;
   }
 
@@ -751,13 +767,49 @@ function parsePlainTextHelperPayload(text) {
 }
 
 function getHelperStartKind(line) {
-  if (line === HELPER_SHELL_START) {
-    return "shell";
+  return parseHelperStartMarker(line).kind;
+}
+
+function parseHelperStartMarker(line) {
+  const text = String(line || "");
+  const shell = parseSpecificHelperStartMarker(text, HELPER_SHELL_START, "shell");
+  if (shell.kind) {
+    return shell;
   }
-  if (line === HELPER_FILE_START) {
-    return "file";
+  const file = parseSpecificHelperStartMarker(text, HELPER_FILE_START, "file");
+  if (file.kind) {
+    return file;
   }
-  return "";
+  return { kind: "", helperId: "", error: "" };
+}
+
+function parseSpecificHelperStartMarker(text, marker, kind) {
+  if (text === marker) {
+    return { kind, helperId: "", error: "" };
+  }
+  if (!text.startsWith(`${marker}:`)) {
+    return { kind: "", helperId: "", error: "" };
+  }
+
+  const helperId = text.slice(marker.length + 1).trim();
+  if (HELPER_ID_PATTERN.test(helperId)) {
+    return { kind, helperId, error: "" };
+  }
+  return {
+    kind,
+    helperId: "",
+    error: `Malformed helper identity suffix on ${marker}. Use ${marker}:<nonce> with 1-128 characters matching ${HELPER_ID_PATTERN.source}.`
+  };
+}
+
+function buildPlainTextHelperPayloadHash({ kind, marker, value, bodyLines, endMarker }) {
+  return stableHash([
+    kind || "",
+    marker || "",
+    value || "",
+    ...(Array.isArray(bodyLines) ? bodyLines : []),
+    endMarker || ""
+  ].join("\n"));
 }
 
 function isHelperEndForKind(kind, line) {
@@ -883,6 +935,9 @@ function extractCommandFromShellOutput(text) {
 }
 
 function validateHelperCall(call) {
+  if (call?.helperMarkerError) {
+    return { ok: false, reason: call.helperMarkerError };
+  }
   if (isFileHelperCall(call)) {
     return validateFileHelperCall(call);
   }

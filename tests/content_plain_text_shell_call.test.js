@@ -58,9 +58,12 @@ const block = [
 
 assert.equal(context.containsToolLanguageHint(block), true);
 const parsed = context.parseCallPayload(block);
+assert.equal(parsed.helperIdSource, "payload-hash");
+assert.equal(parsed.helperId.length > 0, true);
 assert.equal(parsed.target, "%24");
 assert.equal(parsed.cmd, command);
 const [extracted] = context.parsePlainTextHelperBlocks(`before\n${block}\nafter`);
+assert.equal(extracted.helperId, parsed.helperId);
 assert.equal(extracted.target, "%24");
 assert.equal(extracted.cmd, command);
 assert.equal(context.validateHelperCall(parsed).ok, true);
@@ -82,6 +85,26 @@ assert.equal(shellStartAlias.target, undefined);
 assert.equal(context.containsToolLanguageHint("ai-helper-start-shell\n%24\npwd\nai-helper-end-shell"), false);
 assert.equal(context.validateShellCall({ cmd: "ai-helper-start-shell\n%24\npwd\nai-helper-end-shell" }).ok, false);
 
+const suffixedShellA = context.parseCallPayload("ai-helper-shell-start:1001\n%24\npwd\nai-helper-shell-end");
+const suffixedShellB = context.parseCallPayload("ai-helper-shell-start:1002\n%24\npwd\nai-helper-shell-end");
+assert.equal(suffixedShellA.kind, "shell");
+assert.equal(suffixedShellA.helperId, "1001");
+assert.equal(suffixedShellA.helperIdSource, "marker");
+assert.equal(suffixedShellA.cmd, "pwd");
+assert.notEqual(context.buildSemanticCallKey(suffixedShellA), context.buildSemanticCallKey(suffixedShellB));
+assert.notEqual(context.buildSemanticCallKey(suffixedShellA), context.buildSemanticCallKey(parsedEmptyTarget));
+
+const repeatedUnsuffixedA = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+const repeatedUnsuffixedB = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+assert.equal(repeatedUnsuffixedA.helperIdSource, "payload-hash");
+assert.equal(repeatedUnsuffixedA.helperId, repeatedUnsuffixedB.helperId);
+assert.equal(context.buildSemanticCallKey(repeatedUnsuffixedA), context.buildSemanticCallKey(repeatedUnsuffixedB));
+
+const malformedSuffixedShell = context.parseCallPayload("ai-helper-shell-start:not valid\n%24\npwd\nai-helper-shell-end");
+assert.equal(malformedSuffixedShell.kind, "shell");
+assert.equal(malformedSuffixedShell.helperIdSource, "payload-hash");
+assert.match(context.validateHelperCall(malformedSuffixedShell).reason, /Malformed helper identity suffix/);
+
 const fileContent = "line one\n{\"json\":\"does not need escaping\"}\nline three";
 const fileBlock = [
   "ai-helper-file-start",
@@ -91,9 +114,21 @@ const fileBlock = [
 ].join("\n");
 const parsedFile = context.parseCallPayload(fileBlock);
 assert.equal(parsedFile.kind, "file");
+assert.equal(parsedFile.helperIdSource, "payload-hash");
 assert.equal(parsedFile.filename, "helper-output.txt");
 assert.equal(parsedFile.content, fileContent);
 assert.equal(context.validateHelperCall(parsedFile).ok, true);
+
+const suffixedFile = context.parseCallPayload([
+  "ai-helper-file-start:file-1001",
+  "helper-output.txt",
+  fileContent,
+  "ai-helper-file-end"
+].join("\n"));
+assert.equal(suffixedFile.kind, "file");
+assert.equal(suffixedFile.helperId, "file-1001");
+assert.equal(suffixedFile.helperIdSource, "marker");
+assert.equal(suffixedFile.filename, "helper-output.txt");
 
 const fileWithTrailingBlankLine = context.parseCallPayload([
   "ai-helper-file-start",

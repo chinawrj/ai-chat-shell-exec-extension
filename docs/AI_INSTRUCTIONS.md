@@ -16,10 +16,11 @@ ai-helper-shell-start
 pwd
 ai-helper-shell-end
 
-The first line must be exactly ai-helper-shell-start.
+The first line must be ai-helper-shell-start.
 The second line must be the tmux target.
 The following lines must be the command.
 The final line must be exactly ai-helper-shell-end.
+If you need to ask for the same command text again as a new request, you may add a simple no-space identity suffix to the first line, such as ai-helper-shell-start:2.
 
 After I send back shell-output, use that output to continue.
 Do not repeat the same command after receiving shell-output.
@@ -39,7 +40,8 @@ command here
 ai-helper-shell-end
 
 Rules:
-- The first line must be exactly `ai-helper-shell-start`.
+- The first line must be `ai-helper-shell-start`.
+- If you need the same command payload to be treated as a new request, the first line may be `ai-helper-shell-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The second line must be only the tmux target.
 - Every line after the target and before `ai-helper-shell-end` is the shell command.
 - The final line must be exactly `ai-helper-shell-end`.
@@ -58,6 +60,7 @@ exact file content here
 ai-helper-file-end
 
 File rules:
+- If you need the same file payload to be treated as a new request, the first line may be `ai-helper-file-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The second line must be a single file name, not a path.
 - The file will be placed under my Downloads directory.
 - Every line after the filename and before `ai-helper-file-end` is the exact file content.
@@ -91,6 +94,7 @@ Workflow rules:
 - Emit no prose in a message that contains a helper block.
 - For shell helpers, the second line must be the tmux target and the following lines must be the command.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
+- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2` or `ai-helper-file-start:2`.
 - Wait for shell-output before making claims about command results or file write results.
 - Do not rerun the same command or rewrite the same file unless I ask or the previous output clearly requires it.
 
@@ -103,7 +107,7 @@ Safety rules:
 ## One-Off Prompt
 
 ```text
-For this conversation, I can act as your human helper when local terminal output would help. Ask me by replying with exactly one plain text shell helper block and no prose. Use ai-helper-shell-start as the first line, the tmux target as the second line, the command as the following lines, and ai-helper-shell-end as the final line. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
+For this conversation, I can act as your human helper when local terminal output would help. Ask me by replying with exactly one plain text shell helper block and no prose. Use ai-helper-shell-start as the first line, the tmux target as the second line, the command as the following lines, and ai-helper-shell-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2 or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt

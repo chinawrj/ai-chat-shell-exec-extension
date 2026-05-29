@@ -4,6 +4,14 @@
 
 - Nothing yet.
 
+## [0.2.10] - 2026-05-29
+
+- Adds optional helper identity suffixes such as `ai-helper-shell-start:2` and `ai-helper-file-start:2`.
+- Uses the helper identity in duplicate suppression so otherwise-identical helper payloads with different suffixes can run as distinct requests.
+- Derives a stable payload-hash identity for unsuffixed plain text helper blocks.
+- Rejects malformed helper identity suffixes while keeping JSON helper requests and old `ai-helper-start-shell` aliases unsupported.
+- Updates AI instructions and README examples for the optional suffix without changing the human-helper framing.
+
 ## [0.2.9] - 2026-05-29
 
 - Updates the README short AI instruction to include the `ai-helper-file-start` / `ai-helper-file-end` file helper format alongside shell helpers.

@@ -19,7 +19,7 @@ Treat this project as security-sensitive local remote-code execution.
 - `extension/src/background.js`: settings defaults and migrations, health checks, browser-side call ledger, WebSocket forwarding.
 - `extension/src/popup.js`: popup settings UI, tmux target display, config export/import.
 - `server/shell_server.js`: local health/WebSocket server, tmux pane listing, target resolution, tmux command execution, persistent server ledger.
-- `scripts/`: macOS install/dev/release helpers.
+- `scripts/`: macOS LaunchAgent helpers plus cross-platform dev/test/release helpers.
 - `tests/`: standalone Node.js tests. There is no `package.json` or central test runner.
 - `docs/AI_INSTRUCTIONS.md`: instructions for chat models to emit ai-helper blocks; this is not a coding-agent guide.
 
@@ -79,8 +79,9 @@ Package a release:
 - The local server accepts only `chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke` by default. `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` is only for local development tests.
 - The WebSocket server is fixed at `127.0.0.1:17371`; the manual HTTPS test page defaults to `https://localhost:17443/tmux-test-page.html`.
 - Default enabled hosts and chain limit are duplicated in `extension/src/background.js`, `extension/src/content.js`, and `extension/src/popup.js`. Current defaults are `["chatgpt.com", "m365.cloud.microsoft"]` and `maxChainCalls = 100`; `tests/default_enabled_hosts.test.js` enforces this.
-- Shell helpers must use the plain text block format: first line `ai-helper-shell-start`, second line target, command body, final line `ai-helper-shell-end`. JSON `shell-call` code blocks and `ai-helper-start-shell` aliases are intentionally not supported.
-- File helpers use `ai-helper-file-start`, a second-line file name, exact file content, and `ai-helper-file-end`; the server writes only a single file name directly under `$HOME/Downloads`.
+- Shell helpers must use the plain text block format: first line `ai-helper-shell-start` or `ai-helper-shell-start:<identity>`, second line target, command body, final line `ai-helper-shell-end`. JSON `shell-call` code blocks and `ai-helper-start-shell` aliases are intentionally not supported.
+- File helpers use `ai-helper-file-start` or `ai-helper-file-start:<identity>`, a second-line file name, exact file content, and `ai-helper-file-end`; the server writes only a single file name directly under `$HOME/Downloads`.
+- Helper identity suffixes are optional simple no-space values used for duplicate suppression. Unsuffixed helper blocks derive identity from a stable plain text payload hash.
 - Tmux target resolution accepts pane id, `session:window.pane` address, or a unique window name. Ambiguous window names must not resolve.
 - Duplicate execution protection exists in two places: Chrome local storage key `shellCallLedger:v1` and server file `.state/shell-ledger.json`.
 - Do not weaken safeguards that reject copied `shell-output`, markdown wrappers, terminal prompts such as `$ ...`, or repeated command loops.
@@ -93,7 +94,7 @@ Package a release:
 
 - After changing extension files, reload the unpacked extension in `chrome://extensions` and refresh any affected chat tabs.
 - After changing server files while the LaunchAgent is installed, rerun `./scripts/install_shell_server_agent.sh` or restart the foreground server.
-- The installer and uninstaller are macOS-specific and use `launchctl`.
+- The installer and uninstaller are macOS-specific and use `launchctl`; Ubuntu uses the foreground `./scripts/start_shell_server.sh` flow unless the user adds their own service wrapper.
 - `.state/`, `dist/`, `build/`, logs, and `node_modules/` are ignored.
 - Prefer small, focused tests that exercise the standalone Node modules or VM-loaded extension scripts.
 

@@ -129,6 +129,7 @@ async function main() {
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
   const token = `ai-chat-shell-e2e-${Date.now()}`;
+  const helperId = `shell-${Date.now()}`;
   const command = `printf ${token}`;
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
@@ -137,7 +138,12 @@ async function main() {
     composer.dispatchEvent(new Event("input", { bubbles: true }));
     document.getElementById("target").value = ${JSON.stringify(paneId)};
     document.getElementById("command").value = ${JSON.stringify(command)};
-    document.getElementById("insertCall").click();
+    appendAssistantToolCall([
+      ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
+      ${JSON.stringify(paneId)},
+      ${JSON.stringify(command)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
     return true;
   })()`);
 

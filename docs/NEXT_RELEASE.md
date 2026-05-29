@@ -1,20 +1,23 @@
-# Next Release Target: v0.2.10
+# Next Release Plan
 
+Target version: v0.2.11
 Target date: after the next maintenance or compatibility fix.
 
 ## Theme
 
-Polish the tmux-backed release based on real user feedback.
+Follow up on real-world helper identity, browser, and platform feedback.
 
 ## Goals
 
 1. Compatibility follow-up
    - Track chat products that insert extra prose or formatting around plain text helper blocks.
-   - Keep AI-facing instructions neutral and focused on terminal output requests.
+   - Keep AI-facing instructions neutral and focused on requests served by the human helper.
+   - Preserve macOS and Ubuntu e2e coverage for unpacked Chromium-family extension runs.
 
 2. Diagnostics
    - Keep `scripts/doctor.sh` current with release packaging and LaunchAgent behavior.
-   - Improve user-facing errors for missing tmux sessions or inactive panes.
+   - Improve user-facing errors for missing tmux sessions, inactive panes, or browser binding failures.
+   - Watch for confusing duplicate-suppression cases around suffixed and unsuffixed helper blocks.
 
 3. Zero-knowledge site hardening
    - Preserve the no site-specific DOM contract.
@@ -31,5 +34,6 @@ Polish the tmux-backed release based on real user feedback.
 ## Non-Goals
 
 - No site-specific ChatGPT, Claude, or Copilot selectors.
-- No broad automatic execution of ordinary shell examples.
+- No JSON helper revival.
+- No old `ai-helper-start-shell` alias revival.
 - No export of command outputs, command ledgers, cookies, tokens, or page content.
