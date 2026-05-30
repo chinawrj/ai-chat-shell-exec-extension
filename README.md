@@ -4,7 +4,13 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper for local terminal output by returning an explicit fenced `text` code block. The first line is `ai-helper-shell-start`, the second line is the tmux target, the following lines are the command, and the block ends with `ai-helper-shell-end`:
+With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced `text` code block and no prose. The extension recognizes three helper block types:
+
+- Shell helper: request local terminal output from a selected tmux target.
+- Board helper: send one command line to the configured board tmux pane.
+- File helper: write one file under `$HOME/Downloads`.
+
+Shell helper:
 
 ```text
 ai-helper-shell-start
@@ -13,9 +19,25 @@ pwd && ls -la
 ai-helper-shell-end
 ```
 
-It can also ask the human helper to write a file under `$HOME/Downloads`. The first line is `ai-helper-file-start`, the second line is the file name, the following lines are the exact file content, and the block ends with `ai-helper-file-end`. The end marker is not written into the file.
+Board helper:
 
-It can ask for board output with a single-line board helper block. The first line is `ai-helper-board-start`, the body is exactly one board command line, and the block ends with `ai-helper-board-end`. The default board target is the unique tmux window named `board`; set `AI_CHAT_SHELL_BOARD_TARGET` to use a specific pane id or `session:window.pane`.
+```text
+ai-helper-board-start
+version
+ai-helper-board-end
+```
+
+File helper:
+
+```text
+ai-helper-file-start
+notes.txt
+first line
+second line
+ai-helper-file-end
+```
+
+The shell helper's second line is the tmux target and the remaining lines are the command. The board helper body is exactly one command line; the default board target is the unique tmux window named `board`, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
 

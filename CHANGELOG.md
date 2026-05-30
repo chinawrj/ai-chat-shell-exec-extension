@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.3.1] - 2026-05-30
+
+- Clarifies the README introduction so users see all supported helper block types immediately: shell, board, and file.
+- Adds top-level README examples for `ai-helper-shell-start`, `ai-helper-board-start`, and `ai-helper-file-start`.
+- Keeps the AI-facing guidance explicit that helper requests must be exactly one fenced `text` code block with no prose.
+
 ## [0.3.0] - 2026-05-30
 
 - Adds `ai-helper-board-start` / `ai-helper-board-end` blocks for sending one command line to the configured board tmux pane.
