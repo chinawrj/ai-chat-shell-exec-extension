@@ -27,6 +27,26 @@ class FakeWebSocket {
     const payload = JSON.parse(text);
     sentPayloads.push(payload);
     setTimeout(() => {
+      if (payload.type === "run-board") {
+        this.listeners.message?.forEach((callback) => callback({
+          data: JSON.stringify({
+            ok: true,
+            id: payload.id,
+            callKey: payload.callKey,
+            cmd: payload.cmd,
+            target: "%40",
+            targetName: "ForAI:0.0 board",
+            exitCode: 0,
+            stdout: "board-ok\nBOARD> ",
+            stderr: "",
+            timedOut: false,
+            truncated: false,
+            durationMs: 4
+          })
+        }));
+        return;
+      }
+
       this.listeners.message?.forEach((callback) => callback({
         data: JSON.stringify({
           ok: true,
@@ -119,7 +139,34 @@ async function main() {
   assert.equal(duplicate.skipped, true);
   assert.equal(sentPayloads.length, 1);
 
-  console.log("background write-file message tests passed");
+  const boardResponse = await context.handleRunBoardMessage({
+    type: "run-board",
+    id: "board-1",
+    callKey: "board-key-1",
+    cmd: "version",
+    callMeta: { origin: "https://chatgpt.com" }
+  });
+  assert.equal(boardResponse.ok, true);
+  assert.equal(boardResponse.target, "%40");
+  assert.equal(boardResponse.stdout, "board-ok\nBOARD> ");
+  assert.equal(sentPayloads.length, 2);
+  assert.equal(sentPayloads[1].type, "run-board");
+  assert.equal(sentPayloads[1].cmd, "version");
+  assert.equal(sentPayloads[1].timeoutMs, 30000);
+  assert.equal(sentPayloads[1].maxOutputChars, 20000);
+  assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].state, "completed");
+  assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].target, "%40");
+
+  const duplicateBoard = await context.handleRunBoardMessage({
+    type: "run-board",
+    id: "board-1",
+    callKey: "board-key-1",
+    cmd: "version"
+  });
+  assert.equal(duplicateBoard.skipped, true);
+  assert.equal(sentPayloads.length, 2);
+
+  console.log("background write-file and board message tests passed");
 }
 
 main().catch((error) => {

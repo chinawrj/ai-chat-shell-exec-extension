@@ -5,13 +5,22 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {
+  buildBoardHelperExample,
+  buildBoardLogPath,
+  buildBoardTargetErrorResponse,
   buildTmuxCommandArgs,
   buildMissingTargetResponse,
   extractTmuxRunOutput,
+  extractBoardPromptSignature,
   getTmuxEnvSocketPath,
+  normalizeBoardOutput,
+  outputEndsWithBoardPrompt,
   parseTmuxPanes,
+  readBoardLogFromOffset,
+  resolveBoardPane,
   resolveDownloadsFilePath,
   resolveTmuxTarget,
+  validateBoardCommand,
   writeDownloadsFile
 } = require("../server/shell_server.js");
 
@@ -52,6 +61,28 @@ assert.equal(parseTmuxPanes([
   "/tmp",
   "zsh"
 ].join("__AI_CHAT_SHELL_FIELD__"))[0].address, "main:2.1");
+
+const boardPanes = parseTmuxPanes([
+  "%40\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
+  "%41\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh"
+].join("\n"));
+assert.equal(resolveBoardPane(boardPanes).pane.id, "%40");
+assert.equal(resolveBoardPane(boardPanes, "%41").pane.id, "%41");
+assert.equal(resolveBoardPane(boardPanes, "ForAI:0.0").pane.id, "%40");
+assert.equal(resolveBoardPane(boardPanes, "missing").pane, null);
+assert.match(resolveBoardPane(parseTmuxPanes("%42\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh")).error, /No tmux pane/);
+assert.match(resolveBoardPane(parseTmuxPanes([
+  "%43\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
+  "%44\tForAI\t1\tboard\t0\t1\t/Users/rjwang\tscreen"
+].join("\n"))).error, /Multiple tmux panes/);
+assert.equal(buildBoardHelperExample("version"), "ai-helper-board-start\nversion\nai-helper-board-end");
+assert.equal(buildBoardTargetErrorResponse({
+  message: { id: "board-call-1", callKey: "board-key-1" },
+  cmd: "version",
+  panes: boardPanes,
+  error: "No board"
+}).example, "ai-helper-board-start\nversion\nai-helper-board-end");
+assert.match(buildBoardLogPath(boardPanes[0]), /ForAI_0_0__40\.log$/);
 assert.deepEqual(buildTmuxCommandArgs(["list-panes"], "/private/tmp/tmux-501/default"), [
   "-S",
   "/private/tmp/tmux-501/default",
@@ -108,6 +139,31 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.equal(result.foundStart, false);
   assert.equal(result.foundDone, false);
   assert.equal(result.stdout, "");
+}
+
+{
+  assert.equal(normalizeBoardOutput("\u001b[32mESP>\u001b[0m\r\nok\rESP> "), "ESP>\nESP>");
+  assert.equal(normalizeBoardOutput("prompt % \u001b[Kp\bps\r\n  PID TTY\r\n\u001b[1m\u001b[7m%\u001b[27m\u001b[0m          \r \b\u001b[Kprompt % \u001b[K"), "prompt % ps\n  PID TTY\nprompt %");
+  assert.equal(normalizeBoardOutput("a\tb\r\n\u001b[4Cindented"), "a       b\n    indented");
+  assert.equal(extractBoardPromptSignature("\r\nESP32> "), "ESP32>");
+  assert.equal(outputEndsWithBoardPrompt("version\n1.2.3\nESP32>   ", "ESP32>"), true);
+  assert.equal(outputEndsWithBoardPrompt("version\n1.2.3\nbusy", "ESP32>"), false);
+  assert.doesNotThrow(() => validateBoardCommand("version"));
+  assert.throws(() => validateBoardCommand("version\nhelp"), /exactly one command line/);
+  assert.throws(() => validateBoardCommand("ai-helper-board-start"), /copied shell-output text/);
+}
+
+{
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-helper-board-log-"));
+  const logPath = path.join(logDir, "board.log");
+  fs.writeFileSync(logPath, "old output\n", "utf8");
+  const offset = fs.statSync(logPath).size;
+  fs.appendFileSync(logPath, "\u001b[31mversion\u001b[0m\r\n1.2.3\r\nESP> ", "utf8");
+  const captured = readBoardLogFromOffset(logPath, offset, 12);
+  assert.equal(captured.normalized, "version\n1.2.3\nESP>");
+  assert.equal(captured.stdout, "version\n1.2.");
+  assert.equal(captured.truncated, true);
+  fs.rmSync(logDir, { recursive: true, force: true });
 }
 
 {

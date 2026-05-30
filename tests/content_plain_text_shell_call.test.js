@@ -155,6 +155,40 @@ assert.equal(legacyJson.target, undefined);
 const oldMarker = context.parseCallPayload("shell-call-start\n%24\npwd\nshell-call-end");
 assert.equal(oldMarker.cmd, "");
 
+const boardBlock = [
+  "ai-helper-board-start",
+  "version",
+  "ai-helper-board-end"
+].join("\n");
+const parsedBoard = context.parseCallPayload(boardBlock);
+assert.equal(context.containsToolLanguageHint(boardBlock), true);
+assert.equal(parsedBoard.kind, "board");
+assert.equal(parsedBoard.helperIdSource, "payload-hash");
+assert.equal(parsedBoard.cmd, "version");
+assert.equal(context.validateHelperCall(parsedBoard).ok, true);
+assert.equal(context.isRunnableHelperCall(parsedBoard), true);
+
+const suffixedBoardA = context.parseCallPayload("ai-helper-board-start:board-1001\nversion\nai-helper-board-end");
+const suffixedBoardB = context.parseCallPayload("ai-helper-board-start:board-1002\nversion\nai-helper-board-end");
+assert.equal(suffixedBoardA.kind, "board");
+assert.equal(suffixedBoardA.helperId, "board-1001");
+assert.equal(suffixedBoardA.helperIdSource, "marker");
+assert.notEqual(context.buildSemanticCallKey(suffixedBoardA), context.buildSemanticCallKey(suffixedBoardB));
+
+const multiLineBoard = context.parseCallPayload("ai-helper-board-start\nversion\nhelp\nai-helper-board-end");
+assert.equal(multiLineBoard.kind, "board");
+assert.equal(context.validateHelperCall(multiLineBoard).ok, false);
+assert.match(context.validateHelperCall(multiLineBoard).reason, /exactly one command line/);
+
+const emptyBoard = context.parseCallPayload("ai-helper-board-start\nai-helper-board-end");
+assert.equal(emptyBoard.kind, "board");
+assert.equal(context.validateHelperCall(emptyBoard).ok, false);
+assert.match(context.validateHelperCall(emptyBoard).reason, /empty/);
+
+const boardWithMarker = context.parseCallPayload("ai-helper-board-start\nai-helper-shell-start\nai-helper-board-end");
+assert.equal(context.validateHelperCall(boardWithMarker).ok, false);
+assert.match(context.validateHelperCall(boardWithMarker).reason, /copied terminal\/output text/);
+
 const indentedMarker = context.parseCallPayload(" ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
 assert.equal(indentedMarker.cmd, "");
 

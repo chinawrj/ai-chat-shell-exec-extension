@@ -2,12 +2,14 @@ const HELPER_SHELL_START = "ai-helper-shell-start";
 const HELPER_SHELL_END = "ai-helper-shell-end";
 const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
+const HELPER_BOARD_START = "ai-helper-board-start";
+const HELPER_BOARD_END = "ai-helper-board-end";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.30";
+const CONTENT_SCRIPT_VERSION = "0.6.31";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -630,7 +632,8 @@ function getTextScanRoots(root) {
 function containsToolLanguageHint(text) {
   const lower = String(text || "").toLowerCase();
   return lower.includes(HELPER_SHELL_START) ||
-    lower.includes(HELPER_FILE_START);
+    lower.includes(HELPER_FILE_START) ||
+    lower.includes(HELPER_BOARD_START);
 }
 
 function closestMessageContainer(node) {
@@ -710,7 +713,8 @@ function parsePlainTextHelperBlocks(text) {
     }
 
     const endIndex = lines.findIndex((line, lineIndex) =>
-      lineIndex > valueLineIndex && isHelperEndForKind(start.kind, line)
+      lineIndex > (start.kind === "board" ? index : valueLineIndex) &&
+      isHelperEndForKind(start.kind, line)
     );
     if (endIndex < 0) {
       break;
@@ -732,6 +736,14 @@ function parsePlainTextHelperBlocks(text) {
         helperMarkerError: start.error || "",
         filename: normalizeCommand(lines[valueLineIndex]),
         content: lines.slice(valueLineIndex + 1, endIndex).join("\n")
+      });
+    } else if (start.kind === "board") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
       });
     } else {
       calls.push({
@@ -778,6 +790,10 @@ function parseHelperStartMarker(line) {
   if (file.kind) {
     return file;
   }
+  const board = parseSpecificHelperStartMarker(text, HELPER_BOARD_START, "board");
+  if (board.kind) {
+    return board;
+  }
   return { kind: "", helperId: "", error: "" };
 }
 
@@ -817,6 +833,9 @@ function isHelperEndForKind(kind, line) {
   if (kind === "file") {
     return line === HELPER_FILE_END;
   }
+  if (kind === "board") {
+    return line === HELPER_BOARD_END;
+  }
   return false;
 }
 
@@ -842,6 +861,10 @@ function isShellHelperCall(call) {
 
 function isFileHelperCall(call) {
   return call?.kind === "file";
+}
+
+function isBoardHelperCall(call) {
+  return call?.kind === "board";
 }
 
 function isRunnableHelperCall(call) {
@@ -953,6 +976,9 @@ function validateHelperCall(call) {
   if (isFileHelperCall(call)) {
     return validateFileHelperCall(call);
   }
+  if (isBoardHelperCall(call)) {
+    return validateBoardCall(call);
+  }
   return validateShellCall(call);
 }
 
@@ -970,12 +996,30 @@ function validateFileHelperCall(call) {
   return { ok: true };
 }
 
+function validateBoardCall(call) {
+  const cmd = normalizeCommand(call.cmd);
+  if (!cmd) {
+    return { ok: false, reason: "Board command is empty." };
+  }
+
+  const lines = cmd.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  if (lines.length !== 1) {
+    return { ok: false, reason: "Board helper body must contain exactly one command line." };
+  }
+
+  return validateShellLikeCommandText(cmd);
+}
+
 function validateShellCall(call) {
   const cmd = normalizeCommand(call.cmd);
   if (!cmd) {
     return { ok: false, reason: "Command is empty." };
   }
 
+  return validateShellLikeCommandText(cmd);
+}
+
+function validateShellLikeCommandText(cmd) {
   const lower = cmd.toLowerCase();
   const lines = cmd.split("\n").map((line) => line.trim()).filter(Boolean);
   const suspiciousLine = lines.find((line) =>
@@ -985,6 +1029,7 @@ function validateShellCall(call) {
     getHelperStartKind(line) ||
     isHelperEndForKind("shell", line) ||
     isHelperEndForKind("file", line) ||
+    isHelperEndForKind("board", line) ||
     UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
@@ -1022,10 +1067,10 @@ function isCopiedOutputRejectionReason(reason) {
 
 async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
-  const helperName = isFileHelperCall(call) ? "file helper" : "shell call";
+  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : "shell call";
   setStatus(`Rejected ${helperName}: ${reason}`, "error");
   await insertReply([
-    isFileHelperCall(call) ? "File helper rejected:" : "Shell call rejected:",
+    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : "Shell call rejected:",
     "",
     "```shell-output",
     formatRejectedCallSubject(call),
@@ -1038,6 +1083,9 @@ async function replyWithRejectedCall(call, reason) {
 function formatRejectedCallSubject(call) {
   if (isFileHelperCall(call)) {
     return `file: ${call.filename || ""}`;
+  }
+  if (isBoardHelperCall(call)) {
+    return `board: ${call.cmd || ""}`;
   }
   return `$ ${call.cmd || ""}`;
 }
@@ -1082,6 +1130,13 @@ async function runAndReply(callId, call, options = {}) {
         summarizeCommand(call.content || ""),
         "",
         "Write this file and post the result back to this chat?"
+      ] : isBoardHelperCall(call) ?
+      [
+        "AI requested a board command.",
+        "",
+        call.cmd,
+        "",
+        "Send this command to the board and post the output back to this chat?"
       ] :
       [
         "AI requested a local shell command.",
@@ -1109,6 +1164,8 @@ async function runAndReply(callId, call, options = {}) {
   try {
     const response = isFileHelperCall(call) ?
       await sendWriteFileMessage(callId, call, force) :
+      isBoardHelperCall(call) ?
+      await sendRunBoardMessage(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
 
     if (response?.duplicate === true && response?.skipped === true) {
@@ -1118,6 +1175,8 @@ async function runAndReply(callId, call, options = {}) {
 
     const reply = isFileHelperCall(call) ?
       formatFileOutput(call, response, startedAt) :
+      isBoardHelperCall(call) ?
+      formatBoardOutput(call, response, startedAt) :
       formatShellOutput(call, response, startedAt);
     await insertReply(reply);
     setHelperCompletionStatus(call, response);
@@ -1127,13 +1186,15 @@ async function runAndReply(callId, call, options = {}) {
       await clickSendWhenReady();
     }
   } catch (error) {
-    setStatus(`${isFileHelperCall(call) ? "File helper" : "Shell call"} failed: ${error.message || String(error)}`, "error");
+    setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : "Shell call"} failed: ${error.message || String(error)}`, "error");
     const failedResponse = {
       ok: false,
       error: error.message || String(error)
     };
     await insertReply(isFileHelperCall(call) ?
       formatFileOutput(call, failedResponse, startedAt) :
+      isBoardHelperCall(call) ?
+      formatBoardOutput(call, failedResponse, startedAt) :
       formatShellOutput(call, failedResponse, startedAt));
     activeCallId = "";
     if (settings.autoSend !== false) {
@@ -1147,6 +1208,9 @@ async function runAndReply(callId, call, options = {}) {
 function buildRunningStatus(call, force) {
   if (isFileHelperCall(call)) {
     return `${force ? "Force writing" : "Writing"} file: ${summarizeCommand(call.filename || "")}`;
+  }
+  if (isBoardHelperCall(call)) {
+    return `${force ? "Force sending" : "Sending"} board command: ${summarizeCommand(call.cmd)}`;
   }
   return `${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`;
 }
@@ -1182,6 +1246,23 @@ function sendWriteFileMessage(callId, call, force) {
   });
 }
 
+function sendRunBoardMessage(callId, call, force) {
+  return chrome.runtime.sendMessage({
+    type: "run-board",
+    id: callId,
+    callKey: callId,
+    cmd: call.cmd,
+    timeoutMs: call.timeoutMs,
+    maxOutputChars: call.maxOutputChars,
+    callMeta: {
+      origin: location.origin,
+      pathname: location.pathname,
+      promptHash: stableHash(getLastUserMessageText()),
+      force
+    }
+  });
+}
+
 function setHelperCompletionStatus(call, response) {
   if (pendingSelfTest && isExpectedSelfTestCall(call)) {
     const token = pendingSelfTest.token;
@@ -1197,6 +1278,11 @@ function setHelperCompletionStatus(call, response) {
 
   if (isFileHelperCall(call)) {
     setStatus(response?.ok === false ? "File write failed" : "File write completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
+  if (isBoardHelperCall(call)) {
+    setStatus(response?.ok === false ? "Board helper failed" : "Board helper completed", response?.ok === false ? "error" : "ok");
     return;
   }
 
@@ -1250,6 +1336,50 @@ function formatShellOutput(call, response, startedAt) {
 
   return [
     "Shell call result:",
+    "",
+    "```shell-output",
+    ...meta,
+    stdout ? "\nstdout:\n" + stdout : "",
+    stderr ? "\nstderr:\n" + stderr : "",
+    "```"
+  ].join("\n");
+}
+
+function formatBoardOutput(call, response, startedAt) {
+  const commandDisplay = formatShellOutputCommand(call.cmd);
+  if (!response || response.ok === false) {
+    return [
+      "Board command failed:",
+      "",
+      "```shell-output",
+      `board: ${commandDisplay.text}`,
+      commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
+      response?.target ? `target: ${response.target}` : "",
+      response?.targetName ? `targetName: ${response.targetName}` : "",
+      `startedAt: ${startedAt}`,
+      `error: ${response?.error || "Unknown board helper error."}`,
+      response?.stdout ? "\nstdout:\n" + response.stdout : "",
+      response?.tmuxPanes ? "\ntmux targets:\n" + formatTmuxPanesForShellOutput(response.tmuxPanes) : "",
+      response?.example ? "\nexample:\n" + response.example : "",
+      "```"
+    ].filter((line) => line !== "").join("\n");
+  }
+
+  const stdout = response.stdout || "";
+  const stderr = response.stderr || "";
+  const meta = [
+    `board: ${commandDisplay.text}`,
+    commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
+    `target: ${response.target || ""}`,
+    response.targetName ? `targetName: ${response.targetName}` : "",
+    `exitCode: ${response.exitCode}`,
+    `durationMs: ${response.durationMs}`,
+    response.timedOut ? "timedOut: true" : "",
+    response.truncated ? "truncated: true" : ""
+  ].filter(Boolean);
+
+  return [
+    "Board command result:",
     "",
     "```shell-output",
     ...meta,

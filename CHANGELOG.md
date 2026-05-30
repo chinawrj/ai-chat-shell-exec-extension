@@ -4,6 +4,16 @@
 
 - Nothing yet.
 
+## [0.3.0] - 2026-05-30
+
+- Adds `ai-helper-board-start` / `ai-helper-board-end` blocks for sending one command line to the configured board tmux pane.
+- Resolves board commands through `AI_CHAT_SHELL_BOARD_TARGET` or the unique tmux window named `board`.
+- Probes the board prompt before every board command and refuses to send the command if no prompt can be identified.
+- Captures board output with tmux `pipe-pane` byte offsets, including prompt-based completion and timeout partial output.
+- Renders terminal control sequences in board output so common backspace and line-clear redraws match the visible tmux pane.
+- Updates README and AI instruction samples to require fenced `text` helper blocks for shell, board, and file helpers.
+- Adds unit and tmux integration coverage for board helper parsing, target selection, prompt probing, output capture, and duplicate suppression.
+
 ## [0.2.10] - 2026-05-29
 
 - Adds optional helper identity suffixes such as `ai-helper-shell-start:2` and `ai-helper-file-start:2`.

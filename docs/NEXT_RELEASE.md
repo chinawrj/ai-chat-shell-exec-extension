@@ -1,11 +1,11 @@
 # Next Release Plan
 
-Target version: v0.2.11
+Target version: v0.3.1
 Target date: after the next maintenance or compatibility fix.
 
 ## Theme
 
-Follow up on real-world helper identity, browser, and platform feedback.
+Follow up on real-world board helper, browser, and platform feedback.
 
 ## Goals
 
@@ -18,6 +18,7 @@ Follow up on real-world helper identity, browser, and platform feedback.
    - Keep `scripts/doctor.sh` current with release packaging and LaunchAgent behavior.
    - Improve user-facing errors for missing tmux sessions, inactive panes, or browser binding failures.
    - Watch for confusing duplicate-suppression cases around suffixed and unsuffixed helper blocks.
+   - Improve diagnostics for board prompt probe failures and active `tmux pipe-pane` conflicts.
 
 3. Zero-knowledge site hardening
    - Preserve the no site-specific DOM contract.

@@ -65,6 +65,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "run-board") {
+    handleRunBoardMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
   if (message.type !== "run-shell") {
     return false;
   }
@@ -163,6 +173,56 @@ async function handleRunShellMessage(message) {
       duplicate: response?.duplicate === true,
       skipped: response?.skipped === true,
       target: response?.target || payload.target || ""
+    });
+    return response;
+  } catch (error) {
+    await markShellCall(callKey, "failed", {
+      completedAt: Date.now(),
+      error: error.message || String(error)
+    });
+    throw error;
+  }
+}
+
+async function handleRunBoardMessage(message) {
+  const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
+  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
+  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
+  const callKey = message.callKey || message.id || "";
+  const payload = {
+    type: "run-board",
+    id: message.id,
+    callKey,
+    cmd: message.cmd,
+    timeoutMs,
+    maxOutputChars,
+    callMeta: message.callMeta || {}
+  };
+
+  const claim = await claimShellCall(callKey, {
+    ...payload,
+    target: "board"
+  });
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      duplicate: true,
+      skipped: true,
+      callKey,
+      reason: claim.reason
+    };
+  }
+
+  payload.seq = claim.seq;
+  try {
+    const response = await runShellViaWebSocket(payload);
+    await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
+      completedAt: Date.now(),
+      exitCode: response?.exitCode,
+      durationMs: response?.durationMs,
+      duplicate: response?.duplicate === true,
+      skipped: response?.skipped === true,
+      target: response?.target || "board"
     });
     return response;
   } catch (error) {

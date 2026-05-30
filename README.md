@@ -4,7 +4,7 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper for local terminal output by returning an explicit plain text block. The first line is `ai-helper-shell-start`, the second line is the tmux target, the following lines are the command, and the block ends with `ai-helper-shell-end`:
+With the AI-facing instructions in this repo, the AI asks its human helper for local terminal output by returning an explicit fenced `text` code block. The first line is `ai-helper-shell-start`, the second line is the tmux target, the following lines are the command, and the block ends with `ai-helper-shell-end`:
 
 ```text
 ai-helper-shell-start
@@ -15,9 +15,11 @@ ai-helper-shell-end
 
 It can also ask the human helper to write a file under `$HOME/Downloads`. The first line is `ai-helper-file-start`, the second line is the file name, the following lines are the exact file content, and the block ends with `ai-helper-file-end`. The end marker is not written into the file.
 
-For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2` or `ai-helper-file-start:2`.
+It can ask for board output with a single-line board helper block. The first line is `ai-helper-board-start`, the body is exactly one board command line, and the block ends with `ai-helper-board-end`. The default board target is the unique tmux window named `board`; set `AI_CHAT_SHELL_BOARD_TARGET` to use a specific pane id or `session:window.pane`.
 
-The content script waits until the assistant stops streaming, sends the command through the extension background worker to a local WebSocket server, the server sends it into the selected tmux pane, then the content script posts the captured pane output back into the chat composer as a `shell-output` block.
+For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
+
+The content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block.
 
 ## Latest Screenshots
 
@@ -34,7 +36,7 @@ File helper result reply:
 Chrome extensions cannot directly execute local shell commands. This project uses:
 
 - `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. The execution trigger is still limited to explicit ai-helper blocks.
-- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that lists tmux panes, sends commands into a selected pane, and captures output between completion markers.
+- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that lists tmux panes, sends shell commands into a selected pane, and sends board commands into the configured board pane.
 
 Flow:
 
@@ -93,9 +95,43 @@ Start with:
 
 The short version is:
 
+````text
+I can act as your human helper for local terminal output, board output, and helper files.
+
+When output would help, reply with exactly one fenced `text` code block and no prose.
+
+For local terminal output, use:
 ```text
-I can act as your human helper for local terminal output and helper files. When local terminal output would help, ask me by replying with exactly one plain text shell helper block and no prose. The first line must be ai-helper-shell-start, the second line must be the tmux target, the following lines must be the command, and the final line must be ai-helper-shell-end. When writing a helper file would be useful, ask me with exactly one file helper block and no prose. The first line must be ai-helper-file-start, the second line must be a single file name, the following lines must be the exact file content, and the final line must be ai-helper-file-end. If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as ai-helper-shell-start:2 or ai-helper-file-start:2. After I send back shell-output, use that output to continue. Do not repeat the same command after receiving shell-output.
+ai-helper-shell-start
+target here
+command here
+ai-helper-shell-end
 ```
+
+For board output, use:
+```text
+ai-helper-board-start
+one board command here
+ai-helper-board-end
+```
+
+For writing one helper file under my Downloads directory, use:
+```text
+ai-helper-file-start
+filename.ext
+exact file content here
+ai-helper-file-end
+```
+
+Rules:
+- Use the `text` fence exactly, with no text before or after the code block.
+- Shell helpers must put the tmux target on the second line.
+- Board helpers must contain exactly one non-empty board command line and no target.
+- File helpers must put a single file name, not a path, on the second line.
+- If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
+- After I send back shell-output, use that output to continue.
+- Do not repeat the same command after receiving shell-output.
+````
 
 Then run the floating panel's `Test` button once on each AI chat site.
 
@@ -162,7 +198,17 @@ ai-helper-shell-end
 
 The shell helper format maps only the second line to `target` and the remaining body to `cmd`. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
 
-The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1` or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
+For board output, use:
+
+```text
+ai-helper-board-start
+version
+ai-helper-board-end
+```
+
+The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the unique tmux window named `board`. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
+
+The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
 
 To write a file under `$HOME/Downloads`, use:
 
@@ -181,7 +227,7 @@ The file helper format maps the second line to the file name and writes every fo
 The extension does not hard-code a ChatGPT, Claude, or Copilot DOM contract. The default strategy is:
 
 - detect editable chat inputs from standard browser semantics such as `textarea`, `input`, `contenteditable`, and `role="textbox"`;
-- detect tool requests from explicit `ai-helper-shell-start`/`ai-helper-shell-end` and `ai-helper-file-start`/`ai-helper-file-end` blocks;
+- detect tool requests from explicit shell, board, and file helper blocks;
 - post results by writing into the remembered editable input;
 - submit first through generic form submission and synthetic Enter key events;
 - fall back to a saved user-bound send control, then broad send-button heuristics if needed.
@@ -190,8 +236,9 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 
 ## Safety Defaults
 
-- The extension runs only explicit `ai-helper-shell-start`/`ai-helper-shell-end` shell blocks and `ai-helper-file-start`/`ai-helper-file-end` file blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
-- Every command must name a tmux target. Missing or unknown targets are rejected and the reply lists available panes.
+- The extension runs only explicit shell, board, and file helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
+- Every shell helper command must name a tmux target. Missing or unknown targets are rejected and the reply lists available panes.
+- Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or the unique tmux window named `board`, and the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.
 - The default auto-enabled host list contains `chatgpt.com` and `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.

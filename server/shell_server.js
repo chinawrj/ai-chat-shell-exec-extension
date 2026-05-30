@@ -16,6 +16,7 @@ const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const STATE_DIR = path.join(__dirname, "..", ".state");
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
+const BOARD_LOG_DIR = path.join(STATE_DIR, "board-panes");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
@@ -32,10 +33,16 @@ const TMUX_LIST_FORMAT = [
 ].join(TMUX_FIELD_SEPARATOR);
 const TMUX_CAPTURE_HISTORY_LINES = 20000;
 const TMUX_POLL_INTERVAL_MS = 250;
+const DEFAULT_BOARD_WINDOW_NAME = "board";
+const DEFAULT_BOARD_PROBE_IDLE_MS = 500;
+const DEFAULT_BOARD_PROMPT_IDLE_MS = 200;
+const DEFAULT_BOARD_POLL_MS = 100;
 const HELPER_SHELL_START = "ai-helper-shell-start";
 const HELPER_SHELL_END = "ai-helper-shell-end";
 const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
+const HELPER_BOARD_START = "ai-helper-board-start";
+const HELPER_BOARD_END = "ai-helper-board-end";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const SHELL_RUNNER = process.env.AI_CHAT_SHELL_RUNNER || (fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh");
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
@@ -191,6 +198,10 @@ async function handleMessageText(text) {
     return handleWriteFileMessage(message);
   }
 
+  if (message.type === "run-board") {
+    return handleRunBoardMessage(message);
+  }
+
   if (message.type !== "run") {
     throw new Error("Unsupported message type.");
   }
@@ -273,6 +284,93 @@ async function handleMessageText(text) {
     callKey,
     cmd,
     cwd,
+    target: pane.id,
+    targetName: pane.label,
+    timeoutMs,
+    durationMs: Date.now() - started,
+    ...result
+  };
+  completeServerShellCall(callKey, response);
+  return response;
+}
+
+async function handleRunBoardMessage(message) {
+  const cmd = String(message.cmd || "").trim();
+  if (!cmd) {
+    throw new Error("Missing board command.");
+  }
+  if (cmd.length > MAX_COMMAND_CHARS) {
+    throw new Error(`Board command is too long (${cmd.length} chars, max ${MAX_COMMAND_CHARS}).`);
+  }
+  validateBoardCommand(cmd);
+
+  const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
+  const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
+  const panes = await listTmuxPanes();
+  const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "");
+  if (!resolved.pane) {
+    return buildBoardTargetErrorResponse({
+      message,
+      cmd,
+      panes,
+      error: resolved.error
+    });
+  }
+
+  const pane = resolved.pane;
+  const callKey = normalizeCallKey(message.callKey || message.id || hashText([
+    "board",
+    pane.id,
+    cmd,
+    timeoutMs,
+    maxOutputChars
+  ].join("\n")));
+  const started = Date.now();
+  const claim = claimServerShellCall(callKey, {
+    cmd,
+    cwd: pane.currentPath || "",
+    target: pane.id,
+    timeoutMs,
+    maxOutputChars,
+    seq: message.seq,
+    callMeta: message.callMeta || {}
+  });
+  if (claim.action === "skip") {
+    console.log(`[skip] reason=${claim.reason} callKey=${callKey} boardCmd=${JSON.stringify(cmd)}`);
+    return {
+      ok: true,
+      id: message.id,
+      callKey,
+      duplicate: true,
+      skipped: true,
+      reason: claim.reason,
+      cmd,
+      target: pane.id,
+      targetName: pane.label,
+      timeoutMs,
+      durationMs: 0,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      timedOut: false
+    };
+  }
+
+  console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+  const result = await runTmuxBoard({
+    cmd,
+    pane,
+    timeoutMs,
+    maxOutputChars
+  });
+  console.log(`[done-board] ok=${result.ok !== false} exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
+
+  const response = {
+    ok: result.ok !== false,
+    id: message.id,
+    callKey,
+    cmd,
     target: pane.id,
     targetName: pane.label,
     timeoutMs,
@@ -469,6 +567,8 @@ function validateCommand(cmd) {
     line === HELPER_SHELL_END ||
     line === HELPER_FILE_START ||
     line === HELPER_FILE_END ||
+    line === HELPER_BOARD_START ||
+    line === HELPER_BOARD_END ||
     UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
@@ -483,6 +583,17 @@ function validateCommand(cmd) {
   if (suspicious) {
     throw new Error(`Refusing to execute copied shell-output text: ${suspicious}`);
   }
+}
+
+function validateBoardCommand(cmd) {
+  const normalized = String(cmd || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!normalized) {
+    throw new Error("Missing board command.");
+  }
+  if (normalized.includes("\n")) {
+    throw new Error("Board helper body must contain exactly one command line.");
+  }
+  validateCommand(normalized);
 }
 
 async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
@@ -531,6 +642,92 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
       fs.unlinkSync(scriptPath);
     } catch {
       // Best-effort cleanup; stale files are harmless and remain under .state/.
+    }
+  }
+}
+
+async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
+  const timing = getBoardTimingConfig();
+  const logPath = buildBoardLogPath(pane);
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  fs.closeSync(fs.openSync(logPath, "a"));
+
+  const pipeActive = await isTmuxPanePipeActive(pane.id);
+  if (pipeActive) {
+    return {
+      ok: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      error: "Board pane already has an active tmux pipe-pane; command was not sent.",
+      truncated: false,
+      timedOut: false,
+      target: pane.id,
+      targetName: pane.label
+    };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let pipeStarted = false;
+  try {
+    await startTmuxPanePipe(pane.id, logPath);
+    pipeStarted = true;
+    await sleep(timing.pollMs);
+
+    const probeOffset = getFileSize(logPath);
+    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
+    const probe = await waitForBoardIdle({
+      logPath,
+      offset: probeOffset,
+      deadline,
+      idleMs: timing.probeIdleMs,
+      pollMs: timing.pollMs,
+      maxOutputChars
+    });
+    const prompt = extractBoardPromptSignature(probe.normalized);
+    if (!prompt) {
+      return {
+        ok: false,
+        exitCode: 1,
+        stdout: probe.stdout,
+        stderr: "",
+        error: "Board prompt probe failed; command was not sent.",
+        truncated: probe.truncated,
+        timedOut: probe.timedOut,
+        target: pane.id,
+        targetName: pane.label
+      };
+    }
+
+    const commandOffset = getFileSize(logPath);
+    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", cmd], { timeoutMs: 5000 });
+    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
+    const captured = await waitForBoardPrompt({
+      logPath,
+      offset: commandOffset,
+      prompt,
+      deadline,
+      idleMs: timing.promptIdleMs,
+      pollMs: timing.pollMs,
+      maxOutputChars
+    });
+
+    return {
+      exitCode: captured.timedOut ? 124 : 0,
+      stdout: captured.stdout,
+      stderr: captured.timedOut ? "Timed out waiting for board prompt after command. The command may still be running in the target pane." : "",
+      truncated: captured.truncated,
+      timedOut: captured.timedOut,
+      target: pane.id,
+      targetName: pane.label
+    };
+  } finally {
+    if (pipeStarted) {
+      try {
+        await stopTmuxPanePipe(pane.id);
+      } catch (error) {
+        console.error(`[board-pipe] failed to stop pipe for ${pane.id}: ${error.message || String(error)}`);
+      }
     }
   }
 }
@@ -613,6 +810,38 @@ function resolveTmuxTarget(target, panes) {
   return byWindowName.length === 1 ? byWindowName[0] : null;
 }
 
+function resolveBoardPane(panes, configuredTarget = "") {
+  const target = normalizeTmuxTarget(configuredTarget);
+  if (target) {
+    const pane = resolveTmuxTarget(target, panes);
+    return pane ? {
+      pane,
+      error: ""
+    } : {
+      pane: null,
+      error: `Unknown or ambiguous board target from AI_CHAT_SHELL_BOARD_TARGET: ${target}`
+    };
+  }
+
+  const matches = panes.filter((pane) => pane.windowName === DEFAULT_BOARD_WINDOW_NAME);
+  if (matches.length === 1) {
+    return {
+      pane: matches[0],
+      error: ""
+    };
+  }
+  if (matches.length > 1) {
+    return {
+      pane: null,
+      error: `Multiple tmux panes match board window name "${DEFAULT_BOARD_WINDOW_NAME}". Set AI_CHAT_SHELL_BOARD_TARGET to a pane id or session:window.pane.`
+    };
+  }
+  return {
+    pane: null,
+    error: `No tmux pane found in a window named "${DEFAULT_BOARD_WINDOW_NAME}". Set AI_CHAT_SHELL_BOARD_TARGET or create exactly one board window.`
+  };
+}
+
 function buildMissingTargetResponse(message, cmd, panes) {
   return buildTargetErrorResponse({
     message,
@@ -633,6 +862,19 @@ function buildInvalidTargetResponse(message, cmd, target, panes) {
   });
 }
 
+function buildBoardTargetErrorResponse({ message, cmd, panes, error }) {
+  return {
+    ok: false,
+    id: message.id,
+    callKey: message.callKey || message.id || "",
+    cmd,
+    targetRequired: false,
+    error,
+    tmuxPanes: panes,
+    example: buildBoardHelperExample(cmd)
+  };
+}
+
 function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }) {
   return {
     ok: false,
@@ -644,6 +886,14 @@ function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }
     tmuxPanes: panes,
     example: buildTmuxTargetExample(panes, cmd)
   };
+}
+
+function buildBoardHelperExample(cmd = "version") {
+  return [
+    HELPER_BOARD_START,
+    cmd || "version",
+    HELPER_BOARD_END
+  ].join("\n");
 }
 
 function buildTmuxTargetExample(panes, cmd = "pwd") {
@@ -667,6 +917,348 @@ async function captureTmuxPane(target) {
     target
   ], { timeoutMs: 5000 });
   return result.stdout;
+}
+
+function getBoardTimingConfig() {
+  return {
+    probeIdleMs: getEnvClampedNumber("AI_CHAT_SHELL_BOARD_PROBE_IDLE_MS", 100, 60000, DEFAULT_BOARD_PROBE_IDLE_MS),
+    promptIdleMs: getEnvClampedNumber("AI_CHAT_SHELL_BOARD_PROMPT_IDLE_MS", 50, 10000, DEFAULT_BOARD_PROMPT_IDLE_MS),
+    pollMs: getEnvClampedNumber("AI_CHAT_SHELL_BOARD_POLL_MS", 50, 5000, DEFAULT_BOARD_POLL_MS)
+  };
+}
+
+async function isTmuxPanePipeActive(target) {
+  const result = await runTmuxCommand(["display-message", "-p", "-t", target, "#{pane_pipe}"], { timeoutMs: 5000 });
+  return result.stdout.trim() === "1";
+}
+
+async function startTmuxPanePipe(target, logPath) {
+  await runTmuxCommand(["pipe-pane", "-o", "-t", target, `cat >> ${shellQuote(logPath)}`], { timeoutMs: 5000 });
+}
+
+async function stopTmuxPanePipe(target) {
+  await runTmuxCommand(["pipe-pane", "-t", target], { timeoutMs: 5000 });
+}
+
+async function waitForBoardIdle({ logPath, offset, deadline, idleMs, pollMs, maxOutputChars }) {
+  let lastSize = getFileSize(logPath);
+  let lastChangeAt = Date.now();
+  let latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+
+  while (Date.now() < deadline) {
+    await sleep(pollMs);
+    latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+    if (latest.size !== lastSize) {
+      lastSize = latest.size;
+      lastChangeAt = Date.now();
+    }
+    if (latest.bytesRead > 0 && Date.now() - lastChangeAt >= idleMs) {
+      return {
+        ...latest,
+        timedOut: false
+      };
+    }
+  }
+
+  return {
+    ...latest,
+    timedOut: true
+  };
+}
+
+async function waitForBoardPrompt({ logPath, offset, prompt, deadline, idleMs, pollMs, maxOutputChars }) {
+  let lastSize = getFileSize(logPath);
+  let lastChangeAt = Date.now();
+  let latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+
+  while (Date.now() < deadline) {
+    await sleep(pollMs);
+    latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+    if (latest.size !== lastSize) {
+      lastSize = latest.size;
+      lastChangeAt = Date.now();
+    }
+    if (latest.bytesRead > 0 &&
+      outputEndsWithBoardPrompt(latest.normalized, prompt) &&
+      Date.now() - lastChangeAt >= idleMs) {
+      return {
+        ...latest,
+        timedOut: false
+      };
+    }
+  }
+
+  return {
+    ...latest,
+    timedOut: true
+  };
+}
+
+function readBoardLogFromOffset(logPath, offset, maxOutputChars = DEFAULT_MAX_OUTPUT_CHARS) {
+  const size = getFileSize(logPath);
+  const safeOffset = Math.max(0, Math.min(Number(offset) || 0, size));
+  const bytesToRead = Math.max(0, size - safeOffset);
+  if (bytesToRead === 0) {
+    return {
+      size,
+      bytesRead: 0,
+      normalized: "",
+      stdout: "",
+      truncated: false
+    };
+  }
+
+  const fd = fs.openSync(logPath, "r");
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, safeOffset);
+    const normalized = normalizeBoardOutput(buffer.subarray(0, bytesRead).toString("utf8"));
+    const stdout = appendLimited("", normalized, maxOutputChars);
+    return {
+      size,
+      bytesRead,
+      normalized,
+      stdout,
+      truncated: normalized.length > stdout.length
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function normalizeBoardOutput(value) {
+  return renderTerminalText(String(value || ""));
+}
+
+function renderTerminalText(input) {
+  const lines = [[]];
+  let row = 0;
+  let col = 0;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    const code = char.charCodeAt(0);
+
+    if (char === "\x1b") {
+      index = consumeEscapeSequence(input, index, {
+        cursorForward(count) {
+          col += count;
+        },
+        cursorBackward(count) {
+          col = Math.max(0, col - count);
+        },
+        cursorUp(count) {
+          row = Math.max(0, row - count);
+        },
+        cursorDown(count) {
+          row += count;
+          ensureLine(lines, row);
+        },
+        cursorPosition(nextRow, nextCol) {
+          row = Math.max(0, nextRow);
+          col = Math.max(0, nextCol);
+          ensureLine(lines, row);
+        },
+        cursorColumn(nextCol) {
+          col = Math.max(0, nextCol);
+        },
+        eraseLine(mode) {
+          const line = ensureLine(lines, row);
+          if (mode === 2) {
+            lines[row] = [];
+          } else if (mode === 1) {
+            for (let i = 0; i <= col; i += 1) {
+              line[i] = " ";
+            }
+          } else {
+            line.length = Math.min(line.length, col);
+          }
+        },
+        eraseDisplay(mode) {
+          if (mode === 2) {
+            lines.length = 1;
+            lines[0] = [];
+            row = 0;
+            col = 0;
+          }
+        }
+      });
+      continue;
+    }
+
+    if (char === "\r") {
+      if (input[index + 1] === "\n") {
+        index += 1;
+        row += 1;
+        col = 0;
+        ensureLine(lines, row);
+      } else {
+        col = 0;
+      }
+      continue;
+    }
+
+    if (char === "\n") {
+      row += 1;
+      col = 0;
+      ensureLine(lines, row);
+      continue;
+    }
+
+    if (char === "\b") {
+      col = Math.max(0, col - 1);
+      continue;
+    }
+
+    if (char === "\t") {
+      const nextTabStop = col + (8 - (col % 8 || 0));
+      while (col < nextTabStop) {
+        writeTerminalChar(lines, row, col, " ");
+        col += 1;
+      }
+      continue;
+    }
+
+    if ((code >= 0 && code < 32) || code === 127) {
+      continue;
+    }
+
+    writeTerminalChar(lines, row, col, char);
+    col += 1;
+  }
+
+  return lines.map(lineToString).join("\n");
+}
+
+function consumeEscapeSequence(input, startIndex, actions) {
+  const kind = input[startIndex + 1];
+  if (!kind) {
+    return startIndex;
+  }
+
+  if (kind === "]") {
+    for (let index = startIndex + 2; index < input.length; index += 1) {
+      if (input[index] === "\x07") {
+        return index;
+      }
+      if (input[index] === "\x1b" && input[index + 1] === "\\") {
+        return index + 1;
+      }
+    }
+    return input.length - 1;
+  }
+
+  if (kind !== "[") {
+    return startIndex + 1;
+  }
+
+  let endIndex = startIndex + 2;
+  while (endIndex < input.length) {
+    const code = input.charCodeAt(endIndex);
+    if (code >= 0x40 && code <= 0x7e) {
+      break;
+    }
+    endIndex += 1;
+  }
+  if (endIndex >= input.length) {
+    return input.length - 1;
+  }
+
+  applyCsiSequence(input.slice(startIndex + 2, endIndex), input[endIndex], actions);
+  return endIndex;
+}
+
+function applyCsiSequence(rawParams, finalChar, actions) {
+  const params = parseCsiParams(rawParams);
+  const count = params[0] || 1;
+  if (finalChar === "C") {
+    actions.cursorForward(count);
+  } else if (finalChar === "D") {
+    actions.cursorBackward(count);
+  } else if (finalChar === "A") {
+    actions.cursorUp(count);
+  } else if (finalChar === "B") {
+    actions.cursorDown(count);
+  } else if (finalChar === "G") {
+    actions.cursorColumn(Math.max(0, count - 1));
+  } else if (finalChar === "H" || finalChar === "f") {
+    actions.cursorPosition(Math.max(0, (params[0] || 1) - 1), Math.max(0, (params[1] || 1) - 1));
+  } else if (finalChar === "K") {
+    actions.eraseLine(params[0] || 0);
+  } else if (finalChar === "J") {
+    actions.eraseDisplay(params[0] || 0);
+  }
+}
+
+function parseCsiParams(rawParams) {
+  return String(rawParams || "")
+    .replace(/[?<>=]/g, "")
+    .split(/[;:]/)
+    .map((part) => {
+      const number = Number(part);
+      return Number.isFinite(number) ? number : 0;
+    });
+}
+
+function ensureLine(lines, row) {
+  while (lines.length <= row) {
+    lines.push([]);
+  }
+  return lines[row];
+}
+
+function writeTerminalChar(lines, row, col, char) {
+  const line = ensureLine(lines, row);
+  while (line.length < col) {
+    line.push(" ");
+  }
+  line[col] = char;
+}
+
+function lineToString(line) {
+  let text = "";
+  for (let index = 0; index < line.length; index += 1) {
+    text += line[index] || " ";
+  }
+  return text.replace(/[ \t]+$/g, "");
+}
+
+function extractBoardPromptSignature(output) {
+  const lines = normalizeBoardOutput(output)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length > 0 ? lines[lines.length - 1] : "";
+}
+
+function outputEndsWithBoardPrompt(output, prompt) {
+  const expected = String(prompt || "").trim();
+  if (!expected) {
+    return false;
+  }
+  return extractBoardPromptSignature(output) === expected;
+}
+
+function buildBoardLogPath(pane) {
+  const safeName = [
+    pane.session || "tmux",
+    pane.windowIndex || "window",
+    pane.paneIndex || "pane",
+    pane.id || ""
+  ].join("_").replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(BOARD_LOG_DIR, `${safeName}.log`);
+}
+
+function getFileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function getEnvClampedNumber(name, min, max, fallback) {
+  return clampNumber(process.env[name], min, max, fallback);
 }
 
 function runTmuxCommand(args, options) {
@@ -948,19 +1540,29 @@ function resolveCwd(rawCwd, fallbackCwd = "") {
 }
 
 module.exports = {
+  buildBoardHelperExample,
+  buildBoardLogPath,
+  buildBoardTargetErrorResponse,
   buildTmuxCommandArgs,
   buildMissingTargetResponse,
   decodeTextFrames,
   detectDefaultTmuxSocketPath,
   encodeTextFrame,
+  extractBoardPromptSignature,
   extractTmuxRunOutput,
   getTmuxEnvSocketPath,
   getTmuxSocketPath,
   listTmuxPanes,
+  normalizeBoardOutput,
+  outputEndsWithBoardPrompt,
   parseTmuxPanes,
+  readBoardLogFromOffset,
+  resolveBoardPane,
   resolveDownloadsFilePath,
   resolveTmuxTarget,
+  runTmuxBoard,
   runTmuxShell,
   startServer,
+  validateBoardCommand,
   writeDownloadsFile
 };
