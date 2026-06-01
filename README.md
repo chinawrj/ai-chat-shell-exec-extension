@@ -4,7 +4,7 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced `text` code block and no prose. The extension recognizes three helper block types:
+With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes three helper block types:
 
 - Shell helper: request local terminal output from a selected tmux target.
 - Board helper: send one command line to the configured board tmux pane.
@@ -12,7 +12,7 @@ With the AI-facing instructions in this repo, the AI asks its human helper by re
 
 Shell helper:
 
-```text
+```
 ai-helper-shell-start
 %24
 pwd && ls -la
@@ -21,7 +21,7 @@ ai-helper-shell-end
 
 Board helper:
 
-```text
+```
 ai-helper-board-start
 version
 ai-helper-board-end
@@ -29,7 +29,7 @@ ai-helper-board-end
 
 File helper:
 
-```text
+```
 ai-helper-file-start
 notes.txt
 first line
@@ -120,10 +120,10 @@ The short version is:
 ````text
 I can act as your human helper for local terminal output, board output, and helper files.
 
-When output would help, reply with exactly one fenced `text` code block and no prose.
+When output would help, reply with exactly one fenced code block and no prose.
 
 For local terminal output, use:
-```text
+```
 ai-helper-shell-start
 target here
 command here
@@ -131,14 +131,14 @@ ai-helper-shell-end
 ```
 
 For board output, use:
-```text
+```
 ai-helper-board-start
 one board command here
 ai-helper-board-end
 ```
 
 For writing one helper file under my Downloads directory, use:
-```text
+```
 ai-helper-file-start
 filename.ext
 exact file content here
@@ -146,7 +146,7 @@ ai-helper-file-end
 ```
 
 Rules:
-- Use the `text` fence exactly, with no text before or after the code block.
+- Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
 - Shell helpers must put the tmux target on the second line.
 - Board helpers must contain exactly one non-empty board command line and no target.
 - File helpers must put a single file name, not a path, on the second line.
@@ -189,7 +189,7 @@ Use the popup's portable config area to move settings and bindings to another Ch
 
 Plain command blocks are rejected because the server no longer chooses a shell by itself. The AI-facing format is a request to the human helper, and the extension recognizes only this shell helper block shape:
 
-```text
+```
 ai-helper-shell-start
 %24
 uname -a
@@ -202,7 +202,7 @@ When the extension returns a target list, each line is formatted for the AI to r
 
 Keep AI requests minimal by default:
 
-```text
+```
 ai-helper-shell-start
 %24
 git status --short
@@ -211,7 +211,7 @@ ai-helper-shell-end
 
 If the desired window name is unique, this also works:
 
-```text
+```
 ai-helper-shell-start
 build
 git status --short
@@ -222,7 +222,7 @@ The shell helper format maps only the second line to `target` and the remaining 
 
 For board output, use:
 
-```text
+```
 ai-helper-board-start
 version
 ai-helper-board-end
@@ -234,7 +234,7 @@ The start marker can include an optional helper identity suffix, for example `ai
 
 To write a file under `$HOME/Downloads`, use:
 
-```text
+```
 ai-helper-file-start
 notes.txt
 first line
