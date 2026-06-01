@@ -9,7 +9,7 @@ const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
-const CONTENT_SCRIPT_VERSION = "0.6.31";
+const CONTENT_SCRIPT_VERSION = "0.6.32";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -22,6 +22,9 @@ const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
 const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const processedCalls = new Set();
 const processedSemanticCalls = new Set();
+// Keep dedup metadata in memory only; unlike dataset persistence this resets on content-script reinjection.
+// That can re-evaluate existing helpers, but initialThreadSettled already ignores existing history on first scan.
+const processedNodeSemanticKeys = new WeakMap();
 let scanTimer = 0;
 let lastThreadText = "";
 let lastThreadTextAt = Date.now();
@@ -385,7 +388,8 @@ async function scanForShellCall(options = {}) {
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
   if (!force && (processedCalls.has(callKey) ||
     processedSemanticCalls.has(semanticCallKey) ||
-    candidate.node?.dataset?.aiChatShellSemanticKey === semanticCallKey)) {
+    (candidate.node instanceof Element &&
+      processedNodeSemanticKeys.get(candidate.node) === semanticCallKey))) {
     return;
   }
 
@@ -472,9 +476,8 @@ function buildForceCallKey(semanticCallKey) {
 function markCallProcessed(candidate, callKey, semanticCallKey) {
   processedCalls.add(callKey);
   processedSemanticCalls.add(semanticCallKey);
-  if (candidate.node?.dataset) {
-    candidate.node.dataset.aiChatShellCallKey = callKey;
-    candidate.node.dataset.aiChatShellSemanticKey = semanticCallKey;
+  if (candidate.node instanceof Element) {
+    processedNodeSemanticKeys.set(candidate.node, semanticCallKey);
   }
 }
 

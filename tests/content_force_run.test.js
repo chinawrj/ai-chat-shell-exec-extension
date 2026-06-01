@@ -15,5 +15,9 @@ assert.match(source, /function buildForceCallKey\(semanticCallKey\)/);
 assert.match(source, /runAndReply\(executionCallKey,\s*call,\s*\{\s*force\s*\}\)/);
 assert.match(source, /No helper block found on this page/);
 assert.match(source, /setHelperCompletionStatus\(call,\s*response\);\s*activeCallId = "";/);
+assert.match(source, /const processedNodeSemanticKeys = new WeakMap\(\);/);
+assert.match(source, /processedNodeSemanticKeys\.set\(candidate\.node,\s*semanticCallKey\);/);
+assert.match(source, /processedNodeSemanticKeys\.get\(candidate\.node\) === semanticCallKey/);
+assert.doesNotMatch(source, /dataset\.aiChatShell(CallKey|SemanticKey)/);
 
 console.log("content force-run tests passed");
