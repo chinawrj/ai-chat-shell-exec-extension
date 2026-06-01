@@ -9,6 +9,8 @@ const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
+const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
+const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
 const CONTENT_SCRIPT_VERSION = "0.6.32";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -45,13 +47,26 @@ let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
+let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
+// The author-role filter is opt-in. The legacy heuristic that decided whether a
+// helper block came from the assistant or the user produced false positives on
+// hosts that don't expose `data-message-author-role` (or whose nearest
+// recognized container wraps multiple turns), which made the most recent helper
+// block silently skipped. Default to off so the latest helper block always
+// runs; the popup / panel toggle can re-enable strict filtering when needed.
+let authorRoleFilterEnabled = false;
 
 bootstrapActivation().catch(() => {});
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "sync" && (changes.enabled || changes.enabledHosts)) {
     refreshActivation().catch(() => {});
+  }
+  if (areaName === "sync" && changes.disableAuthorRoleFilter) {
+    authorRoleFilterEnabled = changes.disableAuthorRoleFilter.newValue === false;
+    updateRoleFilterButton();
+    scheduleScan();
   }
 });
 
@@ -60,13 +75,15 @@ async function bootstrapActivation() {
 }
 
 async function refreshActivation() {
-  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts"]);
+  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "disableAuthorRoleFilter"]);
+  authorRoleFilterEnabled = settings.disableAuthorRoleFilter === false;
   if (!isSupportedPage() || settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
     deactivateExtension();
     return;
   }
 
   await activateExtension();
+  updateRoleFilterButton();
 }
 
 async function activateExtension() {
@@ -320,6 +337,23 @@ async function scanForShellCall(options = {}) {
     expirePendingSelfTest();
   }
 
+  // Refresh the floating panel's detected-helper view on every scan attempt
+  // before any of the guards below can early-return. The debug body is
+  // independent of whether we will actually run the helper this tick: it
+  // should always reflect the latest fully-terminated helper block in the
+  // current DOM, even while a previous call is still running, while the AI
+  // is streaming a follow-up turn, or while the thread text is still
+  // changing. Otherwise the panel can remain stuck on the first helper
+  // block forever.
+  try {
+    const conversationRoot = getConversationRoot();
+    const allCandidates = extractShellCallCandidates(conversationRoot);
+    updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
+  } catch (_unused) {
+    // Detection runs on a partially-rendered DOM during streaming; never
+    // let a transient scan failure block the rest of the scanner.
+  }
+
   if (activeCallId) {
     if (force && forceAttempts < 20) {
       setStatus("Waiting for current helper call, then running latest", "running");
@@ -352,6 +386,8 @@ async function scanForShellCall(options = {}) {
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
   const now = Date.now();
 
+  const candidate = getLastShellCallCandidate(thread);
+
   if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
     lastThreadTextAt = now;
@@ -366,7 +402,6 @@ async function scanForShellCall(options = {}) {
 
   resetChainForNewHumanPrompt();
 
-  const candidate = getLastShellCallCandidate(thread);
   if (!candidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
@@ -564,10 +599,16 @@ function getLastShellCallCandidate(root) {
     .filter((candidate) => isRunnableHelperCall(candidate.call))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
-  const runnableCandidates = candidates.filter(isRunnableAuthoredCandidate);
-  const assistantCandidates = runnableCandidates.filter(isAssistantAuthoredCandidate);
-  const scopedCandidates = assistantCandidates.length > 0 ? assistantCandidates : runnableCandidates;
-  return scopedCandidates.length > 0 ? scopedCandidates[scopedCandidates.length - 1] : null;
+  // The author-role filter has historically caused the latest helper block to
+  // be skipped whenever the host page didn't expose `data-message-author-role`
+  // (or when a single recognized container wraps several turns). It is now
+  // opt-in via the `disableAuthorRoleFilter` setting; when disabled (the
+  // default) we just trust the DOM order returned by extractShellCallCandidates
+  // and execute the newest visible helper block.
+  const filtered = authorRoleFilterEnabled
+    ? candidates.filter(isRunnableAuthoredCandidate)
+    : candidates;
+  return filtered.length > 0 ? filtered[filtered.length - 1] : null;
 }
 
 function extractShellCallCandidates(root) {
@@ -593,6 +634,7 @@ function extractShellCallCandidates(root) {
       for (const block of extractPlainTextShellCallBlocks(textRoot)) {
         candidates.push({
           ...block,
+          textRoot,
           index: index += 1,
           source: "plain-text-block"
         });
@@ -600,7 +642,12 @@ function extractShellCallCandidates(root) {
     }
   }
 
-  candidates.sort((a, b) => compareNodeOrder(a.node, b.node) || a.index - b.index);
+  // Sort by the textRoot's document position so that helper blocks discovered in the
+  // newest message come last — even when closestMessageContainer walks up to a shared
+  // ancestor for messages whose role/container attributes aren't yet recognizable.
+  candidates.sort((a, b) =>
+    compareNodeOrder(a.textRoot || a.node, b.textRoot || b.node) || a.index - b.index
+  );
   return candidates;
 }
 
@@ -651,35 +698,29 @@ function closestMessageContainer(node) {
   return node.closest('[data-message-author-role], article, [role="article"], [data-testid], section, main > div') || node;
 }
 
-function isAssistantAuthoredCandidate(candidate) {
-  const role = getMessageAuthorRole(candidate.node);
-  return role === "assistant";
-}
-
 function isRunnableAuthoredCandidate(candidate) {
   return getMessageAuthorRole(candidate.node) !== "user";
 }
 
 function getMessageAuthorRole(node) {
-  const container = node?.closest?.('[data-message-author-role], article, [role="article"]');
-  const explicit = container?.getAttribute?.("data-message-author-role") ||
+  // Only trust an explicit attribute. The previous text-prefix heuristic
+  // (e.g. matching "user:" / "you said:" at the start of the container's text)
+  // produced false positives when:
+  //   - closest('article') climbed past the actual message and matched a
+  //     wrapper that contained multiple turns,
+  //   - the host page rendered participant labels as plain text inside the
+  //     message body, or
+  //   - the assistant quoted prior conversation that started with "User:".
+  // Those false positives caused the latest helper block to be silently
+  // skipped, so the heuristic has been removed. When `data-message-author-role`
+  // / `data-author-role` are absent we report an unknown role and let the
+  // caller decide.
+  const explicit = node?.closest?.('[data-message-author-role]')?.getAttribute?.("data-message-author-role") ||
     node?.closest?.('[data-author-role]')?.getAttribute?.("data-author-role") ||
     "";
-  const normalizedExplicit = explicit.toLowerCase();
-  if (normalizedExplicit === "assistant" || normalizedExplicit === "user") {
-    return normalizedExplicit;
-  }
-
-  const text = normalizeText(container?.innerText || container?.textContent || node?.innerText || node?.textContent || "")
-    .toLowerCase();
-  if (text.startsWith("you said:") || text.startsWith("user:")) {
-    return "user";
-  }
-  if (text.startsWith("copilot said:") ||
-    text.startsWith("assistant:") ||
-    text.startsWith("chatgpt said:") ||
-    text.startsWith("claude said:")) {
-    return "assistant";
+  const normalized = String(explicit || "").toLowerCase();
+  if (normalized === "assistant" || normalized === "user") {
+    return normalized;
   }
   return "";
 }
@@ -1172,6 +1213,10 @@ async function runAndReply(callId, call, options = {}) {
   chainCallCount += 1;
   setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
+  // Remember which semantic call we actually attempted to run, so the debug
+  // panel can show whether the next detected candidate matches it (i.e. the
+  // ledger/dedup will treat the next scan as a duplicate of this one).
+  lastExecutedSemanticKey = buildSemanticCallKey(call);
   try {
     const response = isFileHelperCall(call) ?
       await sendWriteFileMessage(callId, call, force) :
@@ -1869,6 +1914,10 @@ function panelProfileKey() {
   return `${PANEL_PROFILE_PREFIX}${location.origin}`;
 }
 
+function debugProfileKey() {
+  return `${DEBUG_PROFILE_PREFIX}${location.origin}`;
+}
+
 function injectStatus() {
   if (document.getElementById(STATUS_ID)) {
     return;
@@ -1912,6 +1961,11 @@ function injectStatus() {
       title: "Force run latest helper block (bypass dedup ledger)"
     },
     { mode: "site", label: "Enable site" },
+    {
+      mode: "role-filter",
+      label: "Role filter",
+      title: "Toggle author-role filter (when off, the newest visible helper block is always executed)"
+    },
     { mode: "input", label: "Bind input" },
     { mode: "send", label: "Bind send" },
     { mode: "shell", label: "Bind shell" },
@@ -1936,6 +1990,28 @@ function injectStatus() {
     actions.appendChild(button);
   }
   panel.appendChild(actions);
+
+  const debugPanel = document.createElement("details");
+  debugPanel.id = "ai-chat-shell-exec-debug";
+  debugPanel.style.cssText = "margin-top:6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;";
+  const debugSummary = document.createElement("summary");
+  debugSummary.textContent = "Detected helper block (debug)";
+  debugSummary.style.cssText = "cursor:pointer;opacity:.85;user-select:none;";
+  const debugBody = document.createElement("pre");
+  debugBody.id = DEBUG_BODY_ID;
+  debugBody.style.cssText = "margin:4px 0 0;padding:6px;background:#0b1220;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;color:#d1d5db;";
+  debugBody.textContent = "(no helper block detected yet)";
+  debugPanel.append(debugSummary, debugBody);
+  panel.appendChild(debugPanel);
+
+  chrome.storage.local.get([debugProfileKey()]).then((stored) => {
+    if (stored[debugProfileKey()]) {
+      debugPanel.open = true;
+    }
+  }).catch(() => {});
+  debugPanel.addEventListener("toggle", () => {
+    chrome.storage.local.set({ [debugProfileKey()]: debugPanel.open }).catch(() => {});
+  });
 
   panel.addEventListener("click", (event) => {
     const button = event.target.closest("[data-shell-tool-action]");
@@ -1963,8 +2039,10 @@ function injectStatus() {
   });
 
   document.documentElement.appendChild(panel);
-  chrome.storage.sync.get(["enabledHosts"]).then((settings) => {
+  chrome.storage.sync.get(["enabledHosts", "disableAuthorRoleFilter"]).then((settings) => {
     updateSiteActionButton(isCurrentHostEnabled(settings.enabledHosts));
+    authorRoleFilterEnabled = settings.disableAuthorRoleFilter === false;
+    updateRoleFilterButton();
   });
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
@@ -2006,6 +2084,98 @@ function rememberSuppressedCallStatus(status) {
   setForceButtonHighlight(true);
 }
 
+function updateDetectedHelperDebug(candidate, allCandidates) {
+  const body = document.getElementById(DEBUG_BODY_ID);
+  if (!body) {
+    return;
+  }
+  const list = Array.isArray(allCandidates) ? allCandidates : [];
+  const total = list.length;
+  let selectedIdx = -1;
+  if (candidate) {
+    selectedIdx = list.findIndex((c) =>
+      c === candidate ||
+      (c.node === candidate.node && c.index === candidate.index)
+    );
+  }
+  const summary = total === 0
+    ? "candidates: 0/0"
+    : `candidates: ${selectedIdx >= 0 ? selectedIdx + 1 : "?"}/${total}`;
+
+  if (!candidate && total === 0) {
+    const lines = [summary, "(no helper block detected)"];
+    if (lastSuppressedCallStatus) {
+      lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
+    }
+    if (lastExecutedSemanticKey) {
+      lines.push(`lastRunSemanticKey: ${lastExecutedSemanticKey}`);
+    }
+    body.textContent = lines.join("\n");
+    return;
+  }
+
+  const lines = [summary];
+
+  if (total > 0) {
+    const MAX_LISTED = 8;
+    const listed = list.slice(0, MAX_LISTED);
+    for (let i = 0; i < listed.length; i += 1) {
+      const c = listed[i];
+      const cCall = c.call || {};
+      const isSelected = i === selectedIdx;
+      const marker = isSelected ? "[*]" : "[ ]";
+      const cKind = cCall.kind || "shell";
+      const cRole = getMessageAuthorRole(c.node) || "?";
+      const cRunnable = isRunnableHelperCall(cCall) ? "yes" : "no";
+      const cVisible = (() => {
+        try {
+          return isVisibleElement(c.node) ? "yes" : "no";
+        } catch (_unused) {
+          return "?";
+        }
+      })();
+      const cCmd = String(cCall.cmd || cCall.content || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 80);
+      lines.push(
+        `${marker} #${i + 1}  kind=${cKind}  role=${cRole}  runnable=${cRunnable}  visible=${cVisible}  cmd: ${cCmd}`
+      );
+    }
+    if (total > MAX_LISTED) {
+      lines.push(`… (+${total - MAX_LISTED} more)`);
+    }
+  }
+
+  if (candidate) {
+    const call = candidate.call || {};
+    const role = getMessageAuthorRole(candidate.node) || "(unknown)";
+    const cmdPreview = String(call.cmd || call.content || "").slice(0, 800);
+    lines.push(
+      `kind:        ${call.kind || "shell"}`,
+      `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
+      `target:      ${call.target || "(none)"}`,
+      `filename:    ${call.filename || ""}`,
+      `cwd:         ${call.cwd || ""}`,
+      `authorRole:  ${role}`,
+      `source:      ${candidate.source || ""}  index:${candidate.index || ""}`,
+      `semanticKey: ${buildSemanticCallKey(call)}`,
+      `detectedAt:  ${new Date().toISOString()}`,
+      `--- cmd / content (first 800 chars) ---`,
+      cmdPreview || "(empty)"
+    );
+  } else {
+    lines.push("(no helper block selected)");
+  }
+
+  if (lastSuppressedCallStatus) {
+    lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
+  }
+  if (lastExecutedSemanticKey) {
+    lines.push(`lastRunSemanticKey: ${lastExecutedSemanticKey}`);
+  }
+  body.textContent = lines.join("\n");
+}
+
 function isSuppressionStatusText(text) {
   const message = String(text || "");
   return message.startsWith("Suppressed duplicate helper call") ||
@@ -2025,6 +2195,13 @@ function handlePanelAction(action) {
   if (action === "site") {
     toggleCurrentSiteEnabled().catch((error) => {
       setStatus(`Site update failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "role-filter") {
+    toggleAuthorRoleFilter().catch((error) => {
+      setStatus(`Role filter update failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
   }
@@ -2081,6 +2258,31 @@ function updateSiteActionButton(enabled) {
   if (button) {
     button.textContent = enabled ? "Disable site" : "Enable site";
   }
+}
+
+async function toggleAuthorRoleFilter() {
+  const settings = await chrome.storage.sync.get(["disableAuthorRoleFilter"]);
+  const currentlyEnabled = settings.disableAuthorRoleFilter === false;
+  const nextEnabled = !currentlyEnabled;
+  await chrome.storage.sync.set({ disableAuthorRoleFilter: !nextEnabled });
+  authorRoleFilterEnabled = nextEnabled;
+  updateRoleFilterButton();
+  setStatus(
+    nextEnabled
+      ? "Role filter enabled: helper blocks in user-authored messages will be skipped"
+      : "Role filter disabled: newest visible helper block will always run",
+    "ok"
+  );
+  scheduleScan();
+}
+
+function updateRoleFilterButton() {
+  const button = document.querySelector(`#${STATUS_ID} [data-shell-tool-action="role-filter"]`);
+  if (!button) {
+    return;
+  }
+  button.textContent = authorRoleFilterEnabled ? "Role filter: on" : "Role filter: off";
+  button.style.background = authorRoleFilterEnabled ? "#374151" : "#6b21a8";
 }
 
 async function runHealthCheck() {

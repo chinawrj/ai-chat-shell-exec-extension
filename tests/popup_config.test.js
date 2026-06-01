@@ -28,6 +28,7 @@ function makeContext() {
     "defaultTimeoutMs",
     "maxOutputChars",
     "maxChainCalls",
+    "disableAuthorRoleFilter",
     "health",
     "save",
     "refreshHealth",
