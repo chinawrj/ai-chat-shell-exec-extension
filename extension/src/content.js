@@ -2072,7 +2072,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
   if (candidate) {
     selectedIdx = list.findIndex((c) =>
       c === candidate ||
-      (c && candidate && c.node === candidate.node && c.index === candidate.index)
+      (c.node === candidate.node && c.index === candidate.index)
     );
   }
   const summary = total === 0
