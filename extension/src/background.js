@@ -3,6 +3,7 @@ const SHELL_SERVER_HEALTH_URL = "http://127.0.0.1:17371/health";
 const CALL_LEDGER_KEY = "shellCallLedger:v1";
 const CALL_LEDGER_LIMIT = 500;
 const RUNNING_LOCK_GRACE_MS = 15000;
+const COMPLETED_DEDUP_TTL_MS = 60_000;
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
@@ -91,13 +92,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleWriteFileMessage(message) {
   const callKey = message.callKey || message.id || "";
+  const force = message.callMeta?.force === true;
   const payload = {
     type: "write-file",
     id: message.id,
     callKey,
     filename: message.filename,
     content: message.content || "",
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   };
 
   const claim = await claimShellCall(callKey, {
@@ -140,6 +143,7 @@ async function handleRunShellMessage(message) {
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
+  const force = message.callMeta?.force === true;
   const payload = {
     type: "run",
     id: message.id,
@@ -149,7 +153,8 @@ async function handleRunShellMessage(message) {
     cwd: message.cwd,
     timeoutMs,
     maxOutputChars,
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   };
 
   const claim = await claimShellCall(callKey, payload);
@@ -189,6 +194,7 @@ async function handleRunBoardMessage(message) {
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
+  const force = message.callMeta?.force === true;
   const payload = {
     type: "run-board",
     id: message.id,
@@ -196,7 +202,8 @@ async function handleRunBoardMessage(message) {
     cmd: message.cmd,
     timeoutMs,
     maxOutputChars,
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   };
 
   const claim = await claimShellCall(callKey, {
@@ -331,17 +338,23 @@ async function claimShellCall(callKey, payload) {
   }
 
   const now = Date.now();
+  const force = payload.callMeta?.force === true || payload.force === true;
   const store = await localGet(CALL_LEDGER_KEY);
   const ledger = store[CALL_LEDGER_KEY] || { nextSeq: 1, calls: {} };
   ledger.calls ||= {};
   const existing = ledger.calls[callKey];
   const lockTtl = Math.max(5000, Number(payload.timeoutMs || 30000) + RUNNING_LOCK_GRACE_MS);
 
-  if (existing?.state === "completed") {
-    return { action: "skip", reason: "completed" };
-  }
-  if (existing?.state === "running" && now - Number(existing.claimedAt || 0) < lockTtl) {
-    return { action: "skip", reason: "running" };
+  if (!force) {
+    if (existing?.state === "completed") {
+      const completedAt = Number(existing.completedAt || 0);
+      if (completedAt && now - completedAt < COMPLETED_DEDUP_TTL_MS) {
+        return { action: "skip", reason: "recently-completed" };
+      }
+    }
+    if (existing?.state === "running" && now - Number(existing.claimedAt || 0) < lockTtl) {
+      return { action: "skip", reason: "running" };
+    }
   }
 
   const seq = Number(ledger.nextSeq || 1);
@@ -354,7 +367,8 @@ async function claimShellCall(callKey, payload) {
     target: payload.target || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
-    promptHash: payload.callMeta?.promptHash || ""
+    promptHash: payload.callMeta?.promptHash || "",
+    forced: force
   };
   pruneCallLedger(ledger);
   await localSet({ [CALL_LEDGER_KEY]: ledger });

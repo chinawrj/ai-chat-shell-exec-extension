@@ -20,6 +20,8 @@ const BOARD_LOG_DIR = path.join(STATE_DIR, "board-panes");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
+const COMPLETED_DEDUP_TTL_MS = 60_000;
+const SERVER_LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TMUX_FIELD_SEPARATOR = "__AI_CHAT_SHELL_FIELD__";
 const TMUX_LIST_FORMAT = [
   "#{pane_id}",
@@ -238,6 +240,7 @@ async function handleMessageText(text) {
     maxOutputChars
   ].join("\n")));
   const started = Date.now();
+  const force = message.callMeta?.force === true || message.force === true;
   const claim = claimServerShellCall(callKey, {
     cmd,
     cwd,
@@ -245,7 +248,8 @@ async function handleMessageText(text) {
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   });
   if (claim.action === "skip") {
     console.log(`[skip] reason=${claim.reason} callKey=${callKey} cmd=${JSON.stringify(cmd)}`);
@@ -326,6 +330,7 @@ async function handleRunBoardMessage(message) {
     maxOutputChars
   ].join("\n")));
   const started = Date.now();
+  const force = message.callMeta?.force === true || message.force === true;
   const claim = claimServerShellCall(callKey, {
     cmd,
     cwd: pane.currentPath || "",
@@ -333,7 +338,8 @@ async function handleRunBoardMessage(message) {
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   });
   if (claim.action === "skip") {
     console.log(`[skip] reason=${claim.reason} callKey=${callKey} boardCmd=${JSON.stringify(cmd)}`);
@@ -388,13 +394,15 @@ function handleWriteFileMessage(message) {
   const downloadsDir = path.join(os.homedir(), "Downloads");
   const filePath = resolveDownloadsFilePath(filename, downloadsDir);
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([filename, content].join("\n")));
+  const force = message.callMeta?.force === true || message.force === true;
   const claim = claimServerShellCall(callKey, {
     cmd: content,
     cwd: downloadsDir,
     target: filePath,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     seq: message.seq,
-    callMeta: message.callMeta || {}
+    callMeta: message.callMeta || {},
+    force
   });
   if (claim.action === "skip") {
     console.log(`[skip] reason=${claim.reason} callKey=${callKey} file=${JSON.stringify(filename)}`);
@@ -466,14 +474,20 @@ function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(
 
 function claimServerShellCall(callKey, payload) {
   const now = Date.now();
+  const force = payload.callMeta?.force === true || payload.force === true;
   const existing = serverLedger.calls?.[callKey];
   const lockTtl = Math.max(5000, Number(payload.timeoutMs || DEFAULT_TIMEOUT_MS) + RUNNING_LOCK_GRACE_MS);
 
-  if (existing?.state === "completed") {
-    return { action: "skip", reason: "completed" };
-  }
-  if (existing?.state === "running" && now - Number(existing.startedAt || 0) < lockTtl) {
-    return { action: "skip", reason: "running" };
+  if (!force) {
+    if (existing?.state === "completed") {
+      const completedAt = Number(existing.completedAt || 0);
+      if (completedAt && now - completedAt < COMPLETED_DEDUP_TTL_MS) {
+        return { action: "skip", reason: "recently-completed" };
+      }
+    }
+    if (existing?.state === "running" && now - Number(existing.startedAt || 0) < lockTtl) {
+      return { action: "skip", reason: "running" };
+    }
   }
 
   serverLedger.calls ||= {};
@@ -486,7 +500,8 @@ function claimServerShellCall(callKey, payload) {
     seq: payload.seq || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
-    promptHash: payload.callMeta?.promptHash || ""
+    promptHash: payload.callMeta?.promptHash || "",
+    forced: force
   };
   saveServerLedger();
   return { action: "run" };
@@ -511,10 +526,20 @@ function loadServerLedger() {
   try {
     const parsed = JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
     if (parsed && typeof parsed === "object") {
-      return {
+      const ledger = {
         version: 1,
         calls: parsed.calls && typeof parsed.calls === "object" ? parsed.calls : {}
       };
+      const beforeCount = Object.keys(ledger.calls).length;
+      pruneExpiredCompletedCalls(ledger);
+      const afterCount = Object.keys(ledger.calls).length;
+      if (afterCount !== beforeCount) {
+        fs.mkdirSync(STATE_DIR, { recursive: true });
+        const tempPath = `${LEDGER_PATH}.tmp`;
+        fs.writeFileSync(tempPath, JSON.stringify(ledger, null, 2));
+        fs.renameSync(tempPath, LEDGER_PATH);
+      }
+      return ledger;
     }
   } catch {
     // Missing or invalid ledger files are treated as an empty ledger.
@@ -531,6 +556,7 @@ function saveServerLedger() {
 }
 
 function pruneServerLedger() {
+  pruneExpiredCompletedCalls(serverLedger);
   const entries = Object.entries(serverLedger.calls || {});
   if (entries.length <= SERVER_LEDGER_LIMIT) {
     return;
@@ -542,6 +568,19 @@ function pruneServerLedger() {
     .forEach(([key]) => {
       delete serverLedger.calls[key];
     });
+}
+
+function pruneExpiredCompletedCalls(ledger) {
+  const cutoff = Date.now() - SERVER_LEDGER_MAX_AGE_MS;
+  for (const [key, entry] of Object.entries(ledger.calls || {})) {
+    if (entry?.state !== "completed") {
+      continue;
+    }
+    const completedAt = Number(entry.completedAt || 0);
+    if (!completedAt || completedAt < cutoff) {
+      delete ledger.calls[key];
+    }
+  }
 }
 
 function normalizeCallKey(value) {

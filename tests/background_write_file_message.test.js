@@ -139,6 +139,32 @@ async function main() {
   assert.equal(duplicate.skipped, true);
   assert.equal(sentPayloads.length, 1);
 
+  const now = Date.now();
+  localStore["shellCallLedger:v1"].calls["ttl-key"] = {
+    state: "completed",
+    completedAt: now - 10_000
+  };
+  const recentCompletedClaim = await context.claimShellCall("ttl-key", {
+    cmd: "echo recent",
+    target: "%40",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(recentCompletedClaim.action, "skip");
+  assert.equal(recentCompletedClaim.reason, "recently-completed");
+
+  localStore["shellCallLedger:v1"].calls["ttl-key"] = {
+    state: "completed",
+    completedAt: now - 61_000
+  };
+  const expiredCompletedClaim = await context.claimShellCall("ttl-key", {
+    cmd: "echo rerun",
+    target: "%40",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(expiredCompletedClaim.action, "run");
+
   const boardResponse = await context.handleRunBoardMessage({
     type: "run-board",
     id: "board-1",
@@ -165,6 +191,20 @@ async function main() {
   });
   assert.equal(duplicateBoard.skipped, true);
   assert.equal(sentPayloads.length, 2);
+
+  const forcedBoard = await context.handleRunBoardMessage({
+    type: "run-board",
+    id: "board-1",
+    callKey: "board-key-1",
+    cmd: "version",
+    callMeta: { force: true }
+  });
+  assert.equal(forcedBoard.ok, true);
+  assert.equal(forcedBoard.skipped, undefined);
+  assert.equal(sentPayloads.length, 3);
+  assert.equal(sentPayloads[2].force, true);
+  assert.equal(sentPayloads[2].callMeta.force, true);
+  assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].forced, true);
 
   console.log("background write-file and board message tests passed");
 }
