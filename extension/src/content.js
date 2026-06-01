@@ -322,6 +322,21 @@ async function scanForShellCall(options = {}) {
     expirePendingSelfTest();
   }
 
+  // Refresh the floating panel's detected-helper view on every scan attempt
+  // before any of the guards below can early-return. The debug body is
+  // independent of whether we will actually run the helper this tick: it
+  // should always reflect the latest fully-terminated helper block in the
+  // current DOM, even while a previous call is still running, while the AI
+  // is streaming a follow-up turn, or while the thread text is still
+  // changing. Otherwise the panel can remain stuck on the first helper
+  // block forever.
+  try {
+    updateDetectedHelperDebug(getLastShellCallCandidate(getConversationRoot()));
+  } catch (_unused) {
+    // Detection runs on a partially-rendered DOM during streaming; never
+    // let a transient scan failure block the rest of the scanner.
+  }
+
   if (activeCallId) {
     if (force && forceAttempts < 20) {
       setStatus("Waiting for current helper call, then running latest", "running");
@@ -354,10 +369,6 @@ async function scanForShellCall(options = {}) {
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
   const now = Date.now();
 
-  // Refresh the floating panel's detected-helper view on every scan attempt,
-  // even when we early-return because the chat thread is still streaming or
-  // hasn't been quiet long enough to act on. Otherwise the panel stays stuck
-  // on the first fully-settled helper block while the AI emits later ones.
   const candidate = getLastShellCallCandidate(thread);
   updateDetectedHelperDebug(candidate);
 

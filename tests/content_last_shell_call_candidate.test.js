@@ -364,9 +364,64 @@ async function verifyDebugPanelUpdatesDuringStreaming() {
   );
 }
 
+async function verifyDebugPanelUpdatesWhileActiveCallRunning() {
+  // Regression: even while a previous helper call is still running
+  // (`activeCallId` is set) or the AI is streaming a follow-up turn
+  // (`isAssistantGenerating()` returns true), the floating panel's
+  // detected-helper debug body must reflect the latest fully-terminated
+  // helper block in the DOM. Otherwise the panel can stay stuck on the
+  // first helper block while subsequent ones are visible in the chat.
+  const context = loadContentContext();
+  const oldCmd = "echo OLD_ACTIVE";
+  const newCmd = "echo NEW_ACTIVE";
+  const oldMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: oldCmd })
+  });
+  const newMessage = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd: newCmd })
+  });
+  const root = createRoot([oldMessage, newMessage]);
+  context.document.body = root;
+
+  const debugBody = { textContent: "" };
+  const origGetElementById = context.document.getElementById;
+  context.document.getElementById = (id) => {
+    if (id === "ai-chat-shell-exec-debug-body") {
+      return debugBody;
+    }
+    return origGetElementById(id);
+  };
+
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  // Pretend a previous helper call is still running: scanForShellCall takes
+  // the `activeCallId` early-return branch before any of the host-check or
+  // candidate-detection code runs. The debug body must still be refreshed.
+  vm.runInContext(
+    "extensionActive = true; activeCallId = 'pending-call-id'; initialThreadSettled = true;",
+    context
+  );
+
+  await context.scanForShellCall();
+
+  assert.ok(
+    debugBody.textContent.includes(newCmd),
+    `active-call debug body should contain newest cmd '${newCmd}' but got: ${debugBody.textContent}`
+  );
+  assert.ok(
+    !debugBody.textContent.includes(oldCmd),
+    `active-call debug body should not contain old cmd '${oldCmd}' but got: ${debugBody.textContent}`
+  );
+}
+
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
+  .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })
