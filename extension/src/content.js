@@ -9,6 +9,8 @@ const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
+const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
+const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
 const CONTENT_SCRIPT_VERSION = "0.6.32";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -45,6 +47,7 @@ let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
+let lastDetectedSkipReason = "";
 let forceCallSequence = 0;
 
 bootstrapActivation().catch(() => {});
@@ -367,6 +370,7 @@ async function scanForShellCall(options = {}) {
   resetChainForNewHumanPrompt();
 
   const candidate = getLastShellCallCandidate(thread);
+  updateDetectedHelperDebug(candidate);
   if (!candidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
@@ -1869,6 +1873,10 @@ function panelProfileKey() {
   return `${PANEL_PROFILE_PREFIX}${location.origin}`;
 }
 
+function debugProfileKey() {
+  return `${DEBUG_PROFILE_PREFIX}${location.origin}`;
+}
+
 function injectStatus() {
   if (document.getElementById(STATUS_ID)) {
     return;
@@ -1937,6 +1945,28 @@ function injectStatus() {
   }
   panel.appendChild(actions);
 
+  const debugPanel = document.createElement("details");
+  debugPanel.id = "ai-chat-shell-exec-debug";
+  debugPanel.style.cssText = "margin-top:6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;";
+  const debugSummary = document.createElement("summary");
+  debugSummary.textContent = "Detected helper block (debug)";
+  debugSummary.style.cssText = "cursor:pointer;opacity:.85;user-select:none;";
+  const debugBody = document.createElement("pre");
+  debugBody.id = DEBUG_BODY_ID;
+  debugBody.style.cssText = "margin:4px 0 0;padding:6px;background:#0b1220;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;color:#d1d5db;";
+  debugBody.textContent = "(no helper block detected yet)";
+  debugPanel.append(debugSummary, debugBody);
+  panel.appendChild(debugPanel);
+
+  chrome.storage.local.get([debugProfileKey()]).then((stored) => {
+    if (stored[debugProfileKey()]) {
+      debugPanel.open = true;
+    }
+  }).catch(() => {});
+  debugPanel.addEventListener("toggle", () => {
+    chrome.storage.local.set({ [debugProfileKey()]: debugPanel.open }).catch(() => {});
+  });
+
   panel.addEventListener("click", (event) => {
     const button = event.target.closest("[data-shell-tool-action]");
     if (!button) {
@@ -2003,7 +2033,39 @@ function setForceButtonHighlight(highlight) {
 
 function rememberSuppressedCallStatus(status) {
   lastSuppressedCallStatus = String(status || "");
+  lastDetectedSkipReason = lastSuppressedCallStatus;
   setForceButtonHighlight(true);
+}
+
+function updateDetectedHelperDebug(candidate) {
+  const body = document.getElementById(DEBUG_BODY_ID);
+  if (!body) {
+    return;
+  }
+  if (!candidate) {
+    body.textContent = "(no helper block detected)";
+    return;
+  }
+  const call = candidate.call || {};
+  const role = getMessageAuthorRole(candidate.node) || "(unknown)";
+  const cmdPreview = String(call.cmd || call.content || "").slice(0, 800);
+  const lines = [
+    `kind:        ${call.kind || "shell"}`,
+    `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
+    `target:      ${call.target || "(none)"}`,
+    `filename:    ${call.filename || ""}`,
+    `cwd:         ${call.cwd || ""}`,
+    `authorRole:  ${role}`,
+    `source:      ${candidate.source || ""}  index:${candidate.index || ""}`,
+    `semanticKey: ${buildSemanticCallKey(call)}`,
+    `detectedAt:  ${new Date().toISOString()}`,
+    `--- cmd / content (first 800 chars) ---`,
+    cmdPreview || "(empty)"
+  ].filter((line) => line !== "");
+  if (lastDetectedSkipReason) {
+    lines.push(`lastSkippedReason: ${lastDetectedSkipReason}`);
+  }
+  body.textContent = lines.join("\n");
 }
 
 function isSuppressionStatusText(text) {

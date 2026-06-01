@@ -238,7 +238,48 @@ async function verifyForceRunUsesLatestHelper() {
   assert.equal(runCalls[0].call.cmd, "echo NEW_FORCE");
 }
 
+async function verifyDebugPanelUpdates() {
+  const context = loadContentContext();
+  const cmd = "echo DEBUG_TEST";
+  const message = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ target: "%24", cmd })
+  });
+  const root = createRoot([message]);
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+
+  // Mock the debug body element so updateDetectedHelperDebug can write to it
+  const debugBody = { textContent: "" };
+  const origGetElementById = context.document.getElementById;
+  context.document.getElementById = (id) => {
+    if (id === "ai-chat-shell-exec-debug-body") {
+      return debugBody;
+    }
+    return origGetElementById(id);
+  };
+
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async () => {};
+  vm.runInContext("extensionActive = true; activeCallId = ''; initialThreadSettled = true;", context);
+
+  await context.scanForShellCall({ force: true });
+
+  assert.ok(debugBody.textContent.includes("target:"), `debug body should contain 'target:' but got: ${debugBody.textContent}`);
+  assert.ok(debugBody.textContent.includes("--- cmd / content (first 800 chars) ---"), `debug body should contain cmd/content header`);
+  assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);
+}
+
 verifyForceRunUsesLatestHelper()
+  .then(() => verifyDebugPanelUpdates())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })
