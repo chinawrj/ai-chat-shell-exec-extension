@@ -370,7 +370,6 @@ async function scanForShellCall(options = {}) {
   const now = Date.now();
 
   const candidate = getLastShellCallCandidate(thread);
-  updateDetectedHelperDebug(candidate);
 
   if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
