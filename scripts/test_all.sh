@@ -24,6 +24,8 @@ run bash -n \
   scripts/start_shell_server.sh \
   scripts/package_release.sh \
   scripts/open_tmux_test_chrome.sh \
+  scripts/build_macos_vision_helper.sh \
+  scripts/run_terminal_vision_self_test.sh \
   scripts/test_all.sh
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

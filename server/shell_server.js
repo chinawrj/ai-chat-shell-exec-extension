@@ -17,6 +17,7 @@ const MAX_COMMAND_CHARS = 8000;
 const STATE_DIR = path.join(__dirname, "..", ".state");
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
 const BOARD_LOG_DIR = path.join(STATE_DIR, "board-panes");
+const VISION_TMP_DIR = path.join(STATE_DIR, "vision");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
@@ -48,6 +49,12 @@ const HELPER_BOARD_END = "ai-helper-board-end";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const SHELL_RUNNER = process.env.AI_CHAT_SHELL_RUNNER || (fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh");
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
+const DEFAULT_VISION_HELPER_PATH = path.join(STATE_DIR, "bin", "macos-vision-helper");
+const VISION_INPUT_MAX_CHARS = 512;
+const VISION_ALLOWED_KEYS = new Set(["enter", "tab", "escape", "backspace", "page-down", "page-up", "ctrl-c"]);
+const VISION_TMUX_RUN_PREFIX = "AIVR";
+const VISION_TMUX_OCR_RUN_PREFIX = "AIVRRUN";
+const VISION_TMUX_OCR_DONE_PREFIX = "AIVRDONE";
 let serverLedger = loadServerLedger();
 
 const server = http.createServer((req, res) => {
@@ -63,6 +70,8 @@ const server = http.createServer((req, res) => {
       allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
       stateDir: STATE_DIR,
       tmuxSocket: getTmuxSocketPath() || null,
+      visionHelper: getVisionHelperPath(),
+      visionAvailable: getVisionAvailability().available,
       ledgerEntries: Object.keys(serverLedger.calls || {}).length
     }));
     return;
@@ -202,6 +211,10 @@ async function handleMessageText(text) {
 
   if (message.type === "run-board") {
     return handleRunBoardMessage(message);
+  }
+
+  if (String(message.type).startsWith("vision-")) {
+    return handleVisionMessage(message);
   }
 
   if (message.type !== "run") {
@@ -441,6 +454,265 @@ function handleWriteFileMessage(message) {
   return response;
 }
 
+async function handleVisionMessage(message) {
+  try {
+    return await handleVisionMessageInner(message);
+  } catch (error) {
+    if (error instanceof VisionValidationError) {
+      return visionError(error.errorCode, error.message);
+    }
+    return visionError("vision-message-failed", error.message || String(error));
+  }
+}
+
+async function handleVisionMessageInner(message) {
+  const type = String(message.type || "");
+  if (type === "vision-health") {
+    const availability = getVisionAvailability();
+    return {
+      ok: true,
+      platform: os.platform(),
+      helperPath: getVisionHelperPath(),
+      available: availability.available,
+      errorCode: availability.errorCode || "",
+      error: availability.error || ""
+    };
+  }
+
+  if (type === "vision-list-windows") {
+    const args = ["list-windows"];
+    if (message.all) {
+      args.push("--all");
+    }
+    if (message.appName) {
+      args.push("--app", validateVisionAppName(message.appName));
+    }
+    const response = await runVisionHelper(args);
+    return ensureVisionOk(response);
+  }
+
+  if (type === "vision-capture") {
+    const windowId = parseVisionWindowId(message.windowId);
+    const response = await runVisionHelper(["capture", "--window-id", String(windowId)]);
+    return ensureVisionWindowResponse(ensureVisionOk(response), { appName: message.appName || "" });
+  }
+
+  if (type === "vision-ocr") {
+    const imageRef = getVisionImageRef(message);
+    const response = await runVisionHelper(["ocr", "--image", imageRef]);
+    return ensureVisionOk(response);
+  }
+
+  if (type === "vision-type") {
+    const windowId = parseVisionWindowId(message.windowId);
+    const text = validateVisionTextInput(message.text);
+    const response = await runVisionHelper(["type", "--window-id", String(windowId), "--text", text]);
+    return ensureVisionOk(response);
+  }
+
+  if (type === "vision-key") {
+    const windowId = parseVisionWindowId(message.windowId);
+    const key = validateVisionKey(message.key);
+    const response = await runVisionHelper(["key", "--window-id", String(windowId), "--key", key]);
+    return ensureVisionOk(response);
+  }
+
+  if (type === "vision-terminal-self-test") {
+    return runVisionTerminalSelfTest(message);
+  }
+
+  if (type === "vision-tmux-run-line" || type === "vision-tmux-run") {
+    return handleVisionTmuxRunLineMessage(message);
+  }
+
+  if (type === "vision-tmux-ocr-run-line" || type === "vision-visual-run-line") {
+    return handleVisionTmuxOcrRunLineMessage(message);
+  }
+
+  return visionError("unsupported-vision-message", `Unsupported vision message type: ${type}`);
+}
+
+async function handleVisionTmuxOcrRunLineMessage(message) {
+  const cmd = validateVisionTmuxCommand(message.cmd);
+  const windowId = parseVisionWindowId(message.windowId);
+  const timeoutMs = clampNumber(message.timeoutMs, 5000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
+  const maxPages = clampNumber(message.maxPages, 1, 200, 40);
+  const pageDelayMs = clampNumber(message.pageDelayMs, 100, 5000, 500);
+  const result = await runVisionTmuxOcrLine({
+    cmd,
+    windowId,
+    timeoutMs,
+    maxPages,
+    pageDelayMs,
+    appName: message.appName || "",
+    oracleTarget: message.target || message.tmuxTarget || ""
+  });
+  return {
+    ok: result.ok !== false,
+    id: message.id,
+    cmd,
+    windowId,
+    timeoutMs,
+    maxPages,
+    ...result
+  };
+}
+
+async function handleVisionTmuxRunLineMessage(message) {
+  const cmd = validateVisionTmuxCommand(message.cmd);
+  const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
+  const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 1000000, DEFAULT_MAX_OUTPUT_CHARS);
+  const panes = await listTmuxPanes();
+  const target = normalizeTmuxTarget(message.target || message.tmuxTarget || "");
+  if (!target) {
+    return visionError("missing-target", "Missing tmux target for vision tmux run.", { tmuxPanes: panes });
+  }
+
+  const pane = resolveTmuxTarget(target, panes);
+  if (!pane) {
+    return visionError("invalid-target", `Unknown or ambiguous tmux target: ${target}`, { tmuxPanes: panes });
+  }
+
+  const result = await runTmuxVisualLine({
+    cmd,
+    pane,
+    timeoutMs,
+    maxOutputChars
+  });
+  return {
+    ok: result.ok !== false,
+    id: message.id,
+    cmd,
+    target: pane.id,
+    targetName: pane.label,
+    timeoutMs,
+    ...result
+  };
+}
+
+async function runVisionTerminalSelfTest(message) {
+  const started = Date.now();
+  const availability = getVisionAvailability();
+  if (!availability.available) {
+    return visionError(availability.errorCode, availability.error);
+  }
+
+  const panes = await listTmuxPanes();
+  const pane = chooseVisionSelfTestPane(message.target || message.tmuxTarget || "", panes);
+  if (!pane) {
+    return visionError("missing-tmux-pane", "No tmux pane is available for Terminal vision self-test.");
+  }
+
+  await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
+  await sleep(250);
+
+  const token = `AIVIS_${randomOcrSafeToken(8)}`;
+  const titleToken = `${token}_TITLE`;
+  const readyToken = `${token}_READY_TERMINAL_OCR`;
+  const loopToken = `${token}_LOOP_OK`;
+  const timeoutMs = clampNumber(message.timeoutMs, 5000, 60000, 15000);
+  const prepCmd = [
+    `printf '\\033]0;${titleToken}\\007'`,
+    "clear",
+    `printf '${readyToken}\\n'`
+  ].join("; ");
+
+  const cwd = resolveCwd(message.cwd, pane.currentPath);
+  const prep = await runTmuxShell({
+    cmd: prepCmd,
+    cwd,
+    pane,
+    timeoutMs,
+    maxOutputChars: 20000
+  });
+  if (prep.ok === false || prep.exitCode !== 0) {
+    return visionError("tmux-prep-failed", prep.stderr || "Could not prepare the tmux pane for vision self-test.", { prep });
+  }
+
+  const windowInfo = message.windowId
+    ? await getVisionTerminalWindowById(parseVisionWindowId(message.windowId))
+    : await waitForVisionTerminalWindow(titleToken, timeoutMs);
+  if (!windowInfo) {
+    return visionError("terminal-window-not-found", `Could not find a visible Terminal window${message.windowId ? ` with id ${message.windowId}` : ` with title token ${titleToken}`}.`, {
+      titleToken,
+      target: pane.id
+    });
+  }
+
+  const firstCapture = await ensureVisionWindowResponse(ensureVisionOk(await runVisionHelper([
+    "capture",
+    "--window-id",
+    String(windowInfo.windowId)
+  ])));
+  const firstOcr = await ocrVisionCapture(firstCapture);
+  const firstText = visionOcrText(firstOcr);
+  if (!visionTextIncludes(firstText, readyToken)) {
+    return visionError("ocr-ready-token-missing", `OCR did not find ${readyToken}.`, {
+      target: pane.id,
+      window: windowInfo,
+      ocrText: firstText
+    });
+  }
+
+  const typeResponse = ensureVisionOk(await runVisionHelper([
+    "type",
+    "--window-id",
+    String(windowInfo.windowId),
+    "--text",
+    `echo ${loopToken}`
+  ]));
+  const keyResponse = ensureVisionOk(await runVisionHelper([
+    "key",
+    "--window-id",
+    String(windowInfo.windowId),
+    "--key",
+    "enter"
+  ]));
+
+  const tmuxText = await waitForTmuxPaneText(pane.id, loopToken, timeoutMs);
+  if (!visionTextIncludes(tmuxText, loopToken)) {
+    return visionError("tmux-input-token-missing", `tmux did not observe typed token ${loopToken}.`, {
+      target: pane.id,
+      window: windowInfo,
+      typed: typeResponse,
+      key: keyResponse,
+      tmuxText
+    });
+  }
+
+  const secondCapture = await ensureVisionWindowResponse(ensureVisionOk(await runVisionHelper([
+    "capture",
+    "--window-id",
+    String(windowInfo.windowId)
+  ])));
+  const secondOcr = await ocrVisionCapture(secondCapture);
+  const secondText = visionOcrText(secondOcr);
+  if (!visionTextIncludes(secondText, loopToken)) {
+    return visionError("ocr-loop-token-missing", `OCR did not find typed token ${loopToken}.`, {
+      target: pane.id,
+      window: windowInfo,
+      ocrText: secondText,
+      tmuxText
+    });
+  }
+
+  return {
+    ok: true,
+    target: pane.id,
+    targetName: pane.label,
+    window: windowInfo,
+    tokens: {
+      title: titleToken,
+      ready: readyToken,
+      loop: loopToken
+    },
+    typed: typeResponse,
+    key: keyResponse,
+    ocrText: secondText,
+    durationMs: Date.now() - started
+  };
+}
+
 function writeDownloadsFile(filename, content, downloadsDir = path.join(os.homedir(), "Downloads")) {
   const filePath = resolveDownloadsFilePath(filename, downloadsDir);
   fs.mkdirSync(downloadsDir, { recursive: true });
@@ -635,6 +907,21 @@ function validateBoardCommand(cmd) {
   validateCommand(normalized);
 }
 
+function validateVisionTmuxCommand(cmd) {
+  const normalized = String(cmd || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!normalized) {
+    throw new VisionValidationError("missing-command", "Missing vision tmux command.");
+  }
+  if (normalized.includes("\n")) {
+    throw new VisionValidationError("multiline-command", "Vision tmux run supports exactly one command line.");
+  }
+  if (normalized.length > MAX_COMMAND_CHARS) {
+    throw new VisionValidationError("command-too-long", `Vision tmux command is too long (${normalized.length} chars, max ${MAX_COMMAND_CHARS}).`);
+  }
+  validateCommand(normalized);
+  return normalized;
+}
+
 async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   const runId = crypto.randomBytes(8).toString("hex");
   const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
@@ -769,6 +1056,393 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
       }
     }
   }
+}
+
+async function runTmuxVisualLine({ cmd, pane, timeoutMs, maxOutputChars }) {
+  const started = Date.now();
+  const runId = randomOcrSafeToken(8);
+  const runWindowName = `${VISION_TMUX_RUN_PREFIX}_RUN_${runId}`;
+  const donePrefix = `${VISION_TMUX_RUN_PREFIX}_DONE_${runId}_`;
+  const runLine = buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix });
+
+  await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
+  await sleep(150);
+  await runTmuxCommand(["send-keys", "-t", pane.id, "C-l"], { timeoutMs: 5000 });
+  await runTmuxCommand(["clear-history", "-t", pane.id], { timeoutMs: 5000 });
+  await runTmuxCommand(["rename-window", "-t", pane.id, runWindowName], { timeoutMs: 5000 });
+  await runTmuxCommand(["send-keys", "-t", pane.id, "-l", runLine], { timeoutMs: 5000 });
+  await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
+
+  const done = await waitForTmuxWindowDone({
+    target: pane.id,
+    donePrefix,
+    timeoutMs
+  });
+  const terminalText = await captureTmuxPane(pane.id, maxOutputChars);
+  const parsed = parseTmuxVisualDoneWindowName(done.windowName, donePrefix);
+  const lineCount = terminalText ? terminalText.split("\n").length : 0;
+  const charCount = terminalText.length;
+
+  return {
+    ok: done.found,
+    runId,
+    runWindowName,
+    doneWindowName: done.windowName,
+    exitCode: done.found ? parsed.exitCode : 124,
+    terminalText,
+    lineCount,
+    charCount,
+    truncated: done.truncated || charCount >= maxOutputChars,
+    timedOut: !done.found,
+    stderr: done.found ? "" : "Timed out waiting for tmux window done marker. The command may still be running in the target pane.",
+    durationMs: Date.now() - started
+  };
+}
+
+async function runVisionTmuxOcrLine({ cmd, windowId, timeoutMs, maxPages, pageDelayMs, appName = "", oracleTarget = "" }) {
+  const started = Date.now();
+  if (appName) {
+    const matched = await getVisionWindowById(windowId, { appName });
+    if (!matched) {
+      return visionError("unexpected-window-app", `Could not find visible target window ${windowId} for app ${validateVisionAppName(appName)}.`, {
+        windowId,
+        appName
+      });
+    }
+  }
+  const runId = randomOcrSafeToken(8);
+  const runWindowName = `${VISION_TMUX_OCR_RUN_PREFIX}${runId}`;
+  const donePrefix = `${VISION_TMUX_OCR_DONE_PREFIX}${runId}`;
+  const runLine = buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix });
+
+  await typeVisionText(windowId, runLine);
+  await pressVisionKey(windowId, "enter");
+
+  const done = await waitForVisionDoneMarker({
+    windowId,
+    donePrefix,
+    timeoutMs
+  });
+  if (!done.found) {
+    return visionError("ocr-done-marker-timeout", "Timed out waiting for OCR to observe tmux done window marker.", {
+      runId,
+      runWindowName,
+      donePrefix,
+      lastOcrText: done.text,
+      lastStatusText: done.statusText || "",
+      durationMs: Date.now() - started
+    });
+  }
+
+  await enterTmuxCopyModeAtHistoryTop(windowId);
+  await sleep(pageDelayMs);
+
+  const pages = await readVisionOcrPages({
+    windowId,
+    maxPages,
+    pageDelayMs
+  });
+  await pressVisionKey(windowId, "escape").catch(() => null);
+
+  const ocrRawText = pages.map((page) => page.text).join("\n");
+  const cleanedPageTexts = pages.map((page) => cleanVisionTmuxOcrText(page.text, donePrefix));
+  const ocrText = cleanVisionTmuxOcrText(stitchOcrPages(cleanedPageTexts), donePrefix);
+  const parsed = parseVisionDoneFromText(done.statusText || done.text, donePrefix);
+  const oracleText = oracleTarget ? await captureTmuxPaneText(oracleTarget).catch(() => "") : "";
+
+  return {
+    ok: true,
+    runId,
+    runWindowName,
+    donePrefix,
+    doneOcrText: done.text,
+    doneWindowName: parsed.doneWindowName,
+    exitCode: parsed.exitCode,
+    ocrText,
+    ocrRawText,
+    ocrPages: pages,
+    ocrLineCount: ocrText ? ocrText.split("\n").length : 0,
+    oracleText,
+    durationMs: Date.now() - started
+  };
+}
+
+function buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix }) {
+  return [
+    `tmux rename-window ${shellQuote(runWindowName)}`,
+    "clear",
+    "tmux clear-history",
+    "printf '\\n'",
+    `( ${cmd} )`,
+    "__AI_VISION_EXIT_CODE=$?",
+    `tmux rename-window \"${donePrefix}\${__AI_VISION_EXIT_CODE}\"`
+  ].join("; ");
+}
+
+function buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix }) {
+  return [
+    `tmux rename-window ${shellQuote(runWindowName)}`,
+    `/bin/sh -c ${shellQuote(cmd)}`,
+    "__AI_VISION_EXIT_CODE=$?",
+    `tmux rename-window \"${donePrefix}\${__AI_VISION_EXIT_CODE}\"`
+  ].join("; ");
+}
+
+async function waitForTmuxWindowDone({ target, donePrefix, timeoutMs }) {
+  const started = Date.now();
+  let lastWindowName = "";
+  while (Date.now() - started < timeoutMs) {
+    await sleep(TMUX_POLL_INTERVAL_MS);
+    lastWindowName = await getTmuxWindowName(target);
+    if (lastWindowName.startsWith(donePrefix)) {
+      return {
+        found: true,
+        windowName: lastWindowName,
+        truncated: false
+      };
+    }
+  }
+  return {
+    found: false,
+    windowName: lastWindowName,
+    truncated: false
+  };
+}
+
+async function getTmuxWindowName(target) {
+  const result = await runTmuxCommand(["display-message", "-p", "-t", target, "#{window_name}"], { timeoutMs: 5000 });
+  return String(result.stdout || "").trim();
+}
+
+function parseTmuxVisualDoneWindowName(windowName, donePrefix) {
+  const raw = String(windowName || "");
+  if (!raw.startsWith(donePrefix)) {
+    return {
+      exitCode: 124
+    };
+  }
+  const suffix = raw.slice(donePrefix.length);
+  const exitCode = Number(suffix);
+  return {
+    exitCode: Number.isInteger(exitCode) ? exitCode : 124
+  };
+}
+
+async function typeVisionText(windowId, text) {
+  const value = String(text || "");
+  if (!value) {
+    return;
+  }
+  const chunkSize = VISION_INPUT_MAX_CHARS;
+  for (let index = 0; index < value.length; index += chunkSize) {
+    const chunk = value.slice(index, index + chunkSize);
+    validateVisionTextInput(chunk);
+    const response = await runVisionHelper(["type", "--window-id", String(windowId), "--text", chunk]);
+    const checked = ensureVisionOk(response);
+    if (checked.ok === false) {
+      throw new VisionValidationError(checked.errorCode || "vision-type-failed", checked.error || "Vision typing failed.");
+    }
+  }
+}
+
+async function pressVisionKey(windowId, key) {
+  const normalized = validateVisionKey(key);
+  const response = await runVisionHelper(["key", "--window-id", String(windowId), "--key", normalized]);
+  const checked = ensureVisionOk(response);
+  if (checked.ok === false) {
+    throw new VisionValidationError(checked.errorCode || "vision-key-failed", checked.error || "Vision key input failed.");
+  }
+  return checked;
+}
+
+async function enterTmuxCopyModeAtHistoryTop(windowId) {
+  await typeVisionText(windowId, "tmux copy-mode \\; send-keys -X history-top");
+  await pressVisionKey(windowId, "enter");
+}
+
+async function captureVisionOcrText(windowId) {
+  const capture = ensureVisionWindowResponse(ensureVisionOk(await runVisionHelper([
+    "capture",
+    "--window-id",
+    String(windowId)
+  ])));
+  if (capture.ok === false) {
+    return capture;
+  }
+  const ocr = await ocrVisionCapture(capture);
+  if (ocr.ok === false) {
+    return ocr;
+  }
+  return {
+    ok: true,
+    capture,
+    ocr,
+    text: visionOcrText(ocr),
+    outputText: visionOcrOutputText(ocr),
+    statusText: visionOcrStatusText(ocr),
+    rows: visionOcrRows(ocr)
+  };
+}
+
+async function waitForVisionDoneMarker({ windowId, donePrefix, timeoutMs }) {
+  const started = Date.now();
+  let lastText = "";
+  let lastStatusText = "";
+  while (Date.now() - started < timeoutMs) {
+    await sleep(500);
+    const captured = await captureVisionOcrText(windowId);
+    if (captured.ok === false) {
+      lastText = captured.error || "";
+      lastStatusText = "";
+      continue;
+    }
+    lastText = captured.text;
+    lastStatusText = captured.statusText || "";
+    if (visionTextIncludes(captured.statusText, donePrefix)) {
+      return {
+        found: true,
+        text: lastText,
+        statusText: captured.statusText,
+        ocr: captured.ocr
+      };
+    }
+  }
+  return {
+    found: false,
+    text: lastText,
+    statusText: lastStatusText
+  };
+}
+
+async function readVisionOcrPages({ windowId, maxPages, pageDelayMs }) {
+  const pages = [];
+  let previousSignature = "";
+  for (let index = 0; index < maxPages; index += 1) {
+    const captured = await captureVisionOcrText(windowId);
+    if (captured.ok === false) {
+      pages.push({
+        page: index + 1,
+        ok: false,
+        errorCode: captured.errorCode || "ocr-page-failed",
+        error: captured.error || "Could not OCR page."
+      });
+      break;
+    }
+    const pageText = captured.outputText || captured.text;
+    const signature = normalizeOcrPageSignature(pageText);
+    if (index > 0 && signature && signature === previousSignature) {
+      break;
+    }
+    pages.push({
+      page: index + 1,
+      ok: true,
+      text: pageText,
+      rawText: captured.text,
+      statusText: captured.statusText,
+      signature,
+      results: captured.ocr.results || []
+    });
+    previousSignature = signature;
+    await pressVisionKey(windowId, "page-down");
+    await sleep(pageDelayMs);
+  }
+  return pages;
+}
+
+function normalizeOcrPageSignature(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stitchOcrPages(pageTexts) {
+  const stitched = [];
+  for (const pageText of pageTexts) {
+    const lines = String(pageText || "")
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => line.trim());
+    const overlap = findLineOverlap(stitched, lines, 120);
+    stitched.push(...lines.slice(overlap));
+  }
+  return stitched.join("\n");
+}
+
+function cleanVisionTmuxOcrText(text, donePrefix = "") {
+  const doneToken = normalizeOcrTokenText(donePrefix);
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      return String(line || "")
+        .replace(/\s+$/, "")
+        .replace(/(?:\s{2,}\[\d+\/\d+\]|\[\d+\/\d+\])$/, "")
+        .trimEnd();
+    })
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return false;
+      }
+      const normalized = normalizeOcrTokenText(trimmed);
+      if (doneToken && normalized.includes(doneToken)) {
+        return false;
+      }
+      if (normalized.includes(VISION_TMUX_OCR_RUN_PREFIX) || normalized.includes(VISION_TMUX_OCR_DONE_PREFIX)) {
+        return false;
+      }
+      if (/tmux\s+copy-mode/i.test(trimmed) || /^\s*-X\s+history-top\b/i.test(trimmed)) {
+        return false;
+      }
+      if (/tmux attach-session/.test(trimmed) && /—|-/.test(trimmed)) {
+        return false;
+      }
+      return true;
+    })
+    .join("\n");
+}
+
+function findLineOverlap(existing, next, maxLines) {
+  const limit = Math.min(maxLines, existing.length, next.length);
+  for (let count = limit; count > 0; count -= 1) {
+    let matches = true;
+    for (let index = 0; index < count; index += 1) {
+      if (normalizeOcrComparableLine(existing[existing.length - count + index]) !== normalizeOcrComparableLine(next[index])) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return count;
+    }
+  }
+  return 0;
+}
+
+function normalizeOcrComparableLine(line) {
+  return String(line || "").replace(/\s+/g, " ").trim();
+}
+
+function parseVisionDoneFromText(text, donePrefix) {
+  const compact = normalizeOcrTokenText(text);
+  const compactPrefix = normalizeOcrTokenText(donePrefix);
+  const index = compact.indexOf(compactPrefix);
+  if (index < 0) {
+    return {
+      doneWindowName: "",
+      exitCode: 124
+    };
+  }
+  const after = compact.slice(index + compactPrefix.length);
+  const match = after.match(/^(\d{1,3})/);
+  const exitCode = match ? Number(match[1]) : 0;
+  return {
+    doneWindowName: `${donePrefix}${Number.isInteger(exitCode) ? exitCode : ""}`,
+    exitCode: Number.isInteger(exitCode) ? exitCode : 0
+  };
 }
 
 function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }) {
@@ -945,7 +1619,7 @@ function buildTmuxTargetExample(panes, cmd = "pwd") {
   ].join("\n");
 }
 
-async function captureTmuxPane(target) {
+async function captureTmuxPane(target, maxOutputChars = 1000000) {
   const result = await runTmuxCommand([
     "capture-pane",
     "-p",
@@ -955,7 +1629,7 @@ async function captureTmuxPane(target) {
     "-t",
     target
   ], { timeoutMs: 5000 });
-  return result.stdout;
+  return appendLimited("", result.stdout, maxOutputChars);
 }
 
 function getBoardTimingConfig() {
@@ -1300,6 +1974,442 @@ function getEnvClampedNumber(name, min, max, fallback) {
   return clampNumber(process.env[name], min, max, fallback);
 }
 
+function getVisionHelperPath() {
+  return process.env.AI_CHAT_SHELL_VISION_HELPER || DEFAULT_VISION_HELPER_PATH;
+}
+
+function getVisionAvailability() {
+  const helperPath = getVisionHelperPath();
+  const helperOverride = Boolean(process.env.AI_CHAT_SHELL_VISION_HELPER);
+  if (os.platform() !== "darwin" && !helperOverride) {
+    return {
+      available: false,
+      errorCode: "non-macos",
+      error: "macOS vision control is only available on macOS."
+    };
+  }
+  if (!fs.existsSync(helperPath)) {
+    return {
+      available: false,
+      errorCode: "helper-missing",
+      error: `macOS vision helper is not built at ${helperPath}. Run ./scripts/build_macos_vision_helper.sh.`
+    };
+  }
+  return {
+    available: true,
+    helperPath
+  };
+}
+
+function parseVisionWindowId(value) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) {
+    throw new VisionValidationError("invalid-window-id", "Missing or invalid windowId.");
+  }
+  return number;
+}
+
+function validateVisionAppName(value) {
+  const appName = String(value || "").trim();
+  if (!appName) {
+    throw new VisionValidationError("invalid-app-name", "Missing appName.");
+  }
+  if (appName.length > 128 || /[\x00-\x1f\x7f]/.test(appName)) {
+    throw new VisionValidationError("invalid-app-name", "Vision appName is invalid.");
+  }
+  return appName;
+}
+
+function validateVisionTextInput(value) {
+  const text = String(value || "");
+  if (!text) {
+    throw new VisionValidationError("invalid-text", "Missing text.");
+  }
+  if (text.length > VISION_INPUT_MAX_CHARS) {
+    throw new VisionValidationError("input-too-long", `Vision text input is too long (${text.length} chars, max ${VISION_INPUT_MAX_CHARS}).`);
+  }
+  if (/[\x00-\x1f\x7f]/.test(text)) {
+    throw new VisionValidationError("unsafe-control-char", "Vision text input must not contain control characters. Use vision-key for Enter, Tab, Escape, Backspace, PageDown, PageUp, or Ctrl-C.");
+  }
+  return text;
+}
+
+function validateVisionKey(value) {
+  const key = String(value || "").toLowerCase();
+  if (!VISION_ALLOWED_KEYS.has(key)) {
+    throw new VisionValidationError("invalid-key", `Unsupported vision key: ${value || ""}.`);
+  }
+  return key;
+}
+
+function getVisionImageRef(message) {
+  if (message.imagePath) {
+    return String(message.imagePath);
+  }
+  const base64 = message.imageBase64 || message.image?.base64 || message.image || "";
+  if (!base64) {
+    throw new VisionValidationError("invalid-image", "Missing imagePath, imageBase64, or image.base64.");
+  }
+  fs.mkdirSync(VISION_TMP_DIR, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(VISION_TMP_DIR, "ocr-"));
+  const imagePath = path.join(dir, "input.png");
+  const text = String(base64);
+  const stripped = text.includes(",") && text.slice(0, text.indexOf(",")).includes("base64")
+    ? text.slice(text.indexOf(",") + 1)
+    : text;
+  fs.writeFileSync(imagePath, Buffer.from(stripped, "base64"));
+  return imagePath;
+}
+
+function ensureVisionOk(response) {
+  if (!response || response.ok === false) {
+    return {
+      ok: false,
+      errorCode: response?.errorCode || "vision-helper-failed",
+      error: response?.error || "macOS vision helper failed.",
+      ...response
+    };
+  }
+  return response;
+}
+
+function ensureVisionWindowResponse(response, { appName = "" } = {}) {
+  if (response.ok === false) {
+    return response;
+  }
+  if (!response.window && !response.windowId && !response.appName) {
+    return visionError("invalid-window-response", "macOS vision helper did not return target window metadata.", { response });
+  }
+  const windowInfo = response.window || response;
+  const expectedAppName = appName ? validateVisionAppName(appName) : "";
+  if (expectedAppName && windowInfo.appName !== expectedAppName) {
+    return visionError("unexpected-window-app", `Target window belongs to ${windowInfo.appName || "(unknown)"}, not ${expectedAppName}.`, { window: windowInfo });
+  }
+  return response;
+}
+
+async function runVisionHelper(args, { timeoutMs = 15000, maxOutputChars = 0 } = {}) {
+  const availability = getVisionAvailability();
+  if (!availability.available) {
+    return visionError(availability.errorCode, availability.error);
+  }
+  const outputLimit = maxOutputChars || (args[0] === "capture" ? 25 * 1024 * 1024 : 1000000);
+  const result = await runCommandRaw(getVisionHelperPath(), args, { timeoutMs, maxOutputChars: outputLimit });
+  const stdout = String(result.stdout || "").trim();
+  let parsed;
+  try {
+    parsed = stdout ? JSON.parse(stdout) : {};
+  } catch {
+    return visionError("invalid-helper-json", "macOS vision helper returned invalid JSON.", {
+      stdout: stdout.slice(0, 2000),
+      stderr: String(result.stderr || "").slice(0, 2000),
+      exitCode: result.exitCode,
+      timedOut: result.timedOut
+    });
+  }
+  if (result.timedOut) {
+    return visionError("helper-timeout", "macOS vision helper timed out.", parsed);
+  }
+  if (result.exitCode !== 0 || parsed.ok === false) {
+    return {
+      ok: false,
+      errorCode: parsed.errorCode || "vision-helper-failed",
+      error: parsed.error || result.stderr || `macOS vision helper exited with ${result.exitCode}.`,
+      exitCode: result.exitCode,
+      ...parsed
+    };
+  }
+  return parsed;
+}
+
+function visionError(errorCode, error, extra = {}) {
+  return {
+    ok: false,
+    errorCode: errorCode || "vision-error",
+    error: error || "Vision control failed.",
+    ...extra
+  };
+}
+
+class VisionValidationError extends Error {
+  constructor(errorCode, message) {
+    super(message);
+    this.errorCode = errorCode;
+  }
+}
+
+function chooseVisionSelfTestPane(target, panes) {
+  if (target) {
+    return resolveTmuxTarget(normalizeTmuxTarget(target), panes);
+  }
+  return panes.find((pane) => pane.active) || panes[0] || null;
+}
+
+function randomOcrSafeToken(length) {
+  const alphabet = "ACEFHJKLMNPRTUVWXYZ";
+  const bytes = crypto.randomBytes(length);
+  let token = "";
+  for (let index = 0; index < length; index += 1) {
+    token += alphabet[bytes[index] % alphabet.length];
+  }
+  return token;
+}
+
+async function waitForVisionTerminalWindow(titleToken, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const listed = ensureVisionOk(await runVisionHelper(["list-windows"], { timeoutMs: 5000 }));
+    if (listed.ok === false) {
+      return null;
+    }
+    const windows = Array.isArray(listed.windows) ? listed.windows : [];
+    const matched = windows.find((windowInfo) => {
+      return windowInfo?.appName === "Terminal" && String(windowInfo.title || "").includes(titleToken);
+    });
+    if (matched) {
+      return matched;
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function getVisionTerminalWindowById(windowId) {
+  return getVisionWindowById(windowId, { appName: "Terminal" });
+}
+
+async function getVisionWindowById(windowId, { appName = "" } = {}) {
+  const args = ["list-windows"];
+  if (appName) {
+    args.push("--app", validateVisionAppName(appName));
+  }
+  const listed = ensureVisionOk(await runVisionHelper(args, { timeoutMs: 5000 }));
+  if (listed.ok === false) {
+    return null;
+  }
+  const windows = Array.isArray(listed.windows) ? listed.windows : [];
+  return windows.find((windowInfo) => {
+    return Number(windowInfo?.windowId) === Number(windowId)
+      && (!appName || windowInfo?.appName === appName);
+  }) || null;
+}
+
+async function ocrVisionCapture(captureResponse) {
+  const base64 = captureResponse?.image?.base64 || "";
+  if (!base64) {
+    return visionError("capture-missing-image", "Vision capture did not include an image.");
+  }
+  return ensureVisionOk(await runVisionHelper(["ocr", "--image", getVisionImageRef({ imageBase64: base64 })]));
+}
+
+function visionOcrText(ocrResponse) {
+  return visionOcrRows(ocrResponse).map((row) => row.text).join("\n");
+}
+
+function visionOcrStatusText(ocrResponse) {
+  const rows = visionOcrRows(ocrResponse);
+  if (!rows.length) {
+    return "";
+  }
+  const imageHeight = Number(ocrResponse?.image?.height || 0);
+  const bottomRows = imageHeight > 0
+    ? rows.filter((row) => row.centerY >= imageHeight * 0.82)
+    : [];
+  const candidates = bottomRows.length ? bottomRows : rows.slice(-3);
+  return candidates.map((row) => row.text).join("\n");
+}
+
+function visionOcrOutputText(ocrResponse) {
+  const rows = visionOcrRows(ocrResponse);
+  if (!rows.length) {
+    return "";
+  }
+  const imageWidth = Number(ocrResponse?.image?.width || 0);
+  const imageHeight = Number(ocrResponse?.image?.height || 0);
+  const topOverlayY = imageHeight > 0 ? Math.max(180, imageHeight * 0.085) : 180;
+  const bottomStatusY = imageHeight > 0 ? imageHeight * 0.94 : Number.POSITIVE_INFINITY;
+
+  return rows
+    .map((row) => {
+      const items = Array.isArray(row.items) && row.items.length ? row.items : [row];
+      const keptItems = items.filter((item) => {
+        const text = String(item.text || "").trim();
+        if (!text) {
+          return false;
+        }
+        if (
+          imageHeight > 0
+          && item.centerY >= bottomStatusY
+          && (/^\[/.test(text) || /\d{1,2}:\d{2}\s+\d{2}-[A-Za-z]{3}-\d{2}/.test(text))
+        ) {
+          return false;
+        }
+        if (
+          imageHeight > 1000
+          && item.centerY <= Math.max(140, imageHeight * 0.07)
+          && item.x > 50
+          && /^tmux\b/i.test(text)
+        ) {
+          return false;
+        }
+        if (
+          imageWidth > 0
+          && imageHeight > 1000
+          && item.centerY <= topOverlayY
+          && item.x >= imageWidth * 0.45
+          && /^\d{1,2}:\d{2}(?::\d{2})?(?:\s+\[\d+\/\d+\])?$/.test(text)
+        ) {
+          return false;
+        }
+        return true;
+      });
+      return visionOcrRowText(keptItems.sort((a, b) => a.x - b.x));
+    })
+    .filter((text) => text.trim())
+    .join("\n");
+}
+
+function visionOcrRows(ocrResponse) {
+  if (!ocrResponse || ocrResponse.ok === false || !Array.isArray(ocrResponse.results)) {
+    return [];
+  }
+
+  const items = ocrResponse.results
+    .map(normalizeVisionOcrItem)
+    .filter(Boolean)
+    .sort((a, b) => a.centerY - b.centerY || a.x - b.x);
+  if (!items.length) {
+    return [];
+  }
+
+  const heights = items.map((item) => item.height).filter((height) => height > 0);
+  const medianHeight = medianNumber(heights) || 12;
+  const rows = [];
+  for (const item of items) {
+    const row = rows.find((candidate) => {
+      const tolerance = Math.max(4, medianHeight * 0.65, Math.max(candidate.height, item.height) * 0.6);
+      return Math.abs(candidate.centerY - item.centerY) <= tolerance;
+    });
+    if (row) {
+      row.items.push(item);
+      row.minY = Math.min(row.minY, item.y);
+      row.maxY = Math.max(row.maxY, item.y + item.height);
+      row.height = Math.max(row.height, item.height);
+      row.centerY = row.items.reduce((sum, value) => sum + value.centerY, 0) / row.items.length;
+    } else {
+      rows.push({
+        items: [item],
+        minY: item.y,
+        maxY: item.y + item.height,
+        height: item.height,
+        centerY: item.centerY
+      });
+    }
+  }
+
+  return rows
+    .sort((a, b) => a.centerY - b.centerY)
+    .map((row) => {
+      const sortedItems = row.items.sort((a, b) => a.x - b.x);
+      return {
+        x: sortedItems[0]?.x || 0,
+        y: row.minY,
+        width: sortedItems.reduce((max, item) => Math.max(max, item.x + item.width), 0) - (sortedItems[0]?.x || 0),
+        height: row.maxY - row.minY,
+        centerY: row.centerY,
+        text: visionOcrRowText(sortedItems),
+        items: sortedItems
+      };
+    })
+    .filter((row) => row.text);
+}
+
+function normalizeVisionOcrItem(item) {
+  const text = String(item?.text || "").replace(/\s+/g, " ").trim();
+  const bbox = item?.bbox || {};
+  const x = Number(bbox.x);
+  const y = Number(bbox.y);
+  const width = Number(bbox.width);
+  const height = Number(bbox.height);
+  if (!text || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+  return {
+    text,
+    x,
+    y,
+    width: Math.max(0, width),
+    height: Math.max(0, height),
+    centerY: y + Math.max(0, height) / 2
+  };
+}
+
+function visionOcrRowText(items) {
+  if (!items.length) {
+    return "";
+  }
+  const charWidths = items
+    .map((item) => item.width / Math.max(1, item.text.length))
+    .filter((width) => Number.isFinite(width) && width > 0);
+  const medianCharWidth = medianNumber(charWidths) || 8;
+  let text = "";
+  let previous = null;
+  for (const item of items) {
+    if (previous) {
+      const gap = item.x - (previous.x + previous.width);
+      if (gap > medianCharWidth * 1.5) {
+        const spaces = Math.max(1, Math.min(12, Math.round(gap / medianCharWidth)));
+        text += " ".repeat(spaces);
+      } else if (gap > 1 && text && !text.endsWith(" ")) {
+        text += " ";
+      }
+    }
+    text += item.text;
+    previous = item;
+  }
+  return text.trimEnd();
+}
+
+function medianNumber(values) {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const midpoint = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) {
+    return sorted[midpoint];
+  }
+  return (sorted[midpoint - 1] + sorted[midpoint]) / 2;
+}
+
+function visionTextIncludes(text, token) {
+  const compactText = normalizeOcrTokenText(text);
+  const compactToken = normalizeOcrTokenText(token);
+  return compactText.includes(compactToken);
+}
+
+function normalizeOcrTokenText(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+async function waitForTmuxPaneText(target, needle, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastText = "";
+  while (Date.now() < deadline) {
+    lastText = await captureTmuxPaneText(target);
+    if (visionTextIncludes(lastText, needle)) {
+      return lastText;
+    }
+    await sleep(250);
+  }
+  return lastText;
+}
+
+async function captureTmuxPaneText(target) {
+  const result = await runTmuxCommand(["capture-pane", "-p", "-J", "-S", "-200", "-t", target], { timeoutMs: 5000 });
+  return result.stdout || "";
+}
+
 function runTmuxCommand(args, options) {
   return runCommand("tmux", buildTmuxCommandArgs(args), options);
 }
@@ -1378,7 +2488,7 @@ function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars 
   };
 }
 
-function runCommand(command, args, { timeoutMs = 5000 } = {}) {
+function runCommandRaw(command, args, { timeoutMs = 5000, maxOutputChars = 1000000 } = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       env: process.env,
@@ -1396,11 +2506,11 @@ function runCommand(command, args, { timeoutMs = 5000 } = {}) {
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk.toString("utf8"), 1000000);
+      stdout = appendLimited(stdout, chunk.toString("utf8"), maxOutputChars);
     });
 
     child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk.toString("utf8"), 1000000);
+      stderr = appendLimited(stderr, chunk.toString("utf8"), maxOutputChars);
     });
 
     child.on("error", (error) => {
@@ -1414,7 +2524,11 @@ function runCommand(command, args, { timeoutMs = 5000 } = {}) {
       const exitCode = Number.isInteger(code) ? code : 128;
       resolve({ ok: exitCode === 0 && !timedOut, stdout, stderr, exitCode, signal, timedOut });
     });
-  }).then((result) => {
+  });
+}
+
+function runCommand(command, args, { timeoutMs = 5000 } = {}) {
+  return runCommandRaw(command, args, { timeoutMs }).then((result) => {
     if (!result.ok) {
       const detail = result.stderr || `${command} ${args.join(" ")} exited with ${result.exitCode}`;
       throw new Error(detail.trim());
@@ -1584,6 +2698,7 @@ module.exports = {
   buildBoardTargetErrorResponse,
   buildTmuxCommandArgs,
   buildMissingTargetResponse,
+  cleanVisionTmuxOcrText,
   decodeTextFrames,
   detectDefaultTmuxSocketPath,
   encodeTextFrame,
@@ -1591,6 +2706,9 @@ module.exports = {
   extractTmuxRunOutput,
   getTmuxEnvSocketPath,
   getTmuxSocketPath,
+  getVisionAvailability,
+  getVisionHelperPath,
+  handleVisionMessage,
   listTmuxPanes,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
@@ -1599,9 +2717,21 @@ module.exports = {
   resolveBoardPane,
   resolveDownloadsFilePath,
   resolveTmuxTarget,
+  runVisionTmuxOcrLine,
+  runTmuxVisualLine,
   runTmuxBoard,
   runTmuxShell,
   startServer,
+  stitchOcrPages,
   validateBoardCommand,
+  validateVisionAppName,
+  validateVisionTmuxCommand,
+  validateVisionKey,
+  validateVisionTextInput,
+  visionOcrOutputText,
+  visionOcrRows,
+  visionOcrStatusText,
+  visionOcrText,
+  visionTextIncludes,
   writeDownloadsFile
 };
