@@ -6,15 +6,14 @@ This is local remote-code execution for AI chat. Install it only on machines you
 
 With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes three helper block types:
 
-- Shell helper: request local terminal output from a selected tmux target.
-- Board helper: send one command line to the configured board tmux pane.
+- Shell helper: request local terminal output from the default `ForAI` tmux session, or from an explicit tmux target.
+- Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
 - File helper: write one file under `$HOME/Downloads`.
 
 Shell helper:
 
 ````
 ai-helper-shell-start
-%24
 pwd && ls -la
 ai-helper-shell-end
 ````
@@ -37,7 +36,7 @@ second line
 ai-helper-file-end
 ````
 
-The shell helper's second line is the tmux target and the remaining lines are the command. The board helper body is exactly one command line; the default board target is the unique tmux window named `board`, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
+By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
 
@@ -125,7 +124,6 @@ When output would help, reply with exactly one fenced code block and no prose.
 For local terminal output, use:
 ````
 ai-helper-shell-start
-target here
 command here
 ai-helper-shell-end
 ````
@@ -147,7 +145,7 @@ ai-helper-file-end
 
 Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
-- Shell helpers must put the tmux target on the second line.
+- Shell helpers may omit the tmux target; omitted targets run in the default `ForAI` `host` window.
 - Board helpers must contain exactly one non-empty board command line and no target.
 - File helpers must put a single file name, not a path, on the second line.
 - If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
@@ -161,7 +159,7 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 - enabled/paused
 - auto-enabled sites
-- available tmux targets to put on the second line of an ai-helper shell block
+- available tmux targets for optional explicit shell targeting
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -191,12 +189,13 @@ Plain command blocks are rejected because the server no longer chooses a shell b
 
 ````
 ai-helper-shell-start
-%24
 uname -a
 ai-helper-shell-end
 ````
 
-`target` can be a tmux pane id such as `%24`, a `session:window.pane` address such as `espcam:0.0`, or a unique window name such as `build`.
+The default target is the `host` window in the `ForAI` tmux session. The local server ensures `ForAI`, `host`, and `board` exist before listing targets or running a shell helper.
+
+To use a non-default target, put it on the second line and put the command on the following lines. `target` can be a tmux pane id such as `%24`, a `session:window.pane` address such as `ForAI:0.0`, or a unique window name such as `host`.
 
 When the extension returns a target list, each line is formatted for the AI to read, for example `target=%24 address=espcam:0.0 window=build command=zsh cwd=/path active=true`. Choose the `target=` value that matches the desired `window=...`.
 
@@ -204,21 +203,20 @@ Keep AI requests minimal by default:
 
 ````
 ai-helper-shell-start
-%24
 git status --short
 ai-helper-shell-end
 ````
 
-If the desired window name is unique, this also works:
+If you want to be explicit, this also works:
 
 ````
 ai-helper-shell-start
-build
+host
 git status --short
 ai-helper-shell-end
 ````
 
-The shell helper format maps only the second line to `target` and the remaining body to `cmd`. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
+For single-line default commands, the helper body is the command. For explicit targets or multiline commands, the helper format maps the second line to `target` and the remaining body to `cmd`; use a blank target line to keep the default target with a multiline command. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
 
 For board output, use:
 
@@ -228,7 +226,7 @@ version
 ai-helper-board-end
 ````
 
-The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the unique tmux window named `board`. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
+The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the `board` window in the `ForAI` tmux session. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
 
 The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
 
@@ -259,8 +257,8 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 ## Safety Defaults
 
 - The extension runs only explicit shell, board, and file helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
-- Every shell helper command must name a tmux target. Missing or unknown targets are rejected and the reply lists available panes.
-- Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or the unique tmux window named `board`, and the server refuses to send the command if the board prompt probe fails.
+- Shell helper commands without a target run in `ForAI:host`; unknown explicit targets are rejected and the reply lists available panes.
+- Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or `ForAI:board`, and the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.
 - The default auto-enabled host list contains `chatgpt.com` and `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.

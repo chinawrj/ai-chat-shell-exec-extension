@@ -13,11 +13,13 @@ const {
   extractTmuxRunOutput,
   extractBoardPromptSignature,
   getTmuxEnvSocketPath,
+  getForAiTmuxConfig,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
   readBoardLogFromOffset,
   resolveBoardPane,
+  resolveDefaultShellPane,
   resolveDownloadsFilePath,
   resolveTmuxTarget,
   validateBoardCommand,
@@ -66,6 +68,13 @@ const boardPanes = parseTmuxPanes([
   "%40\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
   "%41\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh"
 ].join("\n"));
+assert.deepEqual(getForAiTmuxConfig(), {
+  sessionName: "ForAI",
+  hostWindowName: "host",
+  boardWindowName: "board"
+});
+assert.equal(resolveDefaultShellPane(boardPanes).pane.id, "%41");
+assert.equal(resolveTmuxTarget("host", boardPanes).id, "%41");
 assert.equal(resolveBoardPane(boardPanes).pane.id, "%40");
 assert.equal(resolveBoardPane(boardPanes, "%41").pane.id, "%41");
 assert.equal(resolveBoardPane(boardPanes, "ForAI:0.0").pane.id, "%40");

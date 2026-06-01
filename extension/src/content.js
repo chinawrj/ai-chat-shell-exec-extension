@@ -11,7 +11,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.3.2";
+const CONTENT_SCRIPT_VERSION = "0.3.3";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -469,12 +469,6 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
-  if (isShellHelperCall(call) && !call.target) {
-    markCallProcessed(candidate, callKey, semanticCallKey);
-    await replyWithMissingTmuxTarget(call);
-    return;
-  }
-
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
   if (!force && chainCallCount >= maxChainCalls) {
     markCallProcessed(candidate, callKey, semanticCallKey);
@@ -799,13 +793,15 @@ function parsePlainTextHelperBlocks(text) {
         cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
       });
     } else {
+      const shellBodyLines = lines.slice(valueLineIndex, endIndex);
+      const hasExplicitTargetLine = shellBodyLines.length > 1;
       calls.push({
         kind: start.kind,
         helperId,
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
-        target: normalizeCommand(lines[valueLineIndex]),
-        cmd: normalizeCommand(lines.slice(valueLineIndex + 1, endIndex).join("\n"))
+        target: hasExplicitTargetLine ? normalizeCommand(lines[valueLineIndex]) : "",
+        cmd: normalizeCommand((hasExplicitTargetLine ? shellBodyLines.slice(1) : shellBodyLines).join("\n"))
       });
     }
     index = endIndex;
@@ -2047,7 +2043,9 @@ function injectStatus() {
   });
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
-  checkExtensionVersionMatch().catch(() => {});
+  checkStartupTmux().catch((error) => {
+    setStatus(`ForAI tmux startup check failed: ${summarizeCommand(error.message || String(error))}`, "error");
+  });
 }
 
 function setStatus(text, state = "idle") {
@@ -2116,6 +2114,21 @@ async function checkExtensionVersionMatch() {
   }
   extensionVersionWarning = "";
   return true;
+}
+
+async function checkStartupTmux() {
+  const versionOk = await checkExtensionVersionMatch();
+  if (!versionOk) {
+    return;
+  }
+  setStatus("Checking ForAI tmux session", "running");
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure" });
+  if (!tmux?.ok) {
+    setStatus(`ForAI tmux unavailable: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
+    return;
+  }
+  const targetText = tmux.defaultTarget ? ` target ${tmux.defaultTarget}` : "";
+  setStatus(`Shell tool ready v${getDisplayVersion()}; ForAI tmux ready${targetText}`, "ok");
 }
 
 function getExtensionVersionMismatch(background) {
@@ -2369,7 +2382,7 @@ async function runHealthCheck() {
   const [version, health, tmux, profiles] = await Promise.all([
     getBackgroundVersionInfo(),
     chrome.runtime.sendMessage({ type: "shell-health" }),
-    chrome.runtime.sendMessage({ type: "tmux-list" }),
+    chrome.runtime.sendMessage({ type: "tmux-ensure" }),
     chrome.storage.local.get([composerProfileKey(), sendProfileKey(), shellProfileKey()])
   ]);
   updateVersionTooltip(version);
@@ -2397,7 +2410,7 @@ async function runHealthCheck() {
 
   const boundText = bindings.length > 0 ? bindings.join("/") : "auto";
   const pidText = health.pid ? ` pid ${health.pid}` : "";
-  const paneText = tmux?.ok ? `; tmux panes ${tmux.panes?.length || 0}` : "; tmux unavailable";
+  const paneText = tmux?.ok ? `; ForAI ${tmux.defaultTarget || "host"}; tmux panes ${tmux.panes?.length || 0}` : "; tmux unavailable";
   setStatus(`Extension v${getDisplayVersion()}; server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
 }
 

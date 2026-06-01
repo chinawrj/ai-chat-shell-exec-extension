@@ -14,6 +14,7 @@ const {
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-helper-board-integration-"));
 const socketPath = path.join(tmpDir, "tmux.sock");
 const originalSocket = process.env.AI_CHAT_SHELL_TMUX_SOCKET;
+const originalSession = process.env.AI_CHAT_SHELL_TMUX_SESSION;
 process.env.AI_CHAT_SHELL_TMUX_SOCKET = socketPath;
 
 main()
@@ -28,6 +29,11 @@ main()
     } else {
       process.env.AI_CHAT_SHELL_TMUX_SOCKET = originalSocket;
     }
+    if (originalSession === undefined) {
+      delete process.env.AI_CHAT_SHELL_TMUX_SESSION;
+    } else {
+      process.env.AI_CHAT_SHELL_TMUX_SESSION = originalSession;
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   })
   .catch((error) => {
@@ -38,6 +44,7 @@ main()
 async function main() {
   assert.equal(commandExists("tmux"), true, "tmux board integration tests require tmux on PATH.");
 
+  process.env.AI_CHAT_SHELL_TMUX_SESSION = "board_success";
   runTmux(["new-session", "-d", "-s", "board_success", "-n", "board", "env PS1='BOARD> ' /bin/sh -i"]);
   await sleep(1000);
   const successPane = resolveBoardPane(await listTmuxPanes()).pane;
@@ -54,6 +61,7 @@ async function main() {
   assert.match(success.stdout, /BOARD>/);
   killSession("board_success");
 
+  process.env.AI_CHAT_SHELL_TMUX_SESSION = "board_probe_fail";
   runTmux(["new-session", "-d", "-s", "board_probe_fail", "-n", "board", "/bin/cat"]);
   await sleep(1000);
   const failPane = resolveBoardPane(await listTmuxPanes()).pane;

@@ -62,6 +62,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "tmux-ensure") {
+    ensureTmuxTargets()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error),
+        panes: []
+      }));
+    return true;
+  }
+
   if (message.type === "write-file") {
     handleWriteFileMessage(message)
       .then(sendResponse)
@@ -453,6 +464,10 @@ function hashText(input) {
 
 function listTmuxTargets() {
   return runShellViaWebSocket({ type: "tmux-list", timeoutMs: 5000 });
+}
+
+function ensureTmuxTargets() {
+  return runShellViaWebSocket({ type: "tmux-ensure", timeoutMs: 5000 });
 }
 
 function runShellViaWebSocket(payload) {

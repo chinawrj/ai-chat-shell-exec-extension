@@ -84,6 +84,11 @@ const parsedEmptyTarget = context.parseCallPayload(emptyTarget);
 assert.equal(parsedEmptyTarget.target, "");
 assert.equal(parsedEmptyTarget.cmd, "pwd");
 
+const defaultTargetShell = context.parseCallPayload("ai-helper-shell-start\npwd\nai-helper-shell-end");
+assert.equal(defaultTargetShell.target, "");
+assert.equal(defaultTargetShell.cmd, "pwd");
+assert.equal(context.validateHelperCall(defaultTargetShell).ok, true);
+
 const shellStartAlias = context.parseCallPayload("ai-helper-start-shell\n%24\npwd\nai-helper-end-shell");
 assert.equal(shellStartAlias.cmd, "");
 assert.equal(shellStartAlias.target, undefined);

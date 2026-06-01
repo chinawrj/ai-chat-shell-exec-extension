@@ -36,6 +36,8 @@ const TMUX_LIST_FORMAT = [
 ].join(TMUX_FIELD_SEPARATOR);
 const TMUX_CAPTURE_HISTORY_LINES = 20000;
 const TMUX_POLL_INTERVAL_MS = 250;
+const DEFAULT_TMUX_SESSION_NAME = "ForAI";
+const DEFAULT_HOST_WINDOW_NAME = "host";
 const DEFAULT_BOARD_WINDOW_NAME = "board";
 const DEFAULT_BOARD_PROBE_IDLE_MS = 500;
 const DEFAULT_BOARD_PROMPT_IDLE_MS = 200;
@@ -70,6 +72,9 @@ const server = http.createServer((req, res) => {
       allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
       stateDir: STATE_DIR,
       tmuxSocket: getTmuxSocketPath() || null,
+      tmuxDefaultSession: getForAiTmuxConfig().sessionName,
+      tmuxDefaultHostWindow: getForAiTmuxConfig().hostWindowName,
+      tmuxDefaultBoardWindow: getForAiTmuxConfig().boardWindowName,
       visionHelper: getVisionHelperPath(),
       visionAvailable: getVisionAvailability().available,
       ledgerEntries: Object.keys(serverLedger.calls || {}).length
@@ -199,10 +204,15 @@ async function handleMessageText(text) {
   }
 
   if (message.type === "tmux-list") {
+    const layout = await ensureForAiTmuxLayout();
     return {
       ok: true,
-      panes: await listTmuxPanes()
+      ...layout
     };
+  }
+
+  if (message.type === "tmux-ensure") {
+    return ensureForAiTmuxLayout();
   }
 
   if (message.type === "write-file") {
@@ -233,15 +243,14 @@ async function handleMessageText(text) {
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
-  const panes = await listTmuxPanes();
+  const layout = await ensureForAiTmuxLayout();
+  const panes = layout.panes;
   const target = normalizeTmuxTarget(message.target || message.tmuxTarget || "");
-  if (!target) {
-    return buildMissingTargetResponse(message, cmd, panes);
-  }
-
-  const pane = resolveTmuxTarget(target, panes);
+  const pane = target ? resolveTmuxTarget(target, panes) : resolveDefaultShellPane(panes).pane;
   if (!pane) {
-    return buildInvalidTargetResponse(message, cmd, target, panes);
+    return target
+      ? buildInvalidTargetResponse(message, cmd, target, panes)
+      : buildDefaultTargetErrorResponse(message, cmd, panes);
   }
 
   const cwd = resolveCwd(message.cwd, pane.currentPath);
@@ -323,7 +332,8 @@ async function handleRunBoardMessage(message) {
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
-  const panes = await listTmuxPanes();
+  const layout = await ensureForAiTmuxLayout();
+  const panes = layout.panes;
   const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "");
   if (!resolved.pane) {
     return buildBoardTargetErrorResponse({
@@ -1468,6 +1478,83 @@ async function listTmuxPanes() {
   return panes;
 }
 
+async function ensureForAiTmuxLayout() {
+  const config = getForAiTmuxConfig();
+  const createdWindows = [];
+  let createdSession = false;
+
+  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", config.sessionName], { timeoutMs: 5000 });
+  if (!sessionCheck.ok) {
+    await runTmuxCommand([
+      "new-session",
+      "-d",
+      "-s",
+      config.sessionName,
+      "-n",
+      config.hostWindowName
+    ], { timeoutMs: 5000 });
+    createdSession = true;
+    createdWindows.push(config.hostWindowName);
+  }
+
+  let windows = await listTmuxWindows(config.sessionName);
+  if (!windows.includes(config.hostWindowName)) {
+    await runTmuxCommand([
+      "new-window",
+      "-d",
+      "-t",
+      `${config.sessionName}:`,
+      "-n",
+      config.hostWindowName
+    ], { timeoutMs: 5000 });
+    createdWindows.push(config.hostWindowName);
+    windows = await listTmuxWindows(config.sessionName);
+  }
+
+  if (!windows.includes(config.boardWindowName)) {
+    await runTmuxCommand([
+      "new-window",
+      "-d",
+      "-t",
+      `${config.sessionName}:`,
+      "-n",
+      config.boardWindowName
+    ], { timeoutMs: 5000 });
+    createdWindows.push(config.boardWindowName);
+  }
+
+  const panes = await listTmuxPanes();
+  const defaultHost = resolveDefaultShellPane(panes, config).pane;
+  const defaultBoard = resolveDefaultBoardPane(panes, config).pane;
+  return {
+    ok: true,
+    sessionName: config.sessionName,
+    hostWindowName: config.hostWindowName,
+    boardWindowName: config.boardWindowName,
+    createdSession,
+    createdWindows,
+    defaultTarget: defaultHost?.id || "",
+    defaultTargetName: defaultHost?.label || "",
+    boardTarget: defaultBoard?.id || "",
+    boardTargetName: defaultBoard?.label || "",
+    panes
+  };
+}
+
+async function listTmuxWindows(sessionName) {
+  const result = await runTmuxCommand([
+    "list-windows",
+    "-t",
+    sessionName,
+    "-F",
+    "#{window_name}"
+  ], { timeoutMs: 5000 });
+  return String(result.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 function parseTmuxPanes(output) {
   return String(output || "")
     .split(/\r?\n/)
@@ -1519,6 +1606,15 @@ function resolveTmuxTarget(target, panes) {
     return exact;
   }
 
+  const config = getForAiTmuxConfig();
+  const byDefaultSessionWindowName = panes.filter((pane) =>
+    pane.session === config.sessionName &&
+    pane.windowName === normalized
+  );
+  if (byDefaultSessionWindowName.length === 1) {
+    return byDefaultSessionWindowName[0];
+  }
+
   const byWindowName = panes.filter((pane) => pane.windowName === normalized);
   return byWindowName.length === 1 ? byWindowName[0] : null;
 }
@@ -1536,7 +1632,31 @@ function resolveBoardPane(panes, configuredTarget = "") {
     };
   }
 
-  const matches = panes.filter((pane) => pane.windowName === DEFAULT_BOARD_WINDOW_NAME);
+  return resolveDefaultBoardPane(panes);
+}
+
+function resolveDefaultShellPane(panes, config = getForAiTmuxConfig()) {
+  const matches = panes.filter((pane) =>
+    pane.session === config.sessionName &&
+    pane.windowName === config.hostWindowName
+  );
+  if (matches.length > 0) {
+    return {
+      pane: matches.find((pane) => pane.active) || matches[0],
+      error: ""
+    };
+  }
+  return {
+    pane: null,
+    error: `No tmux pane found in ${config.sessionName}:${config.hostWindowName}.`
+  };
+}
+
+function resolveDefaultBoardPane(panes, config = getForAiTmuxConfig()) {
+  const matches = panes.filter((pane) =>
+    pane.session === config.sessionName &&
+    pane.windowName === config.boardWindowName
+  );
   if (matches.length === 1) {
     return {
       pane: matches[0],
@@ -1546,12 +1666,12 @@ function resolveBoardPane(panes, configuredTarget = "") {
   if (matches.length > 1) {
     return {
       pane: null,
-      error: `Multiple tmux panes match board window name "${DEFAULT_BOARD_WINDOW_NAME}". Set AI_CHAT_SHELL_BOARD_TARGET to a pane id or session:window.pane.`
+      error: `Multiple tmux panes match ${config.sessionName}:${config.boardWindowName}. Set AI_CHAT_SHELL_BOARD_TARGET to a pane id or session:window.pane.`
     };
   }
   return {
     pane: null,
-    error: `No tmux pane found in a window named "${DEFAULT_BOARD_WINDOW_NAME}". Set AI_CHAT_SHELL_BOARD_TARGET or create exactly one board window.`
+    error: `No tmux pane found in ${config.sessionName}:${config.boardWindowName}. Run tmux setup or set AI_CHAT_SHELL_BOARD_TARGET.`
   };
 }
 
@@ -1572,6 +1692,17 @@ function buildInvalidTargetResponse(message, cmd, target, panes) {
     panes,
     error: `Unknown or ambiguous tmux target: ${target}`,
     targetRequired: true
+  });
+}
+
+function buildDefaultTargetErrorResponse(message, cmd, panes) {
+  const config = getForAiTmuxConfig();
+  return buildTargetErrorResponse({
+    message,
+    cmd,
+    panes,
+    error: `Default tmux target is unavailable. Expected ${config.sessionName}:${config.hostWindowName}.`,
+    targetRequired: false
   });
 }
 
@@ -1610,10 +1741,10 @@ function buildBoardHelperExample(cmd = "version") {
 }
 
 function buildTmuxTargetExample(panes, cmd = "pwd") {
-  const target = panes[0]?.id || "%pane_id";
+  const target = resolveDefaultShellPane(panes).pane?.id || panes[0]?.id || "";
   return [
     HELPER_SHELL_START,
-    target,
+    target || "",
     cmd || "pwd",
     HELPER_SHELL_END
   ].join("\n");
@@ -1638,6 +1769,22 @@ function getBoardTimingConfig() {
     promptIdleMs: getEnvClampedNumber("AI_CHAT_SHELL_BOARD_PROMPT_IDLE_MS", 50, 10000, DEFAULT_BOARD_PROMPT_IDLE_MS),
     pollMs: getEnvClampedNumber("AI_CHAT_SHELL_BOARD_POLL_MS", 50, 5000, DEFAULT_BOARD_POLL_MS)
   };
+}
+
+function getForAiTmuxConfig() {
+  return {
+    sessionName: normalizeTmuxName(process.env.AI_CHAT_SHELL_TMUX_SESSION, DEFAULT_TMUX_SESSION_NAME),
+    hostWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_HOST_WINDOW, DEFAULT_HOST_WINDOW_NAME),
+    boardWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_BOARD_WINDOW, DEFAULT_BOARD_WINDOW_NAME)
+  };
+}
+
+function normalizeTmuxName(value, fallback) {
+  const text = String(value || "").trim();
+  if (!text || /[\0\r\n]/.test(text)) {
+    return fallback;
+  }
+  return text;
 }
 
 async function isTmuxPanePipeActive(target) {
@@ -2414,6 +2561,10 @@ function runTmuxCommand(args, options) {
   return runCommand("tmux", buildTmuxCommandArgs(args), options);
 }
 
+function runTmuxCommandRaw(args, options) {
+  return runCommandRaw("tmux", buildTmuxCommandArgs(args), options);
+}
+
 function buildTmuxCommandArgs(args, socketPath = getTmuxSocketPath()) {
   return socketPath ? ["-S", socketPath, ...args] : args;
 }
@@ -2706,8 +2857,11 @@ module.exports = {
   extractTmuxRunOutput,
   getTmuxEnvSocketPath,
   getTmuxSocketPath,
+  ensureForAiTmuxLayout,
+  getForAiTmuxConfig,
   getVisionAvailability,
   getVisionHelperPath,
+  handleMessageText,
   handleVisionMessage,
   listTmuxPanes,
   normalizeBoardOutput,
@@ -2715,6 +2869,7 @@ module.exports = {
   parseTmuxPanes,
   readBoardLogFromOffset,
   resolveBoardPane,
+  resolveDefaultShellPane,
   resolveDownloadsFilePath,
   resolveTmuxTarget,
   runVisionTmuxOcrLine,

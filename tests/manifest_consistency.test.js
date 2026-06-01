@@ -36,9 +36,12 @@ for (let index = 0; index < extensionManifest.content_scripts.length; index += 1
 const version = extensionManifest.version;
 assert.match(contentSource, new RegExp(`const CONTENT_SCRIPT_VERSION = "${escapeRegExp(version)}";`));
 assert.match(contentSource, /type: "extension-version"/);
+assert.match(contentSource, /type: "tmux-ensure"/);
+assert.match(contentSource, /Checking ForAI tmux session/);
 assert.match(contentSource, /Extension version mismatch: page v/);
 assert.match(contentSource, /Extension v\$\{getDisplayVersion\(\)\}; server ok/);
 assert.match(backgroundSource, /message\.type === "extension-version"/);
+assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /function getExtensionVersionInfo\(\)/);
 assert.match(changelog, new RegExp(`## \\[${escapeRegExp(version)}\\]`));
 assert.equal(fs.existsSync(path.join(rootDir, "docs", "release-notes", `v${version}.md`)), true);

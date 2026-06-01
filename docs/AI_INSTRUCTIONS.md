@@ -13,15 +13,13 @@ When local terminal output would help, ask me by replying with exactly one fence
 
 ````
 ai-helper-shell-start
-%24
 pwd
 ai-helper-shell-end
 ````
 
 Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 The first line must be ai-helper-shell-start.
-The second line must be the tmux target.
-The following lines must be the command.
+The following line must be a single shell command. It runs in the default `ForAI` `host` tmux window.
 The final line must be exactly ai-helper-shell-end.
 If you need to ask for the same command text again as a new request, you may add a simple no-space identity suffix to the first line, such as ai-helper-shell-start:2.
 
@@ -39,7 +37,6 @@ When local terminal output would help, ask me for one command by replying with e
 Shell helper format:
 ````
 ai-helper-shell-start
-target here
 command here
 ai-helper-shell-end
 ````
@@ -48,10 +45,10 @@ Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - The first line must be `ai-helper-shell-start`.
 - If you need the same command payload to be treated as a new request, the first line may be `ai-helper-shell-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
-- The second line must be only the tmux target.
-- Every line after the target and before `ai-helper-shell-end` is the shell command.
+- By default, omit the tmux target; the command runs in the `host` window of the `ForAI` tmux session.
+- If an explicit target is needed, put only that tmux target on the second line and put the command after it.
+- Target lists use lines like `target=%24 address=ForAI:0.0 window=host command=zsh cwd=/path`. Pick the `target=` value only when the default `ForAI` `host` window is not the right target.
 - The final line must be exactly `ai-helper-shell-end`.
-- Target lists use lines like `target=%24 address=espcam:0.0 window=build command=zsh cwd=/path`. Pick the `target=` value for the desired `window=...`.
 - Do not wrap shell-output, terminal output, markdown, explanations, or prompts inside the helper block.
 - Wait for my shell-output reply before interpreting results or asking for the next command.
 - Do not repeat a command after receiving shell-output for that command.
@@ -103,7 +100,6 @@ Ask me for terminal output with this format:
 
 ````
 ai-helper-shell-start
-%24
 command here
 ai-helper-shell-end
 ````
@@ -131,7 +127,7 @@ Workflow rules:
 - Emit helper requests as exactly one four-backtick fenced code block and no prose.
 - Emit at most one helper block per assistant message.
 - Emit no prose in a message that contains a helper block.
-- For shell helpers, the second line must be the tmux target and the following lines must be the command.
+- For shell helpers, omit the tmux target by default; the command runs in `ForAI:host`. Use an explicit target only when I ask for a non-default tmux pane.
 - For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
 - If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
@@ -148,7 +144,7 @@ Safety rules:
 ## One-Off Prompt
 
 ```text
-For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the tmux target as the second line, the command as the following lines, and ai-helper-shell-end as the final line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
+For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, one shell command as the body, and ai-helper-shell-end as the final line; it runs in the default ForAI host tmux window unless I ask for a non-default target. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt
@@ -156,11 +152,10 @@ For this conversation, I can act as your human helper when local terminal output
 If the floating panel is not available, paste this manually:
 
 `````text
-Reply with exactly these lines and no prose, replacing %24 with a listed tmux target:
+Reply with exactly these lines and no prose:
 
 ````
 ai-helper-shell-start
-%24
 printf ai-chat-shell-exec-ok
 ai-helper-shell-end
 ````
@@ -170,7 +165,6 @@ Expected AI response:
 
 ````
 ai-helper-shell-start
-%24
 printf ai-chat-shell-exec-ok
 ai-helper-shell-end
 ````

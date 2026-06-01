@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.3.3] - 2026-06-01
+
+- Ensures the default `ForAI` tmux session exists when the page plugin starts, with `host` and `board` windows created automatically.
+- Defaults shell helpers without an explicit target to the `ForAI` `host` window.
+- Resolves board helpers to the `ForAI` `board` window by default while preserving `AI_CHAT_SHELL_BOARD_TARGET` overrides.
+
 ## [0.3.2] - 2026-06-01
 
 - Updates AI-facing helper examples and the floating-panel self-test prompt to use plain four-backtick fences.
