@@ -84,7 +84,7 @@ Package a release:
 - File helpers use `ai-helper-file-start` or `ai-helper-file-start:<identity>`, a second-line file name, exact file content, and `ai-helper-file-end`; the server writes only a single file name directly under `$HOME/Downloads`.
 - Helper identity suffixes are optional simple no-space values used for duplicate suppression. Unsuffixed helper blocks derive identity from a stable plain text payload hash.
 - Tmux target resolution accepts pane id, `session:window.pane` address, or a unique window name. Ambiguous window names must not resolve.
-- Duplicate execution protection exists in two places: Chrome local storage key `shellCallLedger:v1` and server file `.state/shell-ledger.json`.
+- Duplicate execution protection exists in two places: Chrome local storage key `shellCallLedger:v1` and server file `.state/shell-ledger.json`; completed entries are deduped for 60s, and force runs bypass dedup while recording `forced: true`.
 - Do not weaken safeguards that reject copied `shell-output`, markdown wrappers, terminal prompts such as `$ ...`, or repeated command loops.
 - `content.js` has tests that match specific function names and source text for force-run behavior. Rename/refactor those areas carefully.
 - `server/shell_server.js` exports helper functions used directly by tests. Preserve exports when changing tmux or WebSocket logic.

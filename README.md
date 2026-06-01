@@ -175,7 +175,7 @@ The floating status panel also has calibration controls for unknown chat systems
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
 - `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
-- `Run latest`: manually recheck the current page once and execute the latest helper block, ignoring automatic scan limits and duplicate suppression.
+- `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered helper/code block area.

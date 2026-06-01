@@ -18,6 +18,7 @@ const PANEL_PROFILE_PREFIX = "panelProfile:";
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LOCAL_MANUAL_TEST_PORT = "17443";
+const FORCE_RUN_STATUS_HINT = "click Force run to bypass";
 const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
 const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const processedCalls = new Set();
@@ -43,6 +44,8 @@ let initialThreadSettled = false;
 let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
+let lastSuppressedCallStatus = "";
+let forceCallSequence = 0;
 
 bootstrapActivation().catch(() => {});
 
@@ -323,7 +326,7 @@ async function scanForShellCall(options = {}) {
       clearTimeout(scanTimer);
       scanTimer = setTimeout(() => {
         scanForShellCall({ force: true, forceAttempts: forceAttempts + 1 }).catch((error) => {
-          setStatus(`Run latest failed: ${summarizeCommand(error.message || String(error))}`, "error");
+          setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
         });
       }, 500);
       return;
@@ -386,11 +389,21 @@ async function scanForShellCall(options = {}) {
   const call = candidate.call;
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
-  if (!force && (processedCalls.has(callKey) ||
-    processedSemanticCalls.has(semanticCallKey) ||
-    (candidate.node instanceof Element &&
-      processedNodeSemanticKeys.get(candidate.node) === semanticCallKey))) {
-    return;
+  if (!force) {
+    let dedupReason = "";
+    if (processedCalls.has(callKey)) {
+      dedupReason = "processed callKey";
+    } else if (processedSemanticCalls.has(semanticCallKey)) {
+      dedupReason = "processed semantic key";
+    } else if (candidate.node instanceof Element &&
+      processedNodeSemanticKeys.get(candidate.node) === semanticCallKey) {
+      dedupReason = "processed node semantic key";
+    }
+    if (dedupReason) {
+      rememberSuppressedCallStatus(dedupReason);
+      setStatus(`Suppressed duplicate helper call: ${summarizeCommand(call.cmd)}`, "ok");
+      return;
+    }
   }
 
   if (!force && pendingSelfTest && !isExpectedSelfTestCall(call)) {
@@ -403,6 +416,7 @@ async function scanForShellCall(options = {}) {
   const lastShellOutputText = getLastShellOutputText();
   const lastPromptOrOutputText = getLastUserMessageText();
   if (!force && shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText)) {
+    rememberSuppressedCallStatus("suppressed shell-output echo");
     markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
@@ -464,13 +478,8 @@ function buildCandidateCallKey(candidate, semanticCallKey) {
 }
 
 function buildForceCallKey(semanticCallKey) {
-  return stableHash([
-    location.origin,
-    "force",
-    semanticCallKey,
-    Date.now(),
-    Math.random()
-  ].join("\n"));
+  forceCallSequence = (forceCallSequence + 1) % 1_000_000;
+  return `${semanticCallKey}:force:${Date.now()}:${forceCallSequence}`;
 }
 
 function markCallProcessed(candidate, callKey, semanticCallKey) {
@@ -1172,6 +1181,7 @@ async function runAndReply(callId, call, options = {}) {
       await sendRunShellMessage(callId, call, force);
 
     if (response?.duplicate === true && response?.skipped === true) {
+      rememberSuppressedCallStatus(`server ${response?.reason || "duplicate"}`);
       setStatus(force ? "Force run skipped by server" : "Skipped duplicate helper call", "ok");
       return;
     }
@@ -1894,20 +1904,27 @@ function injectStatus() {
 
   const actions = document.createElement("div");
   actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
-  for (const [mode, label] of [
-    ["test", "Test"],
-    ["check", "Check"],
-    ["force", "Run latest"],
-    ["site", "Enable site"],
-    ["input", "Bind input"],
-    ["send", "Bind send"],
-    ["shell", "Bind shell"],
-    ["clear", "Clear"]
+  for (const action of [
+    { mode: "test", label: "Test" },
+    { mode: "check", label: "Check" },
+    {
+      mode: "force",
+      label: "Force run",
+      title: "Force run latest helper block (bypass dedup ledger)"
+    },
+    { mode: "site", label: "Enable site" },
+    { mode: "input", label: "Bind input" },
+    { mode: "send", label: "Bind send" },
+    { mode: "shell", label: "Bind shell" },
+    { mode: "clear", label: "Clear" }
   ]) {
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = label;
-    button.dataset.shellToolAction = mode;
+    button.textContent = action.label;
+    button.dataset.shellToolAction = action.mode;
+    if (action.title) {
+      button.title = action.title;
+    }
     button.style.cssText = [
       "border:0",
       "border-radius:6px",
@@ -1961,7 +1978,12 @@ function setStatus(text, state = "idle") {
     return;
   }
 
-  statusText.textContent = text;
+  const suppressed = isSuppressionStatusText(text);
+  if (!suppressed && lastSuppressedCallStatus) {
+    lastSuppressedCallStatus = "";
+    setForceButtonHighlight(false);
+  }
+  statusText.textContent = lastSuppressedCallStatus ? `${text} (${FORCE_RUN_STATUS_HINT})` : text;
   panel.dataset.state = state;
   const colors = {
     idle: "#111827",
@@ -1970,6 +1992,27 @@ function setStatus(text, state = "idle") {
     error: "#b91c1c"
   };
   panel.style.background = colors[state] || colors.idle;
+}
+
+function setForceButtonHighlight(highlight) {
+  const button = document.querySelector(`#${STATUS_ID} [data-shell-tool-action="force"]`);
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+  button.style.background = highlight ? "#b45309" : "#374151";
+}
+
+function rememberSuppressedCallStatus(status) {
+  lastSuppressedCallStatus = String(status || "");
+  setForceButtonHighlight(true);
+}
+
+function isSuppressionStatusText(text) {
+  const message = String(text || "");
+  return message.startsWith("Suppressed duplicate helper call") ||
+    message.startsWith("Suppressed duplicate shell call") ||
+    message === "Skipped duplicate helper call" ||
+    message === "Force run skipped by server";
 }
 
 function handlePanelAction(action) {
@@ -1996,7 +2039,7 @@ function handlePanelAction(action) {
 
   if (action === "force") {
     forceRunLatestShellCall().catch((error) => {
-      setStatus(`Run latest failed: ${summarizeCommand(error.message || String(error))}`, "error");
+      setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
   }
@@ -2018,6 +2061,8 @@ async function forceRunLatestShellCall() {
   pendingSelfTest = null;
   setStatus("Checking latest helper block once", "running");
   await scanForShellCall({ force: true });
+  lastSuppressedCallStatus = "";
+  setForceButtonHighlight(false);
 }
 
 async function toggleCurrentSiteEnabled() {
