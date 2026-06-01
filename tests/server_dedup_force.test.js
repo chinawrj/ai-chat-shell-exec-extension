@@ -69,6 +69,8 @@ try {
   writeLedger({
     forced: { state: "completed", completedAt: Date.now() - 5_000 }
   });
+  const seededForcedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.ok(Date.now() - seededForcedLedger.calls.forced.completedAt < 60_000);
   const forcedContext = loadServerContext();
   const forcedClaim = forcedContext.claimServerShellCall("forced", {
     cmd: "echo force",

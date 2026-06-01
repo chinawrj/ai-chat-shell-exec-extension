@@ -18,6 +18,7 @@ const PANEL_PROFILE_PREFIX = "panelProfile:";
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LOCAL_MANUAL_TEST_PORT = "17443";
+const FORCE_RUN_STATUS_HINT = "click Force run to bypass";
 const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
 const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const processedCalls = new Set();
@@ -44,6 +45,7 @@ let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
+let forceCallSequence = 0;
 
 bootstrapActivation().catch(() => {});
 
@@ -476,7 +478,8 @@ function buildCandidateCallKey(candidate, semanticCallKey) {
 }
 
 function buildForceCallKey(semanticCallKey) {
-  return `${semanticCallKey}:force:${Date.now()}`;
+  forceCallSequence = (forceCallSequence + 1) % 1_000_000;
+  return `${semanticCallKey}:force:${Date.now()}:${forceCallSequence}`;
 }
 
 function markCallProcessed(candidate, callKey, semanticCallKey) {
@@ -1980,7 +1983,7 @@ function setStatus(text, state = "idle") {
     lastSuppressedCallStatus = "";
     setForceButtonHighlight(false);
   }
-  statusText.textContent = lastSuppressedCallStatus ? `${text} (click Force run to bypass)` : text;
+  statusText.textContent = lastSuppressedCallStatus ? `${text} (${FORCE_RUN_STATUS_HINT})` : text;
   panel.dataset.state = state;
   const colors = {
     idle: "#111827",

@@ -577,7 +577,7 @@ function pruneExpiredCompletedCalls(ledger) {
       continue;
     }
     const completedAt = Number(entry.completedAt || 0);
-    if (!completedAt || completedAt < cutoff) {
+    if (completedAt && completedAt < cutoff) {
       delete ledger.calls[key];
     }
   }
