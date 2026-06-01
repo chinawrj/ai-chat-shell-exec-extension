@@ -354,6 +354,13 @@ async function scanForShellCall(options = {}) {
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
   const now = Date.now();
 
+  // Refresh the floating panel's detected-helper view on every scan attempt,
+  // even when we early-return because the chat thread is still streaming or
+  // hasn't been quiet long enough to act on. Otherwise the panel stays stuck
+  // on the first fully-settled helper block while the AI emits later ones.
+  const candidate = getLastShellCallCandidate(thread);
+  updateDetectedHelperDebug(candidate);
+
   if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
     lastThreadTextAt = now;
@@ -368,8 +375,6 @@ async function scanForShellCall(options = {}) {
 
   resetChainForNewHumanPrompt();
 
-  const candidate = getLastShellCallCandidate(thread);
-  updateDetectedHelperDebug(candidate);
   if (!candidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();

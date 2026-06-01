@@ -303,8 +303,70 @@ async function verifyDebugPanelUpdates() {
   assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);
 }
 
+async function verifyDebugPanelUpdatesDuringStreaming() {
+  // Regression: while the AI is streaming a new helper block (or right after
+  // it appears, before the thread text has been quiet for 1200ms), the
+  // floating panel's debug body must already reflect the latest helper block
+  // instead of the first one. Earlier the debug body was only refreshed
+  // after the streaming/quiet early-returns, so the panel stayed stuck on
+  // the first detected helper block.
+  const context = loadContentContext();
+  const oldCmd = "echo OLD_STREAM";
+  const newCmd = "echo NEW_STREAM";
+  const oldMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: oldCmd })
+  });
+  const newMessage = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd: newCmd })
+  });
+  const root = createRoot([oldMessage, newMessage]);
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+
+  const debugBody = { textContent: "" };
+  const origGetElementById = context.document.getElementById;
+  context.document.getElementById = (id) => {
+    if (id === "ai-chat-shell-exec-debug-body") {
+      return debugBody;
+    }
+    return origGetElementById(id);
+  };
+
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async () => {};
+  // Simulate a non-force scan where the thread text just changed (so we hit
+  // the streaming early-return at "threadText !== lastThreadText"). The
+  // debug body must still get updated to the newest helper block.
+  vm.runInContext(
+    "extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ''; lastThreadTextAt = Date.now();",
+    context
+  );
+
+  await context.scanForShellCall();
+
+  assert.ok(
+    debugBody.textContent.includes(newCmd),
+    `streaming-phase debug body should contain newest cmd '${newCmd}' but got: ${debugBody.textContent}`
+  );
+  assert.ok(
+    !debugBody.textContent.includes(oldCmd),
+    `streaming-phase debug body should not contain old cmd '${oldCmd}' but got: ${debugBody.textContent}`
+  );
+}
+
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
+  .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })
