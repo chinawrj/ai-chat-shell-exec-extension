@@ -1,6 +1,6 @@
 # Next Release Plan
 
-Target version: v0.3.2
+Target version: v0.3.3
 Target date: after the next maintenance or compatibility fix.
 
 ## Theme

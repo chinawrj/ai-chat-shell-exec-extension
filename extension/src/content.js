@@ -11,7 +11,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.6.32";
+const CONTENT_SCRIPT_VERSION = "0.3.2";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -49,6 +49,7 @@ let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
 let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
+let extensionVersionWarning = "";
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -1945,7 +1946,7 @@ function injectStatus() {
 
   const statusText = document.createElement("div");
   statusText.id = STATUS_TEXT_ID;
-  statusText.textContent = `Shell tool ready v${CONTENT_SCRIPT_VERSION}`;
+  statusText.textContent = `Shell tool ready v${getDisplayVersion()}`;
   statusText.style.cssText = "margin-bottom:6px;line-height:1.3;cursor:move";
   statusText.title = "Drag to move";
   panel.appendChild(statusText);
@@ -2046,6 +2047,7 @@ function injectStatus() {
   });
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
+  checkExtensionVersionMatch().catch(() => {});
 }
 
 function setStatus(text, state = "idle") {
@@ -2055,20 +2057,97 @@ function setStatus(text, state = "idle") {
     return;
   }
 
+  const requestedText = String(text || "");
+  const effectiveText = extensionVersionWarning && requestedText !== extensionVersionWarning
+    ? `${requestedText} (${extensionVersionWarning})`
+    : requestedText;
+  const effectiveState = extensionVersionWarning ? "error" : state;
   const suppressed = isSuppressionStatusText(text);
   if (!suppressed && lastSuppressedCallStatus) {
     lastSuppressedCallStatus = "";
     setForceButtonHighlight(false);
   }
-  statusText.textContent = lastSuppressedCallStatus ? `${text} (${FORCE_RUN_STATUS_HINT})` : text;
-  panel.dataset.state = state;
+  statusText.textContent = lastSuppressedCallStatus ? `${effectiveText} (${FORCE_RUN_STATUS_HINT})` : effectiveText;
+  panel.dataset.state = effectiveState;
   const colors = {
     idle: "#111827",
     running: "#1d4ed8",
     ok: "#047857",
     error: "#b91c1c"
   };
-  panel.style.background = colors[state] || colors.idle;
+  panel.style.background = colors[effectiveState] || colors.idle;
+}
+
+function getDisplayVersion() {
+  return getManifestVersion() || CONTENT_SCRIPT_VERSION;
+}
+
+function getManifestVersion() {
+  try {
+    return String(chrome.runtime.getManifest?.().version || "");
+  } catch (_unused) {
+    return "";
+  }
+}
+
+async function getBackgroundVersionInfo() {
+  try {
+    return await chrome.runtime.sendMessage({
+      type: "extension-version",
+      contentVersion: CONTENT_SCRIPT_VERSION,
+      manifestVersion: getManifestVersion()
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message || String(error)
+    };
+  }
+}
+
+async function checkExtensionVersionMatch() {
+  const background = await getBackgroundVersionInfo();
+  updateVersionTooltip(background);
+  const mismatch = getExtensionVersionMismatch(background);
+  if (mismatch) {
+    extensionVersionWarning = mismatch;
+    setStatus(mismatch, "error");
+    return false;
+  }
+  extensionVersionWarning = "";
+  return true;
+}
+
+function getExtensionVersionMismatch(background) {
+  if (!background?.ok) {
+    return `Extension background unavailable; refresh this tab: ${summarizeCommand(background?.error || "no response")}`;
+  }
+
+  const expected = CONTENT_SCRIPT_VERSION;
+  const manifestVersion = getManifestVersion();
+  const backgroundVersion = String(background.version || background.backgroundVersion || "");
+  if (backgroundVersion && backgroundVersion !== expected) {
+    return `Extension version mismatch: page v${expected}, background v${backgroundVersion}; refresh this tab`;
+  }
+  if (manifestVersion && manifestVersion !== expected) {
+    return `Extension version mismatch: page v${expected}, manifest v${manifestVersion}; reload extension and refresh this tab`;
+  }
+  return "";
+}
+
+function updateVersionTooltip(background) {
+  const statusText = document.getElementById(STATUS_TEXT_ID);
+  if (!statusText) {
+    return;
+  }
+  const manifestVersion = getManifestVersion() || "(unknown)";
+  const backgroundVersion = background?.version || background?.backgroundVersion || "(unknown)";
+  statusText.title = [
+    "Drag to move",
+    `content v${CONTENT_SCRIPT_VERSION}`,
+    `manifest v${manifestVersion}`,
+    `background v${backgroundVersion}`
+  ].join("\n");
 }
 
 function setForceButtonHighlight(highlight) {
@@ -2287,11 +2366,19 @@ function updateRoleFilterButton() {
 
 async function runHealthCheck() {
   setStatus("Checking shell server and bindings", "running");
-  const [health, tmux, profiles] = await Promise.all([
+  const [version, health, tmux, profiles] = await Promise.all([
+    getBackgroundVersionInfo(),
     chrome.runtime.sendMessage({ type: "shell-health" }),
     chrome.runtime.sendMessage({ type: "tmux-list" }),
     chrome.storage.local.get([composerProfileKey(), sendProfileKey(), shellProfileKey()])
   ]);
+  updateVersionTooltip(version);
+  const versionMismatch = getExtensionVersionMismatch(version);
+  if (versionMismatch) {
+    setStatus(versionMismatch, "error");
+    return;
+  }
+
   const bindings = [
     profiles[composerProfileKey()]?.selector ? "input" : "",
     savedSendSelector || profiles[sendProfileKey()]?.selector ? "send" : "",
@@ -2311,7 +2398,7 @@ async function runHealthCheck() {
   const boundText = bindings.length > 0 ? bindings.join("/") : "auto";
   const pidText = health.pid ? ` pid ${health.pid}` : "";
   const paneText = tmux?.ok ? `; tmux panes ${tmux.panes?.length || 0}` : "; tmux unavailable";
-  setStatus(`Server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
+  setStatus(`Extension v${getDisplayVersion()}; server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
 }
 
 async function runFullChainTest() {
@@ -2333,12 +2420,12 @@ async function runFullChainTest() {
   const prompt = [
     "This is a compatibility self-test. Reply with exactly these lines and no prose:",
     "",
-    "```",
+    "````",
     HELPER_SHELL_START,
     pane.id,
     command,
     HELPER_SHELL_END,
-    "```"
+    "````"
   ].join("\n");
 
   setStatus(`Starting full test on ${pane.id}: ${token}`, "running");

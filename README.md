@@ -12,30 +12,30 @@ With the AI-facing instructions in this repo, the AI asks its human helper by re
 
 Shell helper:
 
-```
+````
 ai-helper-shell-start
 %24
 pwd && ls -la
 ai-helper-shell-end
-```
+````
 
 Board helper:
 
-```
+````
 ai-helper-board-start
 version
 ai-helper-board-end
-```
+````
 
 File helper:
 
-```
+````
 ai-helper-file-start
 notes.txt
 first line
 second line
 ai-helper-file-end
-```
+````
 
 The shell helper's second line is the tmux target and the remaining lines are the command. The board helper body is exactly one command line; the default board target is the unique tmux window named `board`, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
@@ -117,43 +117,43 @@ Start with:
 
 The short version is:
 
-````text
+`````text
 I can act as your human helper for local terminal output, board output, and helper files.
 
 When output would help, reply with exactly one fenced code block and no prose.
 
 For local terminal output, use:
-```
+````
 ai-helper-shell-start
 target here
 command here
 ai-helper-shell-end
-```
+````
 
 For board output, use:
-```
+````
 ai-helper-board-start
 one board command here
 ai-helper-board-end
-```
+````
 
 For writing one helper file under my Downloads directory, use:
-```
+````
 ai-helper-file-start
 filename.ext
 exact file content here
 ai-helper-file-end
-```
+````
 
 Rules:
-- Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
+- Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - Shell helpers must put the tmux target on the second line.
 - Board helpers must contain exactly one non-empty board command line and no target.
 - File helpers must put a single file name, not a path, on the second line.
 - If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
 - After I send back shell-output, use that output to continue.
 - Do not repeat the same command after receiving shell-output.
-````
+`````
 
 Then run the floating panel's `Test` button once on each AI chat site.
 
@@ -189,12 +189,12 @@ Use the popup's portable config area to move settings and bindings to another Ch
 
 Plain command blocks are rejected because the server no longer chooses a shell by itself. The AI-facing format is a request to the human helper, and the extension recognizes only this shell helper block shape:
 
-```
+````
 ai-helper-shell-start
 %24
 uname -a
 ai-helper-shell-end
-```
+````
 
 `target` can be a tmux pane id such as `%24`, a `session:window.pane` address such as `espcam:0.0`, or a unique window name such as `build`.
 
@@ -202,31 +202,31 @@ When the extension returns a target list, each line is formatted for the AI to r
 
 Keep AI requests minimal by default:
 
-```
+````
 ai-helper-shell-start
 %24
 git status --short
 ai-helper-shell-end
-```
+````
 
 If the desired window name is unique, this also works:
 
-```
+````
 ai-helper-shell-start
 build
 git status --short
 ai-helper-shell-end
-```
+````
 
 The shell helper format maps only the second line to `target` and the remaining body to `cmd`. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
 
 For board output, use:
 
-```
+````
 ai-helper-board-start
 version
 ai-helper-board-end
-```
+````
 
 The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the unique tmux window named `board`. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
 
@@ -234,13 +234,13 @@ The start marker can include an optional helper identity suffix, for example `ai
 
 To write a file under `$HOME/Downloads`, use:
 
-```
+````
 ai-helper-file-start
 notes.txt
 first line
 second line with "quotes" and {json}
 ai-helper-file-end
-```
+````
 
 The file helper format maps the second line to the file name and writes every following line up to, but not including, `ai-helper-file-end`.
 
@@ -282,7 +282,7 @@ After changing extension files:
 
 1. Reload the unpacked extension in `chrome://extensions`.
 2. Refresh every AI chat tab you want to use.
-3. Confirm the lower-right status badge shows the latest content script version.
+3. Confirm the lower-right status badge shows the current extension version and that `Check` reports no content/background version mismatch.
 
 After changing server files with the LaunchAgent installed:
 

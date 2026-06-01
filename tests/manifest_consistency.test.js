@@ -7,6 +7,9 @@ const path = require("node:path");
 const rootDir = path.join(__dirname, "..");
 const rootManifest = readJson(path.join(rootDir, "manifest.json"));
 const extensionManifest = readJson(path.join(rootDir, "extension", "manifest.json"));
+const contentSource = fs.readFileSync(path.join(rootDir, "extension", "src", "content.js"), "utf8");
+const backgroundSource = fs.readFileSync(path.join(rootDir, "extension", "src", "background.js"), "utf8");
+const changelog = fs.readFileSync(path.join(rootDir, "CHANGELOG.md"), "utf8");
 
 assert.equal(rootManifest.manifest_version, extensionManifest.manifest_version);
 assert.equal(rootManifest.name, extensionManifest.name);
@@ -30,6 +33,16 @@ for (let index = 0; index < extensionManifest.content_scripts.length; index += 1
   assert.equal(rootScript.run_at, extensionScript.run_at);
 }
 
+const version = extensionManifest.version;
+assert.match(contentSource, new RegExp(`const CONTENT_SCRIPT_VERSION = "${escapeRegExp(version)}";`));
+assert.match(contentSource, /type: "extension-version"/);
+assert.match(contentSource, /Extension version mismatch: page v/);
+assert.match(contentSource, /Extension v\$\{getDisplayVersion\(\)\}; server ok/);
+assert.match(backgroundSource, /message\.type === "extension-version"/);
+assert.match(backgroundSource, /function getExtensionVersionInfo\(\)/);
+assert.match(changelog, new RegExp(`## \\[${escapeRegExp(version)}\\]`));
+assert.equal(fs.existsSync(path.join(rootDir, "docs", "release-notes", `v${version}.md`)), true);
+
 console.log("manifest consistency tests passed");
 
 function readJson(filePath) {
@@ -38,4 +51,8 @@ function readJson(filePath) {
 
 function prefixExtensionPath(filePath) {
   return `extension/${filePath}`;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }

@@ -36,6 +36,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "extension-version") {
+    sendResponse(getExtensionVersionInfo());
+    return false;
+  }
+
   if (message.type === "shell-health") {
     checkShellServerHealth()
       .then(sendResponse)
@@ -273,6 +278,17 @@ async function checkShellServerHealth() {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function getExtensionVersionInfo() {
+  const manifest = chrome.runtime.getManifest?.() || {};
+  const version = String(manifest.version || "");
+  return {
+    ok: true,
+    version,
+    backgroundVersion: version,
+    extensionId: chrome.runtime.id
+  };
 }
 
 function ensureDefaultSettings() {

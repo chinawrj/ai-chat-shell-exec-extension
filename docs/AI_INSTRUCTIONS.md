@@ -6,19 +6,19 @@ After adding instructions, use the floating panel's `Test` button once on that s
 
 ## Minimal
 
-````text
+`````text
 I can act as your human helper for local terminal output.
 
 When local terminal output would help, ask me by replying with exactly one fenced code block and no prose:
 
-```
+````
 ai-helper-shell-start
 %24
 pwd
 ai-helper-shell-end
-```
+````
 
-Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
+Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 The first line must be ai-helper-shell-start.
 The second line must be the tmux target.
 The following lines must be the command.
@@ -27,25 +27,25 @@ If you need to ask for the same command text again as a new request, you may add
 
 After I send back shell-output, use that output to continue.
 Do not repeat the same command after receiving shell-output.
-````
+`````
 
 ## Recommended
 
-````text
+`````text
 I can act as your human helper for local terminal output, board output, and helper files.
 
 When local terminal output would help, ask me for one command by replying with exactly one fenced code block and no prose.
 
 Shell helper format:
-```
+````
 ai-helper-shell-start
 target here
 command here
 ai-helper-shell-end
-```
+````
 
 Rules:
-- Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
+- Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - The first line must be `ai-helper-shell-start`.
 - If you need the same command payload to be treated as a new request, the first line may be `ai-helper-shell-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The second line must be only the tmux target.
@@ -60,14 +60,14 @@ Rules:
 When board output would help, ask me for one board command by replying with exactly one fenced code block and no prose.
 
 Board helper format:
-```
+````
 ai-helper-board-start
 version
 ai-helper-board-end
-```
+````
 
 Board rules:
-- Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
+- Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - The first line must be `ai-helper-board-start`.
 - If you need the same board command to be treated as a new request, the first line may be `ai-helper-board-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The body must be exactly one non-empty board command line.
@@ -77,58 +77,58 @@ Board rules:
 When writing a helper file would be useful, ask me with exactly one fenced code block and no prose.
 
 File helper format:
-```
+````
 ai-helper-file-start
 filename.ext
 exact file content here
 ai-helper-file-end
-```
+````
 
 File rules:
-- Use a plain unlabeled code fence (three backticks) exactly, with no text before or after the code block.
+- Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - If you need the same file payload to be treated as a new request, the first line may be `ai-helper-file-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The second line must be a single file name, not a path.
 - The file will be placed under my Downloads directory.
 - Every line after the filename and before `ai-helper-file-end` is the exact file content.
 - The `ai-helper-file-end` line is not file content.
 - Do not use a file helper block for secrets unless I explicitly ask.
-````
+`````
 
 ## Project Agent
 
-````text
+`````text
 I can act as your human helper when you need local terminal output or board output.
 
 Ask me for terminal output with this format:
 
-```
+````
 ai-helper-shell-start
 %24
 command here
 ai-helper-shell-end
-```
+````
 
 Use the shell helper when command output is needed to inspect files, run tests, check git state, or verify a change.
 
 Ask me to prepare a helper file with this format:
 
-```
+````
 ai-helper-file-start
 filename.ext
 exact file content here
 ai-helper-file-end
-```
+````
 
 Ask me for board output with this format:
 
-```
+````
 ai-helper-board-start
 version
 ai-helper-board-end
-```
+````
 
 Workflow rules:
-- Emit helper requests as exactly one fenced code block and no prose.
+- Emit helper requests as exactly one four-backtick fenced code block and no prose.
 - Emit at most one helper block per assistant message.
 - Emit no prose in a message that contains a helper block.
 - For shell helpers, the second line must be the tmux target and the following lines must be the command.
@@ -143,36 +143,36 @@ Safety rules:
 - Ask before destructive board actions such as reset, flash, erase, persistent configuration writes, credential changes, or long-running streams.
 - Do not request commands or file writes that expose secrets unless I explicitly ask.
 - Summarize results after shell-output is returned.
-````
+`````
 
 ## One-Off Prompt
 
 ```text
-For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the tmux target as the second line, the command as the following lines, and ai-helper-shell-end as the final line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
+For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the tmux target as the second line, the command as the following lines, and ai-helper-shell-end as the final line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt
 
 If the floating panel is not available, paste this manually:
 
-````text
+`````text
 Reply with exactly these lines and no prose, replacing %24 with a listed tmux target:
 
-```
+````
 ai-helper-shell-start
 %24
 printf ai-chat-shell-exec-ok
 ai-helper-shell-end
-```
 ````
+`````
 
 Expected AI response:
 
-```
+````
 ai-helper-shell-start
 %24
 printf ai-chat-shell-exec-ok
 ai-helper-shell-end
-```
+````
 
 You should then return a `shell-output` reply containing `ai-chat-shell-exec-ok`.

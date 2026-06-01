@@ -69,7 +69,7 @@ assert.equal(extracted.cmd, command);
 assert.equal(context.validateHelperCall(parsed).ok, true);
 assert.equal(context.validateShellCall({ cmd: block }).ok, false);
 
-const [fencedExtracted] = context.parsePlainTextHelperBlocks(`\`\`\`text\n${block}\n\`\`\``);
+const [fencedExtracted] = context.parsePlainTextHelperBlocks(`\`\`\`\`\n${block}\n\`\`\`\``);
 assert.equal(fencedExtracted.target, "%24");
 assert.equal(fencedExtracted.cmd, command);
 assert.equal(context.validateHelperCall(fencedExtracted).ok, true);

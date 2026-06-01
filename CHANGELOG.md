@@ -4,6 +4,13 @@
 
 - Nothing yet.
 
+## [0.3.2] - 2026-06-01
+
+- Updates AI-facing helper examples and the floating-panel self-test prompt to use plain four-backtick fences.
+- Keeps runtime helper detection marker-based so rendered `ai-helper-*` blocks continue to work across chat UIs.
+- Adds parser coverage for four-backtick markdown-wrapped helper examples.
+- Unifies the floating panel, extension, and release version at `0.3.2`, and warns from the panel when content/background versions do not match.
+
 ## [0.3.1] - 2026-05-30
 
 - Clarifies the README introduction so users see all supported helper block types immediately: shell, board, and file.
