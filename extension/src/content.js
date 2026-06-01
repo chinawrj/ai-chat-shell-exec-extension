@@ -47,6 +47,7 @@ let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
+let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
 
 bootstrapActivation().catch(() => {});
@@ -331,7 +332,9 @@ async function scanForShellCall(options = {}) {
   // changing. Otherwise the panel can remain stuck on the first helper
   // block forever.
   try {
-    updateDetectedHelperDebug(getLastShellCallCandidate(getConversationRoot()));
+    const conversationRoot = getConversationRoot();
+    const allCandidates = extractShellCallCandidates(conversationRoot);
+    updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
   } catch (_unused) {
     // Detection runs on a partially-rendered DOM during streaming; never
     // let a transient scan failure block the rest of the scanner.
@@ -1194,6 +1197,10 @@ async function runAndReply(callId, call, options = {}) {
   chainCallCount += 1;
   setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
+  // Remember which semantic call we actually attempted to run, so the debug
+  // panel can show whether the next detected candidate matches it (i.e. the
+  // ledger/dedup will treat the next scan as a duplicate of this one).
+  lastExecutedSemanticKey = buildSemanticCallKey(call);
   try {
     const response = isFileHelperCall(call) ?
       await sendWriteFileMessage(callId, call, force) :
@@ -2054,33 +2061,94 @@ function rememberSuppressedCallStatus(status) {
   setForceButtonHighlight(true);
 }
 
-function updateDetectedHelperDebug(candidate) {
+function updateDetectedHelperDebug(candidate, allCandidates) {
   const body = document.getElementById(DEBUG_BODY_ID);
   if (!body) {
     return;
   }
-  if (!candidate) {
-    body.textContent = "(no helper block detected)";
+  const list = Array.isArray(allCandidates) ? allCandidates : [];
+  const total = list.length;
+  let selectedIdx = -1;
+  if (candidate) {
+    selectedIdx = list.findIndex((c) =>
+      c === candidate ||
+      (c && candidate && c.node === candidate.node && c.index === candidate.index)
+    );
+  }
+  const summary = total === 0
+    ? "candidates: 0/0"
+    : `candidates: ${selectedIdx >= 0 ? selectedIdx + 1 : "?"}/${total}`;
+
+  if (!candidate && total === 0) {
+    const lines = [summary, "(no helper block detected)"];
+    if (lastSuppressedCallStatus) {
+      lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
+    }
+    if (lastExecutedSemanticKey) {
+      lines.push(`lastRunSemanticKey: ${lastExecutedSemanticKey}`);
+    }
+    body.textContent = lines.join("\n");
     return;
   }
-  const call = candidate.call || {};
-  const role = getMessageAuthorRole(candidate.node) || "(unknown)";
-  const cmdPreview = String(call.cmd || call.content || "").slice(0, 800);
-  const lines = [
-    `kind:        ${call.kind || "shell"}`,
-    `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
-    `target:      ${call.target || "(none)"}`,
-    `filename:    ${call.filename || ""}`,
-    `cwd:         ${call.cwd || ""}`,
-    `authorRole:  ${role}`,
-    `source:      ${candidate.source || ""}  index:${candidate.index || ""}`,
-    `semanticKey: ${buildSemanticCallKey(call)}`,
-    `detectedAt:  ${new Date().toISOString()}`,
-    `--- cmd / content (first 800 chars) ---`,
-    cmdPreview || "(empty)"
-  ].filter((line) => line !== "");
+
+  const lines = [summary];
+
+  if (total > 0) {
+    const MAX_LISTED = 8;
+    const listed = list.slice(0, MAX_LISTED);
+    for (let i = 0; i < listed.length; i += 1) {
+      const c = listed[i];
+      const cCall = c.call || {};
+      const isSelected = i === selectedIdx;
+      const marker = isSelected ? "[*]" : "[ ]";
+      const cKind = cCall.kind || "shell";
+      const cRole = getMessageAuthorRole(c.node) || "?";
+      const cRunnable = isRunnableHelperCall(cCall) ? "yes" : "no";
+      const cVisible = (() => {
+        try {
+          return isVisibleElement(c.node) ? "yes" : "no";
+        } catch (_unused) {
+          return "?";
+        }
+      })();
+      const cCmd = String(cCall.cmd || cCall.content || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 80);
+      lines.push(
+        `${marker} #${i + 1}  kind=${cKind}  role=${cRole}  runnable=${cRunnable}  visible=${cVisible}  cmd: ${cCmd}`
+      );
+    }
+    if (total > MAX_LISTED) {
+      lines.push(`… (+${total - MAX_LISTED} more)`);
+    }
+  }
+
+  if (candidate) {
+    const call = candidate.call || {};
+    const role = getMessageAuthorRole(candidate.node) || "(unknown)";
+    const cmdPreview = String(call.cmd || call.content || "").slice(0, 800);
+    lines.push(
+      `kind:        ${call.kind || "shell"}`,
+      `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
+      `target:      ${call.target || "(none)"}`,
+      `filename:    ${call.filename || ""}`,
+      `cwd:         ${call.cwd || ""}`,
+      `authorRole:  ${role}`,
+      `source:      ${candidate.source || ""}  index:${candidate.index || ""}`,
+      `semanticKey: ${buildSemanticCallKey(call)}`,
+      `detectedAt:  ${new Date().toISOString()}`,
+      `--- cmd / content (first 800 chars) ---`,
+      cmdPreview || "(empty)"
+    );
+  } else {
+    lines.push("(no helper block selected)");
+  }
+
   if (lastSuppressedCallStatus) {
     lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
+  }
+  if (lastExecutedSemanticKey) {
+    lines.push(`lastRunSemanticKey: ${lastExecutedSemanticKey}`);
   }
   body.textContent = lines.join("\n");
 }

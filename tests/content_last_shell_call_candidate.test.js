@@ -358,9 +358,27 @@ async function verifyDebugPanelUpdatesDuringStreaming() {
     debugBody.textContent.includes(newCmd),
     `streaming-phase debug body should contain newest cmd '${newCmd}' but got: ${debugBody.textContent}`
   );
+  // The candidate-list section now intentionally enumerates every helper
+  // block (so users can spot a wrong selection without DevTools), so the
+  // old cmd may legitimately appear there. What must hold is that the
+  // selected marker [*] is on the new cmd, and the detail / cmd-preview
+  // section below the list reflects the new cmd, not the old one.
+  const streamLines = debugBody.textContent.split("\n");
+  const streamSelected = streamLines.find((line) => /^\[\*\] #\d+/.test(line));
   assert.ok(
-    !debugBody.textContent.includes(oldCmd),
-    `streaming-phase debug body should not contain old cmd '${oldCmd}' but got: ${debugBody.textContent}`
+    streamSelected && streamSelected.includes(newCmd),
+    `streaming-phase debug body should mark the newest cmd as selected, got: ${streamSelected}`
+  );
+  const streamPreviewIdx = streamLines.findIndex((line) => line.startsWith("--- cmd / content"));
+  assert.ok(streamPreviewIdx >= 0, "streaming-phase debug body should contain cmd preview header");
+  const streamPreview = streamLines.slice(streamPreviewIdx + 1).join("\n");
+  assert.ok(
+    streamPreview.includes(newCmd),
+    `streaming-phase cmd preview should contain newest cmd '${newCmd}' but got: ${streamPreview}`
+  );
+  assert.ok(
+    !streamPreview.includes(oldCmd),
+    `streaming-phase cmd preview should not contain old cmd '${oldCmd}' but got: ${streamPreview}`
   );
 }
 
@@ -412,9 +430,97 @@ async function verifyDebugPanelUpdatesWhileActiveCallRunning() {
     debugBody.textContent.includes(newCmd),
     `active-call debug body should contain newest cmd '${newCmd}' but got: ${debugBody.textContent}`
   );
+  // See verifyDebugPanelUpdatesDuringStreaming: the candidate list now
+  // enumerates every helper block by design, so old cmds are allowed to
+  // appear there. The selected marker [*] and the cmd-preview section are
+  // the authoritative checks for "the panel reflects the newest block".
+  const activeLines = debugBody.textContent.split("\n");
+  const activeSelected = activeLines.find((line) => /^\[\*\] #\d+/.test(line));
   assert.ok(
-    !debugBody.textContent.includes(oldCmd),
-    `active-call debug body should not contain old cmd '${oldCmd}' but got: ${debugBody.textContent}`
+    activeSelected && activeSelected.includes(newCmd),
+    `active-call debug body should mark the newest cmd as selected, got: ${activeSelected}`
+  );
+  const activePreviewIdx = activeLines.findIndex((line) => line.startsWith("--- cmd / content"));
+  assert.ok(activePreviewIdx >= 0, "active-call debug body should contain cmd preview header");
+  const activePreview = activeLines.slice(activePreviewIdx + 1).join("\n");
+  assert.ok(
+    activePreview.includes(newCmd),
+    `active-call cmd preview should contain newest cmd '${newCmd}' but got: ${activePreview}`
+  );
+  assert.ok(
+    !activePreview.includes(oldCmd),
+    `active-call cmd preview should not contain old cmd '${oldCmd}' but got: ${activePreview}`
+  );
+}
+
+async function verifyDebugPanelListsAllCandidates() {
+  // The debug body should list every detected helper-block candidate, mark
+  // the selected one with [*], and surface the candidates:<idx>/<total>
+  // header so the user can diagnose detection vs. execution issues without
+  // opening DevTools.
+  const context = loadContentContext();
+  const oldCmd = "echo OLD_LIST";
+  const newCmd = "echo NEW_LIST";
+  const oldMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: oldCmd })
+  });
+  const newMessage = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd: newCmd })
+  });
+  const root = createRoot([oldMessage, newMessage]);
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+
+  const debugBody = { textContent: "" };
+  const origGetElementById = context.document.getElementById;
+  context.document.getElementById = (id) => {
+    if (id === "ai-chat-shell-exec-debug-body") {
+      return debugBody;
+    }
+    return origGetElementById(id);
+  };
+
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async () => {};
+  vm.runInContext("extensionActive = true; activeCallId = ''; initialThreadSettled = true;", context);
+
+  await context.scanForShellCall({ force: true });
+
+  const text = debugBody.textContent;
+  assert.ok(
+    text.includes("candidates: 2/2"),
+    `debug body should contain 'candidates: 2/2' header but got: ${text}`
+  );
+  assert.ok(
+    text.includes(oldCmd),
+    `debug body should list the old candidate's cmd '${oldCmd}' but got: ${text}`
+  );
+  assert.ok(
+    text.includes(newCmd),
+    `debug body should list the new candidate's cmd '${newCmd}' but got: ${text}`
+  );
+  const lines = text.split("\n");
+  const oldLine = lines.find((line) => line.includes(oldCmd) && /^\[[* ]\] #\d+/.test(line));
+  const newLine = lines.find((line) => line.includes(newCmd) && /^\[[* ]\] #\d+/.test(line));
+  assert.ok(oldLine, `expected a candidate row mentioning old cmd, got lines: ${lines.join(" | ")}`);
+  assert.ok(newLine, `expected a candidate row mentioning new cmd, got lines: ${lines.join(" | ")}`);
+  assert.ok(
+    newLine.startsWith("[*]"),
+    `selected marker [*] should be on the row with the newest cmd, got: ${newLine}`
+  );
+  assert.ok(
+    oldLine.startsWith("[ ]"),
+    `unselected marker [ ] should be on the row with the older cmd, got: ${oldLine}`
   );
 }
 
@@ -422,6 +528,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
+  .then(() => verifyDebugPanelListsAllCandidates())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })
