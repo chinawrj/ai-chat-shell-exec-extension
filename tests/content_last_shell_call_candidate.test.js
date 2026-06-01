@@ -255,8 +255,10 @@ async function verifyDebugPanelUpdates() {
 
   // Mock the debug body element so updateDetectedHelperDebug can write to it
   const debugBody = { textContent: "" };
+  const getElementByIdCalls = [];
   const origGetElementById = context.document.getElementById;
   context.document.getElementById = (id) => {
+    getElementByIdCalls.push(id);
     if (id === "ai-chat-shell-exec-debug-body") {
       return debugBody;
     }
@@ -273,6 +275,7 @@ async function verifyDebugPanelUpdates() {
 
   await context.scanForShellCall({ force: true });
 
+  assert.ok(getElementByIdCalls.includes("ai-chat-shell-exec-debug-body"), "getElementById should be called with DEBUG_BODY_ID");
   assert.ok(debugBody.textContent.includes("target:"), `debug body should contain 'target:' but got: ${debugBody.textContent}`);
   assert.ok(debugBody.textContent.includes("--- cmd / content (first 800 chars) ---"), `debug body should contain cmd/content header`);
   assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);

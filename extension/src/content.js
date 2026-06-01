@@ -47,7 +47,6 @@ let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
-let lastDetectedSkipReason = "";
 let forceCallSequence = 0;
 
 bootstrapActivation().catch(() => {});
@@ -2033,7 +2032,6 @@ function setForceButtonHighlight(highlight) {
 
 function rememberSuppressedCallStatus(status) {
   lastSuppressedCallStatus = String(status || "");
-  lastDetectedSkipReason = lastSuppressedCallStatus;
   setForceButtonHighlight(true);
 }
 
@@ -2062,8 +2060,8 @@ function updateDetectedHelperDebug(candidate) {
     `--- cmd / content (first 800 chars) ---`,
     cmdPreview || "(empty)"
   ].filter((line) => line !== "");
-  if (lastDetectedSkipReason) {
-    lines.push(`lastSkippedReason: ${lastDetectedSkipReason}`);
+  if (lastSuppressedCallStatus) {
+    lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
   }
   body.textContent = lines.join("\n");
 }
