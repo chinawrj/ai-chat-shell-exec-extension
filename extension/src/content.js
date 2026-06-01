@@ -562,7 +562,6 @@ function isAssistantGenerating() {
 function getLastShellCallCandidate(root) {
   const candidates = extractShellCallCandidates(root)
     .filter((candidate) => isRunnableHelperCall(candidate.call))
-    .filter((candidate) => !isShellOutputText(candidate.node?.innerText || candidate.node?.textContent || ""))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
   const runnableCandidates = candidates.filter(isRunnableAuthoredCandidate);
