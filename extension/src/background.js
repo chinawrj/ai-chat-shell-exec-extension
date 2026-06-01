@@ -17,7 +17,8 @@ const DEFAULT_SETTINGS = {
   autoSend: true,
   defaultTimeoutMs: 30000,
   maxOutputChars: 20000,
-  maxChainCalls: DEFAULT_MAX_CHAIN_CALLS
+  maxChainCalls: DEFAULT_MAX_CHAIN_CALLS,
+  disableAuthorRoleFilter: true
 };
 
 chrome.runtime.onInstalled.addListener(() => {

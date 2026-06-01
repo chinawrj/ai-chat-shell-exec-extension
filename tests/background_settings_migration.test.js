@@ -12,7 +12,8 @@ const defaultStore = {
   autoSend: true,
   defaultTimeoutMs: 30000,
   maxOutputChars: 20000,
-  maxChainCalls: 100
+  maxChainCalls: 100,
+  disableAuthorRoleFilter: true
 };
 
 function runBackgroundWithStore(syncStore) {
@@ -76,6 +77,18 @@ function runBackgroundWithStore(syncStore) {
   };
   const writes = runBackgroundWithStore(store);
   assert.equal(JSON.stringify(writes), "[]");
+}
+
+{
+  // Legacy stores upgraded after disableAuthorRoleFilter was introduced should
+  // seed the new default (true) so the role filter stays off by default.
+  const store = { ...defaultStore };
+  delete store.disableAuthorRoleFilter;
+  store.settingsMigrationVersion = 2;
+  const writes = runBackgroundWithStore(store);
+  assert.equal(JSON.stringify(writes), JSON.stringify([{
+    disableAuthorRoleFilter: true
+  }]));
 }
 
 console.log("background settings migration tests passed");

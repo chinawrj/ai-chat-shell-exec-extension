@@ -5,7 +5,8 @@ const DEFAULTS = {
   autoSend: true,
   defaultTimeoutMs: 30000,
   maxOutputChars: 20000,
-  maxChainCalls: 100
+  maxChainCalls: 100,
+  disableAuthorRoleFilter: true
 };
 
 const CONFIG_VERSION = 1;
@@ -23,7 +24,8 @@ const fields = {
   requireApproval: document.getElementById("requireApproval"),
   defaultTimeoutMs: document.getElementById("defaultTimeoutMs"),
   maxOutputChars: document.getElementById("maxOutputChars"),
-  maxChainCalls: document.getElementById("maxChainCalls")
+  maxChainCalls: document.getElementById("maxChainCalls"),
+  disableAuthorRoleFilter: document.getElementById("disableAuthorRoleFilter")
 };
 
 const health = document.getElementById("health");
@@ -65,6 +67,7 @@ async function loadSettings() {
   fields.defaultTimeoutMs.value = merged.defaultTimeoutMs;
   fields.maxOutputChars.value = merged.maxOutputChars;
   fields.maxChainCalls.value = merged.maxChainCalls;
+  fields.disableAuthorRoleFilter.checked = merged.disableAuthorRoleFilter !== false;
 }
 
 async function saveSettings() {
@@ -76,7 +79,8 @@ async function saveSettings() {
     requireApproval: fields.requireApproval.checked,
     defaultTimeoutMs: clampNumber(fields.defaultTimeoutMs.value, 1000, 600000, DEFAULTS.defaultTimeoutMs),
     maxOutputChars: clampNumber(fields.maxOutputChars.value, 1000, 200000, DEFAULTS.maxOutputChars),
-    maxChainCalls: clampMinNumber(fields.maxChainCalls.value, 1, DEFAULTS.maxChainCalls)
+    maxChainCalls: clampMinNumber(fields.maxChainCalls.value, 1, DEFAULTS.maxChainCalls),
+    disableAuthorRoleFilter: fields.disableAuthorRoleFilter.checked
   });
   saveButton.textContent = "Saved";
   setTimeout(() => {

@@ -49,12 +49,24 @@ let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
 let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
+// The author-role filter is opt-in. The legacy heuristic that decided whether a
+// helper block came from the assistant or the user produced false positives on
+// hosts that don't expose `data-message-author-role` (or whose nearest
+// recognized container wraps multiple turns), which made the most recent helper
+// block silently skipped. Default to off so the latest helper block always
+// runs; the popup / panel toggle can re-enable strict filtering when needed.
+let authorRoleFilterEnabled = false;
 
 bootstrapActivation().catch(() => {});
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "sync" && (changes.enabled || changes.enabledHosts)) {
     refreshActivation().catch(() => {});
+  }
+  if (areaName === "sync" && changes.disableAuthorRoleFilter) {
+    authorRoleFilterEnabled = changes.disableAuthorRoleFilter.newValue === false;
+    updateRoleFilterButton();
+    scheduleScan();
   }
 });
 
@@ -63,13 +75,15 @@ async function bootstrapActivation() {
 }
 
 async function refreshActivation() {
-  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts"]);
+  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "disableAuthorRoleFilter"]);
+  authorRoleFilterEnabled = settings.disableAuthorRoleFilter === false;
   if (!isSupportedPage() || settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
     deactivateExtension();
     return;
   }
 
   await activateExtension();
+  updateRoleFilterButton();
 }
 
 async function activateExtension() {
@@ -585,13 +599,16 @@ function getLastShellCallCandidate(root) {
     .filter((candidate) => isRunnableHelperCall(candidate.call))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
-  const runnableCandidates = candidates.filter(isRunnableAuthoredCandidate);
-  // Prefer the latest helper block in DOM order. Earlier versions preferred candidates
-  // whose author role explicitly resolved to "assistant", but that caused the newest
-  // helper block to be skipped whenever the latest message had an ambiguous role
-  // attribute (for example, while the chat site is still hydrating the new turn).
-  // The user-authored content is already excluded by isRunnableAuthoredCandidate.
-  return runnableCandidates.length > 0 ? runnableCandidates[runnableCandidates.length - 1] : null;
+  // The author-role filter has historically caused the latest helper block to
+  // be skipped whenever the host page didn't expose `data-message-author-role`
+  // (or when a single recognized container wraps several turns). It is now
+  // opt-in via the `disableAuthorRoleFilter` setting; when disabled (the
+  // default) we just trust the DOM order returned by extractShellCallCandidates
+  // and execute the newest visible helper block.
+  const filtered = authorRoleFilterEnabled
+    ? candidates.filter(isRunnableAuthoredCandidate)
+    : candidates;
+  return filtered.length > 0 ? filtered[filtered.length - 1] : null;
 }
 
 function extractShellCallCandidates(root) {
@@ -686,25 +703,24 @@ function isRunnableAuthoredCandidate(candidate) {
 }
 
 function getMessageAuthorRole(node) {
-  const container = node?.closest?.('[data-message-author-role], article, [role="article"]');
-  const explicit = container?.getAttribute?.("data-message-author-role") ||
+  // Only trust an explicit attribute. The previous text-prefix heuristic
+  // (e.g. matching "user:" / "you said:" at the start of the container's text)
+  // produced false positives when:
+  //   - closest('article') climbed past the actual message and matched a
+  //     wrapper that contained multiple turns,
+  //   - the host page rendered participant labels as plain text inside the
+  //     message body, or
+  //   - the assistant quoted prior conversation that started with "User:".
+  // Those false positives caused the latest helper block to be silently
+  // skipped, so the heuristic has been removed. When `data-message-author-role`
+  // / `data-author-role` are absent we report an unknown role and let the
+  // caller decide.
+  const explicit = node?.closest?.('[data-message-author-role]')?.getAttribute?.("data-message-author-role") ||
     node?.closest?.('[data-author-role]')?.getAttribute?.("data-author-role") ||
     "";
-  const normalizedExplicit = explicit.toLowerCase();
-  if (normalizedExplicit === "assistant" || normalizedExplicit === "user") {
-    return normalizedExplicit;
-  }
-
-  const text = normalizeText(container?.innerText || container?.textContent || node?.innerText || node?.textContent || "")
-    .toLowerCase();
-  if (text.startsWith("you said:") || text.startsWith("user:")) {
-    return "user";
-  }
-  if (text.startsWith("copilot said:") ||
-    text.startsWith("assistant:") ||
-    text.startsWith("chatgpt said:") ||
-    text.startsWith("claude said:")) {
-    return "assistant";
+  const normalized = String(explicit || "").toLowerCase();
+  if (normalized === "assistant" || normalized === "user") {
+    return normalized;
   }
   return "";
 }
@@ -1945,6 +1961,11 @@ function injectStatus() {
       title: "Force run latest helper block (bypass dedup ledger)"
     },
     { mode: "site", label: "Enable site" },
+    {
+      mode: "role-filter",
+      label: "Role filter",
+      title: "Toggle author-role filter (when off, the newest visible helper block is always executed)"
+    },
     { mode: "input", label: "Bind input" },
     { mode: "send", label: "Bind send" },
     { mode: "shell", label: "Bind shell" },
@@ -2018,8 +2039,10 @@ function injectStatus() {
   });
 
   document.documentElement.appendChild(panel);
-  chrome.storage.sync.get(["enabledHosts"]).then((settings) => {
+  chrome.storage.sync.get(["enabledHosts", "disableAuthorRoleFilter"]).then((settings) => {
     updateSiteActionButton(isCurrentHostEnabled(settings.enabledHosts));
+    authorRoleFilterEnabled = settings.disableAuthorRoleFilter === false;
+    updateRoleFilterButton();
   });
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
@@ -2176,6 +2199,13 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "role-filter") {
+    toggleAuthorRoleFilter().catch((error) => {
+      setStatus(`Role filter update failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "check") {
     runHealthCheck().catch((error) => {
       setStatus(`Check failed: ${summarizeCommand(error.message || String(error))}`, "error");
@@ -2228,6 +2258,31 @@ function updateSiteActionButton(enabled) {
   if (button) {
     button.textContent = enabled ? "Disable site" : "Enable site";
   }
+}
+
+async function toggleAuthorRoleFilter() {
+  const settings = await chrome.storage.sync.get(["disableAuthorRoleFilter"]);
+  const currentlyEnabled = settings.disableAuthorRoleFilter === false;
+  const nextEnabled = !currentlyEnabled;
+  await chrome.storage.sync.set({ disableAuthorRoleFilter: !nextEnabled });
+  authorRoleFilterEnabled = nextEnabled;
+  updateRoleFilterButton();
+  setStatus(
+    nextEnabled
+      ? "Role filter enabled: helper blocks in user-authored messages will be skipped"
+      : "Role filter disabled: newest visible helper block will always run",
+    "ok"
+  );
+  scheduleScan();
+}
+
+function updateRoleFilterButton() {
+  const button = document.querySelector(`#${STATUS_ID} [data-shell-tool-action="role-filter"]`);
+  if (!button) {
+    return;
+  }
+  button.textContent = authorRoleFilterEnabled ? "Role filter: on" : "Role filter: off";
+  button.style.background = authorRoleFilterEnabled ? "#374151" : "#6b21a8";
 }
 
 async function runHealthCheck() {
