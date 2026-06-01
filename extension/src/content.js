@@ -568,9 +568,12 @@ function getLastShellCallCandidate(root) {
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
   const runnableCandidates = candidates.filter(isRunnableAuthoredCandidate);
-  const assistantCandidates = runnableCandidates.filter(isAssistantAuthoredCandidate);
-  const scopedCandidates = assistantCandidates.length > 0 ? assistantCandidates : runnableCandidates;
-  return scopedCandidates.length > 0 ? scopedCandidates[scopedCandidates.length - 1] : null;
+  // Prefer the latest helper block in DOM order. Earlier versions preferred candidates
+  // whose author role explicitly resolved to "assistant", but that caused the newest
+  // helper block to be skipped whenever the latest message had an ambiguous role
+  // attribute (for example, while the chat site is still hydrating the new turn).
+  // The user-authored content is already excluded by isRunnableAuthoredCandidate.
+  return runnableCandidates.length > 0 ? runnableCandidates[runnableCandidates.length - 1] : null;
 }
 
 function extractShellCallCandidates(root) {
@@ -596,6 +599,7 @@ function extractShellCallCandidates(root) {
       for (const block of extractPlainTextShellCallBlocks(textRoot)) {
         candidates.push({
           ...block,
+          textRoot,
           index: index += 1,
           source: "plain-text-block"
         });
@@ -603,7 +607,12 @@ function extractShellCallCandidates(root) {
     }
   }
 
-  candidates.sort((a, b) => compareNodeOrder(a.node, b.node) || a.index - b.index);
+  // Sort by the textRoot's document position so that helper blocks discovered in the
+  // newest message come last — even when closestMessageContainer walks up to a shared
+  // ancestor for messages whose role/container attributes aren't yet recognizable.
+  candidates.sort((a, b) =>
+    compareNodeOrder(a.textRoot || a.node, b.textRoot || b.node) || a.index - b.index
+  );
   return candidates;
 }
 
@@ -652,11 +661,6 @@ function containsToolLanguageHint(text) {
 
 function closestMessageContainer(node) {
   return node.closest('[data-message-author-role], article, [role="article"], [data-testid], section, main > div') || node;
-}
-
-function isAssistantAuthoredCandidate(candidate) {
-  const role = getMessageAuthorRole(candidate.node);
-  return role === "assistant";
 }
 
 function isRunnableAuthoredCandidate(candidate) {

@@ -204,6 +204,28 @@ const quotedShellOutput = [
   assert.equal(candidate.call.cmd, "echo NEWEST");
 }
 
+{
+  // Regression: when the newest message has an ambiguous (empty) author role
+  // attribute, the debug panel / executor must still pick its helper block
+  // instead of falling back to an older message that is explicitly tagged as
+  // assistant. Otherwise the first helper block in the conversation gets
+  // surfaced even though the latest one is the real target.
+  const context = loadContentContext();
+  const oldMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: "echo OLD_AMBIG" })
+  });
+  const newMessage = new MockNode({
+    order: 2,
+    role: "",
+    text: createHelperBlock({ cmd: "echo NEW_AMBIG" })
+  });
+  const root = createRoot([oldMessage, newMessage]);
+  const candidate = context.getLastShellCallCandidate(root);
+  assert.ok(candidate);
+  assert.equal(candidate.call.cmd, "echo NEW_AMBIG");
+}
+
 async function verifyForceRunUsesLatestHelper() {
   const context = loadContentContext();
   const oldMessage = createAssistantMessage({
