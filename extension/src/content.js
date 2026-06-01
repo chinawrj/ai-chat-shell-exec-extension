@@ -2085,12 +2085,14 @@ async function runFullChainTest() {
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
   const prompt = [
-    "Compatibility test.",
-    "Reply only with these lines and no prose:",
+    "This is a compatibility self-test. Reply with exactly these lines and no prose:",
+    "",
+    "```",
     HELPER_SHELL_START,
     pane.id,
     command,
-    HELPER_SHELL_END
+    HELPER_SHELL_END,
+    "```"
   ].join("\n");
 
   setStatus(`Starting full test on ${pane.id}: ${token}`, "running");
