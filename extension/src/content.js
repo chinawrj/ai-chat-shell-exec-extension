@@ -11,7 +11,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.3.5";
+const CONTENT_SCRIPT_VERSION = "0.4.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -2101,7 +2101,7 @@ async function checkStartupTmux() {
     setStatus(`ForAI tmux unavailable: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
     return;
   }
-  setStatus(`Shell tool ready v${getDisplayVersion()}; ${formatForAiStatus(tmux)}`, "ok");
+  setStatus(`Shell tool ready v${getDisplayVersion()}; ${formatServerProtocolStatus(health)}; ${formatForAiStatus(tmux)}`, "ok");
 }
 
 function formatForAiStatus(tmux) {
@@ -2115,13 +2115,25 @@ function getShellHealthStatusError(health) {
   if (health && health.originMatches === false) {
     return `Server origin mismatch: ${health.extensionId || "current extension"}`;
   }
-  if (health && health.protocolMatches === false) {
-    return `Server protocol mismatch: restart local shell server for v${getDisplayVersion()}`;
+  if (health && (health.protocolMatches === false || health.helperProtocolMatches === false)) {
+    return health.error || `Server protocol mismatch: restart local shell server for v${getDisplayVersion()}`;
   }
   if (!health?.ok) {
     return `Server offline: ${summarizeCommand(health?.error || "run install/start script")}`;
   }
   return "";
+}
+
+function formatServerProtocolStatus(health) {
+  const release = health?.serverReleaseVersion || health?.releaseVersion || "";
+  const serverProtocol = health?.serverProtocolVersion ?? health?.protocolVersion;
+  const helperProtocol = health?.helperProtocolVersion;
+  const parts = [
+    release ? `server v${release}` : "server version unknown",
+    serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
+    helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown"
+  ];
+  return parts.join(" ");
 }
 
 function getExtensionVersionMismatch(background) {
@@ -2148,11 +2160,15 @@ function updateVersionTooltip(background) {
   }
   const manifestVersion = getManifestVersion() || "(unknown)";
   const backgroundVersion = background?.version || background?.backgroundVersion || "(unknown)";
+  const requiredServerProtocol = background?.requiredServerProtocolVersion || "(unknown)";
+  const helperProtocol = background?.helperProtocolVersion || background?.requiredHelperProtocolVersion || "(unknown)";
   statusText.title = [
     "Drag to move",
     `content v${CONTENT_SCRIPT_VERSION}`,
     `manifest v${manifestVersion}`,
-    `background v${backgroundVersion}`
+    `background v${backgroundVersion}`,
+    `requires server protocol ${requiredServerProtocol}`,
+    `helper protocol ${helperProtocol}`
   ].join("\n");
 }
 
@@ -2423,7 +2439,7 @@ async function runHealthCheck() {
   const paneText = tmux?.ok
     ? `; ${formatForAiStatus(tmux)}; tmux panes ${tmux.panes?.length || 0}`
     : "; tmux unavailable";
-  setStatus(`Extension v${getDisplayVersion()}; server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
+  setStatus(`Extension v${getDisplayVersion()}; ${formatServerProtocolStatus(health)}${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
 }
 
 async function runFullChainTest() {

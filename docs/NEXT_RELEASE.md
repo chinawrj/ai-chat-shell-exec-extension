@@ -1,30 +1,29 @@
 # Next Release Plan
 
-Target version: v0.4.0
-Target date: after the next protocol compatibility iteration.
+Target version: v0.5.0
+Target date: after the local visual adapter proof.
 
 ## Theme
 
-Stabilize extension/server/helper protocol boundaries before expanding visual-control surfaces.
+Prove the macOS local visual control loop before moving the same model to Horizon.
 
-See `docs/ROADMAP.md` for the longer v0.4.0 through v0.6.0 plan.
+See `docs/ROADMAP.md` for the longer v0.5.0 through v0.6.0 plan.
 
 ## Goals
 
-1. Protocol identity
-   - Keep the extension release version separate from the server protocol version.
-   - Add a helper protocol version for the plain `ai-helper-*` marker format.
-   - Report extension version, server protocol version, helper protocol version, and tmux workspace state from the user-facing health surfaces.
+1. Local visual surfaces
+   - Treat Terminal.app and Ghostty as tmux UI surfaces.
+   - Keep direct tmux as the test oracle, but make the visual path depend on screenshot/OCR/input rather than direct pane capture.
 
-2. Stale server detection
-   - Make stale foreground server detection explicit when the extension has been upgraded but the local server is still old.
-   - Keep error text actionable: restart the foreground server from the current checkout.
-   - Preserve the current origin policy and do not weaken local WebSocket safeguards.
+2. Completion and output reconstruction
+   - Use tmux status/window-name markers to detect command completion.
+   - Reconstruct long visible output with pagination and OCR stitching.
+   - Use OCR bounding boxes to order terminal rows and avoid naive string concatenation.
 
-3. Compatibility checks
-   - Keep content/background/server startup checks aligned.
-   - Keep popup and floating-panel diagnostics clear about protocol mismatches and `ForAI` readiness.
-   - Expand tests for version/protocol mismatch cases without adding site-specific DOM coupling.
+3. Safety and scope
+   - Keep single-line command execution for the visual path.
+   - Preserve explicit helper blocks, duplicate suppression, and protocol checks.
+   - Do not introduce Horizon/browser-specific code in this release.
 
 4. Release quality gate
    - `./scripts/test_all.sh` passes.

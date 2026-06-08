@@ -10,7 +10,8 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 1;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 2;
+const REQUIRED_HELPER_PROTOCOL_VERSION = 1;
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -289,30 +290,56 @@ async function checkShellServerHealth() {
     }
 
     const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+    const extensionVersion = getExtensionVersionInfo().version;
+    const serverProtocolVersion = Number(body?.serverProtocolVersion ?? body?.protocolVersion);
+    const helperProtocolVersion = Number(body?.helperProtocolVersion);
+    const serverReleaseVersion = String(body?.serverReleaseVersion || body?.releaseVersion || "");
     const originMatches = body?.allowUntrustedOrigins === true || body?.allowedOrigin === extensionOrigin;
-    const protocolMatches = body?.protocolVersion === REQUIRED_SERVER_PROTOCOL_VERSION;
+    const protocolMatches = serverProtocolVersion === REQUIRED_SERVER_PROTOCOL_VERSION;
+    const helperProtocolMatches = helperProtocolVersion === REQUIRED_HELPER_PROTOCOL_VERSION;
+    const releaseMatches = Boolean(serverReleaseVersion) && serverReleaseVersion === extensionVersion;
     const error = !response.ok
       ? `Shell server health returned HTTP ${response.status}.`
       : !originMatches
       ? `Shell server origin policy does not match ${extensionOrigin}.`
-      : !protocolMatches
-        ? `Shell server protocol mismatch. Expected protocol ${REQUIRED_SERVER_PROTOCOL_VERSION}; restart the local shell server from this release.`
+      : !protocolMatches || !helperProtocolMatches
+        ? buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, extensionVersion })
         : body?.error || "";
 
     return {
       ...body,
-      ok: response.ok && body?.ok === true && originMatches && protocolMatches,
+      ok: response.ok && body?.ok === true && originMatches && protocolMatches && helperProtocolMatches,
       status: response.status,
       url: SHELL_SERVER_HEALTH_URL,
       extensionId: chrome.runtime.id,
+      extensionVersion,
       extensionOrigin,
+      serverReleaseVersion,
+      releaseMatches,
+      requiredServerProtocolVersion: REQUIRED_SERVER_PROTOCOL_VERSION,
+      requiredHelperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION,
+      serverProtocolVersion,
+      helperProtocolVersion,
       originMatches,
       protocolMatches,
+      helperProtocolMatches,
+      staleServer: !protocolMatches || !helperProtocolMatches,
       error
     };
   } finally {
     clearTimeout(timer);
   }
+}
+
+function buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, extensionVersion }) {
+  const serverProtocolText = Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : "(missing)";
+  const helperProtocolText = Number.isFinite(helperProtocolVersion) ? helperProtocolVersion : "(missing)";
+  return [
+    `Shell server protocol mismatch for extension v${extensionVersion || "(unknown)"}.`,
+    `Expected server protocol ${REQUIRED_SERVER_PROTOCOL_VERSION} and helper protocol ${REQUIRED_HELPER_PROTOCOL_VERSION};`,
+    `found server protocol ${serverProtocolText} and helper protocol ${helperProtocolText}.`,
+    "Restart the foreground server from this checkout with ./scripts/start_shell_server.sh."
+  ].join(" ");
 }
 
 async function requireShellServerReady() {
@@ -335,7 +362,10 @@ function getExtensionVersionInfo() {
     ok: true,
     version,
     backgroundVersion: version,
-    extensionId: chrome.runtime.id
+    extensionId: chrome.runtime.id,
+    requiredServerProtocolVersion: REQUIRED_SERVER_PROTOCOL_VERSION,
+    requiredHelperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION,
+    helperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION
   };
 }
 

@@ -55,10 +55,16 @@ async function main() {
       serverHealth.allowUntrustedOrigins === true || serverHealth.allowedOrigin === EXPECTED_EXTENSION_ORIGIN,
       `Existing shell server has unexpected allowed origin: ${serverHealth.allowedOrigin || "(unknown)"}`
     );
+    const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
-      serverHealth.protocolVersion,
+      serverProtocolVersion,
+      2,
+      `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
+    );
+    assert.equal(
+      serverHealth.helperProtocolVersion,
       1,
-      `Existing shell server protocol is ${serverHealth.protocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
+      `Existing shell helper protocol is ${serverHealth.helperProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
 

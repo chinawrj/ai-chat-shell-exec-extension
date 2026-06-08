@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MANIFEST_PATH="$ROOT_DIR/extension/manifest.json"
 SERVER_URL="http://127.0.0.1:17371/health"
+EXPECTED_SERVER_PROTOCOL_VERSION=2
+EXPECTED_HELPER_PROTOCOL_VERSION=1
 FORAI_SESSION="${AI_CHAT_SHELL_TMUX_SESSION:-ForAI}"
 FORAI_HOST_WINDOW="${AI_CHAT_SHELL_HOST_WINDOW:-host}"
 FORAI_BOARD_WINDOW="${AI_CHAT_SHELL_BOARD_WINDOW:-board}"
@@ -165,11 +167,20 @@ if command -v curl >/dev/null 2>&1; then
   health="$(curl -fsS "$SERVER_URL" 2>/dev/null || true)"
   if [[ -n "$health" ]]; then
     pass "Shell server health endpoint is reachable"
-    node - "$health" <<'NODE'
+    node - "$health" "$MANIFEST_PATH" "$EXPECTED_SERVER_PROTOCOL_VERSION" "$EXPECTED_HELPER_PROTOCOL_VERSION" <<'NODE'
+const fs = require("node:fs");
 const health = JSON.parse(process.argv[2]);
+const manifest = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const expectedServerProtocolVersion = Number(process.argv[4]);
+const expectedHelperProtocolVersion = Number(process.argv[5]);
 const expectedOrigin = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
+const serverProtocolVersion = Number(health.serverProtocolVersion ?? health.protocolVersion);
+const helperProtocolVersion = Number(health.helperProtocolVersion);
 console.log(`info: Shell server pid ${health.pid || "unknown"}`);
-console.log(`info: Shell server protocolVersion ${health.protocolVersion || "(missing)"}`);
+console.log(`info: Extension release version ${manifest.version || "(missing)"}`);
+console.log(`info: Shell server release version ${health.serverReleaseVersion || health.releaseVersion || "(missing)"}`);
+console.log(`info: Shell server protocolVersion ${Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : "(missing)"}`);
+console.log(`info: Shell helper protocolVersion ${Number.isFinite(helperProtocolVersion) ? helperProtocolVersion : "(missing)"}`);
 console.log(`info: Shell server allowedOrigin ${health.allowedOrigin || "(missing)"}`);
 console.log(`info: Shell server default tmux ${health.tmuxDefaultSession || "(missing)"}:${health.tmuxDefaultHostWindow || "(missing)"} board=${health.tmuxDefaultBoardWindow || "(missing)"}`);
 console.log(`info: Shell server default cwd ${health.tmuxDefaultCwd || "(missing)"} (${health.tmuxDefaultCwdSource || "unknown"})`);
@@ -185,10 +196,16 @@ if (health.allowUntrustedOrigins === true || health.allowedOrigin === expectedOr
   console.error(`error: Shell server origin policy does not match ${expectedOrigin}`);
   process.exitCode = 1;
 }
-if (health.protocolVersion === 1) {
+if (serverProtocolVersion === expectedServerProtocolVersion) {
   console.log("ok: Shell server protocol version is supported");
 } else {
-  console.error(`error: Shell server protocol version is unsupported or missing: ${health.protocolVersion || "(missing)"}`);
+  console.error(`error: Shell server protocol version is unsupported or missing: ${Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : "(missing)"}. Expected ${expectedServerProtocolVersion}. Restart ./scripts/start_shell_server.sh from this checkout.`);
+  process.exitCode = 1;
+}
+if (helperProtocolVersion === expectedHelperProtocolVersion) {
+  console.log("ok: Shell helper protocol version is supported");
+} else {
+  console.error(`error: Shell helper protocol version is unsupported or missing: ${Number.isFinite(helperProtocolVersion) ? helperProtocolVersion : "(missing)"}. Expected ${expectedHelperProtocolVersion}. Restart ./scripts/start_shell_server.sh from this checkout.`);
   process.exitCode = 1;
 }
 if (health.tmuxDefaultCwdError) {

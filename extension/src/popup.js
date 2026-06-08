@@ -143,7 +143,7 @@ async function refreshHealth() {
     const response = await chrome.runtime.sendMessage({ type: "shell-health" });
     if (response?.ok) {
       health.dataset.state = "ok";
-      health.textContent = `Server OK, pid ${response.pid}`;
+      health.textContent = formatServerHealth(response);
       return;
     }
 
@@ -152,8 +152,8 @@ async function refreshHealth() {
       health.textContent = `Extension ID mismatch. Expected ${response.allowedOrigin || "server origin"}`;
       return;
     }
-    if (response?.protocolMatches === false) {
-      health.textContent = "Server protocol mismatch. Restart the local shell server from this release.";
+    if (response?.protocolMatches === false || response?.helperProtocolMatches === false) {
+      health.textContent = response.error || "Server protocol mismatch. Restart the foreground server from this checkout.";
       return;
     }
     health.textContent = response?.error || "Server not reachable";
@@ -161,6 +161,18 @@ async function refreshHealth() {
     health.dataset.state = "error";
     health.textContent = error.message || String(error);
   }
+}
+
+function formatServerHealth(response) {
+  const release = response?.serverReleaseVersion || response?.releaseVersion || "";
+  const serverProtocol = response?.serverProtocolVersion ?? response?.protocolVersion;
+  const helperProtocol = response?.helperProtocolVersion;
+  return [
+    release ? `Server v${release}` : "Server version unknown",
+    serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
+    helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown",
+    response?.pid ? `pid ${response.pid}` : ""
+  ].filter(Boolean).join(", ");
 }
 
 async function refreshTmuxTargets() {

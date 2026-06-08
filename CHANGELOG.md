@@ -4,6 +4,14 @@
 
 - Nothing yet.
 
+## [0.4.0] - 2026-06-08
+
+- Separates the extension release version from server protocol compatibility by reporting `serverProtocolVersion` and `helperProtocolVersion` from the local server health endpoint.
+- Bumps the shell server protocol to `2` and defines helper protocol `1` for the plain `ai-helper-*` marker format.
+- Makes stale foreground server detection explicit when the extension sees an old server protocol or missing helper protocol metadata, with restart guidance for `./scripts/start_shell_server.sh`.
+- Shows server release, server protocol, helper protocol, and `ForAI` state in floating-panel, popup, and doctor diagnostics.
+- Adds protocol metadata tests for current health responses, old server detection, and helper protocol mismatch handling.
+
 ## [0.3.5] - 2026-06-08
 
 - Hardens shell server startup against broken `.state` paths by preflighting and automatically repairing safe state-directory conflicts before listening.

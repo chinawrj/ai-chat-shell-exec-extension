@@ -102,7 +102,15 @@ function makeContext() {
               }]
             };
           }
-          return { ok: true, pid: 123 };
+          return {
+            ok: true,
+            pid: 123,
+            releaseVersion: "0.4.0",
+            serverReleaseVersion: "0.4.0",
+            protocolVersion: 2,
+            serverProtocolVersion: 2,
+            helperProtocolVersion: 1
+          };
         }
       },
       tabs: {
@@ -150,6 +158,8 @@ function makeContext() {
   const { context, elements, writes } = makeContext();
   await context.loadSettings();
   await context.loadCurrentSite();
+  await context.refreshHealth();
+  assert.equal(elements.get("health").textContent, "Server v0.4.0, protocol 2, helper 1, pid 123");
   await context.refreshTmuxTargets();
   assert.equal(elements.get("tmuxTargets").textContent.includes("defaultSession=ForAI host=%41 board=%40 cwd=/tmp/project"), true);
   assert.equal(elements.get("tmuxTargets").textContent.includes("target=%24 address=espcam:0.0 window=build command=zsh cwd=/tmp/project active=false"), true);

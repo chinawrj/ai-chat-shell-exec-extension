@@ -18,15 +18,20 @@ run node --check server/shell_server.js
 run node --check scripts/start_tmux_test_page_https.js
 run node --check tests/chrome_extension_e2e.test.js
 
-run bash -n \
-  scripts/install_shell_server_agent.sh \
-  scripts/uninstall_shell_server_agent.sh \
-  scripts/start_shell_server.sh \
-  scripts/package_release.sh \
-  scripts/open_tmux_test_chrome.sh \
-  scripts/build_macos_vision_helper.sh \
-  scripts/run_terminal_vision_self_test.sh \
+SHELL_SCRIPTS=(
+  scripts/install_shell_server_agent.sh
+  scripts/uninstall_shell_server_agent.sh
+  scripts/start_shell_server.sh
+  scripts/package_release.sh
+  scripts/open_tmux_test_chrome.sh
+  scripts/build_macos_vision_helper.sh
+  scripts/run_terminal_vision_self_test.sh
   scripts/test_all.sh
+)
+
+for shell_script in "${SHELL_SCRIPTS[@]}"; do
+  run bash -n "$shell_script"
+done
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   run git diff --check

@@ -15,6 +15,8 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const ROOT_DIR = path.join(__dirname, "..");
+const SERVER_PROTOCOL_VERSION = 2;
+const HELPER_PROTOCOL_VERSION = 1;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
@@ -68,36 +70,8 @@ let serverLedger = loadServerLedger();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
-    const forAiConfig = getForAiTmuxConfigForHealth();
-    const state = getStateStatus({ create: true });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      ok: state.ok,
-      error: state.error || "",
-      service: "ai-chat-shell-exec-server",
-      protocolVersion: 1,
-      executionBackend: "tmux",
-      pid: process.pid,
-      uptimeSec: Math.round(process.uptime()),
-      allowedOrigin: ALLOWED_ORIGIN,
-      allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
-      stateDir: state.stateDir,
-      stateSource: state.source,
-      stateOk: state.ok,
-      stateError: state.error || "",
-      stateRepaired: state.repaired === true,
-      stateRepairs: state.repairs || [],
-      tmuxSocket: getTmuxSocketPath() || null,
-      tmuxDefaultSession: forAiConfig.sessionName,
-      tmuxDefaultHostWindow: forAiConfig.hostWindowName,
-      tmuxDefaultBoardWindow: forAiConfig.boardWindowName,
-      tmuxDefaultCwd: forAiConfig.cwd,
-      tmuxDefaultCwdSource: forAiConfig.cwdSource,
-      tmuxDefaultCwdError: forAiConfig.cwdError || "",
-      visionHelper: getVisionHelperPath(),
-      visionAvailable: getVisionAvailability().available,
-      ledgerEntries: Object.keys(serverLedger.calls || {}).length
-    }));
+    res.end(JSON.stringify(buildHealthResponse()));
     return;
   }
 
@@ -323,6 +297,66 @@ function formatConsoleArgs(args) {
   }).join(" ");
 }
 
+function getReleaseVersion() {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, "extension", "manifest.json"), "utf8"));
+    return String(manifest.version || "");
+  } catch (_error) {
+    return "";
+  }
+}
+
+function getProtocolMetadata() {
+  const releaseVersion = getReleaseVersion();
+  return {
+    releaseVersion,
+    serverReleaseVersion: releaseVersion,
+    protocolVersion: SERVER_PROTOCOL_VERSION,
+    serverProtocolVersion: SERVER_PROTOCOL_VERSION,
+    helperProtocolVersion: HELPER_PROTOCOL_VERSION,
+    helperProtocol: "ai-helper-plain-text",
+    executionBackend: "tmux"
+  };
+}
+
+function buildHealthResponse() {
+  const forAiConfig = getForAiTmuxConfigForHealth();
+  const state = getStateStatus({ create: true });
+  return {
+    ok: state.ok,
+    error: state.error || "",
+    service: "ai-chat-shell-exec-server",
+    ...getProtocolMetadata(),
+    pid: process.pid,
+    uptimeSec: Math.round(process.uptime()),
+    allowedOrigin: ALLOWED_ORIGIN,
+    allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
+    stateDir: state.stateDir,
+    stateSource: state.source,
+    stateOk: state.ok,
+    stateError: state.error || "",
+    stateRepaired: state.repaired === true,
+    stateRepairs: state.repairs || [],
+    tmuxSocket: getTmuxSocketPath() || null,
+    tmuxDefaultSession: forAiConfig.sessionName,
+    tmuxDefaultHostWindow: forAiConfig.hostWindowName,
+    tmuxDefaultBoardWindow: forAiConfig.boardWindowName,
+    tmuxDefaultCwd: forAiConfig.cwd,
+    tmuxDefaultCwdSource: forAiConfig.cwdSource,
+    tmuxDefaultCwdError: forAiConfig.cwdError || "",
+    visionHelper: getVisionHelperPath(),
+    visionAvailable: getVisionAvailability().available,
+    ledgerEntries: Object.keys(serverLedger.calls || {}).length
+  };
+}
+
+function withProtocolMetadata(response) {
+  return {
+    ...getProtocolMetadata(),
+    ...response
+  };
+}
+
 async function handleMessageText(text) {
   ensureStateDirReady({ create: true });
   const message = JSON.parse(text);
@@ -332,18 +366,18 @@ async function handleMessageText(text) {
 
   if (message.type === "tmux-list") {
     const layout = await ensureForAiTmuxLayout();
-    return {
+    return withProtocolMetadata({
       ok: true,
       ...layout
-    };
+    });
   }
 
   if (message.type === "tmux-ensure") {
-    return ensureForAiTmuxLayout();
+    return withProtocolMetadata(await ensureForAiTmuxLayout());
   }
 
   if (message.type === "tmux-reset-forai") {
-    return resetForAiTmuxLayout();
+    return withProtocolMetadata(await resetForAiTmuxLayout());
   }
 
   if (message.type === "write-file") {
@@ -3143,9 +3177,12 @@ function resolveCwd(rawCwd, fallbackCwd = "") {
 }
 
 module.exports = {
+  HELPER_PROTOCOL_VERSION,
+  SERVER_PROTOCOL_VERSION,
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildHealthResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
   buildMissingTargetResponse,
@@ -3163,6 +3200,8 @@ module.exports = {
   ensureForAiTmuxLayout,
   ensureStateDirReady,
   getForAiTmuxConfig,
+  getProtocolMetadata,
+  getReleaseVersion,
   getVisionAvailability,
   getVisionHelperPath,
   handleMessageText,

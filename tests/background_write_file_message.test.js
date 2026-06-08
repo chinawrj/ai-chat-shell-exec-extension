@@ -69,6 +69,7 @@ const context = {
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
+      getManifest: () => ({ version: "0.4.0" }),
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
       onMessage: { addListener() {} }
@@ -108,7 +109,11 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-      protocolVersion: 1
+      releaseVersion: "0.4.0",
+      serverReleaseVersion: "0.4.0",
+      protocolVersion: 2,
+      serverProtocolVersion: 2,
+      helperProtocolVersion: 1
     })
   }),
   setTimeout,
@@ -222,9 +227,39 @@ async function main() {
     text: async () => JSON.stringify({
       ok: true,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-      protocolVersion: 0
+      releaseVersion: "0.3.5",
+      serverReleaseVersion: "0.3.5",
+      protocolVersion: 1,
+      serverProtocolVersion: 1,
+      helperProtocolVersion: 1
     })
   });
+
+  await assert.rejects(
+    () => context.handleRunShellMessage({
+      type: "run-shell",
+      id: "shell-protocol-mismatch",
+      callKey: "shell-protocol-mismatch",
+      cmd: "printf stale-server"
+    }),
+    /protocol mismatch/
+  );
+  assert.equal(sentPayloads.length, 3);
+  assert.equal(localStore["shellCallLedger:v1"].calls["shell-protocol-mismatch"].state, "failed");
+
+  await assert.rejects(
+    () => context.handleWriteFileMessage({
+      type: "write-file",
+      id: "file-protocol-mismatch",
+      callKey: "file-protocol-mismatch",
+      filename: "stale-server.txt",
+      content: "must not send"
+    }),
+    /protocol mismatch/
+  );
+  assert.equal(sentPayloads.length, 3);
+  assert.equal(localStore["shellCallLedger:v1"].calls["file-protocol-mismatch"].state, "failed");
+
   await assert.rejects(
     () => context.handleRunBoardMessage({
       type: "run-board",
