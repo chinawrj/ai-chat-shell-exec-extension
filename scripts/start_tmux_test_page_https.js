@@ -6,7 +6,8 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const ROOT_DIR = path.join(__dirname, "..");
-const STATE_DIR = path.join(ROOT_DIR, ".state", "test-page");
+const STATE_ROOT_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || path.join(ROOT_DIR, ".state"));
+const STATE_DIR = path.join(STATE_ROOT_DIR, "test-page");
 const CERT_PATH = path.join(STATE_DIR, "localhost-cert.pem");
 const KEY_PATH = path.join(STATE_DIR, "localhost-key.pem");
 const PORT = Number(process.env.TEST_PAGE_PORT || process.argv[2] || 17443);
@@ -65,7 +66,12 @@ function ensureCertificate() {
 
   if (result.status !== 0) {
     process.stderr.write(result.stderr || result.stdout || "Failed to create localhost certificate.\n");
-    process.stderr.write("Install openssl or create .state/test-page/localhost-cert.pem and localhost-key.pem manually.\n");
+    process.stderr.write(`Install openssl or create ${CERT_PATH} and ${KEY_PATH} manually.\n`);
     process.exit(result.status || 1);
   }
+}
+
+function resolveStateDir(value) {
+  const text = String(value || "").replace(/^~(?=$|\/)/, require("node:os").homedir());
+  return path.isAbsolute(text) ? text : path.resolve(ROOT_DIR, text);
 }

@@ -39,11 +39,31 @@ mkdir -p "$OUT_DIR"
 SOURCE_ZIP="$OUT_DIR/$PACKAGE_BASENAME-source.zip"
 EXTENSION_ZIP="$OUT_DIR/$PACKAGE_BASENAME-chrome-extension.zip"
 
-git archive \
-  --format=zip \
-  --prefix="$PACKAGE_BASENAME/" \
-  --output="$SOURCE_ZIP" \
-  HEAD
+if [[ "${ALLOW_DIRTY:-0}" == "1" ]]; then
+  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-chat-shell-release.XXXXXX")"
+  cleanup_stage() {
+    rm -rf "$STAGE_DIR"
+  }
+  trap cleanup_stage EXIT
+  mkdir -p "$STAGE_DIR/$PACKAGE_BASENAME"
+  while IFS= read -r file_path; do
+    if [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
+      continue
+    fi
+    mkdir -p "$STAGE_DIR/$PACKAGE_BASENAME/$(dirname "$file_path")"
+    cp -pP "$file_path" "$STAGE_DIR/$PACKAGE_BASENAME/$file_path"
+  done < <(git ls-files --cached --others --exclude-standard)
+  (
+    cd "$STAGE_DIR"
+    zip -qr "$SOURCE_ZIP" "$PACKAGE_BASENAME"
+  )
+else
+  git archive \
+    --format=zip \
+    --prefix="$PACKAGE_BASENAME/" \
+    --output="$SOURCE_ZIP" \
+    HEAD
+fi
 
 (
   cd "$ROOT_DIR/extension"

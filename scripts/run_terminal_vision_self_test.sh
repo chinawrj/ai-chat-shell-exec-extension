@@ -3,7 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HELPER="${AI_CHAT_SHELL_VISION_HELPER:-$ROOT_DIR/.state/bin/macos-vision-helper}"
+STATE_DIR_INPUT="${AI_CHAT_SHELL_STATE_DIR:-$ROOT_DIR/.state}"
+if [[ "$STATE_DIR_INPUT" = /* ]]; then
+  STATE_DIR="$STATE_DIR_INPUT"
+else
+  STATE_DIR="$ROOT_DIR/$STATE_DIR_INPUT"
+fi
+HELPER="${AI_CHAT_SHELL_VISION_HELPER:-$STATE_DIR/bin/macos-vision-helper}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   printf '{"ok":false,"skipped":true,"errorCode":"non-macos","error":"Terminal vision self-test only runs on macOS."}\n'

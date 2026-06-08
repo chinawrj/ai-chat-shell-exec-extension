@@ -55,7 +55,7 @@ const response = {
 };
 
 const longCommand = `printf ${"x".repeat(160)}`;
-const longOutput = context.formatShellOutput({ cmd: longCommand, target: "%24" }, response, "2026-05-22T00:00:00.000Z");
+const longOutput = context.formatShellOutput({ cmd: longCommand }, response, "2026-05-22T00:00:00.000Z");
 const longCommandLine = longOutput.split("\n").find((line) => line.startsWith("$ "));
 assert.ok(longCommandLine.length <= 66, longCommandLine);
 assert.match(longOutput, /^cmdHash: [a-f0-9]+$/m);
@@ -64,13 +64,13 @@ assert.equal(context.isSameCommandAsShellOutput(`${longCommand}x`, longOutput), 
 assert.match(longOutput, /stdout:\nok/);
 
 const shortCommand = "pwd";
-const shortOutput = context.formatShellOutput({ cmd: shortCommand, target: "%24" }, response, "2026-05-22T00:00:00.000Z");
+const shortOutput = context.formatShellOutput({ cmd: shortCommand }, response, "2026-05-22T00:00:00.000Z");
 assert.match(shortOutput, /^\$ pwd$/m);
 assert.doesNotMatch(shortOutput, /^cmdHash:/m);
 assert.equal(context.isSameCommandAsShellOutput(shortCommand, shortOutput), true);
 
 const multilineCommand = "printf one\nprintf two";
-const multilineOutput = context.formatShellOutput({ cmd: multilineCommand, target: "%24" }, response, "2026-05-22T00:00:00.000Z");
+const multilineOutput = context.formatShellOutput({ cmd: multilineCommand }, response, "2026-05-22T00:00:00.000Z");
 assert.match(multilineOutput, /^\$ printf one printf two$/m);
 assert.match(multilineOutput, /^cmdHash: [a-f0-9]+$/m);
 assert.equal(context.isSameCommandAsShellOutput(multilineCommand, multilineOutput), true);

@@ -1,12 +1,12 @@
 # AI Chat Shell Exec
 
-Chrome extension for explicit local command execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`, routed through a selected tmux pane.
+Chrome extension for explicit local command execution from AI chat pages such as `https://chatgpt.com/` and `https://claude.ai/`, routed through the default `ForAI:host` tmux pane.
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
 With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes three helper block types:
 
-- Shell helper: request local terminal output from the default `ForAI` tmux session, or from an explicit tmux target.
+- Shell helper: request local terminal output from the default `ForAI` tmux session.
 - Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
 - File helper: write one file under `$HOME/Downloads`.
 
@@ -36,7 +36,7 @@ second line
 ai-helper-file-end
 ````
 
-By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
+By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
 
@@ -57,7 +57,7 @@ File helper result reply:
 Chrome extensions cannot directly execute local shell commands. This project uses:
 
 - `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. The execution trigger is still limited to explicit ai-helper blocks.
-- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that lists tmux panes, sends shell commands into a selected pane, and sends board commands into the configured board pane.
+- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that ensures the default `ForAI` tmux workspace, sends shell commands into `ForAI:host`, and sends board commands into the configured board pane.
 
 Flow:
 
@@ -86,21 +86,15 @@ If you use the release source archive, unzip it and run the commands below from 
 
    `lkmeogidbglhedgekjgbpbfjkpapnhke`
 
-5. Start the local shell server.
-
-   On macOS, install and start the LaunchAgent:
-
-   ```sh
-   ./scripts/install_shell_server_agent.sh
-   ```
-
-   This creates `~/Library/LaunchAgents/com.local.ai-chat-shell-exec-server.plist`, starts the server now, and keeps it running after login. Logs are written under `.state/`. The installer also sets `AI_CHAT_SHELL_TMUX_SOCKET` to the default user tmux socket; override it before running the installer if you use a named tmux socket.
-
-   On Ubuntu, or for a temporary foreground server during development, use:
+5. Start the local shell server in a terminal and leave it running while using the extension.
 
    ```sh
    ./scripts/start_shell_server.sh
    ```
+
+   Runtime state and server logs default to `.state/` under this project directory. Set `AI_CHAT_SHELL_STATE_DIR=/path/to/state` only if you intentionally want runtime state elsewhere. If you use a named tmux socket, set `AI_CHAT_SHELL_TMUX_SOCKET` before starting the server.
+
+   For compatibility with older setup instructions, `./scripts/install_shell_server_agent.sh` first removes any legacy macOS LaunchAgent and then starts the same foreground server. It does not install auto-start.
 
 6. Reload the extension and reload the AI chat page.
 
@@ -145,7 +139,7 @@ ai-helper-file-end
 
 Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
-- Shell helpers may omit the tmux target; omitted targets run in the default `ForAI` `host` window.
+- Shell helpers do not include a tmux target; the entire helper body is the shell command and runs in the default `ForAI` `host` window.
 - Board helpers must contain exactly one non-empty board command line and no target.
 - File helpers must put a single file name, not a path, on the second line.
 - If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
@@ -159,7 +153,8 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 - enabled/paused
 - auto-enabled sites
-- available tmux targets for optional explicit shell targeting
+- visible tmux panes and default `ForAI` workspace state for diagnostics
+- default `ForAI` host/board/cwd state, plus a reset button for the default session
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -172,7 +167,8 @@ By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.micr
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
-- `Check`: verify local shell server health and show whether input/send/shell bindings exist for the current origin.
+- `Check`: verify local shell server health, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
+- `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
 - `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
@@ -193,11 +189,7 @@ uname -a
 ai-helper-shell-end
 ````
 
-The default target is the `host` window in the `ForAI` tmux session. The local server ensures `ForAI`, `host`, and `board` exist before listing targets or running a shell helper.
-
-To use a non-default target, put it on the second line and put the command on the following lines. `target` can be a tmux pane id such as `%24`, a `session:window.pane` address such as `ForAI:0.0`, or a unique window name such as `host`.
-
-When the extension returns a target list, each line is formatted for the AI to read, for example `target=%24 address=espcam:0.0 window=build command=zsh cwd=/path active=true`. Choose the `target=` value that matches the desired `window=...`.
+The default target is the `host` window in the `ForAI` tmux session. The local server ensures `ForAI`, `host`, and `board` exist before listing targets or running a shell helper. New default windows start in the project root unless `AI_CHAT_SHELL_FORAI_CWD` is set.
 
 Keep AI requests minimal by default:
 
@@ -207,16 +199,7 @@ git status --short
 ai-helper-shell-end
 ````
 
-If you want to be explicit, this also works:
-
-````
-ai-helper-shell-start
-host
-git status --short
-ai-helper-shell-end
-````
-
-For single-line default commands, the helper body is the command. For explicit targets or multiline commands, the helper format maps the second line to `target` and the remaining body to `cmd`; use a blank target line to keep the default target with a multiline command. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
+For shell helpers, every line between `ai-helper-shell-start` and `ai-helper-shell-end` is the command body. Multiline commands, heredocs, and `cat <<EOF` file creation are supported as normal shell script text. Shell helpers do not support a target line, and legacy shell target fields are ignored. Legacy JSON shell-call requests and the old `ai-helper-start-shell` / `ai-helper-end-shell` aliases are not supported.
 
 For board output, use:
 
@@ -257,14 +240,16 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 ## Safety Defaults
 
 - The extension runs only explicit shell, board, and file helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
-- Shell helper commands without a target run in `ForAI:host`; unknown explicit targets are rejected and the reply lists available panes.
+- Shell helper commands always run in `ForAI:host`; target lines are not part of the shell helper protocol.
+- Reset actions in the floating panel and popup kill and recreate only the default `ForAI` session.
 - Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or `ForAI:board`, and the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.
 - The default auto-enabled host list contains `chatgpt.com` and `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained helper calls are capped by `maxChainCalls` in extension storage. The default is 100, and the popup enforces only a minimum of 1. New human prompts reset the chain count; tool result replies do not.
-- Duplicate execution is blocked before the command reaches the local server. The content script generates a stable call key from the site, latest human intent, tmux target, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in `.state/shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
+- Duplicate execution is blocked before the command reaches the local server. The content script generates a stable call key from the site, latest human intent, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in the runtime state directory's `shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
+- The runtime state directory defaults to `.state/` under this project directory and is rebuildable: it stores server logs, dedupe ledger data, tmux temporary scripts, board logs, vision temp files, local test assets, and helper build artifacts. The startup script and server preflight the state directory and repair or recreate it before accepting commands. Safe conflicts are moved aside with a `.broken-*` suffix. Use `AI_CHAT_SHELL_STATE_DIR` only when you intentionally want state elsewhere.
 - The WebSocket server only accepts Chrome extension requests by default. Set `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
 - The local server clamps timeout to 1 second through 10 minutes. When a tmux command times out, the server stops waiting and reports that the command may still be running in the pane.
 - Commands longer than 8000 characters are rejected before execution.
@@ -282,13 +267,7 @@ After changing extension files:
 2. Refresh every AI chat tab you want to use.
 3. Confirm the lower-right status badge shows the current extension version and that `Check` reports no content/background version mismatch.
 
-After changing server files with the LaunchAgent installed:
-
-```sh
-./scripts/install_shell_server_agent.sh
-```
-
-For foreground development:
+After changing server files:
 
 1. Stop the old shell server.
 2. Start it again:
@@ -309,7 +288,7 @@ Manual tmux test page:
 node scripts/start_tmux_test_page_https.js
 ```
 
-Open `https://localhost:17443/tmux-test-page.html`, accept the local certificate warning, reload the unpacked extension, copy a tmux target from the popup, click the page composer once, then insert a targeted helper block. This local test port is auto-enabled by the development content script.
+Open `https://localhost:17443/tmux-test-page.html`, accept the local certificate warning, reload the unpacked extension, click the page composer once, then insert a shell helper block. This local test port is auto-enabled by the development content script.
 
 To launch an isolated Chromium-family test profile with this unpacked extension already loaded:
 
@@ -335,7 +314,7 @@ The Chrome extension e2e test launches a real Chromium-family browser with the u
 
 Feature and test coverage is tracked in `docs/FEATURE_TEST_MATRIX.md`. Add or update a row there whenever a feature or test case changes.
 
-Uninstall the LaunchAgent:
+Remove a legacy macOS LaunchAgent from older releases without starting the server:
 
 ```sh
 ./scripts/uninstall_shell_server_agent.sh

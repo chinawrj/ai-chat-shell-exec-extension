@@ -3,7 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROFILE_DIR="$ROOT_DIR/.state/chrome-tmux-test-profile"
+STATE_DIR_INPUT="${AI_CHAT_SHELL_STATE_DIR:-$ROOT_DIR/.state}"
+if [[ "$STATE_DIR_INPUT" = /* ]]; then
+  STATE_DIR="$STATE_DIR_INPUT"
+else
+  STATE_DIR="$ROOT_DIR/$STATE_DIR_INPUT"
+fi
+PROFILE_DIR="$STATE_DIR/chrome-tmux-test-profile"
 EXTENSION_DIR="$ROOT_DIR/extension"
 URL="${1:-https://localhost:17443/tmux-test-page.html}"
 DEBUG_PORT="${CHROME_TEST_DEBUG_PORT:-9223}"

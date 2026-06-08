@@ -10,6 +10,7 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 1;
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -64,6 +65,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "tmux-ensure") {
     ensureTmuxTargets()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error),
+        panes: []
+      }));
+    return true;
+  }
+
+  if (message.type === "tmux-reset-forai") {
+    resetForAiTmuxTargets()
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -137,6 +149,7 @@ async function handleWriteFileMessage(message) {
 
   payload.seq = claim.seq;
   try {
+    await requireShellServerReady();
     const response = await runShellViaWebSocket(payload);
     await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
       completedAt: Date.now(),
@@ -166,7 +179,6 @@ async function handleRunShellMessage(message) {
     id: message.id,
     callKey,
     cmd: message.cmd,
-    target: message.target,
     cwd: message.cwd,
     timeoutMs,
     maxOutputChars,
@@ -187,6 +199,7 @@ async function handleRunShellMessage(message) {
 
   payload.seq = claim.seq;
   try {
+    await requireShellServerReady();
     const response = await runShellViaWebSocket(payload);
     await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
       completedAt: Date.now(),
@@ -194,7 +207,7 @@ async function handleRunShellMessage(message) {
       durationMs: response?.durationMs,
       duplicate: response?.duplicate === true,
       skipped: response?.skipped === true,
-      target: response?.target || payload.target || ""
+      target: response?.target || ""
     });
     return response;
   } catch (error) {
@@ -239,6 +252,7 @@ async function handleRunBoardMessage(message) {
 
   payload.seq = claim.seq;
   try {
+    await requireShellServerReady();
     const response = await runShellViaWebSocket(payload);
     await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
       completedAt: Date.now(),
@@ -276,19 +290,42 @@ async function checkShellServerHealth() {
 
     const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
     const originMatches = body?.allowUntrustedOrigins === true || body?.allowedOrigin === extensionOrigin;
+    const protocolMatches = body?.protocolVersion === REQUIRED_SERVER_PROTOCOL_VERSION;
+    const error = !response.ok
+      ? `Shell server health returned HTTP ${response.status}.`
+      : !originMatches
+      ? `Shell server origin policy does not match ${extensionOrigin}.`
+      : !protocolMatches
+        ? `Shell server protocol mismatch. Expected protocol ${REQUIRED_SERVER_PROTOCOL_VERSION}; restart the local shell server from this release.`
+        : body?.error || "";
 
     return {
-      ok: response.ok && body?.ok === true && originMatches,
+      ...body,
+      ok: response.ok && body?.ok === true && originMatches && protocolMatches,
       status: response.status,
       url: SHELL_SERVER_HEALTH_URL,
       extensionId: chrome.runtime.id,
       extensionOrigin,
       originMatches,
-      ...body
+      protocolMatches,
+      error
     };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function requireShellServerReady() {
+  let health;
+  try {
+    health = await checkShellServerHealth();
+  } catch (error) {
+    throw new Error(`Shell server health check failed: ${error.message || String(error)}`);
+  }
+  if (!health?.ok) {
+    throw new Error(health?.error || "Shell server is not ready.");
+  }
+  return health;
 }
 
 function getExtensionVersionInfo() {
@@ -463,11 +500,18 @@ function hashText(input) {
 }
 
 function listTmuxTargets() {
-  return runShellViaWebSocket({ type: "tmux-list", timeoutMs: 5000 });
+  return requireShellServerReady()
+    .then(() => runShellViaWebSocket({ type: "tmux-list", timeoutMs: 5000 }));
 }
 
 function ensureTmuxTargets() {
-  return runShellViaWebSocket({ type: "tmux-ensure", timeoutMs: 5000 });
+  return requireShellServerReady()
+    .then(() => runShellViaWebSocket({ type: "tmux-ensure", timeoutMs: 5000 }));
+}
+
+function resetForAiTmuxTargets() {
+  return requireShellServerReady()
+    .then(() => runShellViaWebSocket({ type: "tmux-reset-forai", timeoutMs: 10000 }));
 }
 
 function runShellViaWebSocket(payload) {

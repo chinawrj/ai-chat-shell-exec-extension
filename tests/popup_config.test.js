@@ -37,6 +37,7 @@ function makeContext() {
     "addCurrentSite",
     "removeCurrentSite",
     "refreshTmuxTargets",
+    "resetForAiTmux",
     "portableConfig",
     "portableStatus",
     "currentSiteStatus",
@@ -86,6 +87,12 @@ function makeContext() {
           if (message?.type === "tmux-list") {
             return {
               ok: true,
+              sessionName: "ForAI",
+              hostWindowName: "host",
+              boardWindowName: "board",
+              defaultTarget: "%41",
+              boardTarget: "%40",
+              cwd: "/tmp/project",
               panes: [{
                 id: "%24",
                 address: "espcam:0.0",
@@ -144,6 +151,7 @@ function makeContext() {
   await context.loadSettings();
   await context.loadCurrentSite();
   await context.refreshTmuxTargets();
+  assert.equal(elements.get("tmuxTargets").textContent.includes("defaultSession=ForAI host=%41 board=%40 cwd=/tmp/project"), true);
   assert.equal(elements.get("tmuxTargets").textContent.includes("target=%24 address=espcam:0.0 window=build command=zsh cwd=/tmp/project active=false"), true);
 
   await context.exportConfig();

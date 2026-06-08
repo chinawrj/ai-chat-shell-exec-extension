@@ -14,11 +14,16 @@ const ALLOWED_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
-const STATE_DIR = path.join(__dirname, "..", ".state");
+const ROOT_DIR = path.join(__dirname, "..");
+const DEFAULT_STATE_DIR = getDefaultStateDir();
+const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
 const BOARD_LOG_DIR = path.join(STATE_DIR, "board-panes");
 const VISION_TMP_DIR = path.join(STATE_DIR, "vision");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
+const STATE_STDOUT_LOG_PATH = path.join(STATE_DIR, "shell-server.out.log");
+const STATE_STDERR_LOG_PATH = path.join(STATE_DIR, "shell-server.err.log");
+const STATE_REQUIRED_SUBDIRS = ["tmux-runs", "board-panes", "vision", "bin"];
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
 const COMPLETED_DEDUP_TTL_MS = 60_000;
@@ -57,24 +62,38 @@ const VISION_ALLOWED_KEYS = new Set(["enter", "tab", "escape", "backspace", "pag
 const VISION_TMUX_RUN_PREFIX = "AIVR";
 const VISION_TMUX_OCR_RUN_PREFIX = "AIVRRUN";
 const VISION_TMUX_OCR_DONE_PREFIX = "AIVRDONE";
+let stateLoggingConfigured = false;
+let stateLogStreams = null;
 let serverLedger = loadServerLedger();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
+    const forAiConfig = getForAiTmuxConfigForHealth();
+    const state = getStateStatus({ create: true });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
-      ok: true,
+      ok: state.ok,
+      error: state.error || "",
       service: "ai-chat-shell-exec-server",
+      protocolVersion: 1,
       executionBackend: "tmux",
       pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
       allowedOrigin: ALLOWED_ORIGIN,
       allowUntrustedOrigins: ALLOW_UNTRUSTED_ORIGINS,
-      stateDir: STATE_DIR,
+      stateDir: state.stateDir,
+      stateSource: state.source,
+      stateOk: state.ok,
+      stateError: state.error || "",
+      stateRepaired: state.repaired === true,
+      stateRepairs: state.repairs || [],
       tmuxSocket: getTmuxSocketPath() || null,
-      tmuxDefaultSession: getForAiTmuxConfig().sessionName,
-      tmuxDefaultHostWindow: getForAiTmuxConfig().hostWindowName,
-      tmuxDefaultBoardWindow: getForAiTmuxConfig().boardWindowName,
+      tmuxDefaultSession: forAiConfig.sessionName,
+      tmuxDefaultHostWindow: forAiConfig.hostWindowName,
+      tmuxDefaultBoardWindow: forAiConfig.boardWindowName,
+      tmuxDefaultCwd: forAiConfig.cwd,
+      tmuxDefaultCwdSource: forAiConfig.cwdSource,
+      tmuxDefaultCwdError: forAiConfig.cwdError || "",
       visionHelper: getVisionHelperPath(),
       visionAvailable: getVisionAvailability().available,
       ledgerEntries: Object.keys(serverLedger.calls || {}).length
@@ -171,9 +190,23 @@ if (require.main === module) {
 }
 
 function startServer() {
+  let state;
+  try {
+    state = ensureStateDirReady({ create: true });
+  } catch (error) {
+    console.error(error.message || String(error));
+    process.exit(1);
+    return;
+  }
+  configureStateLogging();
+
   server.listen(PORT, HOST, () => {
     console.log(`AI Chat Shell Exec server listening on ws://${HOST}:${PORT}/shell`);
     console.log(`Allowed origin: ${ALLOWED_ORIGIN}`);
+    console.log(`State dir: ${state.stateDir}`);
+    for (const repair of state.repairs || []) {
+      console.log(`[state-repair] moved ${repair.path} to ${repair.backupPath}`);
+    }
   });
 
   server.on("error", (error) => {
@@ -193,11 +226,105 @@ function startServer() {
 
 function shutdown() {
   console.log("AI Chat Shell Exec server stopping");
+  if (stateLogStreams) {
+    stateLogStreams.outStream.end();
+    stateLogStreams.errStream.end();
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();
 }
 
+function configureStateLogging() {
+  if (
+    stateLoggingConfigured ||
+    process.env.AI_CHAT_SHELL_LOG_TO_STATE !== "1" ||
+    process.env.AI_CHAT_SHELL_LOG_TO_STATE_REDIRECTED === "1"
+  ) {
+    return;
+  }
+
+  const originalLog = console.log.bind(console);
+  const originalError = console.error.bind(console);
+  try {
+    const out = prepareStateLogFile(STATE_STDOUT_LOG_PATH, { truncate: true });
+    const err = prepareStateLogFile(STATE_STDERR_LOG_PATH, { truncate: true });
+    const outStream = fs.createWriteStream(STATE_STDOUT_LOG_PATH, { flags: "a" });
+    const errStream = fs.createWriteStream(STATE_STDERR_LOG_PATH, { flags: "a" });
+
+    outStream.on("error", (error) => {
+      originalError(`[state-log] stdout log write failed: ${error.message || String(error)}`);
+    });
+    errStream.on("error", (error) => {
+      originalError(`[state-log] stderr log write failed: ${error.message || String(error)}`);
+    });
+
+    console.log = (...args) => {
+      originalLog(...args);
+      outStream.write(`${formatConsoleArgs(args)}\n`);
+    };
+    console.error = (...args) => {
+      originalError(...args);
+      errStream.write(`${formatConsoleArgs(args)}\n`);
+    };
+
+    stateLogStreams = { outStream, errStream };
+    stateLoggingConfigured = true;
+
+    for (const repair of [...out.repairs, ...err.repairs]) {
+      console.error(`[state-repair] moved invalid state log path to ${repair.backupPath}`);
+    }
+  } catch (error) {
+    originalError(`[state-log] could not enable state logs: ${error.message || String(error)}`);
+  }
+}
+
+function prepareStateLogFile(logPath, { truncate = false } = {}) {
+  const repairs = [];
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  if (fs.existsSync(logPath)) {
+    const stat = fs.statSync(logPath);
+    if (stat.isDirectory()) {
+      repairs.push(movePathAside(logPath, "log-file"));
+    } else {
+      try {
+        fs.accessSync(logPath, fs.constants.W_OK);
+      } catch (_error) {
+        repairs.push(movePathAside(logPath, "log-file"));
+      }
+    }
+  }
+  const fd = fs.openSync(logPath, "a");
+  fs.closeSync(fd);
+  if (truncate) {
+    fs.truncateSync(logPath, 0);
+  }
+  return {
+    path: logPath,
+    repairs
+  };
+}
+
+function formatConsoleArgs(args) {
+  return args.map((arg) => {
+    if (typeof arg === "string") {
+      return arg;
+    }
+    if (arg instanceof Error) {
+      return arg.stack || arg.message;
+    }
+    if (typeof arg === "object" && arg !== null) {
+      try {
+        return JSON.stringify(arg);
+      } catch (_error) {
+        return String(arg);
+      }
+    }
+    return String(arg);
+  }).join(" ");
+}
+
 async function handleMessageText(text) {
+  ensureStateDirReady({ create: true });
   const message = JSON.parse(text);
   if (!message || !message.type) {
     throw new Error("Unsupported message type.");
@@ -213,6 +340,10 @@ async function handleMessageText(text) {
 
   if (message.type === "tmux-ensure") {
     return ensureForAiTmuxLayout();
+  }
+
+  if (message.type === "tmux-reset-forai") {
+    return resetForAiTmuxLayout();
   }
 
   if (message.type === "write-file") {
@@ -245,12 +376,9 @@ async function handleMessageText(text) {
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
   const layout = await ensureForAiTmuxLayout();
   const panes = layout.panes;
-  const target = normalizeTmuxTarget(message.target || message.tmuxTarget || "");
-  const pane = target ? resolveTmuxTarget(target, panes) : resolveDefaultShellPane(panes).pane;
+  const pane = resolveDefaultShellPane(panes).pane;
   if (!pane) {
-    return target
-      ? buildInvalidTargetResponse(message, cmd, target, panes)
-      : buildDefaultTargetErrorResponse(message, cmd, panes);
+    return buildDefaultTargetErrorResponse(message, cmd, panes);
   }
 
   const cwd = resolveCwd(message.cwd, pane.currentPath);
@@ -804,6 +932,118 @@ function completeServerShellCall(callKey, response) {
   saveServerLedger();
 }
 
+function resolveStateDir(value) {
+  const raw = String(value || DEFAULT_STATE_DIR).trim();
+  const expanded = raw.replace(/^~(?=$|\/)/, os.homedir());
+  return path.resolve(ROOT_DIR, expanded);
+}
+
+function getDefaultStateDir() {
+  return path.join(ROOT_DIR, ".state");
+}
+
+function getStateSource() {
+  if (process.env.AI_CHAT_SHELL_STATE_DIR) {
+    return "AI_CHAT_SHELL_STATE_DIR";
+  }
+  return "project-root";
+}
+
+function getStateDir() {
+  return STATE_DIR;
+}
+
+function getStateStatus(options = {}) {
+  try {
+    return ensureStateDirReady(options);
+  } catch (error) {
+    return {
+      ok: false,
+      stateDir: STATE_DIR,
+      source: getStateSource(),
+      error: error.message || String(error)
+    };
+  }
+}
+
+function ensureStateDirReady({ create = false, repair = true } = {}) {
+  const source = getStateSource();
+  const repairs = [];
+  try {
+    if (fs.existsSync(STATE_DIR)) {
+      const stat = fs.statSync(STATE_DIR);
+      if (!stat.isDirectory()) {
+        if (!create || !repair) {
+          throw new Error(`State path exists but is not a directory: ${STATE_DIR}`);
+        }
+        repairs.push(movePathAside(STATE_DIR, "state-path"));
+        fs.mkdirSync(STATE_DIR, { recursive: true });
+      }
+    } else if (create) {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+    } else {
+      throw new Error(`State directory is missing: ${STATE_DIR}`);
+    }
+
+    for (const subdir of STATE_REQUIRED_SUBDIRS) {
+      const subdirPath = path.join(STATE_DIR, subdir);
+      if (fs.existsSync(subdirPath)) {
+        const stat = fs.statSync(subdirPath);
+        if (!stat.isDirectory()) {
+          if (!create || !repair) {
+            throw new Error(`State subpath exists but is not a directory: ${subdirPath}`);
+          }
+          repairs.push(movePathAside(subdirPath, `state-subpath-${subdir}`));
+          fs.mkdirSync(subdirPath, { recursive: true });
+        }
+      } else if (create) {
+        fs.mkdirSync(subdirPath, { recursive: true });
+      }
+    }
+
+    const tempBase = path.join(STATE_DIR, `.state-preflight-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
+    const tempPath = `${tempBase}.tmp`;
+    const finalPath = `${tempBase}.ok`;
+    fs.writeFileSync(tempPath, "ok\n", { flag: "wx" });
+    fs.renameSync(tempPath, finalPath);
+    fs.unlinkSync(finalPath);
+
+    return {
+      ok: true,
+      stateDir: STATE_DIR,
+      source,
+      repaired: repairs.length > 0,
+      repairs,
+      error: ""
+    };
+  } catch (error) {
+    throw new Error(`Shell server state directory is not usable: ${error.message || String(error)}`);
+  }
+}
+
+function movePathAside(targetPath, reason) {
+  const backupPath = nextBackupPath(targetPath, reason);
+  fs.renameSync(targetPath, backupPath);
+  return {
+    path: targetPath,
+    backupPath,
+    reason
+  };
+}
+
+function nextBackupPath(targetPath, reason) {
+  const safeReason = String(reason || "broken").replace(/[^A-Za-z0-9_.-]/g, "-");
+  const stamp = new Date().toISOString().replace(/[^0-9T]/g, "").slice(0, 15);
+  for (let index = 0; index < 100; index += 1) {
+    const suffix = index === 0 ? "" : `-${index}`;
+    const candidate = `${targetPath}.broken-${safeReason}-${stamp}-${process.pid}${suffix}`;
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(`Could not choose backup path for ${targetPath}`);
+}
+
 function loadServerLedger() {
   try {
     const parsed = JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
@@ -823,15 +1063,28 @@ function loadServerLedger() {
       }
       return ledger;
     }
-  } catch {
-    // Missing or invalid ledger files are treated as an empty ledger.
+  } catch (error) {
+    if (fs.existsSync(LEDGER_PATH)) {
+      try {
+        const repair = movePathAside(LEDGER_PATH, "ledger");
+        console.error(`[state-repair] moved invalid shell ledger to ${repair.backupPath}: ${error.message || String(error)}`);
+      } catch (repairError) {
+        console.error(`[state-repair] could not move invalid shell ledger: ${repairError.message || String(repairError)}`);
+      }
+    }
+    // Missing or invalid ledger files are treated as an empty ledger after
+    // preserving the invalid file when possible.
   }
   return { version: 1, calls: {} };
 }
 
 function saveServerLedger() {
+  ensureStateDirReady({ create: true });
   pruneServerLedger();
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  if (fs.existsSync(LEDGER_PATH) && fs.statSync(LEDGER_PATH).isDirectory()) {
+    const repair = movePathAside(LEDGER_PATH, "ledger");
+    console.error(`[state-repair] moved invalid shell ledger path to ${repair.backupPath}`);
+  }
   const tempPath = `${LEDGER_PATH}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(serverLedger, null, 2));
   fs.renameSync(tempPath, LEDGER_PATH);
@@ -977,7 +1230,7 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
     try {
       fs.unlinkSync(scriptPath);
     } catch {
-      // Best-effort cleanup; stale files are harmless and remain under .state/.
+      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
     }
   }
 }
@@ -1491,7 +1744,9 @@ async function ensureForAiTmuxLayout() {
       "-s",
       config.sessionName,
       "-n",
-      config.hostWindowName
+      config.hostWindowName,
+      "-c",
+      config.cwd
     ], { timeoutMs: 5000 });
     createdSession = true;
     createdWindows.push(config.hostWindowName);
@@ -1505,7 +1760,9 @@ async function ensureForAiTmuxLayout() {
       "-t",
       `${config.sessionName}:`,
       "-n",
-      config.hostWindowName
+      config.hostWindowName,
+      "-c",
+      config.cwd
     ], { timeoutMs: 5000 });
     createdWindows.push(config.hostWindowName);
     windows = await listTmuxWindows(config.sessionName);
@@ -1518,7 +1775,9 @@ async function ensureForAiTmuxLayout() {
       "-t",
       `${config.sessionName}:`,
       "-n",
-      config.boardWindowName
+      config.boardWindowName,
+      "-c",
+      config.cwd
     ], { timeoutMs: 5000 });
     createdWindows.push(config.boardWindowName);
   }
@@ -1531,13 +1790,31 @@ async function ensureForAiTmuxLayout() {
     sessionName: config.sessionName,
     hostWindowName: config.hostWindowName,
     boardWindowName: config.boardWindowName,
+    cwd: config.cwd,
+    cwdSource: config.cwdSource,
     createdSession,
     createdWindows,
     defaultTarget: defaultHost?.id || "",
     defaultTargetName: defaultHost?.label || "",
+    defaultTargetCwd: defaultHost?.currentPath || "",
     boardTarget: defaultBoard?.id || "",
     boardTargetName: defaultBoard?.label || "",
+    boardTargetCwd: defaultBoard?.currentPath || "",
     panes
+  };
+}
+
+async function resetForAiTmuxLayout() {
+  const config = getForAiTmuxConfig();
+  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", config.sessionName], { timeoutMs: 5000 });
+  if (sessionCheck.ok) {
+    await runTmuxCommand(["kill-session", "-t", config.sessionName], { timeoutMs: 5000 });
+  }
+  const layout = await ensureForAiTmuxLayout();
+  return {
+    ...layout,
+    reset: true,
+    killedExistingSession: sessionCheck.ok
   };
 }
 
@@ -1676,22 +1953,24 @@ function resolveDefaultBoardPane(panes, config = getForAiTmuxConfig()) {
 }
 
 function buildMissingTargetResponse(message, cmd, panes) {
+  const config = getForAiTmuxConfig();
   return buildTargetErrorResponse({
     message,
     cmd,
     panes,
-    error: "Missing tmux target. Use an ai-helper shell block with target and command.",
-    targetRequired: true
+    error: `Shell helper targets are not supported. Expected default target ${config.sessionName}:${config.hostWindowName}.`,
+    targetRequired: false
   });
 }
 
 function buildInvalidTargetResponse(message, cmd, target, panes) {
+  const config = getForAiTmuxConfig();
   return buildTargetErrorResponse({
     message,
     cmd,
     panes,
-    error: `Unknown or ambiguous tmux target: ${target}`,
-    targetRequired: true
+    error: `Shell helper target is not supported: ${target}. Expected default target ${config.sessionName}:${config.hostWindowName}.`,
+    targetRequired: false
   });
 }
 
@@ -1741,10 +2020,8 @@ function buildBoardHelperExample(cmd = "version") {
 }
 
 function buildTmuxTargetExample(panes, cmd = "pwd") {
-  const target = resolveDefaultShellPane(panes).pane?.id || panes[0]?.id || "";
   return [
     HELPER_SHELL_START,
-    target || "",
     cmd || "pwd",
     HELPER_SHELL_END
   ].join("\n");
@@ -1772,11 +2049,33 @@ function getBoardTimingConfig() {
 }
 
 function getForAiTmuxConfig() {
+  const cwdRaw = process.env.AI_CHAT_SHELL_FORAI_CWD || ROOT_DIR;
   return {
     sessionName: normalizeTmuxName(process.env.AI_CHAT_SHELL_TMUX_SESSION, DEFAULT_TMUX_SESSION_NAME),
     hostWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_HOST_WINDOW, DEFAULT_HOST_WINDOW_NAME),
-    boardWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_BOARD_WINDOW, DEFAULT_BOARD_WINDOW_NAME)
+    boardWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_BOARD_WINDOW, DEFAULT_BOARD_WINDOW_NAME),
+    cwd: resolveForAiCwd(cwdRaw),
+    cwdSource: process.env.AI_CHAT_SHELL_FORAI_CWD ? "AI_CHAT_SHELL_FORAI_CWD" : "project-root"
   };
+}
+
+function getForAiTmuxConfigForHealth() {
+  try {
+    return getForAiTmuxConfig();
+  } catch (error) {
+    return {
+      sessionName: normalizeTmuxName(process.env.AI_CHAT_SHELL_TMUX_SESSION, DEFAULT_TMUX_SESSION_NAME),
+      hostWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_HOST_WINDOW, DEFAULT_HOST_WINDOW_NAME),
+      boardWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_BOARD_WINDOW, DEFAULT_BOARD_WINDOW_NAME),
+      cwd: String(process.env.AI_CHAT_SHELL_FORAI_CWD || ROOT_DIR),
+      cwdSource: process.env.AI_CHAT_SHELL_FORAI_CWD ? "AI_CHAT_SHELL_FORAI_CWD" : "project-root",
+      cwdError: error.message || String(error)
+    };
+  }
+}
+
+function resolveForAiCwd(value) {
+  return fs.realpathSync(resolveCwd(value || ROOT_DIR, ROOT_DIR));
 }
 
 function normalizeTmuxName(value, fallback) {
@@ -2847,6 +3146,7 @@ module.exports = {
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
   buildMissingTargetResponse,
   cleanVisionTmuxOcrText,
@@ -2855,9 +3155,13 @@ module.exports = {
   encodeTextFrame,
   extractBoardPromptSignature,
   extractTmuxRunOutput,
+  getDefaultStateDir,
+  getStateDir,
+  getStateStatus,
   getTmuxEnvSocketPath,
   getTmuxSocketPath,
   ensureForAiTmuxLayout,
+  ensureStateDirReady,
   getForAiTmuxConfig,
   getVisionAvailability,
   getVisionHelperPath,
@@ -2867,10 +3171,12 @@ module.exports = {
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
+  prepareStateLogFile,
   readBoardLogFromOffset,
   resolveBoardPane,
   resolveDefaultShellPane,
   resolveDownloadsFilePath,
+  resetForAiTmuxLayout,
   resolveTmuxTarget,
   runVisionTmuxOcrLine,
   runTmuxVisualLine,

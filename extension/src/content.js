@@ -11,7 +11,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.3.3";
+const CONTENT_SCRIPT_VERSION = "0.3.5";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -488,7 +488,6 @@ function buildSemanticCallKey(call) {
     location.origin,
     normalizeCommand(call.kind || "shell"),
     normalizeCommand(call.helperId || ""),
-    normalizeCommand(call.target || ""),
     normalizeCommand(call.cmd || ""),
     normalizeCommand(call.filename || ""),
     normalizeCommand(call.content || ""),
@@ -793,15 +792,12 @@ function parsePlainTextHelperBlocks(text) {
         cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
       });
     } else {
-      const shellBodyLines = lines.slice(valueLineIndex, endIndex);
-      const hasExplicitTargetLine = shellBodyLines.length > 1;
       calls.push({
         kind: start.kind,
         helperId,
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
-        target: hasExplicitTargetLine ? normalizeCommand(lines[valueLineIndex]) : "",
-        cmd: normalizeCommand((hasExplicitTargetLine ? shellBodyLines.slice(1) : shellBodyLines).join("\n"))
+        cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
       });
     }
     index = endIndex;
@@ -1139,29 +1135,6 @@ function formatRejectedCallSubject(call) {
   return `$ ${call.cmd || ""}`;
 }
 
-async function replyWithMissingTmuxTarget(call) {
-  chainCallCount += 1;
-  setStatus("Rejected shell call: missing tmux target", "error");
-  const response = await chrome.runtime.sendMessage({ type: "tmux-list" });
-  const panes = response?.panes || [];
-  const exampleTarget = panes[0]?.id || "%pane_id";
-  await insertReply([
-    "Shell call rejected:",
-    "",
-    "```shell-output",
-    `$ ${call.cmd}`,
-    "error: Missing tmux target. Use an ai-helper shell block with target and command.",
-    "",
-    "tmux targets:",
-    formatTmuxPanesForShellOutput(panes, response?.error),
-    "",
-    "example:",
-    formatPlainTextShellCallExample(exampleTarget, call.cmd || "pwd"),
-    "```"
-  ].join("\n"));
-  await clickSendWhenReady();
-}
-
 async function runAndReply(callId, call, options = {}) {
   if (!isRunnableHelperCall(call)) {
     return;
@@ -1190,7 +1163,7 @@ async function runAndReply(callId, call, options = {}) {
       [
         "AI requested a local shell command.",
         "",
-        call.target ? `tmux target: ${call.target}` : "tmux target: missing",
+        "tmux target: default ForAI:host",
         call.cwd ? `cwd: ${call.cwd}` : "cwd: shell server default",
         "",
         call.cmd,
@@ -1274,13 +1247,14 @@ function sendRunShellMessage(callId, call, force) {
     type: "run-shell",
     id: callId,
     callKey: callId,
+    cmd: call.cmd,
+    cwd: call.cwd || "",
     callMeta: {
       origin: location.origin,
       pathname: location.pathname,
       promptHash: stableHash(getLastUserMessageText()),
       force
-    },
-    ...call
+    }
   });
 }
 
@@ -1346,7 +1320,6 @@ function setHelperCompletionStatus(call, response) {
 function isExpectedSelfTestCall(call) {
   return !!pendingSelfTest &&
     normalizeCommand(call?.cmd || "") === pendingSelfTest.command &&
-    normalizeCommand(call?.target || "") === normalizeCommand(pendingSelfTest.target || "") &&
     (!call?.cwd || normalizeCommand(call.cwd) === normalizeCommand(pendingSelfTest.cwd || ""));
 }
 
@@ -1366,7 +1339,6 @@ function formatShellOutput(call, response, startedAt) {
       "```shell-output",
       `$ ${commandDisplay.text}`,
       commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
-      call.target ? `target: ${call.target}` : "",
       `startedAt: ${startedAt}`,
       `error: ${response?.error || "Unknown shell server error."}`,
       response?.example ? "\nexample:\n" + response.example : "",
@@ -1380,7 +1352,7 @@ function formatShellOutput(call, response, startedAt) {
   const meta = [
     `$ ${commandDisplay.text}`,
     commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
-    `target: ${response.target || call.target || ""}`,
+    `target: ${response.target || ""}`,
     response.targetName ? `targetName: ${response.targetName}` : "",
     `cwd: ${response.cwd || call.cwd || ""}`,
     `exitCode: ${response.exitCode}`,
@@ -1505,15 +1477,6 @@ function formatTmuxPanesForShellOutput(panes, error = "") {
     pane.currentPath ? `cwd=${pane.currentPath}` : "",
     pane.active ? "active=true" : "active=false"
   ].filter(Boolean).join(" ")).join("\n");
-}
-
-function formatPlainTextShellCallExample(target, cmd) {
-  return [
-    HELPER_SHELL_START,
-    target || "%pane_id",
-    cmd || "pwd",
-    HELPER_SHELL_END
-  ].join("\n");
 }
 
 async function insertReply(text) {
@@ -1953,6 +1916,11 @@ function injectStatus() {
     { mode: "test", label: "Test" },
     { mode: "check", label: "Check" },
     {
+      mode: "reset-tmux",
+      label: "Reset tmux",
+      title: "Recreate the default ForAI tmux session with host and board windows"
+    },
+    {
       mode: "force",
       label: "Force run",
       title: "Force run latest helper block (bypass dedup ledger)"
@@ -2121,14 +2089,39 @@ async function checkStartupTmux() {
   if (!versionOk) {
     return;
   }
-  setStatus("Checking ForAI tmux session", "running");
+  setStatus("Checking shell server and ForAI tmux session", "running");
+  const health = await chrome.runtime.sendMessage({ type: "shell-health" });
+  const healthError = getShellHealthStatusError(health);
+  if (healthError) {
+    setStatus(healthError, "error");
+    return;
+  }
   const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure" });
   if (!tmux?.ok) {
     setStatus(`ForAI tmux unavailable: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
     return;
   }
-  const targetText = tmux.defaultTarget ? ` target ${tmux.defaultTarget}` : "";
-  setStatus(`Shell tool ready v${getDisplayVersion()}; ForAI tmux ready${targetText}`, "ok");
+  setStatus(`Shell tool ready v${getDisplayVersion()}; ${formatForAiStatus(tmux)}`, "ok");
+}
+
+function formatForAiStatus(tmux) {
+  const host = tmux?.defaultTarget ? `host ${tmux.defaultTarget}` : "host missing";
+  const board = tmux?.boardTarget ? `board ${tmux.boardTarget}` : "board missing";
+  const cwd = tmux?.cwd ? `cwd ${summarizeCommand(tmux.cwd)}` : "";
+  return ["ForAI ready", host, board, cwd].filter(Boolean).join("; ");
+}
+
+function getShellHealthStatusError(health) {
+  if (health && health.originMatches === false) {
+    return `Server origin mismatch: ${health.extensionId || "current extension"}`;
+  }
+  if (health && health.protocolMatches === false) {
+    return `Server protocol mismatch: restart local shell server for v${getDisplayVersion()}`;
+  }
+  if (!health?.ok) {
+    return `Server offline: ${summarizeCommand(health?.error || "run install/start script")}`;
+  }
+  return "";
 }
 
 function getExtensionVersionMismatch(background) {
@@ -2245,7 +2238,6 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
     lines.push(
       `kind:        ${call.kind || "shell"}`,
       `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
-      `target:      ${call.target || "(none)"}`,
       `filename:    ${call.filename || ""}`,
       `cwd:         ${call.cwd || ""}`,
       `authorRole:  ${role}`,
@@ -2305,6 +2297,13 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "reset-tmux") {
+    resetForAiTmux().catch((error) => {
+      setStatus(`Reset tmux failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "force") {
     forceRunLatestShellCall().catch((error) => {
       setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
@@ -2331,6 +2330,21 @@ async function forceRunLatestShellCall() {
   await scanForShellCall({ force: true });
   lastSuppressedCallStatus = "";
   setForceButtonHighlight(false);
+}
+
+async function resetForAiTmux() {
+  if (!window.confirm("Reset the ForAI tmux session? This kills the current ForAI host and board windows.")) {
+    setStatus("Reset tmux cancelled", "idle");
+    return;
+  }
+
+  setStatus("Resetting ForAI tmux session", "running");
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-reset-forai" });
+  if (!tmux?.ok) {
+    setStatus(`Reset tmux failed: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
+    return;
+  }
+  setStatus(`Reset ForAI tmux; ${formatForAiStatus(tmux)}`, "ok");
 }
 
 async function toggleCurrentSiteEnabled() {
@@ -2398,19 +2412,17 @@ async function runHealthCheck() {
     savedShellSelector || profiles[shellProfileKey()]?.selector ? "shell" : ""
   ].filter(Boolean);
 
-  if (health && health.originMatches === false) {
-    setStatus(`Server origin mismatch: ${health.extensionId || "current extension"}`, "error");
-    return;
-  }
-
-  if (!health?.ok) {
-    setStatus(`Server offline: ${summarizeCommand(health?.error || "run install/start script")}`, "error");
+  const healthError = getShellHealthStatusError(health);
+  if (healthError) {
+    setStatus(healthError, "error");
     return;
   }
 
   const boundText = bindings.length > 0 ? bindings.join("/") : "auto";
   const pidText = health.pid ? ` pid ${health.pid}` : "";
-  const paneText = tmux?.ok ? `; ForAI ${tmux.defaultTarget || "host"}; tmux panes ${tmux.panes?.length || 0}` : "; tmux unavailable";
+  const paneText = tmux?.ok
+    ? `; ${formatForAiStatus(tmux)}; tmux panes ${tmux.panes?.length || 0}`
+    : "; tmux unavailable";
   setStatus(`Extension v${getDisplayVersion()}; server ok${pidText}; bindings ${boundText}${paneText}`, tmux?.ok === false ? "error" : "ok");
 }
 
@@ -2421,13 +2433,12 @@ async function runFullChainTest() {
     return;
   }
 
-  const tmux = await chrome.runtime.sendMessage({ type: "tmux-list" });
-  if (!tmux?.ok || !Array.isArray(tmux.panes) || tmux.panes.length === 0) {
-    setStatus(`Test failed: ${summarizeCommand(tmux?.error || "no tmux panes found")}`, "error");
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure" });
+  if (!tmux?.ok || !tmux.defaultTarget) {
+    setStatus(`Test failed: ${summarizeCommand(tmux?.error || "default ForAI host target unavailable")}`, "error");
     return;
   }
 
-  const pane = chooseSelfTestPane(tmux.panes);
   const token = `shell-tool-self-test-${Date.now().toString(36)}`;
   const command = `printf ${token}`;
   const prompt = [
@@ -2435,20 +2446,18 @@ async function runFullChainTest() {
     "",
     "````",
     HELPER_SHELL_START,
-    pane.id,
     command,
     HELPER_SHELL_END,
     "````"
   ].join("\n");
 
-  setStatus(`Starting full test on ${pane.id}: ${token}`, "running");
+  setStatus(`Starting full test on default ForAI:host ${tmux.defaultTarget}: ${token}`, "running");
   const composer = await insertReply(prompt);
   const sent = await clickSendWhenReady(composer);
   if (sent) {
     pendingSelfTest = {
       token,
       command,
-      target: pane.id,
       cwd: "",
       startedAt: Date.now()
     };

@@ -11,10 +11,12 @@ const serverDir = path.dirname(serverPath);
 const stateDir = path.join(repoRoot, ".state");
 const ledgerPath = path.join(stateDir, "shell-ledger.json");
 const source = fs.readFileSync(serverPath, "utf8");
+const originalStateDir = process.env.AI_CHAT_SHELL_STATE_DIR;
 
 const hadLedger = fs.existsSync(ledgerPath);
 const ledgerBackup = hadLedger ? fs.readFileSync(ledgerPath, "utf8") : "";
 fs.mkdirSync(stateDir, { recursive: true });
+process.env.AI_CHAT_SHELL_STATE_DIR = stateDir;
 
 function writeLedger(calls) {
   fs.writeFileSync(ledgerPath, JSON.stringify({ version: 1, calls }, null, 2));
@@ -95,6 +97,11 @@ try {
 
   console.log("server dedup force tests passed");
 } finally {
+  if (originalStateDir === undefined) {
+    delete process.env.AI_CHAT_SHELL_STATE_DIR;
+  } else {
+    process.env.AI_CHAT_SHELL_STATE_DIR = originalStateDir;
+  }
   if (hadLedger) {
     fs.writeFileSync(ledgerPath, ledgerBackup);
   } else {

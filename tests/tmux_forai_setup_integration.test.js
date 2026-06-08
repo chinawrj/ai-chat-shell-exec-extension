@@ -11,22 +11,27 @@ const {
   handleMessageText,
   listTmuxPanes,
   resolveBoardPane,
-  resolveDefaultShellPane
+  resolveDefaultShellPane,
+  resetForAiTmuxLayout
 } = require("../server/shell_server.js");
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmux-forai-setup-"));
 const socketPath = path.join(tmpDir, "tmux.sock");
+const forAiCwd = fs.mkdtempSync(path.join(tmpDir, "cwd-"));
+const expectedForAiCwd = fs.realpathSync(forAiCwd);
 const originalEnv = {
   socket: process.env.AI_CHAT_SHELL_TMUX_SOCKET,
   session: process.env.AI_CHAT_SHELL_TMUX_SESSION,
   host: process.env.AI_CHAT_SHELL_HOST_WINDOW,
-  board: process.env.AI_CHAT_SHELL_BOARD_WINDOW
+  board: process.env.AI_CHAT_SHELL_BOARD_WINDOW,
+  cwd: process.env.AI_CHAT_SHELL_FORAI_CWD
 };
 
 process.env.AI_CHAT_SHELL_TMUX_SOCKET = socketPath;
 process.env.AI_CHAT_SHELL_TMUX_SESSION = "ForAI";
 process.env.AI_CHAT_SHELL_HOST_WINDOW = "host";
 process.env.AI_CHAT_SHELL_BOARD_WINDOW = "board";
+process.env.AI_CHAT_SHELL_FORAI_CWD = forAiCwd;
 
 main()
   .then(() => {
@@ -38,6 +43,7 @@ main()
     restoreEnv("AI_CHAT_SHELL_TMUX_SESSION", originalEnv.session);
     restoreEnv("AI_CHAT_SHELL_HOST_WINDOW", originalEnv.host);
     restoreEnv("AI_CHAT_SHELL_BOARD_WINDOW", originalEnv.board);
+    restoreEnv("AI_CHAT_SHELL_FORAI_CWD", originalEnv.cwd);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   })
   .catch((error) => {
@@ -53,10 +59,14 @@ async function main() {
   assert.equal(first.sessionName, "ForAI");
   assert.equal(first.hostWindowName, "host");
   assert.equal(first.boardWindowName, "board");
+  assert.equal(first.cwd, expectedForAiCwd);
+  assert.equal(first.cwdSource, "AI_CHAT_SHELL_FORAI_CWD");
   assert.equal(first.createdSession, true);
   assert.deepEqual(first.createdWindows.sort(), ["board", "host"]);
   assert.ok(first.defaultTarget, "Expected default host target after setup.");
   assert.ok(first.boardTarget, "Expected default board target after setup.");
+  assert.equal(first.defaultTargetCwd, expectedForAiCwd);
+  assert.equal(first.boardTargetCwd, expectedForAiCwd);
 
   const panes = await listTmuxPanes();
   assert.equal(resolveDefaultShellPane(panes).pane.windowName, "host");
@@ -81,6 +91,89 @@ async function main() {
   assert.equal(response.exitCode, 0, JSON.stringify(response));
   assert.match(response.stdout, new RegExp(token));
   assert.match(response.targetName, /ForAI:.* host/);
+  assert.equal(response.cwd, expectedForAiCwd);
+
+  const ignoredTargetToken = `FORAI_IGNORED_TARGET_${Date.now()}`;
+  const ignoredTargetResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-ignored-target-run",
+    callKey: `forai-ignored-target-run-${Date.now()}`,
+    target: "missing-target-should-be-ignored",
+    cmd: `printf '${ignoredTargetToken}\\n'`,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(ignoredTargetResponse.ok, true, JSON.stringify(ignoredTargetResponse));
+  assert.equal(ignoredTargetResponse.exitCode, 0, JSON.stringify(ignoredTargetResponse));
+  assert.match(ignoredTargetResponse.stdout, new RegExp(ignoredTargetToken));
+  assert.match(ignoredTargetResponse.targetName, /ForAI:.* host/);
+
+  const pwdResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-default-pwd",
+    callKey: `forai-default-pwd-${Date.now()}`,
+    cmd: "pwd",
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(pwdResponse.ok, true, JSON.stringify(pwdResponse));
+  assert.equal(pwdResponse.exitCode, 0, JSON.stringify(pwdResponse));
+  assert.equal(pwdResponse.stdout.trim(), expectedForAiCwd);
+
+  const heredocFile = path.join(expectedForAiCwd, `helper-heredoc-${Date.now()}.txt`);
+  const heredocResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-heredoc-run",
+    callKey: `forai-heredoc-run-${Date.now()}`,
+    cmd: [
+      `cat > ${shellQuote(heredocFile)} <<'EOF'`,
+      "HEREDOC_LINE_ONE",
+      "HEREDOC_LINE_TWO",
+      "EOF",
+      "printf 'AFTER_HEREDOC\\n'",
+      `wc -l < ${shellQuote(heredocFile)}`
+    ].join("\n"),
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(heredocResponse.ok, true, JSON.stringify(heredocResponse));
+  assert.equal(heredocResponse.exitCode, 0, JSON.stringify(heredocResponse));
+  assert.match(heredocResponse.stdout, /AFTER_HEREDOC/);
+  assert.match(heredocResponse.stdout, /2/);
+  assert.equal(fs.readFileSync(heredocFile, "utf8"), "HEREDOC_LINE_ONE\nHEREDOC_LINE_TWO\n");
+
+  const reset = await resetForAiTmuxLayout();
+  assert.equal(reset.ok, true);
+  assert.equal(reset.reset, true);
+  assert.equal(reset.killedExistingSession, true);
+  assert.equal(reset.createdSession, true);
+  assert.equal(reset.cwd, expectedForAiCwd);
+  assert.equal(reset.defaultTargetCwd, expectedForAiCwd);
+  assert.equal(reset.boardTargetCwd, expectedForAiCwd);
+
+  const resetToken = `FORAI_RESET_${Date.now()}`;
+  const resetResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-reset-run",
+    callKey: `forai-reset-run-${Date.now()}`,
+    cmd: `printf '${resetToken}\\n'`,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(resetResponse.ok, true, JSON.stringify(resetResponse));
+  assert.equal(resetResponse.exitCode, 0, JSON.stringify(resetResponse));
+  assert.match(resetResponse.stdout, new RegExp(resetToken));
+  assert.match(resetResponse.targetName, /ForAI:.* host/);
+
+  spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", "ForAI"], { encoding: "utf8" });
+  const resetMissing = await resetForAiTmuxLayout();
+  assert.equal(resetMissing.ok, true);
+  assert.equal(resetMissing.reset, true);
+  assert.equal(resetMissing.killedExistingSession, false);
+  assert.equal(resetMissing.createdSession, true);
+  assert.deepEqual(resetMissing.createdWindows.sort(), ["board", "host"]);
+  assert.equal(resetMissing.defaultTargetCwd, expectedForAiCwd);
+  assert.equal(resetMissing.boardTargetCwd, expectedForAiCwd);
 }
 
 function commandExists(command) {
@@ -93,4 +186,8 @@ function restoreEnv(name, value) {
   } else {
     process.env[name] = value;
   }
+}
+
+function shellQuote(value) {
+  return `'${String(value || "").replace(/'/g, "'\\''")}'`;
 }

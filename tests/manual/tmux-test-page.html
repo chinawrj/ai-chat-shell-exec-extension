@@ -278,12 +278,12 @@
           <li>Open this page over HTTPS.</li>
           <li>Reload the unpacked extension.</li>
           <li>This local test port is auto-enabled by the development content script.</li>
-          <li>Refresh targets below, then pick a pane.</li>
+          <li>Refresh tmux status below if you want to inspect the default ForAI panes.</li>
           <li>Click the composer once so the extension can bind it.</li>
         </ol>
 
         <div class="target-header">
-          <h2>tmux targets</h2>
+          <h2>tmux panes</h2>
           <button id="refreshTargets" type="button">Refresh</button>
         </div>
         <div id="targetList" class="target-list" aria-live="polite">
@@ -291,18 +291,12 @@
         </div>
 
         <label>
-          tmux target
-          <input id="target" value="%24" spellcheck="false">
-        </label>
-
-        <label>
           command
           <textarea id="command" spellcheck="false">printf ai-chat-shell-exec-test</textarea>
         </label>
 
         <div class="button-row">
-          <button id="insertCall" class="primary" type="button">Insert targeted helper</button>
-          <button id="insertMissingTarget" type="button">Insert missing-target call</button>
+          <button id="insertCall" class="primary" type="button">Insert shell helper</button>
           <button id="clearThread" type="button">Clear thread</button>
         </div>
 
@@ -328,7 +322,6 @@
       const thread = document.getElementById("thread");
       const composer = document.getElementById("composer");
       const form = document.getElementById("composerForm");
-      const target = document.getElementById("target");
       const command = document.getElementById("command");
       const status = document.getElementById("status");
       const refreshTargets = document.getElementById("refreshTargets");
@@ -340,13 +333,8 @@
 
       document.getElementById("insertCall").addEventListener("click", () => {
         appendAssistantToolCall(formatPlainTextShellCall(
-          target.value.trim(),
           command.value.trim() || "pwd"
         ), "text");
-      });
-
-      document.getElementById("insertMissingTarget").addEventListener("click", () => {
-        appendAssistantToolCall(formatPlainTextShellCall("", command.value.trim() || "pwd"), "text");
       });
 
       document.getElementById("clearThread").addEventListener("click", () => {
@@ -402,7 +390,7 @@
 
         window.clearTimeout(tmuxRefreshTimer);
         if (!data.ok) {
-          renderTargetError(data.error || "Could not list tmux targets.");
+          renderTargetError(data.error || "Could not list tmux panes.");
           return;
         }
 
@@ -433,17 +421,9 @@
           return;
         }
 
-        const currentTarget = target.value.trim();
-        const hasCurrentTarget = panes.some((pane) => pane.id === currentTarget || pane.address === currentTarget);
-        if (!hasCurrentTarget) {
-          target.value = panes[0].id;
-        }
-
         panes.forEach((pane) => {
-          const item = document.createElement("button");
-          item.type = "button";
+          const item = document.createElement("div");
           item.className = "target-item";
-          item.setAttribute("aria-pressed", pane.id === target.value.trim() ? "true" : "false");
 
           const id = document.createElement("span");
           id.className = "target-id";
@@ -462,18 +442,10 @@
           meta.textContent = `${pane.currentCommand || "unknown"} - ${pane.currentPath || ""}`;
 
           item.append(id, main, meta);
-          item.addEventListener("click", () => {
-            target.value = pane.id;
-            Array.from(targetList.querySelectorAll(".target-item")).forEach((button) => {
-              button.setAttribute("aria-pressed", "false");
-            });
-            item.setAttribute("aria-pressed", "true");
-            setStatus(`Selected ${pane.id} (${pane.address || "tmux pane"}).`);
-          });
           targetList.appendChild(item);
         });
 
-        setStatus(`Loaded ${panes.length} tmux target${panes.length === 1 ? "" : "s"}.`);
+        setStatus(`Loaded ${panes.length} tmux pane${panes.length === 1 ? "" : "s"}.`);
       }
 
       function appendAssistantToolCall(body, language) {
@@ -490,10 +462,9 @@
         setStatus("Inserted assistant tool call. The extension should run it after the page settles.");
       }
 
-      function formatPlainTextShellCall(targetValue, commandValue) {
+      function formatPlainTextShellCall(commandValue) {
         return [
           "ai-helper-shell-start",
-          targetValue,
           commandValue,
           "ai-helper-shell-end"
         ].join("\n");

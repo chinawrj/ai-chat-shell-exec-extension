@@ -36,6 +36,7 @@ const importConfigButton = document.getElementById("importConfig");
 const addCurrentSiteButton = document.getElementById("addCurrentSite");
 const removeCurrentSiteButton = document.getElementById("removeCurrentSite");
 const refreshTmuxTargetsButton = document.getElementById("refreshTmuxTargets");
+const resetForAiTmuxButton = document.getElementById("resetForAiTmux");
 const portableConfig = document.getElementById("portableConfig");
 const portableStatus = document.getElementById("portableStatus");
 const currentSiteStatus = document.getElementById("currentSiteStatus");
@@ -56,6 +57,7 @@ importConfigButton.addEventListener("click", importConfig);
 addCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(true));
 removeCurrentSiteButton.addEventListener("click", () => updateCurrentSiteEnabled(false));
 refreshTmuxTargetsButton.addEventListener("click", refreshTmuxTargets);
+resetForAiTmuxButton.addEventListener("click", resetForAiTmuxTargets);
 
 async function loadSettings() {
   const settings = await chrome.storage.sync.get(Object.keys(DEFAULTS));
@@ -150,6 +152,10 @@ async function refreshHealth() {
       health.textContent = `Extension ID mismatch. Expected ${response.allowedOrigin || "server origin"}`;
       return;
     }
+    if (response?.protocolMatches === false) {
+      health.textContent = "Server protocol mismatch. Restart the local shell server from this release.";
+      return;
+    }
     health.textContent = response?.error || "Server not reachable";
   } catch (error) {
     health.dataset.state = "error";
@@ -169,7 +175,30 @@ async function refreshTmuxTargets() {
     }
 
     tmuxTargets.dataset.state = "ok";
-    tmuxTargets.textContent = formatTmuxTargets(response.panes);
+    tmuxTargets.textContent = formatTmuxTargets(response.panes, response);
+  } catch (error) {
+    tmuxTargets.dataset.state = "error";
+    tmuxTargets.textContent = error.message || String(error);
+  }
+}
+
+async function resetForAiTmuxTargets() {
+  if (globalThis.confirm && !globalThis.confirm("Reset the ForAI tmux session? This kills the current ForAI host and board windows.")) {
+    return;
+  }
+
+  tmuxTargets.dataset.state = "checking";
+  tmuxTargets.textContent = "Resetting ForAI tmux...";
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "tmux-reset-forai" });
+    if (!response?.ok) {
+      tmuxTargets.dataset.state = "error";
+      tmuxTargets.textContent = response?.error || "ForAI tmux reset failed";
+      return;
+    }
+
+    tmuxTargets.dataset.state = "ok";
+    tmuxTargets.textContent = formatTmuxTargets(response.panes, response);
   } catch (error) {
     tmuxTargets.dataset.state = "error";
     tmuxTargets.textContent = error.message || String(error);
@@ -257,19 +286,26 @@ function sanitizeSettings(input) {
   };
 }
 
-function formatTmuxTargets(panes) {
+function formatTmuxTargets(panes, layout = {}) {
   if (!Array.isArray(panes) || panes.length === 0) {
     return "No tmux panes found.";
   }
 
-  return panes.map((pane) => [
+  const summary = layout.sessionName ? [
+    `defaultSession=${layout.sessionName}`,
+    `host=${layout.defaultTarget || layout.hostWindowName || "missing"}`,
+    `board=${layout.boardTarget || layout.boardWindowName || "missing"}`,
+    layout.cwd ? `cwd=${layout.cwd}` : ""
+  ].filter(Boolean).join(" ") : "";
+  const paneLines = panes.map((pane) => [
     `target=${pane.id}`,
     `address=${pane.address}`,
     `window=${pane.windowName || "(unnamed)"}`,
     `command=${pane.currentCommand || "unknown"}`,
     pane.currentPath ? `cwd=${pane.currentPath}` : "",
     pane.active ? "active=true" : "active=false"
-  ].filter(Boolean).join(" ")).join("\n");
+  ].filter(Boolean).join(" "));
+  return [summary, ...paneLines].filter(Boolean).join("\n");
 }
 
 function normalizeEnabledHosts(input) {

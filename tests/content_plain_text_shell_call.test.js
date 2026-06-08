@@ -51,7 +51,6 @@ const command = [
 ].join("\n");
 const block = [
   "ai-helper-shell-start",
-  "%24",
   command,
   "ai-helper-shell-end"
 ].join("\n");
@@ -60,32 +59,32 @@ assert.equal(context.containsToolLanguageHint(block), true);
 const parsed = context.parseCallPayload(block);
 assert.equal(parsed.helperIdSource, "payload-hash");
 assert.equal(parsed.helperId.length > 0, true);
-assert.equal(parsed.target, "%24");
+assert.equal(parsed.target, undefined);
 assert.equal(parsed.cmd, command);
 const [extracted] = context.parsePlainTextHelperBlocks(`before\n${block}\nafter`);
 assert.equal(extracted.helperId, parsed.helperId);
-assert.equal(extracted.target, "%24");
+assert.equal(extracted.target, undefined);
 assert.equal(extracted.cmd, command);
 assert.equal(context.validateHelperCall(parsed).ok, true);
 assert.equal(context.validateShellCall({ cmd: block }).ok, false);
 
 const [fencedExtracted] = context.parsePlainTextHelperBlocks(`\`\`\`\`\n${block}\n\`\`\`\``);
-assert.equal(fencedExtracted.target, "%24");
+assert.equal(fencedExtracted.target, undefined);
 assert.equal(fencedExtracted.cmd, command);
 assert.equal(context.validateHelperCall(fencedExtracted).ok, true);
 
-const emptyTarget = [
+const commandWithLeadingBlank = [
   "ai-helper-shell-start",
   "",
   "pwd",
   "ai-helper-shell-end"
 ].join("\n");
-const parsedEmptyTarget = context.parseCallPayload(emptyTarget);
-assert.equal(parsedEmptyTarget.target, "");
-assert.equal(parsedEmptyTarget.cmd, "pwd");
+const parsedLeadingBlank = context.parseCallPayload(commandWithLeadingBlank);
+assert.equal(parsedLeadingBlank.target, undefined);
+assert.equal(parsedLeadingBlank.cmd, "pwd");
 
 const defaultTargetShell = context.parseCallPayload("ai-helper-shell-start\npwd\nai-helper-shell-end");
-assert.equal(defaultTargetShell.target, "");
+assert.equal(defaultTargetShell.target, undefined);
 assert.equal(defaultTargetShell.cmd, "pwd");
 assert.equal(context.validateHelperCall(defaultTargetShell).ok, true);
 
@@ -95,17 +94,17 @@ assert.equal(shellStartAlias.target, undefined);
 assert.equal(context.containsToolLanguageHint("ai-helper-start-shell\n%24\npwd\nai-helper-end-shell"), false);
 assert.equal(context.validateShellCall({ cmd: "ai-helper-start-shell\n%24\npwd\nai-helper-end-shell" }).ok, false);
 
-const suffixedShellA = context.parseCallPayload("ai-helper-shell-start:1001\n%24\npwd\nai-helper-shell-end");
-const suffixedShellB = context.parseCallPayload("ai-helper-shell-start:1002\n%24\npwd\nai-helper-shell-end");
+const suffixedShellA = context.parseCallPayload("ai-helper-shell-start:1001\npwd\nai-helper-shell-end");
+const suffixedShellB = context.parseCallPayload("ai-helper-shell-start:1002\npwd\nai-helper-shell-end");
 assert.equal(suffixedShellA.kind, "shell");
 assert.equal(suffixedShellA.helperId, "1001");
 assert.equal(suffixedShellA.helperIdSource, "marker");
 assert.equal(suffixedShellA.cmd, "pwd");
 assert.notEqual(context.buildSemanticCallKey(suffixedShellA), context.buildSemanticCallKey(suffixedShellB));
-assert.notEqual(context.buildSemanticCallKey(suffixedShellA), context.buildSemanticCallKey(parsedEmptyTarget));
+assert.notEqual(context.buildSemanticCallKey(suffixedShellA), context.buildSemanticCallKey(parsedLeadingBlank));
 
-const repeatedUnsuffixedA = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
-const repeatedUnsuffixedB = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+const repeatedUnsuffixedA = context.parseCallPayload("ai-helper-shell-start\npwd\nai-helper-shell-end");
+const repeatedUnsuffixedB = context.parseCallPayload("ai-helper-shell-start\npwd\nai-helper-shell-end");
 assert.equal(repeatedUnsuffixedA.helperIdSource, "payload-hash");
 assert.equal(repeatedUnsuffixedA.helperId, repeatedUnsuffixedB.helperId);
 assert.equal(context.buildSemanticCallKey(repeatedUnsuffixedA), context.buildSemanticCallKey(repeatedUnsuffixedB));
@@ -114,7 +113,23 @@ const previousPwdOutput = "Shell call result:\n\n```shell-output\n$ pwd\ntarget:
 assert.equal(context.shouldSuppressShellCallEcho(repeatedUnsuffixedA, previousPwdOutput, ""), true);
 assert.equal(context.shouldSuppressShellCallEcho(suffixedShellA, previousPwdOutput, ""), false);
 
-const malformedSuffixedShell = context.parseCallPayload("ai-helper-shell-start:not valid\n%24\npwd\nai-helper-shell-end");
+const heredocShell = context.parseCallPayload([
+  "ai-helper-shell-start",
+  "cat > /tmp/ai-helper-heredoc.txt <<'EOF'",
+  "hello",
+  "EOF",
+  "printf done",
+  "ai-helper-shell-end"
+].join("\n"));
+assert.equal(heredocShell.target, undefined);
+assert.equal(heredocShell.cmd, "cat > /tmp/ai-helper-heredoc.txt <<'EOF'\nhello\nEOF\nprintf done");
+assert.equal(context.validateHelperCall(heredocShell).ok, true);
+
+const legacyTargetLineIsCommand = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+assert.equal(legacyTargetLineIsCommand.target, undefined);
+assert.equal(legacyTargetLineIsCommand.cmd, "%24\npwd");
+
+const malformedSuffixedShell = context.parseCallPayload("ai-helper-shell-start:not valid\npwd\nai-helper-shell-end");
 assert.equal(malformedSuffixedShell.kind, "shell");
 assert.equal(malformedSuffixedShell.helperIdSource, "payload-hash");
 assert.match(context.validateHelperCall(malformedSuffixedShell).reason, /Malformed helper identity suffix/);

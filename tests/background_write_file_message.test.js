@@ -65,6 +65,7 @@ class FakeWebSocket {
 }
 
 const context = {
+  AbortController,
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
@@ -101,7 +102,15 @@ const context = {
   },
   clearTimeout,
   console,
-  fetch: async () => ({ ok: true, status: 200, text: async () => "{}" }),
+  fetch: async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      ok: true,
+      allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
+      protocolVersion: 1
+    })
+  }),
   setTimeout,
   WebSocket: FakeWebSocket
 };
@@ -205,6 +214,29 @@ async function main() {
   assert.equal(sentPayloads[2].force, true);
   assert.equal(sentPayloads[2].callMeta.force, true);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].forced, true);
+
+  const originalFetch = context.fetch;
+  context.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      ok: true,
+      allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
+      protocolVersion: 0
+    })
+  });
+  await assert.rejects(
+    () => context.handleRunBoardMessage({
+      type: "run-board",
+      id: "board-protocol-mismatch",
+      callKey: "board-protocol-mismatch",
+      cmd: "version"
+    }),
+    /protocol mismatch/
+  );
+  assert.equal(sentPayloads.length, 3);
+  assert.equal(localStore["shellCallLedger:v1"].calls["board-protocol-mismatch"].state, "failed");
+  context.fetch = originalFetch;
 
   console.log("background write-file and board message tests passed");
 }

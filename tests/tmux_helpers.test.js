@@ -8,8 +8,8 @@ const {
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
-  buildMissingTargetResponse,
   extractTmuxRunOutput,
   extractBoardPromptSignature,
   getTmuxEnvSocketPath,
@@ -71,7 +71,9 @@ const boardPanes = parseTmuxPanes([
 assert.deepEqual(getForAiTmuxConfig(), {
   sessionName: "ForAI",
   hostWindowName: "host",
-  boardWindowName: "board"
+  boardWindowName: "board",
+  cwd: fs.realpathSync(path.join(__dirname, "..")),
+  cwdSource: "project-root"
 });
 assert.equal(resolveDefaultShellPane(boardPanes).pane.id, "%41");
 assert.equal(resolveTmuxTarget("host", boardPanes).id, "%41");
@@ -176,12 +178,12 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
 }
 
 {
-  const response = buildMissingTargetResponse({ id: "call-1", callKey: "key-1" }, "pwd", panes);
+  const response = buildDefaultTargetErrorResponse({ id: "call-1", callKey: "key-1" }, "pwd", panes);
   assert.equal(response.ok, false);
-  assert.equal(response.targetRequired, true);
-  assert.equal(response.error.includes("Missing tmux target"), true);
+  assert.equal(response.targetRequired, false);
+  assert.equal(response.error.includes("Default tmux target is unavailable"), true);
   assert.equal(response.tmuxPanes.length, 2);
-  assert.equal(response.example, "ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
+  assert.equal(response.example, "ai-helper-shell-start\npwd\nai-helper-shell-end");
 }
 
 {

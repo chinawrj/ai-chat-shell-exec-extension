@@ -4,6 +4,23 @@
 
 - Nothing yet.
 
+## [0.3.5] - 2026-06-08
+
+- Hardens shell server startup against broken `.state` paths by preflighting and automatically repairing safe state-directory conflicts before listening.
+- Adds `AI_CHAT_SHELL_STATE_DIR` so runtime state can be explicitly moved when needed.
+- Removes macOS LaunchAgent auto-start; the shell server now runs as an explicit foreground process with `./scripts/start_shell_server.sh`.
+- Keeps `./scripts/install_shell_server_agent.sh` as a compatibility shortcut that removes legacy LaunchAgents and then starts the foreground server.
+- Reports state directory health and repair actions from `/health` and `scripts/doctor.sh`, and blocks extension execution when the server reports unusable state.
+- Covers missing, corrupted, conflicting, auto-repaired, and unwritable state-directory cases in automated tests.
+
+## [0.3.4] - 2026-06-07
+
+- Starts new `ForAI` `host` and `board` tmux windows in the project root by default, with `AI_CHAT_SHELL_FORAI_CWD` available for an explicit default working directory.
+- Adds a `tmux-reset-forai` server message plus floating-panel and popup reset actions to recreate the default `ForAI` workspace, including when the session is already missing.
+- Removes shell helper target-line parsing so every line between `ai-helper-shell-start` and `ai-helper-shell-end` is command text, including heredocs; legacy shell target fields are ignored.
+- Improves startup, `Check`, popup, health, and doctor diagnostics for default host, board, cwd, and server protocol state.
+- Expands Chrome extension e2e coverage so the primary shell path uses a no-target helper block and verifies default execution in `ForAI:host`.
+
 ## [0.3.3] - 2026-06-01
 
 - Ensures the default `ForAI` tmux session exists when the page plugin starts, with `host` and `board` windows created automatically.

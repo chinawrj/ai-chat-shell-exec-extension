@@ -48,10 +48,17 @@ async function main() {
 
   const serverHealth = await getShellServerHealth().catch(() => null);
   const socketPath = serverHealth?.ok ? String(serverHealth.tmuxSocket || "") : createTempTmuxSocketPath();
+  const expectedDefaultSession = String(serverHealth?.tmuxDefaultSession || "ForAI");
+  const expectedDefaultHostWindow = String(serverHealth?.tmuxDefaultHostWindow || "host");
   if (serverHealth?.ok) {
     assert.ok(
       serverHealth.allowUntrustedOrigins === true || serverHealth.allowedOrigin === EXPECTED_EXTENSION_ORIGIN,
       `Existing shell server has unexpected allowed origin: ${serverHealth.allowedOrigin || "(unknown)"}`
+    );
+    assert.equal(
+      serverHealth.protocolVersion,
+      1,
+      `Existing shell server protocol is ${serverHealth.protocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
 
@@ -136,11 +143,9 @@ async function main() {
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
-    document.getElementById("target").value = ${JSON.stringify(paneId)};
     document.getElementById("command").value = ${JSON.stringify(command)};
     appendAssistantToolCall([
       ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
-      ${JSON.stringify(paneId)},
       ${JSON.stringify(command)},
       "ai-helper-shell-end"
     ].join("\\n"), "text");
@@ -168,6 +173,7 @@ async function main() {
 
   assert.match(finalText, /Shell call result:/);
   assert.match(finalText, /```shell-output/);
+  assert.match(finalText, new RegExp(`targetName: ${escapeRegExp(expectedDefaultSession)}:.* ${escapeRegExp(expectedDefaultHostWindow)}`));
   assert.match(finalText, new RegExp(escapeRegExp(`stdout:\n${token}`)));
 
   if (SCREENSHOT_DIR) {

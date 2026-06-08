@@ -4,7 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOURCE="$ROOT_DIR/native/macos_vision_helper.swift"
-OUT_DIR="$ROOT_DIR/.state/bin"
+STATE_DIR_INPUT="${AI_CHAT_SHELL_STATE_DIR:-$ROOT_DIR/.state}"
+if [[ "$STATE_DIR_INPUT" = /* ]]; then
+  STATE_DIR="$STATE_DIR_INPUT"
+else
+  STATE_DIR="$ROOT_DIR/$STATE_DIR_INPUT"
+fi
+OUT_DIR="$STATE_DIR/bin"
 OUT="$OUT_DIR/macos-vision-helper"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then

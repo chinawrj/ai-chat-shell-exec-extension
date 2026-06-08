@@ -71,10 +71,9 @@ class MockNode extends FakeElement {
   }
 }
 
-function createHelperBlock({ target = "%24", cmd }) {
+function createHelperBlock({ cmd }) {
   return [
     "ai-helper-shell-start",
-    target,
     cmd,
     "ai-helper-shell-end"
   ].join("\n");
@@ -174,7 +173,7 @@ const quotedShellOutput = [
   const root = createRoot([mixedMessage]);
   const candidate = context.getLastShellCallCandidate(root);
   assert.ok(candidate);
-  assert.equal(candidate.call.target, "%24");
+  assert.equal(candidate.call.target, undefined);
   assert.equal(candidate.call.cmd, "echo NEW_MIXED");
 }
 
@@ -265,7 +264,7 @@ async function verifyDebugPanelUpdates() {
   const cmd = "echo DEBUG_TEST";
   const message = createAssistantMessage({
     order: 1,
-    text: createHelperBlock({ target: "%24", cmd })
+    text: createHelperBlock({ cmd })
   });
   const root = createRoot([message]);
   context.document.body = root;
@@ -298,7 +297,6 @@ async function verifyDebugPanelUpdates() {
   await context.scanForShellCall({ force: true });
 
   assert.ok(getElementByIdCalls.includes("ai-chat-shell-exec-debug-body"), "getElementById should be called with DEBUG_BODY_ID");
-  assert.ok(debugBody.textContent.includes("target:"), `debug body should contain 'target:' but got: ${debugBody.textContent}`);
   assert.ok(debugBody.textContent.includes("--- cmd / content (first 800 chars) ---"), `debug body should contain cmd/content header`);
   assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);
 }
