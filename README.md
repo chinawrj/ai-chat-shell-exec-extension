@@ -153,10 +153,9 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 - enabled/paused
 - auto-enabled sites
-- local server release, server/helper/visual protocol diagnostics, and macOS vision helper availability
+- local server release, server protocol, and helper protocol diagnostics
 - visible tmux panes and default `ForAI` workspace state for diagnostics
 - default `ForAI` host/board/cwd state, plus a reset button for the default session
-- macOS visual protocol/app diagnostics and vision helper availability for Terminal.app and Ghostty experiments
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -169,7 +168,7 @@ By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.micr
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
-- `Check`: verify local shell server release/protocol/helper/visual compatibility, macOS vision helper availability, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
+- `Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
 - `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
 - `Bind input`: click it, then click the page's chat input.

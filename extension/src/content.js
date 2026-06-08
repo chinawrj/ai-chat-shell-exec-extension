@@ -2128,20 +2128,14 @@ function formatServerProtocolStatus(health) {
   const release = health?.serverReleaseVersion || health?.releaseVersion || "";
   const serverProtocol = health?.serverProtocolVersion ?? health?.protocolVersion;
   const helperProtocol = health?.helperProtocolVersion;
-  const visualProtocol = health?.visualProtocolVersion;
-  const visualApps = Array.isArray(health?.visualTmuxApps) ? health.visualTmuxApps.join("/") : "";
-  const visionStatus = health?.visionAvailable === true
-    ? "vision ok"
-    : health?.visionAvailable === false
-      ? "vision unavailable"
-      : "";
+  const visionEnabled = health?.visionAvailable === true;
+  const visualApps = visionEnabled && Array.isArray(health?.visualTmuxApps) ? health.visualTmuxApps.join("/") : "";
   const parts = [
     release ? `server v${release}` : "server version unknown",
     serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
     helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown",
-    visualProtocol !== undefined && visualProtocol !== null && visualProtocol !== "" ? `visual ${visualProtocol}` : "",
     visualApps ? `apps ${visualApps}` : "",
-    visionStatus
+    visionEnabled ? "vision ok" : ""
   ];
   return parts.filter(Boolean).join(" ");
 }
