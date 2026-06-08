@@ -23,6 +23,7 @@ SHELL_SCRIPTS=(
   scripts/uninstall_shell_server_agent.sh
   scripts/start_shell_server.sh
   scripts/package_release.sh
+  scripts/doctor.sh
   scripts/open_tmux_test_chrome.sh
   scripts/build_macos_vision_helper.sh
   scripts/run_terminal_vision_self_test.sh

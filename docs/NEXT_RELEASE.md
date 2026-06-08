@@ -1,29 +1,30 @@
 # Next Release Plan
 
-Target version: v0.5.0
-Target date: after the local visual adapter proof.
+Target version: v0.6.0
+Target date: after the Horizon visual adapter proof.
 
 ## Theme
 
-Prove the macOS local visual control loop before moving the same model to Horizon.
+Reuse the local visual tmux adapter model against VMware Horizon Web Access.
 
-See `docs/ROADMAP.md` for the longer v0.5.0 through v0.6.0 plan.
+See `docs/ROADMAP.md` for the longer visual-control plan.
 
 ## Goals
 
-1. Local visual surfaces
-   - Treat Terminal.app and Ghostty as tmux UI surfaces.
-   - Keep direct tmux as the test oracle, but make the visual path depend on screenshot/OCR/input rather than direct pane capture.
+1. Horizon visual surface
+   - Treat Horizon as a browser-hosted visual surface, not as a shell API.
+   - Reuse the same single-line tmux command model, completion marker, and OCR pagination strategy from the local adapter.
+   - Keep any browser control generic; avoid site-specific Horizon DOM coupling unless calibration proves generic input is insufficient.
 
-2. Completion and output reconstruction
-   - Use tmux status/window-name markers to detect command completion.
-   - Reconstruct long visible output with pagination and OCR stitching.
-   - Use OCR bounding boxes to order terminal rows and avoid naive string concatenation.
+2. Remote tmux assumptions
+   - Assume the remote Ubuntu desktop already displays a tmux session.
+   - Detect completion through tmux status/window-name markers visible inside the remote desktop.
+   - Reconstruct output from visible OCR pages rather than direct tmux capture.
 
-3. Safety and scope
-   - Keep single-line command execution for the visual path.
+3. Safety and diagnostics
    - Preserve explicit helper blocks, duplicate suppression, and protocol checks.
-   - Do not introduce Horizon/browser-specific code in this release.
+   - Keep local Terminal/Ghostty support working while adding Horizon.
+   - Add diagnostics that clearly distinguish local visual, Horizon visual, and direct tmux paths.
 
 4. Release quality gate
    - `./scripts/test_all.sh` passes.
@@ -35,5 +36,5 @@ See `docs/ROADMAP.md` for the longer v0.5.0 through v0.6.0 plan.
 
 - No JSON helper revival.
 - No old `ai-helper-start-shell` alias revival.
-- No Horizon/browser visual adapter implementation in this release.
-- No site-specific ChatGPT, Claude, Copilot, or Horizon selectors.
+- No privileged Horizon protocol integration.
+- No direct remote shell API assumption.

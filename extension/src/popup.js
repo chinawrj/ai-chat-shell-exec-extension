@@ -167,10 +167,20 @@ function formatServerHealth(response) {
   const release = response?.serverReleaseVersion || response?.releaseVersion || "";
   const serverProtocol = response?.serverProtocolVersion ?? response?.protocolVersion;
   const helperProtocol = response?.helperProtocolVersion;
+  const visualProtocol = response?.visualProtocolVersion;
+  const visualApps = Array.isArray(response?.visualTmuxApps) ? response.visualTmuxApps.join("/") : "";
+  const visionStatus = response?.visionAvailable === true
+    ? "vision ok"
+    : response?.visionAvailable === false
+      ? "vision unavailable"
+      : "";
   return [
     release ? `Server v${release}` : "Server version unknown",
     serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
     helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown",
+    visualProtocol !== undefined && visualProtocol !== null && visualProtocol !== "" ? `visual ${visualProtocol}` : "",
+    visualApps ? `apps ${visualApps}` : "",
+    visionStatus,
     response?.pid ? `pid ${response.pid}` : ""
   ].filter(Boolean).join(", ");
 }

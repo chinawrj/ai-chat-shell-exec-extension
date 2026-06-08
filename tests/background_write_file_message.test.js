@@ -69,7 +69,7 @@ const context = {
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-      getManifest: () => ({ version: "0.4.0" }),
+      getManifest: () => ({ version: "0.5.0" }),
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
       onMessage: { addListener() {} }
@@ -109,10 +109,10 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-      releaseVersion: "0.4.0",
-      serverReleaseVersion: "0.4.0",
-      protocolVersion: 2,
-      serverProtocolVersion: 2,
+      releaseVersion: "0.5.0",
+      serverReleaseVersion: "0.5.0",
+      protocolVersion: 3,
+      serverProtocolVersion: 3,
       helperProtocolVersion: 1
     })
   }),
@@ -227,10 +227,10 @@ async function main() {
     text: async () => JSON.stringify({
       ok: true,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-      releaseVersion: "0.3.5",
-      serverReleaseVersion: "0.3.5",
-      protocolVersion: 1,
-      serverProtocolVersion: 1,
+      releaseVersion: "0.4.0",
+      serverReleaseVersion: "0.4.0",
+      protocolVersion: 2,
+      serverProtocolVersion: 2,
       helperProtocolVersion: 1
     })
   });

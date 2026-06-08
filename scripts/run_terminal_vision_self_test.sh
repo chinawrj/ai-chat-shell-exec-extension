@@ -25,33 +25,28 @@ fi
 TARGET="${1:-}"
 
 printf 'Open a dedicated Terminal window attached to the target tmux pane, leave it visible, then press Return here.\n' >&2
+printf 'If tmux/Terminal title propagation is disabled, set AI_CHAT_SHELL_VISION_WINDOW_ID=<window id> and rerun this script.\n' >&2
 read -r _
 
 node - "$ROOT_DIR" "$HELPER" "$TARGET" <<'NODE'
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
 const root = process.argv[2];
 const helper = process.argv[3];
 const target = process.argv[4] || "";
 process.env.AI_CHAT_SHELL_VISION_HELPER = helper;
+process.env.AI_CHAT_SHELL_ENABLE_LOW_LEVEL_VISION = "1";
 const { handleVisionMessage } = require(path.join(root, "server", "shell_server.js"));
 
 (async () => {
-  const listed = spawnSync(helper, ["list-windows", "--json"], { encoding: "utf8" });
-  if (listed.status !== 0) {
-    throw new Error(listed.stderr || listed.stdout || "Could not list Terminal windows.");
-  }
-  const windows = JSON.parse(listed.stdout).windows || [];
-  const terminal = windows.find((windowInfo) => windowInfo.appName === "Terminal");
-  if (!terminal) {
-    throw new Error("No visible Terminal window found.");
-  }
-  const result = await handleVisionMessage({
+  const message = {
     type: "vision-terminal-self-test",
     target,
-    windowId: terminal.windowId,
     timeoutMs: 15000
-  });
+  };
+  if (process.env.AI_CHAT_SHELL_VISION_WINDOW_ID) {
+    message.windowId = process.env.AI_CHAT_SHELL_VISION_WINDOW_ID;
+  }
+  const result = await handleVisionMessage(message);
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.ok ? 0 : 1);
 })().catch((error) => {

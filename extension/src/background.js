@@ -10,8 +10,19 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 2;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 3;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 1;
+const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
+  "vision-health",
+  "vision-list-tmux-windows",
+  "vision-list-visual-surfaces",
+  "vision-visual-run-line",
+  "vision-tmux-ocr-run-line"
+]);
+const VISION_COMMAND_MESSAGE_TYPES = new Set([
+  "vision-visual-run-line",
+  "vision-tmux-ocr-run-line"
+]);
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -98,6 +109,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "run-board") {
     handleRunBoardMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
+  if (String(message.type || "").startsWith("vision-")) {
+    handleVisionMessage(message)
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -262,6 +283,69 @@ async function handleRunBoardMessage(message) {
       duplicate: response?.duplicate === true,
       skipped: response?.skipped === true,
       target: response?.target || "board"
+    });
+    return response;
+  } catch (error) {
+    await markShellCall(callKey, "failed", {
+      completedAt: Date.now(),
+      error: error.message || String(error)
+    });
+    throw error;
+  }
+}
+
+async function handleVisionMessage(message) {
+  if (!BACKGROUND_VISION_MESSAGE_TYPES.has(message.type)) {
+    return {
+      ok: false,
+      error: `Unsupported background vision message type: ${message.type || ""}`
+    };
+  }
+
+  if (!VISION_COMMAND_MESSAGE_TYPES.has(message.type)) {
+    await requireShellServerReady();
+    return runShellViaWebSocket(message);
+  }
+
+  const callKey = message.callKey || message.id || hashText([
+    message.type,
+    message.windowId || message.target || message.tmuxTarget || "",
+    message.appName || "",
+    message.cmd || ""
+  ].join("\n"));
+  const target = message.windowId ? `vision-window:${message.windowId}` : `tmux:${message.target || message.tmuxTarget || ""}`;
+  const force = message.callMeta?.force === true || message.force === true;
+  const payload = {
+    ...message,
+    callKey,
+    force
+  };
+  const claim = await claimShellCall(callKey, {
+    ...payload,
+    target,
+    timeoutMs: message.timeoutMs || 30000
+  });
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      duplicate: true,
+      skipped: true,
+      callKey,
+      reason: claim.reason
+    };
+  }
+
+  payload.seq = claim.seq;
+  try {
+    await requireShellServerReady();
+    const response = await runShellViaWebSocket(payload);
+    await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
+      completedAt: Date.now(),
+      exitCode: response?.exitCode,
+      durationMs: response?.durationMs,
+      duplicate: response?.duplicate === true,
+      skipped: response?.skipped === true,
+      target
     });
     return response;
   } catch (error) {

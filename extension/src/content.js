@@ -11,7 +11,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.4.0";
+const CONTENT_SCRIPT_VERSION = "0.5.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -2128,12 +2128,22 @@ function formatServerProtocolStatus(health) {
   const release = health?.serverReleaseVersion || health?.releaseVersion || "";
   const serverProtocol = health?.serverProtocolVersion ?? health?.protocolVersion;
   const helperProtocol = health?.helperProtocolVersion;
+  const visualProtocol = health?.visualProtocolVersion;
+  const visualApps = Array.isArray(health?.visualTmuxApps) ? health.visualTmuxApps.join("/") : "";
+  const visionStatus = health?.visionAvailable === true
+    ? "vision ok"
+    : health?.visionAvailable === false
+      ? "vision unavailable"
+      : "";
   const parts = [
     release ? `server v${release}` : "server version unknown",
     serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
-    helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown"
+    helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown",
+    visualProtocol !== undefined && visualProtocol !== null && visualProtocol !== "" ? `visual ${visualProtocol}` : "",
+    visualApps ? `apps ${visualApps}` : "",
+    visionStatus
   ];
-  return parts.join(" ");
+  return parts.filter(Boolean).join(" ");
 }
 
 function getExtensionVersionMismatch(background) {

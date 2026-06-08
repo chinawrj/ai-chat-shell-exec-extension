@@ -4,6 +4,14 @@
 
 - Nothing yet.
 
+## [0.5.0] - 2026-06-08
+
+- Adds a local visual tmux surface discovery path for macOS windows, defaulting to Terminal.app and Ghostty.
+- Bumps the shell server protocol to `3` while keeping helper protocol `1`.
+- Reports visual protocol metadata and supported local visual tmux apps from server health.
+- Lets the extension background forward the supported visual discovery/run requests through the same stale-server health gate used by shell, file, board, and tmux messages.
+- Adds coverage for visual surface listing, background vision forwarding, stale-server blocking, and supported-app metadata.
+
 ## [0.4.0] - 2026-06-08
 
 - Separates the extension release version from server protocol compatibility by reporting `serverProtocolVersion` and `helperProtocolVersion` from the local server health endpoint.

@@ -7,6 +7,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const {
+  handleVisionMessage,
   listTmuxPanes,
   runTmuxVisualLine,
   validateVisionTmuxCommand
@@ -32,7 +33,9 @@ function runTmux(socketPath, args, options = {}) {
   const socketPath = path.join(tmpDir, "tmux.sock");
   const sessionName = `visionrun_${Date.now()}`;
   const originalSocket = process.env.AI_CHAT_SHELL_TMUX_SOCKET;
+  const originalDirectVisualTmux = process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX;
   process.env.AI_CHAT_SHELL_TMUX_SOCKET = socketPath;
+  delete process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX;
 
   try {
     runTmux(socketPath, ["new-session", "-d", "-s", sessionName, "-x", "80", "-y", "24"]);
@@ -65,12 +68,52 @@ function runTmux(socketPath, args, options = {}) {
 
     assert.equal(validateVisionTmuxCommand("false && echo no || echo yes"), "false && echo no || echo yes");
     assert.throws(() => validateVisionTmuxCommand("echo one\necho two"), /one command line/);
+
+    const disabledVisualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-disabled",
+      callKey: `vision-tmux-run-disabled-${Date.now()}`,
+      target: paneId,
+      cmd: "printf 'VISION_TMUX_DISABLED\\n'",
+      timeoutMs: 10000
+    });
+    assert.equal(disabledVisualMessage.ok, false);
+    assert.equal(disabledVisualMessage.errorCode, "direct-visual-tmux-disabled");
+
+    process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX = "1";
+    const visualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-message",
+      callKey: `vision-tmux-run-message-${Date.now()}`,
+      target: paneId,
+      cmd: "printf 'VISION_TMUX_LEDGER_OK\\n'",
+      timeoutMs: 10000
+    });
+    assert.equal(visualMessage.ok, true);
+    assert.equal(visualMessage.exitCode, 0);
+    assert.equal(visualMessage.terminalText.includes("VISION_TMUX_LEDGER_OK"), true);
+
+    const duplicateVisualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-message",
+      callKey: visualMessage.callKey,
+      target: paneId,
+      cmd: "printf 'VISION_TMUX_LEDGER_OK\\n'",
+      timeoutMs: 10000
+    });
+    assert.equal(duplicateVisualMessage.skipped, true);
+    assert.equal(duplicateVisualMessage.reason, "recently-completed");
   } finally {
     spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", sessionName], { encoding: "utf8" });
     if (originalSocket === undefined) {
       delete process.env.AI_CHAT_SHELL_TMUX_SOCKET;
     } else {
       process.env.AI_CHAT_SHELL_TMUX_SOCKET = originalSocket;
+    }
+    if (originalDirectVisualTmux === undefined) {
+      delete process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX;
+    } else {
+      process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX = originalDirectVisualTmux;
     }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

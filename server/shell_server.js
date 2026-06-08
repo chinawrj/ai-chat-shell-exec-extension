@@ -15,7 +15,7 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 2;
+const SERVER_PROTOCOL_VERSION = 3;
 const HELPER_PROTOCOL_VERSION = 1;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -61,9 +61,12 @@ const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGIN
 const DEFAULT_VISION_HELPER_PATH = path.join(STATE_DIR, "bin", "macos-vision-helper");
 const VISION_INPUT_MAX_CHARS = 512;
 const VISION_ALLOWED_KEYS = new Set(["enter", "tab", "escape", "backspace", "page-down", "page-up", "ctrl-c"]);
+const VISION_TMUX_DEFAULT_APPS = ["Terminal", "Ghostty"];
 const VISION_TMUX_RUN_PREFIX = "AIVR";
 const VISION_TMUX_OCR_RUN_PREFIX = "AIVRRUN";
 const VISION_TMUX_OCR_DONE_PREFIX = "AIVRDONE";
+const VISION_TMUX_OCR_START_PREFIX = "AIVRSTART";
+const VISION_TMUX_HISTORY_LIMIT = 200000;
 let stateLoggingConfigured = false;
 let stateLogStreams = null;
 let serverLedger = loadServerLedger();
@@ -315,6 +318,8 @@ function getProtocolMetadata() {
     serverProtocolVersion: SERVER_PROTOCOL_VERSION,
     helperProtocolVersion: HELPER_PROTOCOL_VERSION,
     helperProtocol: "ai-helper-plain-text",
+    visualProtocolVersion: 1,
+    visualTmuxApps: getVisionTmuxAppNames(),
     executionBackend: "tmux"
   };
 }
@@ -322,6 +327,7 @@ function getProtocolMetadata() {
 function buildHealthResponse() {
   const forAiConfig = getForAiTmuxConfigForHealth();
   const state = getStateStatus({ create: true });
+  const visionAvailability = getVisionAvailability();
   return {
     ok: state.ok,
     error: state.error || "",
@@ -345,7 +351,9 @@ function buildHealthResponse() {
     tmuxDefaultCwdSource: forAiConfig.cwdSource,
     tmuxDefaultCwdError: forAiConfig.cwdError || "",
     visionHelper: getVisionHelperPath(),
-    visionAvailable: getVisionAvailability().available,
+    visionAvailable: visionAvailability.available,
+    visionErrorCode: visionAvailability.errorCode || "",
+    visionError: visionAvailability.error || "",
     ledgerEntries: Object.keys(serverLedger.calls || {}).length
   };
 }
@@ -652,6 +660,9 @@ async function handleVisionMessageInner(message) {
   }
 
   if (type === "vision-list-windows") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     const args = ["list-windows"];
     if (message.all) {
       args.push("--all");
@@ -663,19 +674,32 @@ async function handleVisionMessageInner(message) {
     return ensureVisionOk(response);
   }
 
+  if (type === "vision-list-tmux-windows" || type === "vision-list-visual-surfaces") {
+    return listVisionTmuxWindows(message);
+  }
+
   if (type === "vision-capture") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     const windowId = parseVisionWindowId(message.windowId);
     const response = await runVisionHelper(["capture", "--window-id", String(windowId)]);
     return ensureVisionWindowResponse(ensureVisionOk(response), { appName: message.appName || "" });
   }
 
   if (type === "vision-ocr") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     const imageRef = getVisionImageRef(message);
     const response = await runVisionHelper(["ocr", "--image", imageRef]);
     return ensureVisionOk(response);
   }
 
   if (type === "vision-type") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     const windowId = parseVisionWindowId(message.windowId);
     const text = validateVisionTextInput(message.text);
     const response = await runVisionHelper(["type", "--window-id", String(windowId), "--text", text]);
@@ -683,6 +707,9 @@ async function handleVisionMessageInner(message) {
   }
 
   if (type === "vision-key") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     const windowId = parseVisionWindowId(message.windowId);
     const key = validateVisionKey(message.key);
     const response = await runVisionHelper(["key", "--window-id", String(windowId), "--key", key]);
@@ -690,10 +717,20 @@ async function handleVisionMessageInner(message) {
   }
 
   if (type === "vision-terminal-self-test") {
+    if (!isLowLevelVisionEnabled()) {
+      return lowLevelVisionDisabledError(type);
+    }
     return runVisionTerminalSelfTest(message);
   }
 
   if (type === "vision-tmux-run-line" || type === "vision-tmux-run") {
+    if (!isDirectVisualTmuxEnabled()) {
+      return visionError(
+        "direct-visual-tmux-disabled",
+        "Direct tmux visual run messages are disabled outside explicit local test mode.",
+        { enableEnv: "AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX" }
+      );
+    }
     return handleVisionTmuxRunLineMessage(message);
   }
 
@@ -704,30 +741,113 @@ async function handleVisionMessageInner(message) {
   return visionError("unsupported-vision-message", `Unsupported vision message type: ${type}`);
 }
 
+async function listVisionTmuxWindows(message = {}) {
+  const supportedApps = getVisionTmuxAppNames();
+  const requestedApp = message.appName ? validateVisionAppName(message.appName) : "";
+  if (requestedApp && !supportedApps.includes(requestedApp)) {
+    return visionError("unsupported-visual-app", `Unsupported local visual tmux app: ${requestedApp}.`, {
+      supportedApps
+    });
+  }
+
+  const listed = ensureVisionOk(await runVisionHelper(["list-windows"]));
+  if (listed.ok === false) {
+    return listed;
+  }
+
+  const windows = (Array.isArray(listed.windows) ? listed.windows : [])
+    .filter((windowInfo) => {
+      const appName = String(windowInfo?.appName || "");
+      return requestedApp ? appName === requestedApp : supportedApps.includes(appName);
+    })
+    .map((windowInfo) => ({
+      ...windowInfo,
+      surfaceType: "macos-window",
+      visualAdapter: "tmux-ocr",
+      supportedApp: true,
+      tmuxVerified: false,
+      requiresTmux: true
+    }));
+
+  return {
+    ok: true,
+    platform: os.platform(),
+    supportedApps,
+    surfaceType: "macos-window",
+    visualAdapter: "tmux-ocr",
+    windows,
+    count: windows.length
+  };
+}
+
 async function handleVisionTmuxOcrRunLineMessage(message) {
   const cmd = validateVisionTmuxCommand(message.cmd);
   const windowId = parseVisionWindowId(message.windowId);
   const timeoutMs = clampNumber(message.timeoutMs, 5000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxPages = clampNumber(message.maxPages, 1, 200, 40);
   const pageDelayMs = clampNumber(message.pageDelayMs, 100, 5000, 500);
+  const appName = message.appName || "";
+  const target = `vision-window:${windowId}`;
+  const surface = await getVisionTmuxWindowById(windowId, { appName });
+  if (surface.ok === false) {
+    return surface;
+  }
+  const callKey = normalizeCallKey(message.callKey || message.id || hashText([
+    "vision-ocr",
+    windowId,
+    appName,
+    cmd,
+    maxPages
+  ].join("\n")));
+  const force = message.callMeta?.force === true || message.force === true;
+  const claim = claimServerShellCall(callKey, {
+    cmd,
+    cwd: "",
+    target,
+    timeoutMs,
+    seq: message.seq,
+    callMeta: message.callMeta || {},
+    force
+  });
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      id: message.id,
+      callKey,
+      duplicate: true,
+      skipped: true,
+      reason: claim.reason,
+      cmd,
+      windowId,
+      timeoutMs,
+      durationMs: 0
+    };
+  }
   const result = await runVisionTmuxOcrLine({
     cmd,
     windowId,
     timeoutMs,
     maxPages,
     pageDelayMs,
-    appName: message.appName || "",
-    oracleTarget: message.target || message.tmuxTarget || ""
+    appName
   });
-  return {
+  const response = {
     ok: result.ok !== false,
     id: message.id,
+    callKey,
     cmd,
     windowId,
     timeoutMs,
     maxPages,
     ...result
   };
+  completeServerShellCall(callKey, {
+    ...response,
+    exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
+    timedOut: response.timedOut === true,
+    truncated: response.truncated === true
+  });
+  return response;
 }
 
 async function handleVisionTmuxRunLineMessage(message) {
@@ -745,21 +865,62 @@ async function handleVisionTmuxRunLineMessage(message) {
     return visionError("invalid-target", `Unknown or ambiguous tmux target: ${target}`, { tmuxPanes: panes });
   }
 
+  const callKey = normalizeCallKey(message.callKey || message.id || hashText([
+    "vision-tmux",
+    pane.id,
+    cmd,
+    timeoutMs,
+    maxOutputChars
+  ].join("\n")));
+  const force = message.callMeta?.force === true || message.force === true;
+  const claim = claimServerShellCall(callKey, {
+    cmd,
+    cwd: pane.currentPath || "",
+    target: pane.id,
+    timeoutMs,
+    seq: message.seq,
+    callMeta: message.callMeta || {},
+    force
+  });
+  if (claim.action === "skip") {
+    return {
+      ok: true,
+      id: message.id,
+      callKey,
+      duplicate: true,
+      skipped: true,
+      reason: claim.reason,
+      cmd,
+      target: pane.id,
+      targetName: pane.label,
+      timeoutMs,
+      durationMs: 0
+    };
+  }
+
   const result = await runTmuxVisualLine({
     cmd,
     pane,
     timeoutMs,
     maxOutputChars
   });
-  return {
+  const response = {
     ok: result.ok !== false,
     id: message.id,
+    callKey,
     cmd,
     target: pane.id,
     targetName: pane.label,
     timeoutMs,
     ...result
   };
+  completeServerShellCall(callKey, {
+    ...response,
+    exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
+    timedOut: response.timedOut === true,
+    truncated: response.truncated === true
+  });
+  return response;
 }
 
 async function runVisionTerminalSelfTest(message) {
@@ -1396,21 +1557,18 @@ async function runTmuxVisualLine({ cmd, pane, timeoutMs, maxOutputChars }) {
   };
 }
 
-async function runVisionTmuxOcrLine({ cmd, windowId, timeoutMs, maxPages, pageDelayMs, appName = "", oracleTarget = "" }) {
+async function runVisionTmuxOcrLine({ cmd, windowId, timeoutMs, maxPages, pageDelayMs, appName = "" }) {
   const started = Date.now();
-  if (appName) {
-    const matched = await getVisionWindowById(windowId, { appName });
-    if (!matched) {
-      return visionError("unexpected-window-app", `Could not find visible target window ${windowId} for app ${validateVisionAppName(appName)}.`, {
-        windowId,
-        appName
-      });
-    }
+  const surface = await getVisionTmuxWindowById(windowId, { appName });
+  if (surface.ok === false) {
+    return surface;
   }
   const runId = randomOcrSafeToken(8);
   const runWindowName = `${VISION_TMUX_OCR_RUN_PREFIX}${runId}`;
   const donePrefix = `${VISION_TMUX_OCR_DONE_PREFIX}${runId}`;
-  const runLine = buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix });
+  const startMarker = `${VISION_TMUX_OCR_START_PREFIX}${runId}`;
+  const historyLimit = VISION_TMUX_HISTORY_LIMIT;
+  const runLine = buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix, startMarker, historyLimit });
 
   await typeVisionText(windowId, runLine);
   await pressVisionKey(windowId, "enter");
@@ -1434,43 +1592,85 @@ async function runVisionTmuxOcrLine({ cmd, windowId, timeoutMs, maxPages, pageDe
   await enterTmuxCopyModeAtHistoryTop(windowId);
   await sleep(pageDelayMs);
 
-  const pages = await readVisionOcrPages({
+  const pageResult = await readVisionOcrPages({
     windowId,
     maxPages,
     pageDelayMs
   });
+  const pages = pageResult.pages;
   await pressVisionKey(windowId, "escape").catch(() => null);
 
   const ocrRawText = pages.map((page) => page.text).join("\n");
-  const cleanedPageTexts = pages.map((page) => cleanVisionTmuxOcrText(page.text, donePrefix));
-  const ocrText = cleanVisionTmuxOcrText(stitchOcrPages(cleanedPageTexts), donePrefix);
+  const rawStitch = stitchOcrPagesDetailed(pages.map((page) => page.text));
+  const rawStitchedText = rawStitch.text;
+  const historyStartFound = visionTextIncludes(rawStitchedText, startMarker);
+  const cleanedPageDetails = pages.map((page) => cleanVisionTmuxOcrTextDetailed(page.text, donePrefix));
+  const cleanedPageTexts = cleanedPageDetails.map((detail) => detail.text);
+  const cleanedStitch = stitchOcrPagesDetailed(cleanedPageTexts);
+  const finalClean = cleanVisionTmuxOcrTextDetailed(cleanedStitch.text, donePrefix);
+  const ocrText = finalClean.text;
+  const ocrCleanupLossy = rawStitch.lossy
+    || cleanedStitch.lossy
+    || finalClean.lossy
+    || cleanedPageDetails.some((detail) => detail.lossy);
   const parsed = parseVisionDoneFromText(done.statusText || done.text, donePrefix);
-  const oracleText = oracleTarget ? await captureTmuxPaneText(oracleTarget).catch(() => "") : "";
+
+  if (pageResult.failed) {
+    return visionError(pageResult.errorCode || "ocr-page-failed", pageResult.error || "Could not OCR output page.", {
+      runId,
+      runWindowName,
+      startMarker,
+      donePrefix,
+      doneOcrText: done.text,
+      doneWindowName: parsed.doneWindowName,
+      exitCode: parsed.exitCode,
+      exitCodeKnown: parsed.exitCodeKnown !== false,
+      ocrPages: pages,
+      failedPage: pageResult.failedPage,
+      truncated: true,
+      paginationEnded: pageResult.ended === true,
+      historyLimit,
+      historyStartFound,
+      ocrCleanupLossy,
+      durationMs: Date.now() - started
+    });
+  }
 
   return {
     ok: true,
     runId,
     runWindowName,
+    startMarker,
     donePrefix,
     doneOcrText: done.text,
     doneWindowName: parsed.doneWindowName,
     exitCode: parsed.exitCode,
+    exitCodeKnown: parsed.exitCodeKnown !== false,
     ocrText,
     ocrRawText,
     ocrPages: pages,
     ocrLineCount: ocrText ? ocrText.split("\n").length : 0,
-    oracleText,
+    truncated: pageResult.truncated === true || !historyStartFound || ocrCleanupLossy || (pageResult.repeatSignatureDetected === true && pageResult.ended !== true),
+    paginationEnded: pageResult.ended === true,
+    repeatSignatureDetected: pageResult.repeatSignatureDetected === true,
+    historyLimit,
+    historyStartFound,
+    ocrCleanupLossy,
+    ocrFullOverlapPages: Array.from(new Set([...rawStitch.fullOverlapPages, ...cleanedStitch.fullOverlapPages])),
     durationMs: Date.now() - started
   };
 }
 
-function buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix }) {
+function buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix, startMarker = "", historyLimit = VISION_TMUX_HISTORY_LIMIT }) {
   return [
-    `tmux rename-window ${shellQuote(runWindowName)}`,
-    "clear",
-    "tmux clear-history",
-    "printf '\\n'",
-    `( ${cmd} )`,
+    [
+      `tmux rename-window ${shellQuote(runWindowName)}`,
+      `tmux set-option -w history-limit ${Number(historyLimit) || VISION_TMUX_HISTORY_LIMIT}`,
+      "clear",
+      "tmux clear-history",
+      startMarker ? `printf '%s\\n' ${shellQuote(startMarker)}` : "printf '\\n'",
+      `/bin/sh -c ${shellQuote(cmd)}`
+    ].join(" && "),
     "__AI_VISION_EXIT_CODE=$?",
     `tmux rename-window \"${donePrefix}\${__AI_VISION_EXIT_CODE}\"`
   ].join("; ");
@@ -1483,6 +1683,56 @@ function buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix }) {
     "__AI_VISION_EXIT_CODE=$?",
     `tmux rename-window \"${donePrefix}\${__AI_VISION_EXIT_CODE}\"`
   ].join("; ");
+}
+
+async function getVisionTmuxWindowById(windowId, { appName = "" } = {}) {
+  const supportedApps = getVisionTmuxAppNames();
+  const requestedApp = appName ? validateVisionAppName(appName) : "";
+  if (requestedApp && !supportedApps.includes(requestedApp)) {
+    return visionError("unsupported-visual-app", `Unsupported local visual tmux app: ${requestedApp}.`, {
+      windowId,
+      appName: requestedApp,
+      supportedApps
+    });
+  }
+
+  const listed = ensureVisionOk(await runVisionHelper(["list-windows"], { timeoutMs: 5000 }));
+  if (listed.ok === false) {
+    return listed;
+  }
+
+  const windows = Array.isArray(listed.windows) ? listed.windows : [];
+  const windowInfo = windows.find((candidate) => Number(candidate?.windowId) === Number(windowId));
+  if (!windowInfo) {
+    return visionError("invalid-window", `Could not find visible target window ${windowId}.`, {
+      windowId,
+      supportedApps
+    });
+  }
+
+  const actualApp = String(windowInfo.appName || "");
+  if (requestedApp && actualApp !== requestedApp) {
+    return visionError("unexpected-window-app", `Target window ${windowId} belongs to ${actualApp || "(unknown)"}, not ${requestedApp}.`, {
+      windowId,
+      appName: requestedApp,
+      actualAppName: actualApp,
+      supportedApps
+    });
+  }
+
+  if (!supportedApps.includes(actualApp)) {
+    return visionError("unsupported-visual-app", `Unsupported local visual tmux app: ${actualApp || "(unknown)"}.`, {
+      windowId,
+      appName: actualApp,
+      supportedApps
+    });
+  }
+
+  return {
+    ok: true,
+    window: windowInfo,
+    supportedApps
+  };
 }
 
 async function waitForTmuxWindowDone({ target, donePrefix, timeoutMs }) {
@@ -1595,11 +1845,14 @@ async function waitForVisionDoneMarker({ windowId, donePrefix, timeoutMs }) {
     }
     lastText = captured.text;
     lastStatusText = captured.statusText || "";
-    if (visionTextIncludes(captured.statusText, donePrefix)) {
+    const parsedDone = parseVisionDoneFromText(captured.statusText, donePrefix);
+    if (parsedDone.exitCodeKnown === true) {
       return {
         found: true,
         text: lastText,
         statusText: captured.statusText,
+        doneWindowName: parsedDone.doneWindowName,
+        exitCode: parsedDone.exitCode,
         ocr: captured.ocr
       };
     }
@@ -1614,6 +1867,8 @@ async function waitForVisionDoneMarker({ windowId, donePrefix, timeoutMs }) {
 async function readVisionOcrPages({ windowId, maxPages, pageDelayMs }) {
   const pages = [];
   let previousSignature = "";
+  let ended = false;
+  let repeatSignatureDetected = false;
   for (let index = 0; index < maxPages; index += 1) {
     const captured = await captureVisionOcrText(windowId);
     if (captured.ok === false) {
@@ -1623,12 +1878,28 @@ async function readVisionOcrPages({ windowId, maxPages, pageDelayMs }) {
         errorCode: captured.errorCode || "ocr-page-failed",
         error: captured.error || "Could not OCR page."
       });
-      break;
+      return {
+        pages,
+        ended: false,
+        failed: true,
+        failedPage: index + 1,
+        errorCode: captured.errorCode || "ocr-page-failed",
+        error: captured.error || "Could not OCR page.",
+        truncated: true
+      };
     }
-    const pageText = captured.outputText || captured.text;
-    const signature = normalizeOcrPageSignature(pageText);
+    const pageText = captured.text;
+    const statusSignature = normalizeOcrPageSignature(captured.statusText);
+    const signature = normalizeOcrPageSignature([
+      pageText,
+      statusSignature ? `STATUS:${statusSignature}` : ""
+    ].filter(Boolean).join("\n"));
     if (index > 0 && signature && signature === previousSignature) {
-      break;
+      repeatSignatureDetected = true;
+      if (visionStatusLooksAtCopyModeBottom(captured.statusText)) {
+        ended = true;
+        break;
+      }
     }
     pages.push({
       page: index + 1,
@@ -1636,6 +1907,7 @@ async function readVisionOcrPages({ windowId, maxPages, pageDelayMs }) {
       text: pageText,
       rawText: captured.text,
       statusText: captured.statusText,
+      statusSignature,
       signature,
       results: captured.ocr.results || []
     });
@@ -1643,7 +1915,13 @@ async function readVisionOcrPages({ windowId, maxPages, pageDelayMs }) {
     await pressVisionKey(windowId, "page-down");
     await sleep(pageDelayMs);
   }
-  return pages;
+  return {
+    pages,
+    ended,
+    failed: false,
+    repeatSignatureDetected,
+    truncated: pages.length >= maxPages && !ended
+  };
 }
 
 function normalizeOcrPageSignature(text) {
@@ -1656,28 +1934,53 @@ function normalizeOcrPageSignature(text) {
     .trim();
 }
 
+function visionStatusLooksAtCopyModeBottom(statusText) {
+  const matches = Array.from(String(statusText || "").matchAll(/\[(\d+)\/(\d+)\]/g));
+  return matches.some((match) => Number(match[1]) === 0 && Number(match[2]) === 0);
+}
+
 function stitchOcrPages(pageTexts) {
+  return stitchOcrPagesDetailed(pageTexts).text;
+}
+
+function stitchOcrPagesDetailed(pageTexts) {
   const stitched = [];
-  for (const pageText of pageTexts) {
+  const fullOverlapPages = [];
+  for (let index = 0; index < pageTexts.length; index += 1) {
+    const pageText = pageTexts[index];
     const lines = String(pageText || "")
       .split(/\r?\n/)
       .map((line) => line.trimEnd())
       .filter((line) => line.trim());
     const overlap = findLineOverlap(stitched, lines, 120);
+    if (lines.length > 0 && overlap >= lines.length) {
+      fullOverlapPages.push(index + 1);
+    }
     stitched.push(...lines.slice(overlap));
   }
-  return stitched.join("\n");
+  return {
+    text: stitched.join("\n"),
+    lossy: fullOverlapPages.length > 0,
+    fullOverlapPages
+  };
 }
 
 function cleanVisionTmuxOcrText(text, donePrefix = "") {
+  return cleanVisionTmuxOcrTextDetailed(text, donePrefix).text;
+}
+
+function cleanVisionTmuxOcrTextDetailed(text, donePrefix = "") {
   const doneToken = normalizeOcrTokenText(donePrefix);
-  return String(text || "")
+  const removedLines = [];
+  const lines = String(text || "")
     .split(/\r?\n/)
     .map((line) => {
-      return String(line || "")
-        .replace(/\s+$/, "")
-        .replace(/(?:\s{2,}\[\d+\/\d+\]|\[\d+\/\d+\])$/, "")
-        .trimEnd();
+      const rawLine = String(line || "").replace(/\s+$/, "");
+      const withoutStatusSuffix = rawLine.replace(/(?:\s{2,}\[\d+\/\d+\]|\[\d+\/\d+\])$/, "");
+      if (withoutStatusSuffix !== rawLine) {
+        removedLines.push({ line: rawLine.trim(), reason: "status-suffix", lossy: true });
+      }
+      return withoutStatusSuffix.trimEnd();
     })
     .filter((line) => {
       const trimmed = line.trim();
@@ -1686,20 +1989,33 @@ function cleanVisionTmuxOcrText(text, donePrefix = "") {
       }
       const normalized = normalizeOcrTokenText(trimmed);
       if (doneToken && normalized.includes(doneToken)) {
+        removedLines.push({ line: trimmed, reason: "done-marker", lossy: false });
         return false;
       }
       if (normalized.includes(VISION_TMUX_OCR_RUN_PREFIX) || normalized.includes(VISION_TMUX_OCR_DONE_PREFIX)) {
+        removedLines.push({ line: trimmed, reason: "vision-marker", lossy: false });
         return false;
       }
-      if (/tmux\s+copy-mode/i.test(trimmed) || /^\s*-X\s+history-top\b/i.test(trimmed)) {
+      if (normalized.includes(VISION_TMUX_OCR_START_PREFIX)) {
+        removedLines.push({ line: trimmed, reason: "start-marker", lossy: false });
+        return false;
+      }
+      if (/^\s*(?:.{0,80}[%$#]\s*)?tmux\s+copy-mode\s+\\+;\s+send-keys\b/i.test(trimmed) || /^\s*-X\s+history-top\b/i.test(trimmed)) {
+        removedLines.push({ line: trimmed, reason: "copy-mode-command", lossy: true });
         return false;
       }
       if (/tmux attach-session/.test(trimmed) && /—|-/.test(trimmed)) {
+        removedLines.push({ line: trimmed, reason: "terminal-title", lossy: true });
         return false;
       }
       return true;
     })
     .join("\n");
+  return {
+    text: lines,
+    removedLines,
+    lossy: removedLines.some((line) => line.lossy)
+  };
 }
 
 function findLineOverlap(existing, next, maxLines) {
@@ -1735,10 +2051,18 @@ function parseVisionDoneFromText(text, donePrefix) {
   }
   const after = compact.slice(index + compactPrefix.length);
   const match = after.match(/^(\d{1,3})/);
-  const exitCode = match ? Number(match[1]) : 0;
+  if (!match) {
+    return {
+      doneWindowName: donePrefix,
+      exitCode: 124,
+      exitCodeKnown: false
+    };
+  }
+  const exitCode = Number(match[1]);
   return {
-    doneWindowName: `${donePrefix}${Number.isInteger(exitCode) ? exitCode : ""}`,
-    exitCode: Number.isInteger(exitCode) ? exitCode : 0
+    doneWindowName: `${donePrefix}${exitCode}`,
+    exitCode,
+    exitCodeKnown: true
   };
 }
 
@@ -2481,6 +2805,36 @@ function getVisionAvailability() {
   };
 }
 
+function getVisionTmuxAppNames() {
+  const configured = String(process.env.AI_CHAT_SHELL_VISION_TMUX_APPS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const names = configured.length ? configured : VISION_TMUX_DEFAULT_APPS;
+  const valid = names.filter((appName) => {
+    return VISION_TMUX_DEFAULT_APPS.includes(appName)
+      && appName.length <= 128
+      && !/[\x00-\x1f\x7f]/.test(appName);
+  });
+  return Array.from(new Set(valid.length ? valid : VISION_TMUX_DEFAULT_APPS));
+}
+
+function isDirectVisualTmuxEnabled() {
+  return process.env.AI_CHAT_SHELL_ENABLE_DIRECT_VISUAL_TMUX === "1";
+}
+
+function isLowLevelVisionEnabled() {
+  return process.env.AI_CHAT_SHELL_ENABLE_LOW_LEVEL_VISION === "1";
+}
+
+function lowLevelVisionDisabledError(type) {
+  return visionError(
+    "low-level-vision-disabled",
+    `Low-level vision message ${type} is disabled outside explicit local test mode.`,
+    { enableEnv: "AI_CHAT_SHELL_ENABLE_LOW_LEVEL_VISION" }
+  );
+}
+
 function parseVisionWindowId(value) {
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) {
@@ -3185,6 +3539,7 @@ module.exports = {
   buildHealthResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
+  buildTmuxVisualOcrRunLine,
   buildMissingTargetResponse,
   cleanVisionTmuxOcrText,
   decodeTextFrames,
@@ -3204,12 +3559,14 @@ module.exports = {
   getReleaseVersion,
   getVisionAvailability,
   getVisionHelperPath,
+  getVisionTmuxAppNames,
   handleMessageText,
   handleVisionMessage,
   listTmuxPanes,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
+  parseVisionDoneFromText,
   prepareStateLogFile,
   readBoardLogFromOffset,
   resolveBoardPane,

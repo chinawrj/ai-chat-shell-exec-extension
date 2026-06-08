@@ -153,9 +153,10 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 
 - enabled/paused
 - auto-enabled sites
-- local server release, server protocol, and helper protocol diagnostics
+- local server release, server/helper/visual protocol diagnostics, and macOS vision helper availability
 - visible tmux panes and default `ForAI` workspace state for diagnostics
 - default `ForAI` host/board/cwd state, plus a reset button for the default session
+- macOS visual protocol/app diagnostics and vision helper availability for Terminal.app and Ghostty experiments
 - auto-send shell results
 - per-command browser confirmation
 - timeout, output cap, and automatic chain limit
@@ -168,7 +169,7 @@ By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.micr
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
-- `Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
+- `Check`: verify local shell server release/protocol/helper/visual compatibility, macOS vision helper availability, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
 - `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
 - `Bind input`: click it, then click the page's chat input.
@@ -179,6 +180,16 @@ The floating status panel also has calibration controls for unknown chat systems
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.
 
 Use the popup's portable config area to move settings and bindings to another Chrome profile or machine. It exports only extension settings and calibration selectors; it does not export shell command ledgers or page content.
+
+## Local Visual Tmux Adapter
+
+The server also exposes macOS-only `vision-*` messages for experiments where Terminal.app or Ghostty displays a tmux session and the server controls that visible window through screenshot/OCR plus Accessibility input. Build the helper first:
+
+```sh
+./scripts/build_macos_vision_helper.sh
+```
+
+The v0.5.0 local visual adapter defaults to Terminal.app and Ghostty as supported tmux UI windows. Set `AI_CHAT_SHELL_VISION_TMUX_APPS` to a comma-separated subset of `Terminal,Ghostty` only for local experiments. Horizon/browser visual control is intentionally left for a later release.
 
 ## Tool Call Format
 

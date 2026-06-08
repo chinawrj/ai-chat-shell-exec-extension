@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const repoRoot = path.join(__dirname, "..");
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ai-shell-protocol-"));
 const originalStateDir = process.env.AI_CHAT_SHELL_STATE_DIR;
+const originalVisionTmuxApps = process.env.AI_CHAT_SHELL_VISION_TMUX_APPS;
 
 main().catch((error) => {
   console.error(error);
@@ -21,23 +22,33 @@ async function main() {
     const server = require(path.join(repoRoot, "server", "shell_server.js"));
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
 
-    assert.equal(server.SERVER_PROTOCOL_VERSION, 2);
+    assert.equal(server.SERVER_PROTOCOL_VERSION, 3);
     assert.equal(server.HELPER_PROTOCOL_VERSION, 1);
+    assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
+    process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "Ghostty,Google Chrome,bad\napp";
+    assert.deepEqual(server.getVisionTmuxAppNames(), ["Ghostty"]);
+    process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "bad\napp";
+    assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
+    delete process.env.AI_CHAT_SHELL_VISION_TMUX_APPS;
 
     const metadata = server.getProtocolMetadata();
     assert.equal(metadata.releaseVersion, manifest.version);
     assert.equal(metadata.serverReleaseVersion, manifest.version);
-    assert.equal(metadata.protocolVersion, 2);
-    assert.equal(metadata.serverProtocolVersion, 2);
+    assert.equal(metadata.protocolVersion, 3);
+    assert.equal(metadata.serverProtocolVersion, 3);
     assert.equal(metadata.helperProtocolVersion, 1);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
+    assert.equal(metadata.visualProtocolVersion, 1);
+    assert.deepEqual(metadata.visualTmuxApps, ["Terminal", "Ghostty"]);
 
     const health = server.buildHealthResponse();
     assert.equal(health.ok, true);
     assert.equal(health.service, "ai-chat-shell-exec-server");
     assert.equal(health.serverReleaseVersion, manifest.version);
-    assert.equal(health.serverProtocolVersion, 2);
+    assert.equal(health.serverProtocolVersion, 3);
     assert.equal(health.helperProtocolVersion, 1);
+    assert.equal(health.visualProtocolVersion, 1);
+    assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
     assert.equal(health.executionBackend, "tmux");
     assert.equal(health.tmuxDefaultSession, "ForAI");
 
@@ -48,8 +59,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 2,
-        serverProtocolVersion: 2,
+        protocolVersion: 3,
+        serverProtocolVersion: 3,
         helperProtocolVersion: 1
       },
       assertHealth: (result) => {
@@ -57,7 +68,7 @@ async function main() {
         assert.equal(result.protocolMatches, true);
         assert.equal(result.helperProtocolMatches, true);
         assert.equal(result.releaseMatches, true);
-        assert.equal(result.requiredServerProtocolVersion, 2);
+        assert.equal(result.requiredServerProtocolVersion, 3);
         assert.equal(result.requiredHelperProtocolVersion, 1);
       }
     });
@@ -67,14 +78,14 @@ async function main() {
       body: {
         ok: true,
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-        protocolVersion: 1
+        protocolVersion: 2
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 2 and helper protocol 1/);
+        assert.match(result.error, /Expected server protocol 3 and helper protocol 1/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -86,8 +97,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 2,
-        serverProtocolVersion: 2,
+        protocolVersion: 3,
+        serverProtocolVersion: 3,
         helperProtocolVersion: 0
       },
       assertHealth: (result) => {
@@ -105,8 +116,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 2,
-        serverProtocolVersion: 2
+        protocolVersion: 3,
+        serverProtocolVersion: 3
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);
@@ -123,6 +134,11 @@ async function main() {
       delete process.env.AI_CHAT_SHELL_STATE_DIR;
     } else {
       process.env.AI_CHAT_SHELL_STATE_DIR = originalStateDir;
+    }
+    if (originalVisionTmuxApps === undefined) {
+      delete process.env.AI_CHAT_SHELL_VISION_TMUX_APPS;
+    } else {
+      process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = originalVisionTmuxApps;
     }
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -145,7 +161,7 @@ function makeBackgroundContext(healthBody) {
     chrome: {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-        getManifest: () => ({ version: "0.4.0" }),
+        getManifest: () => ({ version: "0.5.0" }),
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener() {} }
