@@ -7,7 +7,7 @@
    ./scripts/test_all.sh
    ```
 
-3. Review the version-specific release notes under `docs/release-notes/vX.Y.Z.md` and run any extra manual validation they list. For v0.5.0 this includes:
+3. Review the version-specific release notes under `docs/release-notes/vX.Y.Z.md` and run any extra manual validation they list. For visual-control releases this includes:
 
    ```sh
    ./scripts/build_macos_vision_helper.sh

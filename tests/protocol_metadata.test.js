@@ -161,7 +161,7 @@ function makeBackgroundContext(healthBody) {
     chrome: {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-        getManifest: () => ({ version: "0.5.0" }),
+        getManifest: () => ({ version: "0.5.1" }),
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener() {} }

@@ -4,6 +4,12 @@
 
 - Nothing yet.
 
+## [0.5.1] - 2026-06-09
+
+- Corrects the agent-facing project guide so shell helper blocks use the current no-target format and always run in `ForAI:host`.
+- Keeps the basic non-vision tmux workflow explicit in maintenance guidance: foreground server startup, automatic `ForAI` workspace setup, and legacy LaunchAgent cleanup.
+- Adds regression coverage so project docs do not reintroduce the obsolete shell target line.
+
 ## [0.5.0] - 2026-06-08
 
 - Adds a local visual tmux surface discovery path for macOS windows, defaulting to Terminal.app and Ghostty.

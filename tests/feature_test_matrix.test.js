@@ -34,6 +34,9 @@ assert.match(runner, /find tests -maxdepth 1 -name '\*\.test\.js'/);
 assert.match(runner, /tests\/chrome_extension_e2e\.test\.js/);
 assert.match(docs, /docs\/FEATURE_TEST_MATRIX\.md/);
 assert.match(docs, /\.\/scripts\/test_all\.sh/);
+assert.match(docs, /Shell helpers do not include a tmux target/);
+assert.match(docs, /default `ForAI:host` tmux pane/);
+assert.doesNotMatch(docs, /second line target/);
 
 console.log("feature/test matrix tests passed");
 

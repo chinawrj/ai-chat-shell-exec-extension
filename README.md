@@ -188,7 +188,7 @@ The server also exposes macOS-only `vision-*` messages for experiments where Ter
 ./scripts/build_macos_vision_helper.sh
 ```
 
-The v0.5.0 local visual adapter defaults to Terminal.app and Ghostty as supported tmux UI windows. Set `AI_CHAT_SHELL_VISION_TMUX_APPS` to a comma-separated subset of `Terminal,Ghostty` only for local experiments. Horizon/browser visual control is intentionally left for a later release.
+The local visual adapter defaults to Terminal.app and Ghostty as supported tmux UI windows. Set `AI_CHAT_SHELL_VISION_TMUX_APPS` to a comma-separated subset of `Terminal,Ghostty` only for local experiments. Horizon/browser visual control is intentionally left for a later release.
 
 ## Tool Call Format
 
