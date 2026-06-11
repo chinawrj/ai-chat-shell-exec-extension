@@ -10,6 +10,8 @@ The long-term target is a single helper protocol that can run commands through d
 - Visual tmux: a macOS UI window displays a tmux session, while OCR and input control operate the visible terminal.
 - Horizon tmux: a browser-hosted VMware Horizon session displays a remote Ubuntu tmux session, while the extension controls input and reconstructs output visually.
 
+Current planning stance: direct tmux remains the primary product path, and local Terminal/Ghostty visual tmux remains an experimental adapter. Horizon tmux is parked and should not be implemented or planned as the next release unless a user explicitly asks to resume Horizon work.
+
 The AI-facing helper format should stay simple. Prefer no-target shell helpers by default:
 
 ````
@@ -51,9 +53,11 @@ Goal: prove the full visual control loop on macOS before involving Horizon.
 - Reconstruct long output from the visible tmux UI with pagination and OCR stitching.
 - Keep direct tmux as the oracle/test adapter where possible, but do not require direct tmux access for the production visual path.
 
-### v0.6.0: Horizon Visual Adapter
+### Parked: v0.6.0 Horizon Visual Adapter
 
 Goal: reuse the local visual adapter model against VMware Horizon Web Access.
+
+Status: deferred for a long period. Do not begin this work by default. Resume only when a user explicitly asks for Horizon/VMware Web Access support, and start by writing a fresh implementation plan.
 
 - Assume the remote Ubuntu desktop always has tmux running.
 - Treat Horizon as a browser visual surface, not as a shell API.

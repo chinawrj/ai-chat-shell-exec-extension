@@ -69,7 +69,7 @@ const context = {
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-      getManifest: () => ({ version: "0.5.1" }),
+      getManifest: () => ({ version: "0.5.2" }),
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
       onMessage: { addListener() {} }
@@ -109,8 +109,8 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-      releaseVersion: "0.5.1",
-      serverReleaseVersion: "0.5.1",
+      releaseVersion: "0.5.2",
+      serverReleaseVersion: "0.5.2",
       protocolVersion: 3,
       serverProtocolVersion: 3,
       helperProtocolVersion: 1

@@ -4,6 +4,14 @@
 
 - Nothing yet.
 
+## [0.5.2] - 2026-06-11
+
+- Lets closed four-backtick fenced shell helpers recover when `ai-helper-shell-end` is missing.
+- Lets closed four-backtick fenced file helpers recover when `ai-helper-file-end` is missing.
+- Lets closed four-backtick fenced board helpers recover when `ai-helper-board-end` is missing.
+- Keeps incomplete helper starts ignored when either the opening or closing four-backtick fence is absent.
+- Adds parser coverage and updates the feature/test matrix for fenced missing-end recovery across all helper types.
+
 ## [0.5.1] - 2026-06-09
 
 - Corrects the agent-facing project guide so shell helper blocks use the current no-target format and always run in `ForAI:host`.

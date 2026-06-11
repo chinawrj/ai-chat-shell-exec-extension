@@ -73,6 +73,45 @@ assert.equal(fencedExtracted.target, undefined);
 assert.equal(fencedExtracted.cmd, command);
 assert.equal(context.validateHelperCall(fencedExtracted).ok, true);
 
+const [fencedFallbackShell] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-shell-start",
+  "pwd",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackShell.kind, "shell");
+assert.equal(fencedFallbackShell.inferredEndMarker, true);
+assert.equal(fencedFallbackShell.cmd, "pwd");
+assert.equal(context.validateHelperCall(fencedFallbackShell).ok, true);
+assert.equal(
+  fencedFallbackShell.helperId,
+  context.parseCallPayload("ai-helper-shell-start\npwd\nai-helper-shell-end").helperId
+);
+
+const parsedFencedFallbackShell = context.parseCallPayload([
+  "````",
+  "ai-helper-shell-start",
+  "pwd",
+  "````"
+].join("\n"));
+assert.equal(parsedFencedFallbackShell.kind, "shell");
+assert.equal(parsedFencedFallbackShell.inferredEndMarker, true);
+assert.equal(parsedFencedFallbackShell.cmd, "pwd");
+
+assert.equal(context.parsePlainTextHelperBlocks("ai-helper-shell-start\npwd\n````").length, 0);
+assert.equal(context.parsePlainTextHelperBlocks("````\nai-helper-shell-start\npwd").length, 0);
+
+const [fencedFallbackBeforeLaterEnd] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-shell-start",
+  "echo FENCE_BOUNDARY",
+  "````",
+  "later text",
+  "ai-helper-shell-end"
+].join("\n"));
+assert.equal(fencedFallbackBeforeLaterEnd.inferredEndMarker, true);
+assert.equal(fencedFallbackBeforeLaterEnd.cmd, "echo FENCE_BOUNDARY");
+
 const commandWithLeadingBlank = [
   "ai-helper-shell-start",
   "",
@@ -168,6 +207,20 @@ const fileWithTrailingBlankLine = context.parseCallPayload([
 ].join("\n"));
 assert.equal(fileWithTrailingBlankLine.content, "line\n");
 
+const [fencedFallbackFile] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-file-start",
+  "fallback-file.txt",
+  "line one",
+  "",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackFile.kind, "file");
+assert.equal(fencedFallbackFile.inferredEndMarker, true);
+assert.equal(fencedFallbackFile.filename, "fallback-file.txt");
+assert.equal(fencedFallbackFile.content, "line one\n");
+assert.equal(context.validateHelperCall(fencedFallbackFile).ok, true);
+
 const legacyJson = context.parseCallPayload("{\"target\":\"%24\",\"cmd\":\"pwd\"}");
 assert.equal(legacyJson.cmd, "");
 assert.equal(legacyJson.target, undefined);
@@ -194,6 +247,17 @@ assert.equal(suffixedBoardA.kind, "board");
 assert.equal(suffixedBoardA.helperId, "board-1001");
 assert.equal(suffixedBoardA.helperIdSource, "marker");
 assert.notEqual(context.buildSemanticCallKey(suffixedBoardA), context.buildSemanticCallKey(suffixedBoardB));
+
+const [fencedFallbackBoard] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-board-start",
+  "version",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackBoard.kind, "board");
+assert.equal(fencedFallbackBoard.inferredEndMarker, true);
+assert.equal(fencedFallbackBoard.cmd, "version");
+assert.equal(context.validateHelperCall(fencedFallbackBoard).ok, true);
 
 const multiLineBoard = context.parseCallPayload("ai-helper-board-start\nversion\nhelp\nai-helper-board-end");
 assert.equal(multiLineBoard.kind, "board");

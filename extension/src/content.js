@@ -4,6 +4,7 @@ const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
 const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
+const HELPER_FENCE_MARKER = "````";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
@@ -11,7 +12,7 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.5.1";
+const CONTENT_SCRIPT_VERSION = "0.5.2";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -758,11 +759,11 @@ function parsePlainTextHelperBlocks(text) {
       break;
     }
 
-    const endIndex = lines.findIndex((line, lineIndex) =>
-      lineIndex > (start.kind === "board" ? index : valueLineIndex) &&
-      isHelperEndForKind(start.kind, line)
-    );
-    if (endIndex < 0) {
+    const fenceEndIndex = findHelperFenceEndIndex(lines, index, start.kind);
+    const endIndex = findHelperEndIndex(lines, index, valueLineIndex, start.kind, fenceEndIndex);
+    const inferredEndMarker = endIndex < 0 && fenceEndIndex >= 0;
+    const blockEndIndex = inferredEndMarker ? fenceEndIndex : endIndex;
+    if (blockEndIndex < 0) {
       break;
     }
 
@@ -770,8 +771,8 @@ function parsePlainTextHelperBlocks(text) {
       kind: start.kind,
       marker,
       value: lines[valueLineIndex],
-      bodyLines: lines.slice(valueLineIndex + 1, endIndex),
-      endMarker: lines[endIndex]
+      bodyLines: lines.slice(valueLineIndex + 1, blockEndIndex),
+      endMarker: expectedHelperEndMarker(start.kind)
     });
 
     if (start.kind === "file") {
@@ -780,8 +781,9 @@ function parsePlainTextHelperBlocks(text) {
         helperId,
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
+        inferredEndMarker,
         filename: normalizeCommand(lines[valueLineIndex]),
-        content: lines.slice(valueLineIndex + 1, endIndex).join("\n")
+        content: lines.slice(valueLineIndex + 1, blockEndIndex).join("\n")
       });
     } else if (start.kind === "board") {
       calls.push({
@@ -789,7 +791,8 @@ function parsePlainTextHelperBlocks(text) {
         helperId,
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
-        cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
+        inferredEndMarker,
+        cmd: normalizeCommand(lines.slice(valueLineIndex, blockEndIndex).join("\n"))
       });
     } else {
       calls.push({
@@ -797,13 +800,35 @@ function parsePlainTextHelperBlocks(text) {
         helperId,
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
-        cmd: normalizeCommand(lines.slice(valueLineIndex, endIndex).join("\n"))
+        inferredEndMarker,
+        cmd: normalizeCommand(lines.slice(valueLineIndex, blockEndIndex).join("\n"))
       });
     }
-    index = endIndex;
+    index = blockEndIndex;
   }
 
   return calls;
+}
+
+function findHelperEndIndex(lines, startIndex, valueLineIndex, kind, fenceEndIndex) {
+  const minEndIndex = kind === "board" ? startIndex : valueLineIndex;
+  return lines.findIndex((line, lineIndex) =>
+    lineIndex > minEndIndex &&
+    (fenceEndIndex < 0 || lineIndex < fenceEndIndex) &&
+    isHelperEndForKind(kind, line)
+  );
+}
+
+function findHelperFenceEndIndex(lines, startIndex, kind) {
+  if (startIndex <= 0 || lines[startIndex - 1] !== HELPER_FENCE_MARKER) {
+    return -1;
+  }
+
+  const minEndIndex = kind === "board" ? startIndex : startIndex + 1;
+  return lines.findIndex((line, lineIndex) =>
+    lineIndex > minEndIndex &&
+    line === HELPER_FENCE_MARKER
+  );
 }
 
 function parsePlainTextHelperPayload(text) {
@@ -815,7 +840,10 @@ function parsePlainTextHelperPayload(text) {
   const lines = splitShellCallLines(text);
   const start = parseHelperStartMarker(lines[0]);
   if (!start.kind || !isHelperEndForKind(start.kind, lines[lines.length - 1])) {
-    return null;
+    const fencedStart = lines[0] === HELPER_FENCE_MARKER ? parseHelperStartMarker(lines[1]) : { kind: "" };
+    if (!fencedStart.kind || lines[lines.length - 1] !== HELPER_FENCE_MARKER) {
+      return null;
+    }
   }
 
   return blocks[0];
@@ -872,16 +900,20 @@ function buildPlainTextHelperPayloadHash({ kind, marker, value, bodyLines, endMa
 }
 
 function isHelperEndForKind(kind, line) {
+  return line === expectedHelperEndMarker(kind);
+}
+
+function expectedHelperEndMarker(kind) {
   if (kind === "shell") {
-    return line === HELPER_SHELL_END;
+    return HELPER_SHELL_END;
   }
   if (kind === "file") {
-    return line === HELPER_FILE_END;
+    return HELPER_FILE_END;
   }
   if (kind === "board") {
-    return line === HELPER_BOARD_END;
+    return HELPER_BOARD_END;
   }
-  return false;
+  return "";
 }
 
 function splitShellCallLines(text) {
