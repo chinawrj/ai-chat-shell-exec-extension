@@ -186,6 +186,20 @@
         color: #4b5563;
       }
 
+      .agent-output {
+        min-height: 92px;
+        max-height: 220px;
+        overflow: auto;
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        background: #f8fafc;
+        color: #111827;
+        white-space: pre-wrap;
+        font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
       .thread {
         overflow: auto;
         padding: 24px;
@@ -300,6 +314,40 @@
           <button id="clearThread" type="button">Clear thread</button>
         </div>
 
+        <h2>agent hub</h2>
+        <label>
+          role
+          <select id="agentRole">
+            <option value="master">master</option>
+            <option value="slave">slave</option>
+          </select>
+        </label>
+        <label>
+          agent id
+          <input id="agentId" value="master" spellcheck="false">
+        </label>
+        <label>
+          to
+          <input id="agentTo" value="slave-a" spellcheck="false">
+        </label>
+        <label>
+          task id
+          <input id="agentTaskId" value="task-local-001" spellcheck="false">
+        </label>
+        <label>
+          message
+          <textarea id="agentBody" spellcheck="false">Inspect the local parser and reply to master.</textarea>
+        </label>
+        <div class="button-row">
+          <button id="agentRegister" type="button">Register</button>
+          <button id="agentList" type="button">List</button>
+          <button id="agentSend" type="button">Send</button>
+          <button id="agentPoll" type="button">Poll</button>
+          <button id="agentAck" type="button">Ack first</button>
+          <button id="insertAgentMessage" type="button">Insert agent helper</button>
+        </div>
+        <pre id="agentOutput" class="agent-output" aria-live="polite">(agent hub output)</pre>
+
         <div id="status" class="status" aria-live="polite"></div>
       </aside>
 
@@ -328,8 +376,12 @@
       const targetList = document.getElementById("targetList");
       const TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
       const TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
+      const AGENT_REQUEST = "ai-chat-shell-exec:agent-request";
+      const AGENT_RESPONSE = "ai-chat-shell-exec:agent-response";
       let tmuxRequestId = "";
       let tmuxRefreshTimer = 0;
+      let agentRequestId = "";
+      let lastPolledAgentMessageId = "";
 
       document.getElementById("insertCall").addEventListener("click", () => {
         appendAssistantToolCall(formatPlainTextShellCall(
@@ -362,7 +414,59 @@
 
       refreshTargets.addEventListener("click", requestTmuxTargets);
       window.addEventListener("message", handleTmuxTargetResponse);
+      window.addEventListener("message", handleAgentResponse);
       window.setTimeout(requestTmuxTargets, 300);
+
+      document.getElementById("agentRegister").addEventListener("click", () => {
+        requestAgentHub({
+          type: "agent-register",
+          agentId: agentField("agentId"),
+          role: agentField("agentRole"),
+          origin: location.origin,
+          pathname: location.pathname
+        });
+      });
+
+      document.getElementById("agentList").addEventListener("click", () => {
+        requestAgentHub({ type: "agent-list" });
+      });
+
+      document.getElementById("agentSend").addEventListener("click", () => {
+        requestAgentHub({
+          type: "agent-send",
+          from: agentField("agentId"),
+          to: agentField("agentTo"),
+          taskId: agentField("agentTaskId"),
+          body: agentField("agentBody")
+        });
+      });
+
+      document.getElementById("agentPoll").addEventListener("click", () => {
+        requestAgentHub({
+          type: "agent-poll",
+          agentId: agentField("agentId")
+        });
+      });
+
+      document.getElementById("agentAck").addEventListener("click", () => {
+        if (!lastPolledAgentMessageId) {
+          renderAgentOutput({ ok: false, error: "No polled message to ack." });
+          return;
+        }
+        requestAgentHub({
+          type: "agent-ack",
+          agentId: agentField("agentId"),
+          messageId: lastPolledAgentMessageId
+        });
+      });
+
+      document.getElementById("insertAgentMessage").addEventListener("click", () => {
+        appendAssistantToolCall(formatAgentMessageCall({
+          to: agentField("agentTo"),
+          taskId: agentField("agentTaskId"),
+          body: agentField("agentBody")
+        }), "text");
+      });
 
       function requestTmuxTargets() {
         tmuxRequestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -395,6 +499,42 @@
         }
 
         renderTargets(Array.isArray(data.panes) ? data.panes : []);
+      }
+
+      function requestAgentHub(payload) {
+        agentRequestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        renderAgentOutput({ pending: true, payload });
+        window.postMessage({
+          type: AGENT_REQUEST,
+          requestId: agentRequestId,
+          payload
+        }, window.location.origin);
+      }
+
+      function handleAgentResponse(event) {
+        if (event.source !== window || event.origin !== window.location.origin) {
+          return;
+        }
+
+        const data = event.data || {};
+        if (data.type !== AGENT_RESPONSE || data.requestId !== agentRequestId) {
+          return;
+        }
+
+        const response = data.response || {};
+        if (Array.isArray(response.messages) && response.messages[0]?.messageId) {
+          lastPolledAgentMessageId = response.messages[0].messageId;
+        }
+        renderAgentOutput(response);
+      }
+
+      function agentField(id) {
+        const element = document.getElementById(id);
+        return String(element?.value || "").trim();
+      }
+
+      function renderAgentOutput(value) {
+        document.getElementById("agentOutput").textContent = JSON.stringify(value, null, 2);
       }
 
       function renderTargetLoading() {
@@ -468,6 +608,17 @@
           commandValue,
           "ai-helper-shell-end"
         ].join("\n");
+      }
+
+      function formatAgentMessageCall({ to, taskId, body }) {
+        return [
+          "ai-helper-agent-message-start",
+          `to: ${to}`,
+          taskId ? `task-id: ${taskId}` : "",
+          "",
+          body,
+          "ai-helper-agent-message-end"
+        ].filter((line, index) => index !== 2 || Boolean(taskId)).join("\n");
       }
 
       function appendMessage(role, text) {

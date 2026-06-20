@@ -141,6 +141,158 @@ async function main() {
   await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status panel");
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
+  const agentTaskId = `task-e2e-${Date.now()}`;
+  const agentBody = `agent hub local page message ${agentTaskId}`;
+  await page.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector("[data-shell-agent-role]").value = "master";
+    panel.querySelector("[data-shell-agent-id]").value = "master";
+    panel.querySelector('[data-shell-tool-action="agent-register"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered master master")`, "panel agent master registration");
+
+  let agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-register",
+    agentId: "slave-a",
+    role: "slave",
+    origin: "https://localhost:17443",
+    pathname: "/tmux-test-page.html"
+  });
+  assert.equal(agentResponse.ok, true);
+  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "master"));
+  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a"));
+
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-send",
+    from: "master",
+    to: "slave-a",
+    taskId: agentTaskId,
+    body: agentBody
+  });
+  assert.equal(agentResponse.ok, true);
+  const agentMessageId = agentResponse.message.messageId;
+  assert.equal(agentResponse.message.to, "slave-a");
+
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-poll",
+    agentId: "slave-a"
+  });
+  assert.equal(agentResponse.ok, true);
+  assert.equal(agentResponse.messages.length, 1);
+  assert.equal(agentResponse.messages[0].body, agentBody);
+
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-ack",
+    agentId: "slave-a",
+    messageId: agentMessageId
+  });
+  assert.equal(agentResponse.ok, true);
+
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-poll",
+    agentId: "slave-a"
+  });
+  assert.equal(agentResponse.ok, true);
+  assert.equal(agentResponse.messages.length, 0);
+
+  const helperAgentTaskId = `task-helper-e2e-${Date.now()}`;
+  const helperAgentBody = `agent helper detected on local page ${helperAgentTaskId}`;
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-agent-message-start:agent-e2e",
+      "to: master",
+      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
+      "",
+      ${JSON.stringify(helperAgentBody)},
+      "ai-helper-agent-message-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+
+  const agentHelperText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Agent message result:") &&
+      text.includes("to: master") &&
+      text.includes(${JSON.stringify(`task-id: ${helperAgentTaskId}`)}) ? text : "";
+  })()`, "agent-message helper result from extension");
+  assert.match(agentHelperText, /Agent message result:/);
+
+  const masterPage = await openChromePage(debugPort, TEST_PAGE_URL);
+  cleanup.push(() => masterPage.close());
+  await masterPage.send("Page.enable");
+  await masterPage.send("Runtime.enable");
+  await waitForEvaluate(masterPage, "document.readyState === 'complete'", "master test page load");
+  await waitForEvaluate(masterPage, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "master extension status panel");
+  await masterPage.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
+  await masterPage.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector("[data-shell-agent-role]").value = "master";
+    panel.querySelector("[data-shell-agent-id]").value = "master";
+    panel.querySelector('[data-shell-tool-action="agent-register"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(masterPage, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered master master")`, "master panel agent registration");
+  const masterDeliveredText = await waitForEvaluateValue(masterPage, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`Message from slave-a for task ${helperAgentTaskId}:`)}) &&
+      text.includes(${JSON.stringify(helperAgentBody)}) ? text : "";
+  })()`, "slave reply delivered into master tab");
+  assert.match(masterDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
+
+  const deliveryTaskId = `task-delivery-e2e-${Date.now()}`;
+  const deliveryBody = `deliver this task into the slave composer ${deliveryTaskId}`;
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-send",
+    from: "master",
+    to: "slave-a",
+    taskId: deliveryTaskId,
+    body: deliveryBody
+  });
+  assert.equal(agentResponse.ok, true);
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`, "focus composer for agent delivery");
+  const deliveredText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`Message from master for task ${deliveryTaskId}:`)}) &&
+      text.includes(${JSON.stringify(deliveryBody)}) &&
+      text.includes("You are slave-a") ? text : "";
+  })()`, "agent message delivered into local page composer");
+  assert.match(deliveredText, new RegExp(escapeRegExp(deliveryBody)));
+
+  const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
+  await page.evaluate(`(() => {
+    document.getElementById("command").value = ${JSON.stringify(`printf ${agentTmuxToken}`)};
+    appendAssistantToolCall([
+      "ai-helper-shell-start:agent-tmux-e2e",
+      ${JSON.stringify(`printf ${agentTmuxToken}`)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const agentTmuxText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Shell call result:") &&
+      text.includes("targetName: ForAI-slave-a") &&
+      text.includes(${JSON.stringify(`stdout:\n${agentTmuxToken}`)}) ? text : "";
+  })()`, "agent shell helper uses per-agent tmux");
+  assert.match(agentTmuxText, /targetName: ForAI-slave-a/);
+
+  agentResponse = await sendLocalAgentRequest(page, {
+    type: "agent-unregister",
+    agentId: "slave-a"
+  });
+  assert.equal(agentResponse.ok, true);
+
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;
   const command = `printf ${token}`;
@@ -518,6 +670,38 @@ async function waitForChromePageWebSocket(debugPort, url) {
   }, "Chrome page websocket");
 }
 
+async function openChromePage(debugPort, url) {
+  const target = await createChromePageTarget(debugPort, url);
+  const wsUrl = target.webSocketDebuggerUrl || await waitForChromePageWebSocket(debugPort, url);
+  return CdpClient.connect(wsUrl);
+}
+
+function createChromePageTarget(debugPort, url) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port: debugPort,
+      path: `/json/new?${encodeURIComponent(url)}`,
+      method: "PUT"
+    }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        text += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(text));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
 async function saveScreenshot(page, filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   await page.evaluate(`(() => {
@@ -571,6 +755,35 @@ function sleep(ms) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function sendLocalAgentRequest(page, payload) {
+  const expression = `new Promise((resolve, reject) => {
+    const requestId = "agent-e2e-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+    const timeout = setTimeout(() => {
+      window.removeEventListener("message", handler);
+      reject(new Error("Timed out waiting for local agent response"));
+    }, 5000);
+    function handler(event) {
+      if (event.source !== window || event.origin !== window.location.origin) {
+        return;
+      }
+      const data = event.data || {};
+      if (data.type !== "ai-chat-shell-exec:agent-response" || data.requestId !== requestId) {
+        return;
+      }
+      clearTimeout(timeout);
+      window.removeEventListener("message", handler);
+      resolve(data.response || {});
+    }
+    window.addEventListener("message", handler);
+    window.postMessage({
+      type: "ai-chat-shell-exec:agent-request",
+      requestId,
+      payload: ${JSON.stringify(payload)}
+    }, window.location.origin);
+  })`;
+  return page.evaluate(expression);
 }
 
 class CdpClient {

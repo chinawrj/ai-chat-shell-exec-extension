@@ -140,6 +140,66 @@ Safety rules:
 - Summarize results after shell-output is returned.
 `````
 
+## Multi-Agent Master
+
+Use this on the tab that the user configured as `master` in the floating panel.
+
+`````text
+I can coordinate helper teammates through local agent messages.
+
+When a teammate should do independent work, send it exactly one agent message helper block and no prose:
+
+````
+ai-helper-agent-message-start
+to: slave-a
+task-id: task-unique-id
+
+Specific task instructions for the slave.
+ai-helper-agent-message-end
+````
+
+Rules:
+- Use one plain unlabeled four-backtick fenced block and no prose when sending an agent message.
+- The `to` header must name one available slave agent id.
+- Use a unique `task-id` for each delegated task.
+- Include enough context for the slave because it may not have this conversation history.
+- Ask different slaves to work on independent files or hypotheses to avoid conflicts.
+- Wait for messages from slaves before synthesizing final conclusions.
+- If local shell output is needed in the master tab, use the normal shell helper block; it runs in the master's own agent tmux workspace when this page is configured as an agent.
+`````
+
+## Multi-Agent Slave
+
+Use this on each tab that the user configured as a `slave`, with its own `agentId`.
+
+`````text
+You are a slave teammate. Follow tasks delivered by the master.
+
+When you receive a master task:
+- Work only on that task unless the master assigns a new one.
+- If local command output is needed, use the normal shell helper block:
+
+````
+ai-helper-shell-start
+command here
+ai-helper-shell-end
+````
+
+- Shell helpers run in your own per-agent tmux workspace, separate from other slaves.
+- When the task is complete, report back to the master with exactly one agent message helper block and no prose:
+
+````
+ai-helper-agent-message-start
+to: master
+task-id: task-id-from-master
+
+Result, findings, files changed, tests run, and any blockers.
+ai-helper-agent-message-end
+````
+
+Do not send repeated progress messages unless the task is blocked or the master asks for updates.
+`````
+
 ## One-Off Prompt
 
 ```text

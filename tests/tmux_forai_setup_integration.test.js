@@ -39,6 +39,7 @@ main()
   })
   .finally(() => {
     spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", "ForAI"], { encoding: "utf8" });
+    spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", "ForAI-slave-a"], { encoding: "utf8" });
     restoreEnv("AI_CHAT_SHELL_TMUX_SOCKET", originalEnv.socket);
     restoreEnv("AI_CHAT_SHELL_TMUX_SESSION", originalEnv.session);
     restoreEnv("AI_CHAT_SHELL_HOST_WINDOW", originalEnv.host);
@@ -92,6 +93,23 @@ async function main() {
   assert.match(response.stdout, new RegExp(token));
   assert.match(response.targetName, /ForAI:.* host/);
   assert.equal(response.cwd, expectedForAiCwd);
+
+  const agentToken = `FORAI_AGENT_${Date.now()}`;
+  const agentResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-agent-run",
+    callKey: `forai-agent-run-${Date.now()}`,
+    agentId: "slave-a",
+    cmd: `printf '${agentToken}\\n'`,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
+  assert.equal(agentResponse.agentId, "slave-a");
+  assert.equal(agentResponse.exitCode, 0, JSON.stringify(agentResponse));
+  assert.match(agentResponse.stdout, new RegExp(agentToken));
+  assert.match(agentResponse.targetName, /ForAI-slave-a:.* host/);
+  assert.equal(agentResponse.cwd, expectedForAiCwd);
 
   const ignoredTargetToken = `FORAI_IGNORED_TARGET_${Date.now()}`;
   const ignoredTargetResponse = await handleMessageText(JSON.stringify({

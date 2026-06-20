@@ -23,6 +23,14 @@ const VISION_COMMAND_MESSAGE_TYPES = new Set([
   "vision-visual-run-line",
   "vision-tmux-ocr-run-line"
 ]);
+const BACKGROUND_AGENT_MESSAGE_TYPES = new Set([
+  "agent-register",
+  "agent-unregister",
+  "agent-list",
+  "agent-send",
+  "agent-poll",
+  "agent-ack"
+]);
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -117,6 +125,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (String(message.type || "").startsWith("agent-")) {
+    handleAgentMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
   if (String(message.type || "").startsWith("vision-")) {
     handleVisionMessage(message)
       .then(sendResponse)
@@ -140,6 +158,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+
+async function handleAgentMessage(message) {
+  if (!BACKGROUND_AGENT_MESSAGE_TYPES.has(message.type)) {
+    return {
+      ok: false,
+      error: `Unsupported background agent message type: ${message.type || ""}`
+    };
+  }
+  await requireShellServerReady();
+  return runShellViaWebSocket(message);
+}
 
 async function handleWriteFileMessage(message) {
   const callKey = message.callKey || message.id || "";
@@ -200,6 +229,7 @@ async function handleRunShellMessage(message) {
     type: "run",
     id: message.id,
     callKey,
+    agentId: message.agentId || "",
     cmd: message.cmd,
     cwd: message.cwd,
     timeoutMs,

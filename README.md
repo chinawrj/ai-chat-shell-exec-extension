@@ -180,6 +180,27 @@ Drag the panel title to move the floating window. You can also click a bind mode
 
 Use the popup's portable config area to move settings and bindings to another Chrome profile or machine. It exports only extension settings and calibration selectors; it does not export shell command ledgers or page content.
 
+## Local Multi-Agent Tabs
+
+The floating panel can register an enabled page as a local agent. Set a role (`master` or `slave`) and an `agentId`, then click `Save`. Selecting a role suggests a usable default id (`master` for a master tab and a tab-local `slave-*` id for a slave tab). Use `Roster` to see agents currently registered with the local server and pending message counts.
+
+Agent pages can send messages through the local WebSocket agent hub:
+
+````
+ai-helper-agent-message-start
+to: slave-a
+task-id: task-001
+
+Investigate this independently and report back.
+ai-helper-agent-message-end
+````
+
+Messages are delivered to the recipient tab's composer and acknowledged after the page sends them. Agent tabs poll the local hub as a heartbeat, so active tabs stay online in the roster; if the in-memory roster is lost after a local server restart, the page re-registers itself on the next poll. A slave can reply to the master with the same helper format using `to: master`.
+
+When a registered agent page emits a normal shell helper, the server routes it to an isolated tmux workspace named `ForAI-<agentId>:host`. Non-agent pages continue to use the default `ForAI:host` path.
+
+For AI-facing master/slave instruction templates, see `docs/AI_INSTRUCTIONS.md`.
+
 ## Local Visual Tmux Adapter
 
 The server also exposes macOS-only `vision-*` messages for experiments where Terminal.app or Ghostty displays a tmux session and the server controls that visible window through screenshot/OCR plus Accessibility input. Build the helper first:

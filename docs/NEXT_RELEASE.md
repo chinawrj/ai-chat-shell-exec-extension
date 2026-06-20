@@ -1,6 +1,6 @@
 # Next Release Plan
 
-Target version: v0.5.x maintenance, unless a user explicitly asks for Horizon work.
+Target version: v0.6.x maintenance, unless a user explicitly asks for Horizon work.
 Target date: as needed for reliability, compatibility, or security fixes.
 
 ## Theme
@@ -42,4 +42,4 @@ See `docs/ROADMAP.md` for the longer visual-control plan.
 
 ## Parked Backlog
 
-Horizon visual adapter work is intentionally parked for a long period. If a user explicitly asks to resume it, restart from the `v0.6.0: Horizon Visual Adapter` section in `docs/ROADMAP.md` and first produce a fresh plan before implementation.
+Horizon visual adapter work is intentionally parked for a long period. If a user explicitly asks to resume it, restart from the parked Horizon section in `docs/ROADMAP.md` and first produce a fresh plan before implementation.

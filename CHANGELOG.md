@@ -4,6 +4,17 @@
 
 - Nothing yet.
 
+## [0.6.0] - 2026-06-21
+
+- Adds local multi-agent tabs: users can register enabled chat pages as `master` or `slave` agents from the floating panel.
+- Adds an in-memory local WebSocket agent hub with `agent-register`, `agent-unregister`, `agent-list`, `agent-send`, `agent-poll`, and `agent-ack` messages.
+- Adds `ai-helper-agent-message-start` / `ai-helper-agent-message-end` helper blocks so master and slave tabs can exchange task messages through the local hub.
+- Routes shell helpers from registered agent tabs into isolated per-agent tmux workspaces such as `ForAI-slave-a:host`, while non-agent pages continue to use `ForAI:host`.
+- Keeps active agent tabs online with poll-based heartbeats, auto re-registers after local server roster loss, and prevents duplicate task insertion while a message waits for the send button.
+- Improves the floating panel with clearer `Save`/`Roster` agent controls, default agent-id suggestions, and pending message counts.
+- Requires both sender and recipient agents to be registered before accepting hub messages.
+- Adds master/slave AI instruction templates, local manual test controls, feature/test matrix coverage, unit tests, tmux integration tests, and Chrome extension e2e coverage for multi-tab agent delivery.
+
 ## [0.5.2] - 2026-06-11
 
 - Lets closed four-backtick fenced shell helpers recover when `ai-helper-shell-end` is missing.

@@ -67,9 +67,15 @@ const VISION_TMUX_OCR_RUN_PREFIX = "AIVRRUN";
 const VISION_TMUX_OCR_DONE_PREFIX = "AIVRDONE";
 const VISION_TMUX_OCR_START_PREFIX = "AIVRSTART";
 const VISION_TMUX_HISTORY_LIMIT = 200000;
+const AGENT_ROSTER_TTL_MS = 60_000;
+const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const AGENT_ROLES = new Set(["master", "slave"]);
+const AGENT_MESSAGE_MAX_CHARS = 20000;
+const AGENT_MAILBOX_LIMIT = 500;
 let stateLoggingConfigured = false;
 let stateLogStreams = null;
 let serverLedger = loadServerLedger();
+let agentHubState = createAgentHubState();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -400,6 +406,10 @@ async function handleMessageText(text) {
     return handleVisionMessage(message);
   }
 
+  if (String(message.type).startsWith("agent-")) {
+    return handleAgentHubMessage(message);
+  }
+
   if (message.type !== "run") {
     throw new Error("Unsupported message type.");
   }
@@ -416,11 +426,12 @@ async function handleMessageText(text) {
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
-  const layout = await ensureForAiTmuxLayout();
+  const config = getRunTmuxConfig(message);
+  const layout = await ensureForAiTmuxLayout(config);
   const panes = layout.panes;
-  const pane = resolveDefaultShellPane(panes).pane;
+  const pane = resolveDefaultShellPane(panes, config).pane;
   if (!pane) {
-    return buildDefaultTargetErrorResponse(message, cmd, panes);
+    return buildDefaultTargetErrorResponse(message, cmd, panes, config);
   }
 
   const cwd = resolveCwd(message.cwd, pane.currentPath);
@@ -478,6 +489,7 @@ async function handleMessageText(text) {
     ok: true,
     id: message.id,
     callKey,
+    agentId: config.agentId || "",
     cmd,
     cwd,
     target: pane.id,
@@ -632,6 +644,256 @@ function handleWriteFileMessage(message) {
     truncated: false
   });
   return response;
+}
+
+function createAgentHubState() {
+  return {
+    roster: new Map(),
+    mailbox: []
+  };
+}
+
+function resetAgentHubForTests() {
+  agentHubState = createAgentHubState();
+}
+
+function handleAgentHubMessage(message, now = Date.now()) {
+  const type = String(message.type || "");
+  pruneAgentRoster(now);
+
+  if (type === "agent-register") {
+    return registerAgent(message, now);
+  }
+  if (type === "agent-unregister") {
+    const agentId = validateAgentId(message.agentId, "agentId");
+    agentHubState.roster.delete(agentId);
+    return {
+      ok: true,
+      type,
+      agentId,
+      agents: listAgents(now)
+    };
+  }
+  if (type === "agent-list") {
+    const pending = countPendingAgentMessages();
+    return {
+      ok: true,
+      type,
+      agents: listAgents(now, pending),
+      pending
+    };
+  }
+  if (type === "agent-send") {
+    return sendAgentMessage(message, now);
+  }
+  if (type === "agent-poll") {
+    return pollAgentMessages(message, now);
+  }
+  if (type === "agent-ack") {
+    return ackAgentMessage(message, now);
+  }
+
+  throw new Error(`Unsupported agent message type: ${type}`);
+}
+
+function registerAgent(message, now = Date.now()) {
+  const agentId = validateAgentId(message.agentId, "agentId");
+  const role = validateAgentRole(message.role);
+  const agent = {
+    agentId,
+    role,
+    displayName: normalizeAgentDisplayName(message.displayName || agentId),
+    origin: String(message.origin || "").slice(0, 512),
+    pathname: String(message.pathname || "").slice(0, 1024),
+    tabId: message.tabId === undefined || message.tabId === null ? "" : String(message.tabId).slice(0, 128),
+    registeredAt: agentHubState.roster.get(agentId)?.registeredAt || now,
+    lastSeenAt: now
+  };
+  agentHubState.roster.set(agentId, agent);
+  return {
+    ok: true,
+    type: "agent-register",
+    agent,
+    agents: listAgents(now)
+  };
+}
+
+function sendAgentMessage(message, now = Date.now()) {
+  const from = validateAgentId(message.from || message.agentId, "from");
+  const to = validateAgentId(message.to, "to");
+  if (!touchAgent(from, now)) {
+    return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-send", from });
+  }
+  const body = String(message.body || "");
+  if (!body.trim()) {
+    return agentHubError("missing-body", "Missing agent message body.", { type: "agent-send" });
+  }
+  if (body.length > AGENT_MESSAGE_MAX_CHARS) {
+    return agentHubError("message-too-large", `Agent message body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-send" });
+  }
+  if (!agentHubState.roster.has(to)) {
+    return agentHubError("recipient-not-registered", `Agent recipient is not registered: ${to}`, { type: "agent-send", to });
+  }
+
+  const taskId = normalizeAgentTaskId(message.taskId || "");
+  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
+  if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
+    return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-send", messageId });
+  }
+
+  const envelope = {
+    messageId,
+    from,
+    to,
+    taskId,
+    body,
+    createdAt: now,
+    ackedAt: 0
+  };
+  agentHubState.mailbox.push(envelope);
+  pruneAgentMailbox();
+  return {
+    ok: true,
+    type: "agent-send",
+    message: envelope
+  };
+}
+
+function pollAgentMessages(message, now = Date.now()) {
+  const agentId = validateAgentId(message.agentId, "agentId");
+  const limit = clampNumber(message.limit, 1, 100, 20);
+  const registered = touchAgent(agentId, now);
+  const messages = agentHubState.mailbox
+    .filter((item) => item.to === agentId && !item.ackedAt)
+    .slice(0, limit);
+  return {
+    ok: true,
+    type: "agent-poll",
+    agentId,
+    registered,
+    now,
+    messages
+  };
+}
+
+function ackAgentMessage(message, now = Date.now()) {
+  const agentId = validateAgentId(message.agentId, "agentId");
+  const messageId = normalizeAgentMessageId(message.messageId || "");
+  if (!messageId) {
+    return agentHubError("missing-message-id", "Missing agent messageId.", { type: "agent-ack", agentId });
+  }
+  const item = agentHubState.mailbox.find((candidate) => candidate.messageId === messageId && candidate.to === agentId);
+  if (!item) {
+    return agentHubError("message-not-found", `Agent message not found for ${agentId}: ${messageId}`, { type: "agent-ack", agentId, messageId });
+  }
+  item.ackedAt = now;
+  return {
+    ok: true,
+    type: "agent-ack",
+    agentId,
+    messageId,
+    ackedAt: now
+  };
+}
+
+function listAgents(now = Date.now(), pending = countPendingAgentMessages()) {
+  pruneAgentRoster(now);
+  return Array.from(agentHubState.roster.values())
+    .sort((a, b) => a.agentId.localeCompare(b.agentId))
+    .map((agent) => ({
+      ...agent,
+      pendingCount: pending[agent.agentId] || 0
+    }));
+}
+
+function pruneAgentRoster(now = Date.now()) {
+  for (const [agentId, agent] of agentHubState.roster.entries()) {
+    if (now - Number(agent.lastSeenAt || 0) > AGENT_ROSTER_TTL_MS) {
+      agentHubState.roster.delete(agentId);
+    }
+  }
+}
+
+function touchAgent(agentId, now = Date.now()) {
+  const agent = agentHubState.roster.get(agentId);
+  if (!agent) {
+    return false;
+  }
+  agent.lastSeenAt = now;
+  return true;
+}
+
+function pruneAgentMailbox() {
+  if (agentHubState.mailbox.length <= AGENT_MAILBOX_LIMIT) {
+    return;
+  }
+  const unacked = agentHubState.mailbox.filter((item) => !item.ackedAt);
+  const acked = agentHubState.mailbox.filter((item) => item.ackedAt);
+  agentHubState.mailbox = [
+    ...acked.slice(Math.max(0, acked.length - Math.floor(AGENT_MAILBOX_LIMIT / 4))),
+    ...unacked.slice(Math.max(0, unacked.length - AGENT_MAILBOX_LIMIT))
+  ];
+}
+
+function countPendingAgentMessages() {
+  const counts = {};
+  for (const item of agentHubState.mailbox) {
+    if (!item.ackedAt) {
+      counts[item.to] = (counts[item.to] || 0) + 1;
+    }
+  }
+  return counts;
+}
+
+function validateAgentId(value, fieldName) {
+  const text = String(value || "").trim();
+  if (!AGENT_ID_PATTERN.test(text)) {
+    throw new Error(`Invalid ${fieldName || "agentId"}. Use 1-64 characters: letters, numbers, dot, underscore, or dash; start with a letter or number.`);
+  }
+  return text;
+}
+
+function validateAgentRole(value) {
+  const role = String(value || "").trim();
+  if (!AGENT_ROLES.has(role)) {
+    throw new Error("Invalid agent role. Use master or slave.");
+  }
+  return role;
+}
+
+function normalizeAgentDisplayName(value) {
+  return String(value || "").trim().slice(0, 128);
+}
+
+function normalizeAgentTaskId(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(text)) {
+    throw new Error("Invalid task-id. Use 1-128 simple characters without spaces.");
+  }
+  return text;
+}
+
+function normalizeAgentMessageId(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,160}$/.test(text)) {
+    throw new Error("Invalid messageId. Use simple characters without spaces.");
+  }
+  return text;
+}
+
+function agentHubError(errorCode, error, extra = {}) {
+  return {
+    ok: false,
+    errorCode,
+    error,
+    ...extra
+  };
 }
 
 async function handleVisionMessage(message) {
@@ -2089,12 +2351,11 @@ async function listTmuxPanes() {
   return panes;
 }
 
-async function ensureForAiTmuxLayout() {
-  const config = getForAiTmuxConfig();
+async function ensureForAiTmuxLayout(config = getForAiTmuxConfig()) {
   const createdWindows = [];
   let createdSession = false;
 
-  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", config.sessionName], { timeoutMs: 5000 });
+  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", exactTmuxSessionTarget(config.sessionName)], { timeoutMs: 5000 });
   if (!sessionCheck.ok) {
     await runTmuxCommand([
       "new-session",
@@ -2116,7 +2377,7 @@ async function ensureForAiTmuxLayout() {
       "new-window",
       "-d",
       "-t",
-      `${config.sessionName}:`,
+      exactTmuxSessionWindowTarget(config.sessionName),
       "-n",
       config.hostWindowName,
       "-c",
@@ -2131,7 +2392,7 @@ async function ensureForAiTmuxLayout() {
       "new-window",
       "-d",
       "-t",
-      `${config.sessionName}:`,
+      exactTmuxSessionWindowTarget(config.sessionName),
       "-n",
       config.boardWindowName,
       "-c",
@@ -2164,9 +2425,9 @@ async function ensureForAiTmuxLayout() {
 
 async function resetForAiTmuxLayout() {
   const config = getForAiTmuxConfig();
-  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", config.sessionName], { timeoutMs: 5000 });
+  const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", exactTmuxSessionTarget(config.sessionName)], { timeoutMs: 5000 });
   if (sessionCheck.ok) {
-    await runTmuxCommand(["kill-session", "-t", config.sessionName], { timeoutMs: 5000 });
+    await runTmuxCommand(["kill-session", "-t", exactTmuxSessionTarget(config.sessionName)], { timeoutMs: 5000 });
   }
   const layout = await ensureForAiTmuxLayout();
   return {
@@ -2180,7 +2441,7 @@ async function listTmuxWindows(sessionName) {
   const result = await runTmuxCommand([
     "list-windows",
     "-t",
-    sessionName,
+    exactTmuxSessionTarget(sessionName),
     "-F",
     "#{window_name}"
   ], { timeoutMs: 5000 });
@@ -2188,6 +2449,14 @@ async function listTmuxWindows(sessionName) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function exactTmuxSessionTarget(sessionName) {
+  return `=${sessionName}`;
+}
+
+function exactTmuxSessionWindowTarget(sessionName) {
+  return `=${sessionName}:`;
 }
 
 function parseTmuxPanes(output) {
@@ -2332,8 +2601,7 @@ function buildInvalidTargetResponse(message, cmd, target, panes) {
   });
 }
 
-function buildDefaultTargetErrorResponse(message, cmd, panes) {
-  const config = getForAiTmuxConfig();
+function buildDefaultTargetErrorResponse(message, cmd, panes, config = getForAiTmuxConfig()) {
   return buildTargetErrorResponse({
     message,
     cmd,
@@ -2414,6 +2682,21 @@ function getForAiTmuxConfig() {
     boardWindowName: normalizeTmuxName(process.env.AI_CHAT_SHELL_BOARD_WINDOW, DEFAULT_BOARD_WINDOW_NAME),
     cwd: resolveForAiCwd(cwdRaw),
     cwdSource: process.env.AI_CHAT_SHELL_FORAI_CWD ? "AI_CHAT_SHELL_FORAI_CWD" : "project-root"
+  };
+}
+
+function getRunTmuxConfig(message = {}) {
+  const agentId = String(message.agentId || "").trim();
+  if (!agentId) {
+    return getForAiTmuxConfig();
+  }
+  const safeAgentId = validateAgentId(agentId, "agentId");
+  const base = getForAiTmuxConfig();
+  return {
+    ...base,
+    agentId: safeAgentId,
+    sessionName: normalizeTmuxName(`ForAI-${safeAgentId}`, `${DEFAULT_TMUX_SESSION_NAME}-${safeAgentId}`),
+    sessionNameSource: "agentId"
   };
 }
 
@@ -3560,6 +3843,7 @@ module.exports = {
   getVisionAvailability,
   getVisionHelperPath,
   getVisionTmuxAppNames,
+  handleAgentHubMessage,
   handleMessageText,
   handleVisionMessage,
   listTmuxPanes,
@@ -3569,6 +3853,7 @@ module.exports = {
   parseVisionDoneFromText,
   prepareStateLogFile,
   readBoardLogFromOffset,
+  resetAgentHubForTests,
   resolveBoardPane,
   resolveDefaultShellPane,
   resolveDownloadsFilePath,

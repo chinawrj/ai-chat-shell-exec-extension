@@ -273,6 +273,123 @@ const boardWithMarker = context.parseCallPayload("ai-helper-board-start\nai-help
 assert.equal(context.validateHelperCall(boardWithMarker).ok, false);
 assert.match(context.validateHelperCall(boardWithMarker).reason, /copied terminal\/output text/);
 
+const agentMessageBlock = [
+  "ai-helper-agent-message-start",
+  "to: slave-a",
+  "task-id: task-001",
+  "",
+  "Inspect parser behavior.",
+  "Report back with findings.",
+  "ai-helper-agent-message-end"
+].join("\n");
+const parsedAgentMessage = context.parseCallPayload(agentMessageBlock);
+assert.equal(context.containsToolLanguageHint(agentMessageBlock), true);
+assert.equal(parsedAgentMessage.kind, "agent-message");
+assert.equal(parsedAgentMessage.helperIdSource, "payload-hash");
+assert.equal(parsedAgentMessage.to, "slave-a");
+assert.equal(parsedAgentMessage.taskId, "task-001");
+assert.equal(parsedAgentMessage.body, "Inspect parser behavior.\nReport back with findings.");
+assert.equal(context.validateHelperCall(parsedAgentMessage).ok, true);
+assert.equal(context.isRunnableHelperCall(parsedAgentMessage), true);
+
+const suffixedAgentMessageA = context.parseCallPayload([
+  "ai-helper-agent-message-start:agent-1001",
+  "to: slave-a",
+  "",
+  "hello",
+  "ai-helper-agent-message-end"
+].join("\n"));
+const suffixedAgentMessageB = context.parseCallPayload([
+  "ai-helper-agent-message-start:agent-1002",
+  "to: slave-a",
+  "",
+  "hello",
+  "ai-helper-agent-message-end"
+].join("\n"));
+assert.equal(suffixedAgentMessageA.kind, "agent-message");
+assert.equal(suffixedAgentMessageA.helperId, "agent-1001");
+assert.notEqual(context.buildSemanticCallKey(suffixedAgentMessageA), context.buildSemanticCallKey(suffixedAgentMessageB));
+
+const [fencedFallbackAgentMessage] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-agent-message-start",
+  "to: master",
+  "task-id: task-002",
+  "",
+  "done",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackAgentMessage.kind, "agent-message");
+assert.equal(fencedFallbackAgentMessage.inferredEndMarker, true);
+assert.equal(fencedFallbackAgentMessage.to, "master");
+assert.equal(fencedFallbackAgentMessage.taskId, "task-002");
+assert.equal(fencedFallbackAgentMessage.body, "done");
+assert.equal(context.validateHelperCall(fencedFallbackAgentMessage).ok, true);
+
+const missingAgentRecipient = context.parseCallPayload([
+  "ai-helper-agent-message-start",
+  "task-id: task-003",
+  "",
+  "hello",
+  "ai-helper-agent-message-end"
+].join("\n"));
+assert.equal(missingAgentRecipient.kind, "agent-message");
+assert.equal(context.validateHelperCall(missingAgentRecipient).ok, false);
+assert.match(context.validateHelperCall(missingAgentRecipient).reason, /missing a to header/);
+
+const unsafeAgentRecipient = context.parseCallPayload([
+  "ai-helper-agent-message-start",
+  "to: ../slave",
+  "",
+  "hello",
+  "ai-helper-agent-message-end"
+].join("\n"));
+assert.equal(context.validateHelperCall(unsafeAgentRecipient).ok, false);
+assert.match(context.validateHelperCall(unsafeAgentRecipient).reason, /safe agent id/);
+
+const emptyAgentBody = context.parseCallPayload([
+  "ai-helper-agent-message-start",
+  "to: slave-a",
+  "",
+  "ai-helper-agent-message-end"
+].join("\n"));
+assert.equal(context.validateHelperCall(emptyAgentBody).ok, false);
+assert.match(context.validateHelperCall(emptyAgentBody).reason, /body is empty/);
+
+const slaveInboundPrompt = context.formatInboundAgentPrompt({
+  role: "slave",
+  agentId: "slave-a"
+}, {
+  from: "master",
+  taskId: "task-001",
+  body: "Inspect parser behavior."
+});
+assert.match(slaveInboundPrompt, /You are slave-a/);
+assert.match(slaveInboundPrompt, /ai-helper-agent-message-start/);
+assert.match(slaveInboundPrompt, /to: master/);
+assert.match(slaveInboundPrompt, /task-id: task-001/);
+assert.match(slaveInboundPrompt, /ai-helper-agent-message-end/);
+
+const masterInboundPrompt = context.formatInboundAgentPrompt({
+  role: "master",
+  agentId: "master"
+}, {
+  from: "slave-a",
+  taskId: "task-001",
+  body: "Done."
+});
+assert.match(masterInboundPrompt, /Message from slave-a for task task-001:/);
+assert.match(masterInboundPrompt, /Done\./);
+assert.equal(masterInboundPrompt.includes("<your result>"), false);
+
+assert.equal(context.getSuggestedAgentIdForRole("master"), "master");
+assert.equal(context.getSuggestedAgentIdForRole("none"), "");
+assert.equal(context.formatAgentRosterSummary([
+  { agentId: "master", role: "master", pendingCount: 0 },
+  { agentId: "slave-a", role: "slave", pendingCount: 2 },
+  { agentId: "slave-b", role: "slave" }
+], { "slave-b": 1 }), "master:master, slave-a:slave pending:2, slave-b:slave pending:1");
+
 const indentedMarker = context.parseCallPayload(" ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
 assert.equal(indentedMarker.cmd, "");
 

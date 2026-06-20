@@ -4,26 +4,35 @@ const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
 const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
+const HELPER_AGENT_MESSAGE_START = "ai-helper-agent-message-start";
+const HELPER_AGENT_MESSAGE_END = "ai-helper-agent-message-end";
 const HELPER_FENCE_MARKER = "````";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const AGENT_MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const AGENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.5.2";
+const CONTENT_SCRIPT_VERSION = "0.6.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
+const AGENT_SESSION_PROFILE_KEY = "aiChatShellExecAgentProfile";
+const AGENT_SESSION_TAB_ID_KEY = "aiChatShellExecAgentTabId";
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LOCAL_MANUAL_TEST_PORT = "17443";
 const FORCE_RUN_STATUS_HINT = "click Force run to bypass";
 const MANUAL_TMUX_LIST_REQUEST = "ai-chat-shell-exec:tmux-list-request";
 const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
+const MANUAL_AGENT_REQUEST = "ai-chat-shell-exec:agent-request";
+const MANUAL_AGENT_RESPONSE = "ai-chat-shell-exec:agent-response";
+const AGENT_POLL_INTERVAL_MS = 2000;
 const processedCalls = new Set();
 const processedSemanticCalls = new Set();
 // Keep dedup metadata in memory only; unlike dataset persistence this resets on content-script reinjection.
@@ -51,6 +60,9 @@ let lastSuppressedCallStatus = "";
 let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
 let extensionVersionWarning = "";
+let agentPollTimer = 0;
+let agentDeliveryInFlight = false;
+let pendingAgentDeliveryMessageId = "";
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -99,6 +111,7 @@ async function activateExtension() {
   await loadLocalProfiles();
   observeThread();
   installPageEventListeners();
+  startAgentPolling();
   scheduleScan();
 }
 
@@ -109,6 +122,7 @@ function deactivateExtension() {
   pendingSelfTest = null;
   lastPointerTarget = null;
   clearTimeout(scanTimer);
+  stopAgentPolling();
   threadObserver?.disconnect();
   threadObserver = null;
   removePageEventListeners();
@@ -153,6 +167,7 @@ function installPageEventListeners() {
   document.addEventListener("dragstart", handleBindingDragStart, true);
   if (isLocalManualTestPage()) {
     window.addEventListener("message", handleManualTmuxListRequest);
+    window.addEventListener("message", handleManualAgentRequest);
   }
   pageEventListenersInstalled = true;
 }
@@ -169,6 +184,7 @@ function removePageEventListeners() {
   document.removeEventListener("click", handleBindingClick, true);
   document.removeEventListener("dragstart", handleBindingDragStart, true);
   window.removeEventListener("message", handleManualTmuxListRequest);
+  window.removeEventListener("message", handleManualAgentRequest);
   pageEventListenersInstalled = false;
 }
 
@@ -198,6 +214,46 @@ async function handleManualTmuxListRequest(event) {
       ok: false,
       panes: [],
       error: error?.message || String(error)
+    }, location.origin);
+  }
+}
+
+async function handleManualAgentRequest(event) {
+  if (!isLocalManualTestPage() || event.source !== window || event.origin !== location.origin) {
+    return;
+  }
+
+  const data = event.data || {};
+  if (!data || data.type !== MANUAL_AGENT_REQUEST) {
+    return;
+  }
+
+  const payload = data.payload || {};
+  try {
+    if (!String(payload.type || "").startsWith("agent-")) {
+      throw new Error("Manual agent request payload must use an agent-* type.");
+    }
+    const response = await chrome.runtime.sendMessage(payload);
+    if (payload.type === "agent-register" && response?.ok === true) {
+      await setCurrentAgentProfile(payload.role || "none", payload.agentId || "");
+      startAgentPolling();
+    } else if (payload.type === "agent-unregister" && response?.ok === true) {
+      await setCurrentAgentProfile("none", "");
+      startAgentPolling();
+    }
+    window.postMessage({
+      type: MANUAL_AGENT_RESPONSE,
+      requestId: data.requestId || "",
+      response
+    }, location.origin);
+  } catch (error) {
+    window.postMessage({
+      type: MANUAL_AGENT_RESPONSE,
+      requestId: data.requestId || "",
+      response: {
+        ok: false,
+        error: error?.message || String(error)
+      }
     }, location.origin);
   }
 }
@@ -438,7 +494,7 @@ async function scanForShellCall(options = {}) {
     }
     if (dedupReason) {
       rememberSuppressedCallStatus(dedupReason);
-      setStatus(`Suppressed duplicate helper call: ${summarizeCommand(call.cmd)}`, "ok");
+      setStatus(`Suppressed duplicate helper call: ${summarizeCommand(helperPreviewText(call))}`, "ok");
       return;
     }
   }
@@ -492,6 +548,9 @@ function buildSemanticCallKey(call) {
     normalizeCommand(call.cmd || ""),
     normalizeCommand(call.filename || ""),
     normalizeCommand(call.content || ""),
+    normalizeCommand(call.to || ""),
+    normalizeCommand(call.taskId || ""),
+    normalizeCommand(call.body || ""),
     normalizeCommand(call.cwd || ""),
     call.timeoutMs || "",
     call.maxOutputChars || ""
@@ -505,6 +564,16 @@ function buildCandidateCallKey(candidate, semanticCallKey) {
     candidate.index || "",
     semanticCallKey
   ].join("\n"));
+}
+
+function helperPreviewText(call) {
+  if (isFileHelperCall(call)) {
+    return call.filename || call.content || "";
+  }
+  if (isAgentMessageHelperCall(call)) {
+    return call.body || call.to || "";
+  }
+  return call.cmd || "";
 }
 
 function buildForceCallKey(semanticCallKey) {
@@ -686,7 +755,8 @@ function containsToolLanguageHint(text) {
   const lower = String(text || "").toLowerCase();
   return lower.includes(HELPER_SHELL_START) ||
     lower.includes(HELPER_FILE_START) ||
-    lower.includes(HELPER_BOARD_START);
+    lower.includes(HELPER_BOARD_START) ||
+    lower.includes(HELPER_AGENT_MESSAGE_START);
 }
 
 function closestMessageContainer(node) {
@@ -794,6 +864,15 @@ function parsePlainTextHelperBlocks(text) {
         inferredEndMarker,
         cmd: normalizeCommand(lines.slice(valueLineIndex, blockEndIndex).join("\n"))
       });
+    } else if (start.kind === "agent-message") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        inferredEndMarker,
+        ...parseAgentMessageLines(lines.slice(valueLineIndex, blockEndIndex))
+      });
     } else {
       calls.push({
         kind: start.kind,
@@ -867,6 +946,10 @@ function parseHelperStartMarker(line) {
   if (board.kind) {
     return board;
   }
+  const agentMessage = parseSpecificHelperStartMarker(text, HELPER_AGENT_MESSAGE_START, "agent-message");
+  if (agentMessage.kind) {
+    return agentMessage;
+  }
   return { kind: "", helperId: "", error: "" };
 }
 
@@ -913,7 +996,43 @@ function expectedHelperEndMarker(kind) {
   if (kind === "board") {
     return HELPER_BOARD_END;
   }
+  if (kind === "agent-message") {
+    return HELPER_AGENT_MESSAGE_END;
+  }
   return "";
+}
+
+function parseAgentMessageLines(lines) {
+  const headerLines = [];
+  let bodyStartIndex = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (String(lines[index] || "").trim() === "") {
+      bodyStartIndex = index + 1;
+      break;
+    }
+    headerLines.push(lines[index]);
+  }
+
+  const headers = {};
+  const malformedHeaders = [];
+  for (const line of headerLines) {
+    const match = String(line || "").match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/);
+    if (!match) {
+      malformedHeaders.push(line);
+      continue;
+    }
+    headers[match[1].toLowerCase()] = match[2].trim();
+  }
+
+  const bodyLines = bodyStartIndex >= 0 ? lines.slice(bodyStartIndex) : [];
+  return {
+    to: headers.to || "",
+    taskId: headers["task-id"] || "",
+    body: bodyLines.join("\n"),
+    agentHeaderError: malformedHeaders.length > 0
+      ? `Malformed agent message header: ${malformedHeaders[0]}`
+      : ""
+  };
 }
 
 function splitShellCallLines(text) {
@@ -944,8 +1063,18 @@ function isBoardHelperCall(call) {
   return call?.kind === "board";
 }
 
+function isAgentMessageHelperCall(call) {
+  return call?.kind === "agent-message";
+}
+
 function isRunnableHelperCall(call) {
-  return isFileHelperCall(call) ? call.filename !== undefined : Boolean(call?.cmd);
+  if (isFileHelperCall(call)) {
+    return call.filename !== undefined;
+  }
+  if (isAgentMessageHelperCall(call)) {
+    return call.to !== undefined || call.body !== undefined;
+  }
+  return Boolean(call?.cmd);
 }
 
 function resetChainForNewHumanPrompt() {
@@ -1056,6 +1185,9 @@ function validateHelperCall(call) {
   if (isBoardHelperCall(call)) {
     return validateBoardCall(call);
   }
+  if (isAgentMessageHelperCall(call)) {
+    return validateAgentMessageCall(call);
+  }
   return validateShellCall(call);
 }
 
@@ -1087,6 +1219,31 @@ function validateBoardCall(call) {
   return validateShellLikeCommandText(cmd);
 }
 
+function validateAgentMessageCall(call) {
+  if (call?.agentHeaderError) {
+    return { ok: false, reason: call.agentHeaderError };
+  }
+  const to = normalizeCommand(call.to || "");
+  if (!to) {
+    return { ok: false, reason: "Agent message is missing a to header." };
+  }
+  if (!AGENT_MESSAGE_ID_PATTERN.test(to)) {
+    return { ok: false, reason: "Agent message to header must be a safe agent id." };
+  }
+  const taskId = normalizeCommand(call.taskId || "");
+  if (taskId && !AGENT_TASK_ID_PATTERN.test(taskId)) {
+    return { ok: false, reason: "Agent message task-id must be a safe id without spaces." };
+  }
+  const body = String(call.body || "");
+  if (!body.trim()) {
+    return { ok: false, reason: "Agent message body is empty." };
+  }
+  if (body.length > 20000) {
+    return { ok: false, reason: "Agent message body is too large." };
+  }
+  return { ok: true };
+}
+
 function validateShellCall(call) {
   const cmd = normalizeCommand(call.cmd);
   if (!cmd) {
@@ -1107,6 +1264,7 @@ function validateShellLikeCommandText(cmd) {
     isHelperEndForKind("shell", line) ||
     isHelperEndForKind("file", line) ||
     isHelperEndForKind("board", line) ||
+    isHelperEndForKind("agent-message", line) ||
     UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
@@ -1144,10 +1302,10 @@ function isCopiedOutputRejectionReason(reason) {
 
 async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
-  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : "shell call";
+  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : "shell call";
   setStatus(`Rejected ${helperName}: ${reason}`, "error");
   await insertReply([
-    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : "Shell call rejected:",
+    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : "Shell call rejected:",
     "",
     "```shell-output",
     formatRejectedCallSubject(call),
@@ -1163,6 +1321,9 @@ function formatRejectedCallSubject(call) {
   }
   if (isBoardHelperCall(call)) {
     return `board: ${call.cmd || ""}`;
+  }
+  if (isAgentMessageHelperCall(call)) {
+    return `agent-message: ${call.to || ""}`;
   }
   return `$ ${call.cmd || ""}`;
 }
@@ -1191,6 +1352,16 @@ async function runAndReply(callId, call, options = {}) {
         call.cmd,
         "",
         "Send this command to the board and post the output back to this chat?"
+      ] : isAgentMessageHelperCall(call) ?
+      [
+        "AI requested an agent message.",
+        "",
+        `to: ${call.to || ""}`,
+        call.taskId ? `task-id: ${call.taskId}` : "",
+        "",
+        call.body || "",
+        "",
+        "Send this message through the local agent hub and post the result back to this chat?"
       ] :
       [
         "AI requested a local shell command.",
@@ -1224,6 +1395,8 @@ async function runAndReply(callId, call, options = {}) {
       await sendWriteFileMessage(callId, call, force) :
       isBoardHelperCall(call) ?
       await sendRunBoardMessage(callId, call, force) :
+      isAgentMessageHelperCall(call) ?
+      await sendAgentMessage(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
 
     if (response?.duplicate === true && response?.skipped === true) {
@@ -1236,6 +1409,8 @@ async function runAndReply(callId, call, options = {}) {
       formatFileOutput(call, response, startedAt) :
       isBoardHelperCall(call) ?
       formatBoardOutput(call, response, startedAt) :
+      isAgentMessageHelperCall(call) ?
+      formatAgentMessageOutput(call, response, startedAt) :
       formatShellOutput(call, response, startedAt);
     await insertReply(reply);
     setHelperCompletionStatus(call, response);
@@ -1245,7 +1420,7 @@ async function runAndReply(callId, call, options = {}) {
       await clickSendWhenReady();
     }
   } catch (error) {
-    setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : "Shell call"} failed: ${error.message || String(error)}`, "error");
+    setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : isAgentMessageHelperCall(call) ? "Agent message" : "Shell call"} failed: ${error.message || String(error)}`, "error");
     const failedResponse = {
       ok: false,
       error: error.message || String(error)
@@ -1254,6 +1429,8 @@ async function runAndReply(callId, call, options = {}) {
       formatFileOutput(call, failedResponse, startedAt) :
       isBoardHelperCall(call) ?
       formatBoardOutput(call, failedResponse, startedAt) :
+      isAgentMessageHelperCall(call) ?
+      formatAgentMessageOutput(call, failedResponse, startedAt) :
       formatShellOutput(call, failedResponse, startedAt));
     activeCallId = "";
     if (settings.autoSend !== false) {
@@ -1271,14 +1448,20 @@ function buildRunningStatus(call, force) {
   if (isBoardHelperCall(call)) {
     return `${force ? "Force sending" : "Sending"} board command: ${summarizeCommand(call.cmd)}`;
   }
+  if (isAgentMessageHelperCall(call)) {
+    return `${force ? "Force sending" : "Sending"} agent message to ${call.to || "(missing)"}`;
+  }
   return `${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`;
 }
 
-function sendRunShellMessage(callId, call, force) {
+async function sendRunShellMessage(callId, call, force) {
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.agentId && profile.role !== "none" ? profile.agentId : "";
   return chrome.runtime.sendMessage({
     type: "run-shell",
     id: callId,
     callKey: callId,
+    agentId,
     cmd: call.cmd,
     cwd: call.cwd || "",
     callMeta: {
@@ -1323,6 +1506,230 @@ function sendRunBoardMessage(callId, call, force) {
   });
 }
 
+async function sendAgentMessage(callId, call, force) {
+  const profile = await getCurrentAgentProfile();
+  if (!profile.agentId || !profile.role || profile.role === "none") {
+    throw new Error("Current page is not configured as an agent. Set this tab to master or slave before sending agent messages.");
+  }
+  return chrome.runtime.sendMessage({
+    type: "agent-send",
+    id: callId,
+    messageId: callId,
+    from: profile.agentId,
+    to: call.to,
+    taskId: call.taskId || "",
+    body: call.body || "",
+    callMeta: {
+      origin: location.origin,
+      pathname: location.pathname,
+      promptHash: stableHash(getLastUserMessageText()),
+      force
+    }
+  });
+}
+
+async function getCurrentAgentProfile() {
+  const sessionProfile = readSessionAgentProfile();
+  if (sessionProfile.agentId || sessionProfile.role !== "none") {
+    return sessionProfile;
+  }
+  const key = agentProfileKey();
+  const profiles = await chrome.storage.local.get([key]);
+  const profile = profiles[key] || {};
+  return {
+    role: normalizeCommand(profile.role || "none"),
+    agentId: normalizeCommand(profile.agentId || "")
+  };
+}
+
+async function setCurrentAgentProfile(role, agentId) {
+  const profile = {
+    role: normalizeCommand(role || "none"),
+    agentId: normalizeCommand(agentId || "")
+  };
+  try {
+    window.sessionStorage.setItem(AGENT_SESSION_PROFILE_KEY, JSON.stringify(profile));
+  } catch (_unused) {
+    // Session storage is best effort; local storage still preserves a default.
+  }
+  await chrome.storage.local.set({
+    [agentProfileKey()]: profile
+  });
+}
+
+function getSuggestedAgentIdForRole(role) {
+  const normalizedRole = normalizeCommand(role || "none");
+  if (normalizedRole === "master") {
+    return "master";
+  }
+  if (normalizedRole === "slave") {
+    return `slave-${stableHash(`${location.origin}:${location.pathname}:${getAgentTabInstanceId()}`).slice(0, 8)}`;
+  }
+  return "";
+}
+
+function getAgentTabInstanceId() {
+  try {
+    const existing = window.sessionStorage.getItem(AGENT_SESSION_TAB_ID_KEY);
+    if (existing) {
+      return existing;
+    }
+    const entropy = globalThis.crypto?.randomUUID?.() || `${Date.now()}:${globalThis.performance?.now?.() || 0}`;
+    const generated = stableHash(`${entropy}:${location.href || location.origin}`);
+    window.sessionStorage.setItem(AGENT_SESSION_TAB_ID_KEY, generated);
+    return generated;
+  } catch (_unused) {
+    return stableHash(`${location.origin}:${location.pathname}`);
+  }
+}
+
+function readSessionAgentProfile() {
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(AGENT_SESSION_PROFILE_KEY) || "{}");
+    return {
+      role: normalizeCommand(parsed.role || "none"),
+      agentId: normalizeCommand(parsed.agentId || "")
+    };
+  } catch (_unused) {
+    return {
+      role: "none",
+      agentId: ""
+    };
+  }
+}
+
+function agentProfileKey() {
+  return `agentProfile:${location.origin}`;
+}
+
+function registerAgentProfile(profile) {
+  return chrome.runtime.sendMessage({
+    type: "agent-register",
+    agentId: profile.agentId,
+    role: profile.role,
+    origin: location.origin,
+    pathname: location.pathname
+  });
+}
+
+function startAgentPolling() {
+  stopAgentPolling();
+  agentPollTimer = window.setTimeout(runAgentPollLoop, 500);
+}
+
+function stopAgentPolling() {
+  if (agentPollTimer) {
+    window.clearTimeout(agentPollTimer);
+    agentPollTimer = 0;
+  }
+  agentDeliveryInFlight = false;
+  pendingAgentDeliveryMessageId = "";
+}
+
+async function runAgentPollLoop() {
+  agentPollTimer = 0;
+  try {
+    await pollAndDeliverAgentMessage();
+  } catch (_unused) {
+    // Keep polling quiet; explicit Check/List actions surface diagnostics.
+  } finally {
+    if (extensionActive) {
+      agentPollTimer = window.setTimeout(runAgentPollLoop, AGENT_POLL_INTERVAL_MS);
+    }
+  }
+}
+
+async function pollAndDeliverAgentMessage() {
+  if (agentDeliveryInFlight || activeCallId) {
+    return;
+  }
+  const profile = await getCurrentAgentProfile();
+  if (!profile.agentId || profile.role === "none") {
+    return;
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: "agent-poll",
+    agentId: profile.agentId,
+    limit: 1
+  });
+  if (response?.registered === false) {
+    await registerAgentProfile(profile);
+    setStatus(`Re-registered ${profile.role} ${profile.agentId}`, "ok");
+    return;
+  }
+  if (!response?.ok || !Array.isArray(response.messages) || response.messages.length === 0) {
+    return;
+  }
+
+  const [message] = response.messages;
+  if (!message?.messageId) {
+    return;
+  }
+
+  agentDeliveryInFlight = true;
+  try {
+    if (pendingAgentDeliveryMessageId !== message.messageId) {
+      const text = formatInboundAgentPrompt(profile, message);
+      setStatus(`Delivering agent message from ${message.from || "(unknown)"}`, "running");
+      await insertReply(text);
+      pendingAgentDeliveryMessageId = message.messageId;
+    } else {
+      setStatus(`Agent message ${message.messageId} is waiting for send button`, "running");
+    }
+    const sent = await clickSendWhenReady();
+    if (!sent) {
+      setStatus("Agent message inserted once; waiting for send button", "error");
+      return;
+    }
+    const ack = await ackDeliveredAgentMessage(profile, message);
+    if (!ack?.ok) {
+      setStatus(`Agent message delivered but ack failed: ${summarizeCommand(ack?.error || "unknown")}`, "error");
+      return;
+    }
+    pendingAgentDeliveryMessageId = "";
+    setStatus(`Delivered agent message ${message.messageId}`, "ok");
+  } finally {
+    agentDeliveryInFlight = false;
+  }
+}
+
+function ackDeliveredAgentMessage(profile, message) {
+  return chrome.runtime.sendMessage({
+    type: "agent-ack",
+    agentId: profile.agentId,
+    messageId: message.messageId
+  });
+}
+
+function formatInboundAgentPrompt(profile, message) {
+  const from = message.from || "(unknown)";
+  const task = message.taskId ? ` for task ${message.taskId}` : "";
+  const body = String(message.body || "");
+  if (profile.role === "slave") {
+    return [
+      `Message from ${from}${task}:`,
+      "",
+      body,
+      "",
+      `You are ${profile.agentId}. Complete the task in this chat. If you need local shell output, use the normal ai-helper-shell block. When finished, reply to ${from} with this exact helper format:`,
+      "",
+      "ai-helper-agent-message-start",
+      `to: ${from}`,
+      message.taskId ? `task-id: ${message.taskId}` : "",
+      "",
+      "<your result>",
+      "ai-helper-agent-message-end"
+    ].join("\n");
+  }
+
+  return [
+    `Message from ${from}${task}:`,
+    "",
+    body
+  ].join("\n");
+}
+
 function setHelperCompletionStatus(call, response) {
   if (pendingSelfTest && isExpectedSelfTestCall(call)) {
     const token = pendingSelfTest.token;
@@ -1343,6 +1750,11 @@ function setHelperCompletionStatus(call, response) {
 
   if (isBoardHelperCall(call)) {
     setStatus(response?.ok === false ? "Board helper failed" : "Board helper completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
+  if (isAgentMessageHelperCall(call)) {
+    setStatus(response?.ok === false ? "Agent message failed" : "Agent message sent", response?.ok === false ? "error" : "ok");
     return;
   }
 
@@ -1468,6 +1880,34 @@ function formatFileOutput(call, response, startedAt) {
     response.path ? `path: ${response.path}` : "",
     `bytes: ${response.bytes}`,
     `durationMs: ${response.durationMs}`,
+    "```"
+  ].filter((line) => line !== "").join("\n");
+}
+
+function formatAgentMessageOutput(call, response, startedAt) {
+  if (!response || response.ok === false) {
+    return [
+      "Agent message failed:",
+      "",
+      "```shell-output",
+      `agent-message: ${call.to || ""}`,
+      call.taskId ? `task-id: ${call.taskId}` : "",
+      `startedAt: ${startedAt}`,
+      `error: ${response?.error || "Unknown agent hub error."}`,
+      "```"
+    ].filter((line) => line !== "").join("\n");
+  }
+
+  const message = response.message || {};
+  return [
+    "Agent message result:",
+    "",
+    "```shell-output",
+    `from: ${message.from || ""}`,
+    `to: ${message.to || call.to || ""}`,
+    message.taskId || call.taskId ? `task-id: ${message.taskId || call.taskId}` : "",
+    `messageId: ${message.messageId || response.messageId || ""}`,
+    `durationMs: ${response.durationMs || 0}`,
     "```"
   ].filter((line) => line !== "").join("\n");
 }
@@ -1988,6 +2428,20 @@ function injectStatus() {
   }
   panel.appendChild(actions);
 
+  const agentControls = document.createElement("div");
+  agentControls.style.cssText = "display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto;gap:4px;align-items:center;margin-top:6px";
+  agentControls.innerHTML = [
+    '<select data-shell-agent-role title="Agent role" style="border:0;border-radius:6px;padding:3px 4px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;">',
+    '<option value="none">none</option>',
+    '<option value="master">master</option>',
+    '<option value="slave">slave</option>',
+    '</select>',
+    '<input data-shell-agent-id title="Agent id" placeholder="agentId" style="min-width:72px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
+    '<button type="button" data-shell-tool-action="agent-register" title="Save this page agent role and register it with the local hub" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Save</button>',
+    '<button type="button" data-shell-tool-action="agent-list" title="Show local agent roster and pending message counts" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Roster</button>'
+  ].join("");
+  panel.appendChild(agentControls);
+
   const debugPanel = document.createElement("details");
   debugPanel.id = "ai-chat-shell-exec-debug";
   debugPanel.style.cssText = "margin-top:6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;";
@@ -2020,6 +2474,12 @@ function injectStatus() {
     handlePanelAction(button.dataset.shellToolAction);
   }, true);
 
+  panel.addEventListener("change", (event) => {
+    if (event.target?.matches?.("[data-shell-agent-role]")) {
+      applyAgentRoleSuggestion(event.target.value);
+    }
+  }, true);
+
   panel.addEventListener("dragover", (event) => {
     event.preventDefault();
     panel.style.outline = "2px solid #93c5fd";
@@ -2041,6 +2501,7 @@ function injectStatus() {
     authorRoleFilterEnabled = settings.disableAuthorRoleFilter === false;
     updateRoleFilterButton();
   });
+  loadAgentControls().catch(() => {});
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
   checkStartupTmux().catch((error) => {
@@ -2271,7 +2732,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
           return "?";
         }
       })();
-      const cCmd = String(cCall.cmd || cCall.content || "")
+      const cCmd = String(helperPreviewText(cCall) || "")
         .replace(/\s+/g, " ")
         .slice(0, 80);
       lines.push(
@@ -2286,7 +2747,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
   if (candidate) {
     const call = candidate.call || {};
     const role = getMessageAuthorRole(candidate.node) || "(unknown)";
-    const cmdPreview = String(call.cmd || call.content || "").slice(0, 800);
+    const cmdPreview = String(helperPreviewText(call) || "").slice(0, 800);
     lines.push(
       `kind:        ${call.kind || "shell"}`,
       `helperId:    ${call.helperId || "(none)"} (${call.helperIdSource || "n/a"})`,
@@ -2363,6 +2824,20 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "agent-register") {
+    registerCurrentPageAgent().catch((error) => {
+      setStatus(`Agent register failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "agent-list") {
+    listRegisteredAgents().catch((error) => {
+      setStatus(`Agent list failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
@@ -2374,6 +2849,84 @@ function handlePanelAction(action) {
 
   bindingMode = action;
   setStatus(`Click a page element, or drag it onto this panel, to bind ${action}`, "running");
+}
+
+async function loadAgentControls() {
+  const profile = await getCurrentAgentProfile();
+  const role = document.querySelector(`#${STATUS_ID} [data-shell-agent-role]`);
+  const agentId = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
+  if (role) {
+    role.value = profile.role || "none";
+  }
+  if (agentId) {
+    agentId.value = profile.agentId || "";
+  }
+}
+
+function applyAgentRoleSuggestion(role) {
+  const agentIdElement = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
+  if (!agentIdElement || normalizeCommand(agentIdElement.value || "")) {
+    return;
+  }
+  agentIdElement.value = getSuggestedAgentIdForRole(role);
+}
+
+async function registerCurrentPageAgent() {
+  const roleElement = document.querySelector(`#${STATUS_ID} [data-shell-agent-role]`);
+  const agentIdElement = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
+  const role = normalizeCommand(roleElement?.value || "none");
+  const agentId = normalizeCommand(agentIdElement?.value || "");
+
+  if (role === "none") {
+    await setCurrentAgentProfile("none", "");
+    startAgentPolling();
+    if (agentId) {
+      await chrome.runtime.sendMessage({ type: "agent-unregister", agentId });
+    }
+    setStatus("Agent mode disabled for this origin", "idle");
+    return;
+  }
+
+  if (!["master", "slave"].includes(role)) {
+    throw new Error("Role must be none, master, or slave.");
+  }
+  if (!AGENT_MESSAGE_ID_PATTERN.test(agentId)) {
+    throw new Error("Agent id must be 1-64 safe characters and start with a letter or number.");
+  }
+
+  const response = await registerAgentProfile({ role, agentId });
+  if (!response?.ok) {
+    throw new Error(response?.error || "Agent hub registration failed.");
+  }
+
+  await setCurrentAgentProfile(role, agentId);
+  startAgentPolling();
+  const count = Array.isArray(response.agents) ? response.agents.length : 0;
+  setStatus(`Registered ${role} ${agentId}; polling every ${AGENT_POLL_INTERVAL_MS / 1000}s; ${count} agent${count === 1 ? "" : "s"} online`, "ok");
+}
+
+async function listRegisteredAgents() {
+  const response = await chrome.runtime.sendMessage({ type: "agent-list" });
+  if (!response?.ok) {
+    throw new Error(response?.error || "Agent list failed.");
+  }
+  const agents = Array.isArray(response.agents) ? response.agents : [];
+  if (agents.length === 0) {
+    setStatus("No agents registered", "idle");
+    return;
+  }
+  const summary = formatAgentRosterSummary(agents, response.pending);
+  setStatus(`Agents online: ${summary}`, "ok");
+}
+
+function formatAgentRosterSummary(agents, pending) {
+  const pendingCounts = pending && typeof pending === "object" ? pending : {};
+  return (Array.isArray(agents) ? agents : [])
+    .map((agent) => {
+      const count = Number(agent.pendingCount ?? pendingCounts[agent.agentId] ?? 0);
+      return `${agent.agentId}:${agent.role}${count > 0 ? ` pending:${count}` : ""}`;
+    })
+    .join(", ");
 }
 
 async function forceRunLatestShellCall() {

@@ -53,7 +53,17 @@ Goal: prove the full visual control loop on macOS before involving Horizon.
 - Reconstruct long output from the visible tmux UI with pagination and OCR stitching.
 - Keep direct tmux as the oracle/test adapter where possible, but do not require direct tmux access for the production visual path.
 
-### Parked: v0.6.0 Horizon Visual Adapter
+### v0.6.0: Local Multi-Agent Tabs
+
+Goal: let users simulate a small local agent team with multiple chat tabs before adding any remote orchestration layer.
+
+- Let enabled pages register as `master` or `slave` agents from the floating panel.
+- Route agent task messages through the local WebSocket server with an in-memory roster and mailbox.
+- Deliver incoming messages into the recipient tab's composer and acknowledge after the page sends them.
+- Keep each registered agent tab's shell helpers isolated in a per-agent `ForAI-<agentId>:host` tmux workspace.
+- Preserve the existing direct tmux workflow for non-agent pages.
+
+### Parked: Horizon Visual Adapter
 
 Goal: reuse the local visual adapter model against VMware Horizon Web Access.
 

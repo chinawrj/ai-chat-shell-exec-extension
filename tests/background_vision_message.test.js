@@ -52,7 +52,7 @@ const context = {
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-      getManifest: () => ({ version: "0.5.2" }),
+      getManifest: () => ({ version: "0.6.0" }),
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
       onMessage: { addListener() {} }
@@ -191,8 +191,8 @@ function currentHealthBody() {
   return {
     ok: true,
     allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-    releaseVersion: "0.5.2",
-    serverReleaseVersion: "0.5.2",
+    releaseVersion: "0.6.0",
+    serverReleaseVersion: "0.6.0",
     protocolVersion: 3,
     serverProtocolVersion: 3,
     helperProtocolVersion: 1
