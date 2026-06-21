@@ -195,9 +195,36 @@ Investigate this independently and report back.
 ai-helper-agent-message-end
 ````
 
-Messages are delivered to the recipient tab's composer and acknowledged after the page sends them. Agent tabs poll the local hub as a heartbeat, so active tabs stay online in the roster; if the in-memory roster is lost after a local server restart, the page re-registers itself on the next poll. A slave can reply to the master with the same helper format using `to: master`.
+Messages are delivered to the recipient tab's composer and acknowledged after the page sends them. If the target AI page is not ready, the extension keeps the message as a visible pending delivery in the floating panel and retries until the composer/send control is ready. Agent tabs poll the local hub as a heartbeat, so active tabs stay online in the roster; if the in-memory roster is lost after a local server restart, the page re-registers itself on the next poll. A slave can reply to the master with the same helper format using `to: master`.
 
 When a registered agent page emits a normal shell helper, the server routes it to an isolated tmux workspace named `ForAI-<agentId>:host`. Non-agent pages continue to use the default `ForAI:host` path.
+
+### Tmux AI Agents
+
+A tmux pane can also be registered as a `tmux-ai` agent when that pane is already running an AI teammate such as Claude. The server treats that pane as an AI runtime: it sends task prompts into the pane, and the AI must actively return the result by calling the provided CLI. The server does not scan tmux output for replies.
+
+From a web page registered as `master`, use the floating panel's tmux-ai slave controls: refresh/select a tmux target, enter a slave agent id such as `slave-tmux`, then click `Register`. The local server validates the target pane and registers that tmux pane as a `tmux-ai` slave. The local manual test page exposes the same registration message for debugging, but the master panel is the normal control entry.
+
+Sending an agent task to that id pastes a prompt into the target pane. The prompt includes a reply file and a short per-task script command like:
+
+```sh
+printf '%s\n' 'final result' > /path/to/agent-replies/msg-001-slave-tmux.md
+sh /path/to/agent-replies/msg-001-slave-tmux-reply.sh
+```
+
+The tmux-hosted AI should write its final answer to the body file and run the short script exactly once. The script wraps the longer `agent_reply_cli.js --from --to --task-id --reply-to --body-file ...` command so the slave does not need to copy or remember every flag. The CLI sends `agent-reply` to the local server, which delivers the result to the recipient agent mailbox. If the recipient web page is open but not ready to send yet, the extension shows the reply as pending and acknowledges it only after the page sends it into the chat.
+
+This repository also includes a project-level Claude Code skill at `.claude/skills/tmux-ai-slave-reply/SKILL.md`. When Claude is running from this checkout or a release source archive, the skill teaches a tmux-hosted Claude slave to use the reply file and CLI command from the task prompt instead of only answering in the terminal.
+
+For the opt-in real Claude end-to-end test, open Claude in a tmux pane and run:
+
+```sh
+AI_CHAT_SHELL_REAL_CLAUDE_E2E=1 \
+AI_CHAT_SHELL_REAL_CLAUDE_TARGET='%1' \
+node tests/real_claude_tmux_slave_e2e.test.js
+```
+
+When `AI_CHAT_SHELL_REAL_CLAUDE_TARGET` is omitted, the test uses the first tmux pane whose command or window name looks like Claude. By default it auto-approves Claude Code prompts that ask to allow writes under `agent-replies/`; set `AI_CHAT_SHELL_REAL_CLAUDE_AUTO_APPROVE=0` to handle those prompts manually.
 
 For AI-facing master/slave instruction templates, see `docs/AI_INSTRUCTIONS.md`.
 

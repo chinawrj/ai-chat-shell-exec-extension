@@ -58,7 +58,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      3,
+      4,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -71,6 +71,9 @@ async function main() {
   const sessionName = `ai_chat_shell_e2e_${process.pid}_${Date.now()}`;
   const paneId = startTmuxSession(socketPath, sessionName);
   cleanup.push(() => killTmuxSession(socketPath, sessionName));
+  const tmuxAiSessionName = `ai_chat_shell_agent_e2e_${process.pid}_${Date.now()}`;
+  startTmuxCatSession(socketPath, tmuxAiSessionName);
+  cleanup.push(() => killTmuxSession(socketPath, tmuxAiSessionName));
 
   if (!serverHealth?.ok) {
     const server = spawnNode(["server/shell_server.js"], {
@@ -243,6 +246,74 @@ async function main() {
       text.includes(${JSON.stringify(helperAgentBody)}) ? text : "";
   })()`, "slave reply delivered into master tab");
   assert.match(masterDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
+
+  const tmuxAiTaskId = `task-tmux-ai-e2e-${Date.now()}`;
+  const tmuxAiBody = `tmux AI agent task delivered from browser e2e ${tmuxAiTaskId}`;
+  await masterPage.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector("[data-shell-tmux-ai-id]").value = "slave-tmux-ai";
+    const target = panel.querySelector("[data-shell-tmux-ai-target]");
+    const option = document.createElement("option");
+    option.value = ${JSON.stringify(`${tmuxAiSessionName}:0.0`)};
+    option.textContent = option.value;
+    target.appendChild(option);
+    target.value = option.value;
+    panel.querySelector('[data-shell-tool-action="tmux-ai-register"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(masterPage, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered tmux-ai slave slave-tmux-ai")`, "master panel tmux-ai slave registration");
+  agentResponse = await sendLocalAgentRequest(masterPage, {
+    type: "agent-list"
+  });
+  assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
+  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-tmux-ai" && agent.surface === "tmux-ai"));
+  await masterPage.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector('[data-shell-tool-action="agent-check"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(masterPage, `(() => {
+    const text = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText || "";
+    return text.includes("Agent setup check:") &&
+      text.includes("tmux-ai slaves: slave-tmux-ai@") &&
+      text.includes("Ready: ask the master AI");
+  })()`, "master panel agent setup check ready state");
+
+  agentResponse = await sendLocalAgentRequest(masterPage, {
+    type: "agent-send",
+    from: "master",
+    to: "slave-tmux-ai",
+    taskId: tmuxAiTaskId,
+    body: tmuxAiBody,
+    messageId: `msg-${tmuxAiTaskId}`
+  });
+  assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
+  assert.equal(agentResponse.message.deliverySurface, "tmux-ai");
+  assert.equal(agentResponse.delivery.status, "delivered");
+  assert.match(agentResponse.delivery.replyCommand, /^sh '/);
+  assert.match(agentResponse.delivery.replyScriptFile, /reply\.sh$/);
+  const tmuxAiPaneText = runTmux(socketPath, ["capture-pane", "-p", "-J", "-S", "-200", "-t", `${tmuxAiSessionName}:0.0`]).stdout;
+  assert.match(tmuxAiPaneText, new RegExp(escapeRegExp(tmuxAiBody)));
+  assert.match(tmuxAiPaneText, /Reply command \(short\):/);
+  assert.match(tmuxAiPaneText, /reply\.sh/);
+
+  const tmuxAiReplyBody = `tmux AI CLI reply delivered to master ${tmuxAiTaskId}`;
+  fs.mkdirSync(path.dirname(agentResponse.delivery.replyBodyFile), { recursive: true });
+  fs.writeFileSync(agentResponse.delivery.replyBodyFile, tmuxAiReplyBody, "utf8");
+  const cliReply = spawnSync("sh", [agentResponse.delivery.replyScriptFile], {
+    cwd: ROOT_DIR,
+    encoding: "utf8"
+  });
+  assert.equal(cliReply.status, 0, `agent reply CLI failed:\nstdout:\n${cliReply.stdout}\nstderr:\n${cliReply.stderr}`);
+  const cliReplyJson = JSON.parse(cliReply.stdout);
+  assert.equal(cliReplyJson.ok, true, JSON.stringify(cliReplyJson));
+
+  const tmuxAiDeliveredText = await waitForEvaluateValue(masterPage, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`Message from slave-tmux-ai for task ${tmuxAiTaskId}:`)}) &&
+      text.includes(${JSON.stringify(tmuxAiReplyBody)}) ? text : "";
+  })()`, "tmux AI CLI reply delivered into master tab");
+  assert.match(tmuxAiDeliveredText, new RegExp(escapeRegExp(tmuxAiReplyBody)));
 
   const deliveryTaskId = `task-delivery-e2e-${Date.now()}`;
   const deliveryBody = `deliver this task into the slave composer ${deliveryTaskId}`;
@@ -508,6 +579,14 @@ function startTmuxSession(socketPath, sessionName) {
   const result = runTmux(socketPath, ["list-panes", "-t", sessionName, "-F", "#{pane_id}"]);
   const [paneId] = result.stdout.trim().split(/\r?\n/);
   assert.ok(paneId, "Could not determine e2e tmux pane id.");
+  return paneId;
+}
+
+function startTmuxCatSession(socketPath, sessionName) {
+  runTmux(socketPath, ["new-session", "-d", "-s", sessionName, "-n", "ai", "/bin/cat"]);
+  const result = runTmux(socketPath, ["list-panes", "-t", sessionName, "-F", "#{pane_id}"]);
+  const [paneId] = result.stdout.trim().split(/\r?\n/);
+  assert.ok(paneId, "Could not determine e2e tmux-ai pane id.");
   return paneId;
 }
 

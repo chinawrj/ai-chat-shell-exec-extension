@@ -327,6 +327,10 @@
           <input id="agentId" value="master" spellcheck="false">
         </label>
         <label>
+          tmux-ai target
+          <input id="agentTmuxTarget" value="ForAI:host" spellcheck="false">
+        </label>
+        <label>
           to
           <input id="agentTo" value="slave-a" spellcheck="false">
         </label>
@@ -335,13 +339,19 @@
           <input id="agentTaskId" value="task-local-001" spellcheck="false">
         </label>
         <label>
+          reply to
+          <input id="agentReplyTo" value="" spellcheck="false">
+        </label>
+        <label>
           message
           <textarea id="agentBody" spellcheck="false">Inspect the local parser and reply to master.</textarea>
         </label>
         <div class="button-row">
           <button id="agentRegister" type="button">Register</button>
+          <button id="agentRegisterTmuxAi" type="button">Register tmux-ai</button>
           <button id="agentList" type="button">List</button>
           <button id="agentSend" type="button">Send</button>
+          <button id="agentReply" type="button">Reply</button>
           <button id="agentPoll" type="button">Poll</button>
           <button id="agentAck" type="button">Ack first</button>
           <button id="insertAgentMessage" type="button">Insert agent helper</button>
@@ -427,6 +437,15 @@
         });
       });
 
+      document.getElementById("agentRegisterTmuxAi").addEventListener("click", () => {
+        requestAgentHub({
+          type: "agent-register-tmux-ai",
+          agentId: agentField("agentId"),
+          role: agentField("agentRole"),
+          target: agentField("agentTmuxTarget")
+        });
+      });
+
       document.getElementById("agentList").addEventListener("click", () => {
         requestAgentHub({ type: "agent-list" });
       });
@@ -437,6 +456,17 @@
           from: agentField("agentId"),
           to: agentField("agentTo"),
           taskId: agentField("agentTaskId"),
+          body: agentField("agentBody")
+        });
+      });
+
+      document.getElementById("agentReply").addEventListener("click", () => {
+        requestAgentHub({
+          type: "agent-reply",
+          from: agentField("agentId"),
+          to: agentField("agentTo"),
+          taskId: agentField("agentTaskId"),
+          replyTo: agentField("agentReplyTo"),
           body: agentField("agentBody")
         });
       });
@@ -524,6 +554,9 @@
         const response = data.response || {};
         if (Array.isArray(response.messages) && response.messages[0]?.messageId) {
           lastPolledAgentMessageId = response.messages[0].messageId;
+        }
+        if (response.message?.messageId) {
+          document.getElementById("agentReplyTo").value = response.message.messageId;
         }
         renderAgentOutput(response);
       }

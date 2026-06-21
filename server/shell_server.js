@@ -15,17 +15,18 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 3;
+const SERVER_PROTOCOL_VERSION = 4;
 const HELPER_PROTOCOL_VERSION = 1;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
 const BOARD_LOG_DIR = path.join(STATE_DIR, "board-panes");
 const VISION_TMP_DIR = path.join(STATE_DIR, "vision");
+const AGENT_REPLY_DIR = path.join(STATE_DIR, "agent-replies");
 const LEDGER_PATH = path.join(STATE_DIR, "shell-ledger.json");
 const STATE_STDOUT_LOG_PATH = path.join(STATE_DIR, "shell-server.out.log");
 const STATE_STDERR_LOG_PATH = path.join(STATE_DIR, "shell-server.err.log");
-const STATE_REQUIRED_SUBDIRS = ["tmux-runs", "board-panes", "vision", "bin"];
+const STATE_REQUIRED_SUBDIRS = ["tmux-runs", "board-panes", "vision", "agent-replies", "bin"];
 const SERVER_LEDGER_LIMIT = 1000;
 const RUNNING_LOCK_GRACE_MS = 15000;
 const COMPLETED_DEDUP_TTL_MS = 60_000;
@@ -70,6 +71,8 @@ const VISION_TMUX_HISTORY_LIMIT = 200000;
 const AGENT_ROSTER_TTL_MS = 60_000;
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_ROLES = new Set(["master", "slave"]);
+const AGENT_SURFACES = new Set(["web", "tmux-ai"]);
+const AGENT_REPLY_MODES = new Set(["poll", "cli"]);
 const AGENT_MESSAGE_MAX_CHARS = 20000;
 const AGENT_MAILBOX_LIMIT = 500;
 let stateLoggingConfigured = false;
@@ -407,7 +410,7 @@ async function handleMessageText(text) {
   }
 
   if (String(message.type).startsWith("agent-")) {
-    return handleAgentHubMessage(message);
+    return handleAgentHubMessageAsync(message);
   }
 
   if (message.type !== "run") {
@@ -686,6 +689,12 @@ function handleAgentHubMessage(message, now = Date.now()) {
   if (type === "agent-send") {
     return sendAgentMessage(message, now);
   }
+  if (type === "agent-task-status") {
+    return getAgentTaskStatus(message, now);
+  }
+  if (type === "agent-reply") {
+    return replyAgentMessage(message, now);
+  }
   if (type === "agent-poll") {
     return pollAgentMessages(message, now);
   }
@@ -696,12 +705,28 @@ function handleAgentHubMessage(message, now = Date.now()) {
   throw new Error(`Unsupported agent message type: ${type}`);
 }
 
+async function handleAgentHubMessageAsync(message, now = Date.now()) {
+  ensureStateDirReady({ create: true });
+  const type = String(message.type || "");
+  pruneAgentRoster(now);
+
+  if (type === "agent-register-tmux-ai") {
+    return registerTmuxAiAgent(message, now);
+  }
+  if (type === "agent-send") {
+    return sendAgentMessageAsync(message, now);
+  }
+  return handleAgentHubMessage(message, now);
+}
+
 function registerAgent(message, now = Date.now()) {
   const agentId = validateAgentId(message.agentId, "agentId");
   const role = validateAgentRole(message.role);
   const agent = {
     agentId,
     role,
+    surface: "web",
+    replyMode: "poll",
     displayName: normalizeAgentDisplayName(message.displayName || agentId),
     origin: String(message.origin || "").slice(0, 512),
     pathname: String(message.pathname || "").slice(0, 1024),
@@ -713,6 +738,47 @@ function registerAgent(message, now = Date.now()) {
   return {
     ok: true,
     type: "agent-register",
+    agent,
+    agents: listAgents(now)
+  };
+}
+
+async function registerTmuxAiAgent(message, now = Date.now()) {
+  const agentId = validateAgentId(message.agentId, "agentId");
+  const role = validateAgentRole(message.role);
+  const target = normalizeTmuxTarget(message.target || message.tmuxTarget || "");
+  if (!target) {
+    return agentHubError("missing-tmux-target", "Missing tmux target for tmux-ai agent.", { type: "agent-register-tmux-ai", agentId });
+  }
+  const panes = await listTmuxPanes();
+  const pane = resolveTmuxTarget(target, panes);
+  if (!pane) {
+    return agentHubError("tmux-target-not-found", `Tmux target not found or ambiguous: ${target}`, {
+      type: "agent-register-tmux-ai",
+      agentId,
+      target,
+      tmuxPanes: panes
+    });
+  }
+  const agent = {
+    agentId,
+    role,
+    surface: "tmux-ai",
+    replyMode: "cli",
+    displayName: normalizeAgentDisplayName(message.displayName || agentId),
+    tmuxTarget: target,
+    tmuxPaneId: pane.id,
+    tmuxTargetName: pane.label,
+    tmuxSession: pane.session,
+    tmuxWindowName: pane.windowName,
+    tmuxAddress: pane.address,
+    registeredAt: agentHubState.roster.get(agentId)?.registeredAt || now,
+    lastSeenAt: now
+  };
+  agentHubState.roster.set(agentId, agent);
+  return {
+    ok: true,
+    type: "agent-register-tmux-ai",
     agent,
     agents: listAgents(now)
   };
@@ -734,11 +800,187 @@ function sendAgentMessage(message, now = Date.now()) {
   if (!agentHubState.roster.has(to)) {
     return agentHubError("recipient-not-registered", `Agent recipient is not registered: ${to}`, { type: "agent-send", to });
   }
+  const recipient = agentHubState.roster.get(to);
+  if (recipient?.surface === "tmux-ai") {
+    return agentHubError("tmux-ai-send-requires-async", "tmux-ai delivery requires the async agent hub path.", { type: "agent-send", to });
+  }
 
   const taskId = normalizeAgentTaskId(message.taskId || "");
   const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
   if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
     return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-send", messageId });
+  }
+  const replyTo = normalizeAgentMessageId(message.replyTo || "");
+  const replyValidation = validatePollAgentReplyTo({ from, to, replyTo, taskId, now });
+  if (!replyValidation.ok) {
+    return replyValidation;
+  }
+
+  const envelope = {
+    messageId,
+    from,
+    to,
+    taskId,
+    replyTo,
+    body,
+    createdAt: now,
+    ackedAt: 0,
+    deliverySurface: "web",
+    replyMode: "poll"
+  };
+  agentHubState.mailbox.push(envelope);
+  if (replyValidation.original) {
+    replyValidation.original.repliedAt = now;
+    replyValidation.original.replyMessageId = messageId;
+  }
+  pruneAgentMailbox();
+  return {
+    ok: true,
+    type: "agent-send",
+    message: envelope
+  };
+}
+
+function validatePollAgentReplyTo({ from, to, replyTo, taskId, now }) {
+  if (!replyTo) {
+    return { ok: true, original: null };
+  }
+  const original = agentHubState.mailbox.find((item) => item.messageId === replyTo && item.deliverySurface !== "tmux-ai");
+  if (!original) {
+    return agentHubError("reply-target-not-found", `Reply target not found for ${from}: ${replyTo}`, { type: "agent-send", from, replyTo });
+  }
+  if (original.from !== to || original.to !== from) {
+    return agentHubError("reply-recipient-mismatch", `Agent reply route must match original ${original.from}->${original.to}: ${from}->${to}`, {
+      type: "agent-send",
+      from,
+      to,
+      replyTo
+    });
+  }
+  if (taskId && original.taskId && taskId !== original.taskId) {
+    return agentHubError("reply-task-mismatch", `Agent reply task-id must match original task ${original.taskId}: ${taskId}`, {
+      type: "agent-send",
+      from,
+      replyTo,
+      taskId
+    });
+  }
+  if (original.repliedAt) {
+    return agentHubError("duplicate-reply", `Agent task already has a reply: ${replyTo}`, {
+      type: "agent-send",
+      from,
+      replyTo,
+      replyMessageId: original.replyMessageId || "",
+      repliedAt: original.repliedAt || now
+    });
+  }
+  return { ok: true, original };
+}
+
+function getAgentTaskStatus(message, now = Date.now()) {
+  const agentId = validateAgentId(message.agentId || message.from, "agentId");
+  if (!touchAgent(agentId, now)) {
+    return agentHubError("sender-not-registered", `Agent is not registered: ${agentId}`, { type: "agent-task-status", agentId });
+  }
+  const messageId = normalizeAgentMessageId(message.messageId || "");
+  const taskId = normalizeAgentTaskId(message.taskId || "");
+  if (!messageId && !taskId) {
+    return agentHubError("missing-message-id", "Missing messageId or taskId for task status.", { type: "agent-task-status", agentId });
+  }
+  const task = agentHubState.mailbox.find((item) =>
+    (messageId && item.messageId === messageId || taskId && item.taskId === taskId) &&
+    canInspectAgentTask(agentId, item)
+  );
+  if (!task) {
+    return agentHubError("task-not-found", `Agent task not found for ${agentId}: ${messageId || taskId}`, { type: "agent-task-status", agentId, messageId, taskId });
+  }
+  const replyMessage = task.replyMessageId
+    ? agentHubState.mailbox.find((item) => item.messageId === task.replyMessageId) || null
+    : task.replyTo ? task : null;
+  const status = getAgentTaskStatusName(task, replyMessage);
+  return {
+    ok: true,
+    type: "agent-task-status",
+    agentId,
+    status,
+    ageMs: Math.max(0, now - Number(task.createdAt || now)),
+    message: task,
+    replyMessage,
+    nextAction: getAgentTaskStatusNextAction(status, task)
+  };
+}
+
+function canInspectAgentTask(agentId, item) {
+  return item.from === agentId || item.to === agentId ||
+    (item.replyTo && agentHubState.mailbox.some((original) =>
+      original.messageId === item.replyTo && (original.from === agentId || original.to === agentId)
+    ));
+}
+
+function getAgentTaskStatusName(task, replyMessage) {
+  if (task.replyTo) {
+    return task.ackedAt ? "reply-acked" : "reply-waiting-for-master";
+  }
+  if (replyMessage) {
+    return replyMessage.ackedAt ? "replied-and-acked" : "replied-waiting-for-master";
+  }
+  if (task.deliverySurface === "tmux-ai" && task.replyMode === "cli") {
+    return task.repliedAt ? "replied-waiting-for-master" : "waiting-for-tmux-ai-reply";
+  }
+  if (!task.ackedAt) {
+    return "waiting-for-recipient-poll";
+  }
+  return "delivered-waiting-for-reply";
+}
+
+function getAgentTaskStatusNextAction(status, task) {
+  if (status === "waiting-for-recipient-poll") {
+    return `Wait for ${task.to} to poll, or open that agent page and click Save/Check.`;
+  }
+  if (status === "delivered-waiting-for-reply") {
+    return `Wait for ${task.to} to complete the task and send a reply-to ${task.messageId} result.`;
+  }
+  if (status === "waiting-for-tmux-ai-reply") {
+    return "Keep the tmux-ai pane running. If it is stuck, inspect the pane and rerun the reply command from the task prompt.";
+  }
+  if (status === "replied-waiting-for-master" || status === "reply-waiting-for-master") {
+    return "Open the master page and wait for polling, or click Check to verify the page is still registered.";
+  }
+  return "No action required unless the master needs another task.";
+}
+
+async function sendAgentMessageAsync(message, now = Date.now()) {
+  const from = validateAgentId(message.from || message.agentId, "from");
+  const to = validateAgentId(message.to, "to");
+  const sender = agentHubState.roster.get(from);
+  if (!sender) {
+    return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-send", from });
+  }
+  touchAgent(from, now);
+  const recipient = agentHubState.roster.get(to);
+  if (!recipient) {
+    return agentHubError("recipient-not-registered", `Agent recipient is not registered: ${to}`, { type: "agent-send", to });
+  }
+  if (recipient.surface !== "tmux-ai") {
+    return sendAgentMessage(message, now);
+  }
+
+  const body = String(message.body || "");
+  if (!body.trim()) {
+    return agentHubError("missing-body", "Missing agent message body.", { type: "agent-send" });
+  }
+  if (body.length > AGENT_MESSAGE_MAX_CHARS) {
+    return agentHubError("message-too-large", `Agent message body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-send" });
+  }
+  const taskId = normalizeAgentTaskId(message.taskId || "");
+  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
+  if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
+    return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-send", messageId });
+  }
+
+  const delivery = await deliverTmuxAiTask({ sender, recipient, body, taskId, messageId, now });
+  if (!delivery.ok) {
+    return delivery;
   }
 
   const envelope = {
@@ -748,14 +990,170 @@ function sendAgentMessage(message, now = Date.now()) {
     taskId,
     body,
     createdAt: now,
-    ackedAt: 0
+    ackedAt: now,
+    deliveredAt: now,
+    deliverySurface: "tmux-ai",
+    replyMode: "cli",
+    replyBodyFile: delivery.replyBodyFile,
+    tmuxPaneId: delivery.tmuxPaneId,
+    tmuxTargetName: delivery.tmuxTargetName,
+    repliedAt: 0,
+    replyMessageId: ""
   };
   agentHubState.mailbox.push(envelope);
   pruneAgentMailbox();
   return {
     ok: true,
     type: "agent-send",
-    message: envelope
+    message: envelope,
+    delivery: {
+      surface: "tmux-ai",
+      status: "delivered",
+      replyMode: "cli",
+      tmuxPaneId: delivery.tmuxPaneId,
+      tmuxTargetName: delivery.tmuxTargetName,
+      replyBodyFile: delivery.replyBodyFile,
+      replyScriptFile: delivery.replyScriptFile,
+      replyCommand: delivery.replyCommand,
+      fullReplyCommand: delivery.fullReplyCommand,
+      nextStep: delivery.nextStep
+    }
+  };
+}
+
+async function deliverTmuxAiTask({ sender, recipient, body, taskId, messageId, now }) {
+  const panes = await listTmuxPanes();
+  const pane = resolveTmuxTarget(recipient.tmuxPaneId || recipient.tmuxTarget, panes);
+  if (!pane) {
+    return agentHubError("tmux-target-unavailable", `Tmux target is no longer available for ${recipient.agentId}: ${recipient.tmuxTarget || recipient.tmuxPaneId || ""}`, {
+      type: "agent-send",
+      to: recipient.agentId,
+      tmuxTarget: recipient.tmuxTarget || "",
+      tmuxPaneId: recipient.tmuxPaneId || "",
+      tmuxPanes: panes
+    });
+  }
+  recipient.tmuxPaneId = pane.id;
+  recipient.tmuxTargetName = pane.label;
+  recipient.tmuxSession = pane.session;
+  recipient.tmuxWindowName = pane.windowName;
+  recipient.tmuxAddress = pane.address;
+  recipient.lastSeenAt = now;
+
+  const replyBodyFile = path.join(AGENT_REPLY_DIR, `${safeFilePart(messageId)}-${safeFilePart(recipient.agentId)}.md`);
+  const fullReplyCommand = buildAgentReplyCommand({
+    from: recipient.agentId,
+    to: sender.agentId,
+    taskId,
+    replyTo: messageId,
+    bodyFile: replyBodyFile
+  });
+  const replyScriptFile = path.join(AGENT_REPLY_DIR, `${safeFilePart(messageId)}-${safeFilePart(recipient.agentId)}-reply.sh`);
+  writeAgentReplyScript(replyScriptFile, fullReplyCommand);
+  const replyCommand = `sh ${shellQuote(replyScriptFile)}`;
+  const prompt = buildTmuxAiTaskPrompt({
+    from: sender.agentId,
+    to: recipient.agentId,
+    role: recipient.role,
+    taskId,
+    messageId,
+    body,
+    replyBodyFile,
+    replyCommand
+  });
+  await sendTextToTmuxPane(pane.id, prompt);
+  return {
+    ok: true,
+    tmuxPaneId: pane.id,
+    tmuxTargetName: pane.label,
+    replyBodyFile,
+    replyScriptFile,
+    replyCommand,
+    fullReplyCommand,
+    nextStep: `The tmux AI must write its final answer to ${replyBodyFile}, then run the short reply script command ${replyCommand}.`
+  };
+}
+
+function replyAgentMessage(message, now = Date.now()) {
+  const from = validateAgentId(message.from || message.agentId, "from");
+  const to = validateAgentId(message.to, "to");
+  const sender = agentHubState.roster.get(from);
+  if (!sender) {
+    return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-reply", from });
+  }
+  if (sender.surface !== "tmux-ai") {
+    return agentHubError("sender-not-tmux-ai", `Agent reply sender must be a tmux-ai agent: ${from}`, { type: "agent-reply", from });
+  }
+  touchAgent(from, now);
+  if (!agentHubState.roster.has(to)) {
+    return agentHubError("recipient-not-registered", `Agent recipient is not registered: ${to}`, { type: "agent-reply", to });
+  }
+  const body = String(message.body || "");
+  if (!body.trim()) {
+    return agentHubError("missing-body", "Missing agent reply body.", { type: "agent-reply" });
+  }
+  if (body.length > AGENT_MESSAGE_MAX_CHARS) {
+    return agentHubError("message-too-large", `Agent reply body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-reply" });
+  }
+  const replyTo = normalizeAgentMessageId(message.replyTo || "");
+  if (!replyTo) {
+    return agentHubError("missing-reply-to", "Missing replyTo message id.", { type: "agent-reply", from });
+  }
+  const original = agentHubState.mailbox.find((item) => item.messageId === replyTo && item.to === from && item.deliverySurface === "tmux-ai");
+  if (!original) {
+    return agentHubError("reply-target-not-found", `Reply target not found for ${from}: ${replyTo}`, { type: "agent-reply", from, replyTo });
+  }
+  if (to !== original.from) {
+    return agentHubError("reply-recipient-mismatch", `Agent reply recipient must match original sender ${original.from}: ${to}`, {
+      type: "agent-reply",
+      from,
+      to,
+      replyTo
+    });
+  }
+  const taskId = normalizeAgentTaskId(message.taskId || original.taskId || "");
+  if (message.taskId && original.taskId && taskId !== original.taskId) {
+    return agentHubError("reply-task-mismatch", `Agent reply task-id must match original task ${original.taskId}: ${taskId}`, {
+      type: "agent-reply",
+      from,
+      replyTo,
+      taskId
+    });
+  }
+  if (original.repliedAt) {
+    return agentHubError("duplicate-reply", `Agent task already has a reply: ${replyTo}`, {
+      type: "agent-reply",
+      from,
+      replyTo,
+      replyMessageId: original.replyMessageId || ""
+    });
+  }
+  const messageId = normalizeAgentMessageId(message.messageId || `reply-${now}-${crypto.randomBytes(6).toString("hex")}`);
+  if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
+    return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-reply", messageId });
+  }
+  const envelope = {
+    messageId,
+    from,
+    to,
+    taskId,
+    replyTo,
+    body,
+    createdAt: now,
+    ackedAt: 0,
+    deliverySurface: "web",
+    replyMode: "poll"
+  };
+  agentHubState.mailbox.push(envelope);
+  original.repliedAt = now;
+  original.replyMessageId = messageId;
+  pruneAgentMailbox();
+  return {
+    ok: true,
+    type: "agent-reply",
+    message: envelope,
+    repliedTo: replyTo,
+    repliedAt: now
   };
 }
 
@@ -808,6 +1206,9 @@ function listAgents(now = Date.now(), pending = countPendingAgentMessages()) {
 
 function pruneAgentRoster(now = Date.now()) {
   for (const [agentId, agent] of agentHubState.roster.entries()) {
+    if (agent.surface === "tmux-ai") {
+      continue;
+    }
     if (now - Number(agent.lastSeenAt || 0) > AGENT_ROSTER_TTL_MS) {
       agentHubState.roster.delete(agentId);
     }
@@ -824,15 +1225,29 @@ function touchAgent(agentId, now = Date.now()) {
 }
 
 function pruneAgentMailbox() {
-  if (agentHubState.mailbox.length <= AGENT_MAILBOX_LIMIT) {
-    return;
+  agentHubState.mailbox = pruneAgentMailboxItems(agentHubState.mailbox, AGENT_MAILBOX_LIMIT);
+}
+
+function pruneAgentMailboxItems(mailbox, limit = AGENT_MAILBOX_LIMIT) {
+  if (!Array.isArray(mailbox) || mailbox.length <= limit) {
+    return Array.isArray(mailbox) ? mailbox : [];
   }
-  const unacked = agentHubState.mailbox.filter((item) => !item.ackedAt);
-  const acked = agentHubState.mailbox.filter((item) => item.ackedAt);
-  agentHubState.mailbox = [
-    ...acked.slice(Math.max(0, acked.length - Math.floor(AGENT_MAILBOX_LIMIT / 4))),
-    ...unacked.slice(Math.max(0, unacked.length - AGENT_MAILBOX_LIMIT))
+  const replyPendingTmuxAiTasks = mailbox.filter(isReplyPendingTmuxAiTask);
+  const protectedMessageIds = new Set(replyPendingTmuxAiTasks.map((item) => item.messageId));
+  const unacked = mailbox.filter((item) => !item.ackedAt && !protectedMessageIds.has(item.messageId));
+  const acked = mailbox.filter((item) => item.ackedAt && !protectedMessageIds.has(item.messageId));
+  return [
+    ...replyPendingTmuxAiTasks,
+    ...acked.slice(Math.max(0, acked.length - Math.floor(limit / 4))),
+    ...unacked.slice(Math.max(0, unacked.length - limit))
   ];
+}
+
+function isReplyPendingTmuxAiTask(item) {
+  return item?.deliverySurface === "tmux-ai" &&
+    item.replyMode === "cli" &&
+    !item.repliedAt &&
+    Boolean(item.messageId);
 }
 
 function countPendingAgentMessages() {
@@ -843,6 +1258,81 @@ function countPendingAgentMessages() {
     }
   }
   return counts;
+}
+
+function buildAgentReplyCommand({ from, to, taskId, replyTo, bodyFile }) {
+  return [
+    shellQuote(process.execPath),
+    shellQuote(path.join(ROOT_DIR, "server", "agent_reply_cli.js")),
+    "--from",
+    shellQuote(from),
+    "--to",
+    shellQuote(to),
+    taskId ? `--task-id ${shellQuote(taskId)}` : "",
+    "--reply-to",
+    shellQuote(replyTo),
+    "--body-file",
+    shellQuote(bodyFile)
+  ].filter(Boolean).join(" ");
+}
+
+function writeAgentReplyScript(scriptFile, fullReplyCommand) {
+  fs.mkdirSync(path.dirname(scriptFile), { recursive: true });
+  fs.writeFileSync(scriptFile, [
+    "#!/usr/bin/env sh",
+    "set -eu",
+    fullReplyCommand,
+    ""
+  ].join("\n"), { mode: 0o700 });
+}
+
+function buildTmuxAiTaskPrompt({ from, to, role, taskId, messageId, body, replyBodyFile, replyCommand }) {
+  const command = replyCommand || buildAgentReplyCommand({
+    from: to,
+    to: from,
+    taskId,
+    replyTo: messageId,
+    bodyFile: replyBodyFile
+  });
+  return [
+    "You are registered as a local tmux AI agent.",
+    "Reply path is explicit: write final answer to the reply file, then run the CLI command.",
+    "If the CLI fails, read its JSON error and fix the listed field before retrying once.",
+    "",
+    "Identity:",
+    `Agent id: ${to}`,
+    `Role: ${role}`,
+    `Task from: ${from}`,
+    taskId ? `Task id: ${taskId}` : "Task id: (none)",
+    `Message id: ${messageId}`,
+    "",
+    "Task:",
+    body,
+    "",
+    "Reply file:",
+    replyBodyFile,
+    "",
+    "Reply command (short):",
+    command,
+    "",
+    "The short command already contains all CLI flags. Do not reconstruct or memorize the long agent_reply_cli.js command.",
+    "",
+    "Do not report completion only in this terminal. The master receives results only through the CLI."
+  ].join("\n");
+}
+
+async function sendTextToTmuxPane(paneId, text) {
+  const value = String(text || "");
+  const chunkSize = 500;
+  for (let offset = 0; offset < value.length; offset += chunkSize) {
+    await runTmuxCommand(["send-keys", "-t", paneId, "-l", value.slice(offset, offset + chunkSize)], { timeoutMs: 5000 });
+  }
+  await sleep(150);
+  await runTmuxCommand(["send-keys", "-t", paneId, "Enter"], { timeoutMs: 5000 });
+}
+
+function safeFilePart(value) {
+  return String(value || "").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 96) || "agent";
 }
 
 function validateAgentId(value, fieldName) {
@@ -888,12 +1378,75 @@ function normalizeAgentMessageId(value) {
 }
 
 function agentHubError(errorCode, error, extra = {}) {
+  const explanation = explainAgentHubError(errorCode, extra);
   return {
     ok: false,
     errorCode,
     error,
+    ...explanation,
     ...extra
   };
+}
+
+function explainAgentHubError(errorCode, extra = {}) {
+  const type = String(extra.type || "");
+  if (errorCode === "recipient-not-registered") {
+    return {
+      hint: "The target agent is not online in the local agent hub.",
+      nextAction: "Open the target web page or register the tmux-ai pane, click Save/Register, then run Agent Check or Roster before resending."
+    };
+  }
+  if (errorCode === "sender-not-registered") {
+    return {
+      hint: "The sending page or tmux-ai runtime is not registered with this server.",
+      nextAction: type === "agent-reply"
+        ? "Register the tmux-ai pane from the master page again, then rerun the latest reply command."
+        : "Set this page role to master or slave, click Save, then resend the task."
+    };
+  }
+  if (errorCode === "tmux-target-not-found" || errorCode === "tmux-target-unavailable") {
+    return {
+      hint: "The selected tmux target cannot be resolved to one active pane.",
+      nextAction: "Start the AI in tmux, click Refresh in the master panel, select the exact pane, then Register it again."
+    };
+  }
+  if (errorCode === "missing-body") {
+    return {
+      hint: "The agent message has no task/result body.",
+      nextAction: "Add the task or result text below the blank line in the agent helper block, then retry."
+    };
+  }
+  if (errorCode === "duplicate-message-id") {
+    return {
+      hint: "The same message id was already accepted by the local hub.",
+      nextAction: "Use a new helper identity or wait for the current task to complete before resending."
+    };
+  }
+  if (errorCode === "duplicate-reply") {
+    return {
+      hint: "The original task already has a recorded reply.",
+      nextAction: "Do not rerun this reply. Ask the master to create a new task if another result is needed."
+    };
+  }
+  if (errorCode === "reply-target-not-found") {
+    return {
+      hint: "The reply-to message id does not match an active task for this sender.",
+      nextAction: "Copy the reply-to value from the current task prompt, not from an older task."
+    };
+  }
+  if (errorCode === "reply-recipient-mismatch") {
+    return {
+      hint: "The reply route does not match the original task sender and recipient.",
+      nextAction: "Use the to/from values from the task prompt exactly."
+    };
+  }
+  if (errorCode === "reply-task-mismatch") {
+    return {
+      hint: "The reply task id does not match the original task.",
+      nextAction: "Copy the task-id from the task prompt exactly."
+    };
+  }
+  return {};
 }
 
 async function handleVisionMessage(message) {
@@ -3844,13 +4397,17 @@ module.exports = {
   getVisionHelperPath,
   getVisionTmuxAppNames,
   handleAgentHubMessage,
+  handleAgentHubMessageAsync,
   handleMessageText,
   handleVisionMessage,
+  buildAgentReplyCommand,
+  buildTmuxAiTaskPrompt,
   listTmuxPanes,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
   parseVisionDoneFromText,
+  pruneAgentMailboxItems,
   prepareStateLogFile,
   readBoardLogFromOffset,
   resetAgentHubForTests,

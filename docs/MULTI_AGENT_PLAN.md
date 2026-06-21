@@ -166,6 +166,26 @@ Verification:
 - Disabled hosts do not register or poll.
 - Malicious agent IDs and oversized messages are rejected.
 
+### Step 9: Tmux AI Agent Runtime
+
+Goal: allow a user-selected tmux pane running an AI teammate to join the same local agent roster as `master` or `slave`.
+
+Implementation:
+
+- Add `surface: "tmux-ai"` and `replyMode: "cli"` to the agent roster model.
+- Add `agent-register-tmux-ai` to register an explicit tmux target after resolving it to a pane id.
+- When `agent-send` targets a `tmux-ai` recipient, paste a task prompt into the pane instead of storing it for web polling.
+- The prompt includes agent id, role, sender, task id, message id, result body-file path, and a short per-task `sh ...-reply.sh` command. The generated script wraps the longer `node server/agent_reply_cli.js --from --to --task-id --reply-to --body-file ...` command so the tmux AI does not need to copy every flag.
+- Add `agent-reply` for the tmux-hosted AI to return results by CLI. The server validates that the sender is a registered `tmux-ai` agent and that `replyTo` points to an unreplied task for that agent.
+- Do not scan tmux output for replies. The CLI is the only completion channel for tmux-ai agents.
+
+Verification:
+
+- `tests/tmux_agent_integration.test.js` covers tmux target registration, prompt delivery, CLI-style reply insertion into the master mailbox, duplicate reply rejection, and missing target errors.
+- `tests/agent_reply_cli.test.js` covers CLI argument parsing, body-file validation, and WebSocket payload forwarding.
+- `tests/chrome_extension_e2e.test.js` covers web master -> tmux-ai slave -> CLI reply -> web master delivery.
+- Final manual/terminal validation uses a real `claude` process in tmux as the tmux-ai runtime.
+
 ## Deferred Work
 
 - Persistent mailbox across server restarts.

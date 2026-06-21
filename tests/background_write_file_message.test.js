@@ -111,8 +111,8 @@ const context = {
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       releaseVersion: "0.6.0",
       serverReleaseVersion: "0.6.0",
-      protocolVersion: 3,
-      serverProtocolVersion: 3,
+      protocolVersion: 4,
+      serverProtocolVersion: 4,
       helperProtocolVersion: 1
     })
   }),

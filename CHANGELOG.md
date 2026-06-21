@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## [0.7.0] - 2026-06-21
 
-- Nothing yet.
+- Adds tmux-ai agents: an explicit tmux pane can register as a `master` or `slave` AI runtime and receive task prompts from the local agent hub.
+- Adds the `agent-register-tmux-ai` and `agent-reply` hub messages plus `server/agent_reply_cli.js`, so tmux-hosted AI teammates return results by actively calling the CLI instead of relying on tmux output parsing.
+- Bumps the shell server protocol to `4` while keeping helper protocol `1`, because tmux-ai agent registration and CLI reply support require matching server/background behavior.
+- Extends the manual test page, tmux integration coverage, CLI tests, background forwarding tests, and Chrome e2e to cover web master -> tmux-ai slave -> CLI reply -> web master delivery.
+- Adds an opt-in real Claude Code tmux slave e2e test for the full web master panel -> tmux-ai Claude -> CLI reply -> web master page path.
+- Adds `reply-to` correlation for web slave replies, agent task status diagnostics, clearer agent hub error hints, and a project-level Claude Code skill for tmux-ai slave reply workflow.
+- Generates a short per-task reply script for tmux-ai slaves so the AI only needs to write the reply file and run `sh ...-reply.sh`; the script wraps the longer CLI flags.
 
 ## [0.6.0] - 2026-06-21
 

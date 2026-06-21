@@ -30,6 +30,8 @@ class FakeWebSocket {
           ok: true,
           type: payload.type,
           agentId: payload.agentId,
+          from: payload.from,
+          to: payload.to,
           messageId: payload.messageId,
           messages: payload.type === "agent-poll" ? [] : undefined
         })
@@ -82,7 +84,7 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       releaseVersion: "0.6.0",
-      serverProtocolVersion: 3,
+      serverProtocolVersion: 4,
       helperProtocolVersion: 1,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       pid: 123
@@ -107,13 +109,23 @@ vm.runInContext(script, context, { filename: "background.js" });
   assert.equal(sentPayloads[0].agentId, "master");
 
   response = await context.handleAgentMessage({
+    type: "agent-register-tmux-ai",
+    agentId: "slave-tmux",
+    role: "slave",
+    target: "AgentSession:0.0"
+  });
+  assert.equal(response.ok, true);
+  assert.equal(sentPayloads[1].type, "agent-register-tmux-ai");
+  assert.equal(sentPayloads[1].target, "AgentSession:0.0");
+
+  response = await context.handleAgentMessage({
     type: "agent-send",
     from: "master",
     to: "slave-a",
     body: "hello"
   });
   assert.equal(response.ok, true);
-  assert.equal(sentPayloads[1].type, "agent-send");
+  assert.equal(sentPayloads[2].type, "agent-send");
 
   response = await context.handleAgentMessage({
     type: "agent-poll",
@@ -122,7 +134,7 @@ vm.runInContext(script, context, { filename: "background.js" });
   assert.equal(response.ok, true);
   assert.equal(Array.isArray(response.messages), true);
   assert.equal(response.messages.length, 0);
-  assert.equal(sentPayloads[2].type, "agent-poll");
+  assert.equal(sentPayloads[3].type, "agent-poll");
 
   response = await context.handleAgentMessage({
     type: "agent-ack",
@@ -130,7 +142,26 @@ vm.runInContext(script, context, { filename: "background.js" });
     messageId: "msg-1"
   });
   assert.equal(response.ok, true);
-  assert.equal(sentPayloads[3].type, "agent-ack");
+  assert.equal(sentPayloads[4].type, "agent-ack");
+
+  response = await context.handleAgentMessage({
+    type: "agent-task-status",
+    agentId: "master",
+    messageId: "msg-1"
+  });
+  assert.equal(response.ok, true);
+  assert.equal(sentPayloads[5].type, "agent-task-status");
+
+  response = await context.handleAgentMessage({
+    type: "agent-reply",
+    from: "slave-tmux",
+    to: "master",
+    replyTo: "msg-1",
+    body: "done"
+  });
+  assert.equal(response.ok, true);
+  assert.equal(sentPayloads[6].type, "agent-reply");
+  assert.equal(sentPayloads[6].replyTo, "msg-1");
 
   response = await context.handleAgentMessage({
     type: "agent-delete-everything",
@@ -138,7 +169,7 @@ vm.runInContext(script, context, { filename: "background.js" });
   });
   assert.equal(response.ok, false);
   assert.match(response.error, /Unsupported background agent message type/);
-  assert.equal(sentPayloads.length, 4);
+  assert.equal(sentPayloads.length, 7);
 
   console.log("background agent message tests passed");
 })();

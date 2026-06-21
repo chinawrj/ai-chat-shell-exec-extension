@@ -277,6 +277,7 @@ const agentMessageBlock = [
   "ai-helper-agent-message-start",
   "to: slave-a",
   "task-id: task-001",
+  "reply-to: msg-parent-001",
   "",
   "Inspect parser behavior.",
   "Report back with findings.",
@@ -288,6 +289,7 @@ assert.equal(parsedAgentMessage.kind, "agent-message");
 assert.equal(parsedAgentMessage.helperIdSource, "payload-hash");
 assert.equal(parsedAgentMessage.to, "slave-a");
 assert.equal(parsedAgentMessage.taskId, "task-001");
+assert.equal(parsedAgentMessage.replyTo, "msg-parent-001");
 assert.equal(parsedAgentMessage.body, "Inspect parser behavior.\nReport back with findings.");
 assert.equal(context.validateHelperCall(parsedAgentMessage).ok, true);
 assert.equal(context.isRunnableHelperCall(parsedAgentMessage), true);
@@ -347,6 +349,17 @@ const unsafeAgentRecipient = context.parseCallPayload([
 assert.equal(context.validateHelperCall(unsafeAgentRecipient).ok, false);
 assert.match(context.validateHelperCall(unsafeAgentRecipient).reason, /safe agent id/);
 
+const unsafeAgentReplyTo = context.parseCallPayload([
+  "ai-helper-agent-message-start",
+  "to: master",
+  "reply-to: ../msg",
+  "",
+  "hello",
+  "ai-helper-agent-message-end"
+].join("\n"));
+assert.equal(context.validateHelperCall(unsafeAgentReplyTo).ok, false);
+assert.match(context.validateHelperCall(unsafeAgentReplyTo).reason, /reply-to must be a safe message id/);
+
 const emptyAgentBody = context.parseCallPayload([
   "ai-helper-agent-message-start",
   "to: slave-a",
@@ -361,6 +374,7 @@ const slaveInboundPrompt = context.formatInboundAgentPrompt({
   agentId: "slave-a"
 }, {
   from: "master",
+  messageId: "msg-001",
   taskId: "task-001",
   body: "Inspect parser behavior."
 });
@@ -368,6 +382,7 @@ assert.match(slaveInboundPrompt, /You are slave-a/);
 assert.match(slaveInboundPrompt, /ai-helper-agent-message-start/);
 assert.match(slaveInboundPrompt, /to: master/);
 assert.match(slaveInboundPrompt, /task-id: task-001/);
+assert.match(slaveInboundPrompt, /reply-to: msg-001/);
 assert.match(slaveInboundPrompt, /ai-helper-agent-message-end/);
 
 const masterInboundPrompt = context.formatInboundAgentPrompt({

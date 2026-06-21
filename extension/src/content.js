@@ -15,8 +15,9 @@ const AGENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
+const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.6.0";
+const CONTENT_SCRIPT_VERSION = "0.7.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -63,6 +64,7 @@ let extensionVersionWarning = "";
 let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
 let pendingAgentDeliveryMessageId = "";
+let pendingAgentDelivery = null;
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -1028,6 +1030,7 @@ function parseAgentMessageLines(lines) {
   return {
     to: headers.to || "",
     taskId: headers["task-id"] || "",
+    replyTo: headers["reply-to"] || "",
     body: bodyLines.join("\n"),
     agentHeaderError: malformedHeaders.length > 0
       ? `Malformed agent message header: ${malformedHeaders[0]}`
@@ -1233,6 +1236,10 @@ function validateAgentMessageCall(call) {
   const taskId = normalizeCommand(call.taskId || "");
   if (taskId && !AGENT_TASK_ID_PATTERN.test(taskId)) {
     return { ok: false, reason: "Agent message task-id must be a safe id without spaces." };
+  }
+  const replyTo = normalizeCommand(call.replyTo || "");
+  if (replyTo && !AGENT_MESSAGE_ID_PATTERN.test(replyTo)) {
+    return { ok: false, reason: "Agent message reply-to must be a safe message id." };
   }
   const body = String(call.body || "");
   if (!body.trim()) {
@@ -1518,6 +1525,7 @@ async function sendAgentMessage(callId, call, force) {
     from: profile.agentId,
     to: call.to,
     taskId: call.taskId || "",
+    replyTo: call.replyTo || "",
     body: call.body || "",
     callMeta: {
       origin: location.origin,
@@ -1623,7 +1631,7 @@ function stopAgentPolling() {
     agentPollTimer = 0;
   }
   agentDeliveryInFlight = false;
-  pendingAgentDeliveryMessageId = "";
+  clearPendingAgentDelivery();
 }
 
 async function runAgentPollLoop() {
@@ -1648,6 +1656,15 @@ async function pollAndDeliverAgentMessage() {
     return;
   }
 
+  if (pendingAgentDelivery) {
+    if (pendingAgentDelivery.profileAgentId === profile.agentId) {
+      await deliverAgentMessageToPage(profile, pendingAgentDelivery.message);
+      return;
+    }
+    clearPendingAgentDelivery();
+    setStatus(`Cleared pending agent delivery after profile changed to ${profile.agentId}`, "idle");
+  }
+
   const response = await chrome.runtime.sendMessage({
     type: "agent-poll",
     agentId: profile.agentId,
@@ -1667,31 +1684,143 @@ async function pollAndDeliverAgentMessage() {
     return;
   }
 
+  await deliverAgentMessageToPage(profile, message);
+}
+
+async function deliverAgentMessageToPage(profile, message) {
   agentDeliveryInFlight = true;
   try {
-    if (pendingAgentDeliveryMessageId !== message.messageId) {
-      const text = formatInboundAgentPrompt(profile, message);
+    const pending = ensurePendingAgentDelivery(profile, message);
+    if (pending.sent) {
+      await ackSentPendingAgentMessage(profile, message, pending);
+      return;
+    }
+    if (pending.inserted && !agentDeliveryPromptStillPresent(pending)) {
+      pending.inserted = false;
+      pending.lastError = "inserted prompt no longer present";
+      pending.updatedAt = Date.now();
+      updatePendingAgentDeliveryPanel();
+    }
+    if (!pending.inserted) {
+      const text = pending.promptText || formatInboundAgentPrompt(profile, message);
       setStatus(`Delivering agent message from ${message.from || "(unknown)"}`, "running");
-      await insertReply(text);
-      pendingAgentDeliveryMessageId = message.messageId;
+      try {
+        await insertReply(text);
+        pending.inserted = true;
+        pending.lastError = "";
+        pending.updatedAt = Date.now();
+        updatePendingAgentDeliveryPanel();
+      } catch (error) {
+        pending.lastError = error.message || String(error);
+        pending.updatedAt = Date.now();
+        setStatus(`Agent message ${message.messageId} cached; waiting for chat composer`, "running");
+        updatePendingAgentDeliveryPanel();
+        return;
+      }
     } else {
       setStatus(`Agent message ${message.messageId} is waiting for send button`, "running");
     }
     const sent = await clickSendWhenReady();
     if (!sent) {
-      setStatus("Agent message inserted once; waiting for send button", "error");
+      pending.lastError = "send button not ready";
+      pending.updatedAt = Date.now();
+      setStatus("Agent message cached in panel; waiting for AI page to be ready", "running");
+      updatePendingAgentDeliveryPanel();
       return;
     }
-    const ack = await ackDeliveredAgentMessage(profile, message);
-    if (!ack?.ok) {
-      setStatus(`Agent message delivered but ack failed: ${summarizeCommand(ack?.error || "unknown")}`, "error");
-      return;
-    }
-    pendingAgentDeliveryMessageId = "";
-    setStatus(`Delivered agent message ${message.messageId}`, "ok");
+    pending.sent = true;
+    pending.lastError = "";
+    pending.updatedAt = Date.now();
+    updatePendingAgentDeliveryPanel();
+    await ackSentPendingAgentMessage(profile, message, pending);
   } finally {
     agentDeliveryInFlight = false;
   }
+}
+
+async function ackSentPendingAgentMessage(profile, message, pending) {
+  const ack = await ackDeliveredAgentMessage(profile, message);
+  if (!ack?.ok) {
+    pending.lastError = ack?.error || "ack failed";
+    pending.updatedAt = Date.now();
+    updatePendingAgentDeliveryPanel();
+    setStatus(`Agent message sent; waiting to ack local hub: ${summarizeCommand(ack?.error || "unknown")}`, "running");
+    return;
+  }
+  clearPendingAgentDelivery();
+  setStatus(`Delivered agent message ${message.messageId}`, "ok");
+}
+
+function ensurePendingAgentDelivery(profile, message) {
+  if (pendingAgentDelivery?.messageId === message.messageId) {
+    pendingAgentDelivery.message = message;
+    pendingAgentDelivery.updatedAt = Date.now();
+    updatePendingAgentDeliveryPanel();
+    return pendingAgentDelivery;
+  }
+
+  pendingAgentDelivery = {
+    messageId: message.messageId,
+    profileAgentId: profile.agentId,
+    message,
+    promptText: formatInboundAgentPrompt(profile, message),
+    inserted: false,
+    sent: false,
+    lastError: "",
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  pendingAgentDeliveryMessageId = message.messageId;
+  updatePendingAgentDeliveryPanel();
+  return pendingAgentDelivery;
+}
+
+function agentDeliveryPromptStillPresent(pending) {
+  const composer = lastComposerElement || closestEditable(document.activeElement);
+  if (!composer || !composer.isConnected || !isEditableElement(composer)) {
+    return false;
+  }
+  return contentEditableHasText(composer, pending.promptText || "");
+}
+
+function clearPendingAgentDelivery() {
+  pendingAgentDelivery = null;
+  pendingAgentDeliveryMessageId = "";
+  updatePendingAgentDeliveryPanel();
+}
+
+function updatePendingAgentDeliveryPanel() {
+  const element = document.getElementById?.(PENDING_AGENT_DELIVERY_ID);
+  if (!element) {
+    return;
+  }
+  if (!pendingAgentDelivery) {
+    element.hidden = true;
+    element.textContent = "";
+    return;
+  }
+
+  const message = pendingAgentDelivery.message || {};
+  const from = message.from || "(unknown)";
+  const task = message.taskId ? ` task ${message.taskId}` : "";
+  const phase = pendingAgentDelivery.sent
+    ? "sent to AI page; waiting to ack local hub"
+    : pendingAgentDelivery.inserted ? "waiting for AI page send readiness" : "waiting for chat composer";
+  const nextAction = pendingAgentDelivery.sent
+    ? "No resend will happen; the extension will retry only the local ack."
+    : pendingAgentDelivery.inserted
+      ? "Keep this tab open until the page send button is ready."
+      : "Click/focus the chat composer or wait for the page to finish loading.";
+  const preview = summarizeCommand(message.body || "").slice(0, 180);
+  const error = pendingAgentDelivery.lastError ? `\nLast issue: ${summarizeCommand(pendingAgentDelivery.lastError)}` : "";
+  element.hidden = false;
+  element.textContent = [
+    `Pending agent message from ${from}${task}: ${phase}`,
+    "Status: cached in this extension panel until the AI page is ready.",
+    `Next: ${nextAction}`,
+    error,
+    preview ? `Preview: ${preview}` : ""
+  ].filter(Boolean).join("\n");
 }
 
 function ackDeliveredAgentMessage(profile, message) {
@@ -1717,6 +1846,7 @@ function formatInboundAgentPrompt(profile, message) {
       "ai-helper-agent-message-start",
       `to: ${from}`,
       message.taskId ? `task-id: ${message.taskId}` : "",
+      `reply-to: ${message.messageId}`,
       "",
       "<your result>",
       "ai-helper-agent-message-end"
@@ -1894,11 +2024,14 @@ function formatAgentMessageOutput(call, response, startedAt) {
       call.taskId ? `task-id: ${call.taskId}` : "",
       `startedAt: ${startedAt}`,
       `error: ${response?.error || "Unknown agent hub error."}`,
+      response?.hint ? `hint: ${response.hint}` : "",
+      response?.nextAction ? `nextAction: ${response.nextAction}` : "",
       "```"
     ].filter((line) => line !== "").join("\n");
   }
 
   const message = response.message || {};
+  const delivery = response.delivery || {};
   return [
     "Agent message result:",
     "",
@@ -1906,7 +2039,13 @@ function formatAgentMessageOutput(call, response, startedAt) {
     `from: ${message.from || ""}`,
     `to: ${message.to || call.to || ""}`,
     message.taskId || call.taskId ? `task-id: ${message.taskId || call.taskId}` : "",
+    message.replyTo || call.replyTo ? `reply-to: ${message.replyTo || call.replyTo}` : "",
     `messageId: ${message.messageId || response.messageId || ""}`,
+    delivery.surface ? `delivery: ${delivery.surface}` : "",
+    delivery.replyBodyFile ? `replyBodyFile: ${delivery.replyBodyFile}` : "",
+    delivery.replyScriptFile ? `replyScriptFile: ${delivery.replyScriptFile}` : "",
+    delivery.replyCommand ? `replyCommand: ${delivery.replyCommand}` : "",
+    delivery.nextStep ? `nextStep: ${delivery.nextStep}` : "",
     `durationMs: ${response.durationMs || 0}`,
     "```"
   ].filter((line) => line !== "").join("\n");
@@ -2429,7 +2568,7 @@ function injectStatus() {
   panel.appendChild(actions);
 
   const agentControls = document.createElement("div");
-  agentControls.style.cssText = "display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto;gap:4px;align-items:center;margin-top:6px";
+  agentControls.style.cssText = "display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto auto;gap:4px;align-items:center;margin-top:6px";
   agentControls.innerHTML = [
     '<select data-shell-agent-role title="Agent role" style="border:0;border-radius:6px;padding:3px 4px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;">',
     '<option value="none">none</option>',
@@ -2438,9 +2577,41 @@ function injectStatus() {
     '</select>',
     '<input data-shell-agent-id title="Agent id" placeholder="agentId" style="min-width:72px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
     '<button type="button" data-shell-tool-action="agent-register" title="Save this page agent role and register it with the local hub" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Save</button>',
-    '<button type="button" data-shell-tool-action="agent-list" title="Show local agent roster and pending message counts" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Roster</button>'
+    '<button type="button" data-shell-tool-action="agent-list" title="Show local agent roster and pending message counts" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Roster</button>',
+    '<button type="button" data-shell-tool-action="agent-check" title="Explain whether master/slave/tmux-ai setup is ready" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Check</button>'
   ].join("");
   panel.appendChild(agentControls);
+
+  const tmuxAiControls = document.createElement("div");
+  tmuxAiControls.style.cssText = "display:grid;grid-template-columns:minmax(78px,1fr) minmax(120px,1.5fr) auto auto;gap:4px;align-items:center;margin-top:6px";
+  tmuxAiControls.innerHTML = [
+    '<input data-shell-tmux-ai-id title="Tmux AI slave agent id" placeholder="slave-tmux" style="min-width:78px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
+    '<select data-shell-tmux-ai-target title="Tmux AI target pane" style="min-width:120px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
+    '<option value="">tmux target</option>',
+    '</select>',
+    '<button type="button" data-shell-tool-action="tmux-ai-refresh" title="Refresh available tmux panes for tmux-ai slaves" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Refresh</button>',
+    '<button type="button" data-shell-tool-action="tmux-ai-register" title="Register this tmux pane as a slave managed by the local server" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Register</button>'
+  ].join("");
+  panel.appendChild(tmuxAiControls);
+
+  const pendingAgentDeliveryPanel = document.createElement("div");
+  pendingAgentDeliveryPanel.id = PENDING_AGENT_DELIVERY_ID;
+  pendingAgentDeliveryPanel.hidden = true;
+  pendingAgentDeliveryPanel.style.cssText = [
+    "margin-top:6px",
+    "padding:6px",
+    "border-radius:6px",
+    "background:#1f2937",
+    "color:#dbeafe",
+    "font:11px ui-monospace,SFMono-Regular,Menlo,monospace",
+    "line-height:1.35",
+    "white-space:pre-wrap",
+    "word-break:break-word",
+    "max-height:120px",
+    "overflow:auto"
+  ].join(";");
+  panel.appendChild(pendingAgentDeliveryPanel);
+  updatePendingAgentDeliveryPanel();
 
   const debugPanel = document.createElement("details");
   debugPanel.id = "ai-chat-shell-exec-debug";
@@ -2502,6 +2673,7 @@ function injectStatus() {
     updateRoleFilterButton();
   });
   loadAgentControls().catch(() => {});
+  refreshTmuxAiTargetOptions({ quiet: true }).catch(() => {});
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
   checkStartupTmux().catch((error) => {
@@ -2838,6 +3010,27 @@ function handlePanelAction(action) {
     return;
   }
 
+  if (action === "agent-check") {
+    runAgentSetupCheck().catch((error) => {
+      setStatus(`Agent check failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "tmux-ai-refresh") {
+    refreshTmuxAiTargetOptions().catch((error) => {
+      setStatus(`Tmux AI refresh failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "tmux-ai-register") {
+    registerTmuxAiSlaveFromPanel().catch((error) => {
+      setStatus(`Tmux AI register failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
@@ -2919,6 +3112,51 @@ async function listRegisteredAgents() {
   setStatus(`Agents online: ${summary}`, "ok");
 }
 
+async function runAgentSetupCheck() {
+  const profile = await getCurrentAgentProfile();
+  const [agentList, tmuxList] = await Promise.all([
+    chrome.runtime.sendMessage({ type: "agent-list" }).catch((error) => ({ ok: false, error: error.message || String(error) })),
+    chrome.runtime.sendMessage({ type: "tmux-list" }).catch((error) => ({ ok: false, error: error.message || String(error) }))
+  ]);
+  const agents = Array.isArray(agentList?.agents) ? agentList.agents : [];
+  const panes = Array.isArray(tmuxList?.panes) ? tmuxList.panes : Array.isArray(tmuxList?.tmuxPanes) ? tmuxList.tmuxPanes : [];
+  const tmuxAiAgents = agents.filter((agent) => agent.surface === "tmux-ai");
+  const parts = [
+    `this tab: ${profile.role && profile.role !== "none" && profile.agentId ? `${profile.role} ${profile.agentId}` : "not saved as an agent"}`,
+    `agents: ${agentList?.ok ? agents.length : `unavailable (${summarizeCommand(agentList?.error || "agent-list failed")})`}`,
+    `tmux panes: ${tmuxList?.ok ? panes.length : `unavailable (${summarizeCommand(tmuxList?.error || "tmux-list failed")})`}`,
+    `tmux-ai slaves: ${tmuxAiAgents.length ? tmuxAiAgents.map((agent) => `${agent.agentId}@${agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget || "tmux"}`).join(", ") : "none"}`
+  ];
+
+  let next = "Ready: ask the master AI to send an agent task to a tmux-ai slave.";
+  let state = "ok";
+  if (!profile.agentId || profile.role === "none") {
+    next = "Next: choose role master or slave, enter an agent id, then click Save.";
+    state = "error";
+  } else if (!agentList?.ok) {
+    next = "Next: make sure the local shell server is running, then click Check again.";
+    state = "error";
+  } else if (profile.role === "master" && !tmuxList?.ok) {
+    next = "Next: fix tmux-list/server access before registering tmux-ai slaves.";
+    state = "error";
+  } else if (profile.role === "master" && tmuxAiAgents.length === 0) {
+    next = panes.length
+      ? "Next: enter a tmux-ai slave id, select the AI tmux pane, then click Register."
+      : "Next: start the AI in a tmux pane, click Refresh, then Register it as tmux-ai.";
+    state = "error";
+  }
+
+  setStatus(`Agent setup check: ${parts.join("; ")}. ${next}`, state);
+  return {
+    ok: state === "ok",
+    profile,
+    agents,
+    panes,
+    tmuxAiAgents,
+    next
+  };
+}
+
 function formatAgentRosterSummary(agents, pending) {
   const pendingCounts = pending && typeof pending === "object" ? pending : {};
   return (Array.isArray(agents) ? agents : [])
@@ -2927,6 +3165,95 @@ function formatAgentRosterSummary(agents, pending) {
       return `${agent.agentId}:${agent.role}${count > 0 ? ` pending:${count}` : ""}`;
     })
     .join(", ");
+}
+
+async function refreshTmuxAiTargetOptions(options = {}) {
+  const quiet = Boolean(options.quiet);
+  const targetElement = document.querySelector(`#${STATUS_ID} [data-shell-tmux-ai-target]`);
+  if (!targetElement) {
+    return null;
+  }
+  if (!quiet) {
+    setStatus("Refreshing tmux AI targets", "running");
+  }
+  const response = await chrome.runtime.sendMessage({ type: "tmux-list" });
+  if (!response?.ok) {
+    throw new Error(response?.error || "tmux-list failed.");
+  }
+  const panes = Array.isArray(response.panes) ? response.panes : Array.isArray(response.tmuxPanes) ? response.tmuxPanes : [];
+  populateTmuxAiTargetOptions(targetElement, panes);
+  if (!quiet) {
+    setStatus(`Tmux AI targets: ${panes.length} pane${panes.length === 1 ? "" : "s"}`, panes.length ? "ok" : "idle");
+  }
+  return panes;
+}
+
+function populateTmuxAiTargetOptions(targetElement, panes) {
+  const previousValue = String(targetElement.value || "");
+  targetElement.textContent = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "tmux target";
+  targetElement.appendChild(placeholder);
+
+  for (const pane of Array.isArray(panes) ? panes : []) {
+    const value = pane.address || pane.id || "";
+    if (!value) {
+      continue;
+    }
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = `${value} ${pane.windowName || pane.currentCommand || ""}`.trim();
+    option.title = [
+      pane.id ? `pane ${pane.id}` : "",
+      pane.currentCommand ? `command ${pane.currentCommand}` : "",
+      pane.currentPath ? `cwd ${pane.currentPath}` : ""
+    ].filter(Boolean).join("; ");
+    targetElement.appendChild(option);
+  }
+
+  if (previousValue && Array.from(targetElement.options).some((option) => option.value === previousValue)) {
+    targetElement.value = previousValue;
+  }
+}
+
+async function registerTmuxAiSlaveFromPanel() {
+  const agentIdElement = document.querySelector(`#${STATUS_ID} [data-shell-tmux-ai-id]`);
+  const targetElement = document.querySelector(`#${STATUS_ID} [data-shell-tmux-ai-target]`);
+  const agentId = normalizeCommand(agentIdElement?.value || "");
+  let target = normalizeCommand(targetElement?.value || "");
+  const profile = await getCurrentAgentProfile();
+
+  if (profile.role !== "master" || !profile.agentId) {
+    throw new Error("Tmux AI setup needs a master page first: choose role master, enter an agent id, then click Save.");
+  }
+  if (!AGENT_MESSAGE_ID_PATTERN.test(agentId)) {
+    throw new Error("Tmux AI slave id is required. Use 1-64 letters, numbers, dots, underscores, or hyphens, starting with a letter or number.");
+  }
+  if (!target) {
+    const panes = await refreshTmuxAiTargetOptions({ quiet: true });
+    if (Array.isArray(panes) && panes.length === 1) {
+      target = panes[0].address || panes[0].id || "";
+      if (targetElement) {
+        targetElement.value = target;
+      }
+    }
+  }
+  if (!target) {
+    throw new Error("Choose a tmux target pane first. Click Refresh, then select the tmux window where the AI slave is already running.");
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: "agent-register-tmux-ai",
+    agentId,
+    role: "slave",
+    target
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "tmux-ai registration failed.");
+  }
+  setStatus(`Registered tmux-ai slave ${agentId} at ${target}`, "ok");
+  return response;
 }
 
 async function forceRunLatestShellCall() {

@@ -10,7 +10,7 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 3;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 4;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 1;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
   "vision-health",
@@ -25,11 +25,14 @@ const VISION_COMMAND_MESSAGE_TYPES = new Set([
 ]);
 const BACKGROUND_AGENT_MESSAGE_TYPES = new Set([
   "agent-register",
+  "agent-register-tmux-ai",
   "agent-unregister",
   "agent-list",
   "agent-send",
+  "agent-task-status",
   "agent-poll",
-  "agent-ack"
+  "agent-ack",
+  "agent-reply"
 ]);
 const DEFAULT_SETTINGS = {
   enabled: true,
