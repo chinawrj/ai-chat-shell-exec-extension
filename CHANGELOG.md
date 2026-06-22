@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1] - 2026-06-22
+
+- Updates the README multi-agent guide with copyable browser master/slave prompts, browser-tab smoke-test steps, and clearer pending-delivery behavior.
+- Adds a simple web master + tmux Claude quick start that covers starting Claude in tmux, registering `slave-tmux` from the master panel, and verifying the first `TMUX_AI_SMOKE_OK` reply.
+- Documents the project-level Claude Code skill fallback, the short per-task reply script workflow, `claude.ai` manual enablement, and common multi-agent troubleshooting cases.
+
 ## [0.7.0] - 2026-06-21
 
 - Adds tmux-ai agents: an explicit tmux pane can register as a `master` or `slave` AI runtime and receive task prompts from the local agent hub.
