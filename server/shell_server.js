@@ -16,7 +16,7 @@ const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const ROOT_DIR = path.join(__dirname, "..");
 const SERVER_PROTOCOL_VERSION = 4;
-const HELPER_PROTOCOL_VERSION = 1;
+const HELPER_PROTOCOL_VERSION = 2;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
@@ -1200,8 +1200,25 @@ function listAgents(now = Date.now(), pending = countPendingAgentMessages()) {
     .sort((a, b) => a.agentId.localeCompare(b.agentId))
     .map((agent) => ({
       ...agent,
-      pendingCount: pending[agent.agentId] || 0
+      pendingCount: pending[agent.agentId] || 0,
+      lastSeenAgeMs: Math.max(0, now - Number(agent.lastSeenAt || now)),
+      canReceiveTask: agent.role === "slave",
+      capabilities: getAgentCapabilities(agent)
     }));
+}
+
+function getAgentCapabilities(agent) {
+  const capabilities = ["agent-message"];
+  if (agent.role === "slave") {
+    capabilities.push("receive-task", "reply-to-master");
+  }
+  if (agent.surface === "web") {
+    capabilities.push("poll-delivery", "per-agent-shell-workspace");
+  }
+  if (agent.surface === "tmux-ai") {
+    capabilities.push("tmux-prompt-delivery", "reply-file", "short-reply-script");
+  }
+  return capabilities;
 }
 
 function pruneAgentRoster(now = Date.now()) {

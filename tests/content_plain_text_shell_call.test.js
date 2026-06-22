@@ -369,6 +369,82 @@ const emptyAgentBody = context.parseCallPayload([
 assert.equal(context.validateHelperCall(emptyAgentBody).ok, false);
 assert.match(context.validateHelperCall(emptyAgentBody).reason, /body is empty/);
 
+const rosterBlock = [
+  "ai-helper-agent-roster-start",
+  "role: slave",
+  "surface: tmux-ai",
+  "ai-helper-agent-roster-end"
+].join("\n");
+const parsedRoster = context.parseCallPayload(rosterBlock);
+assert.equal(context.containsToolLanguageHint(rosterBlock), true);
+assert.equal(parsedRoster.kind, "agent-roster");
+assert.equal(parsedRoster.role, "slave");
+assert.equal(parsedRoster.surface, "tmux-ai");
+assert.equal(context.validateHelperCall(parsedRoster).ok, true);
+assert.equal(context.isRunnableHelperCall(parsedRoster), true);
+
+const rosterNoFilters = context.parseCallPayload([
+  "ai-helper-agent-roster-start",
+  "ai-helper-agent-roster-end"
+].join("\n"));
+assert.equal(rosterNoFilters.kind, "agent-roster");
+assert.equal(rosterNoFilters.role, "");
+assert.equal(context.validateHelperCall(rosterNoFilters).ok, true);
+
+const [fencedFallbackRoster] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-agent-roster-start",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackRoster.kind, "agent-roster");
+assert.equal(fencedFallbackRoster.inferredEndMarker, true);
+assert.equal(context.validateHelperCall(fencedFallbackRoster).ok, true);
+
+const invalidRosterFilter = context.parseCallPayload([
+  "ai-helper-agent-roster-start",
+  "role: worker",
+  "ai-helper-agent-roster-end"
+].join("\n"));
+assert.equal(context.validateHelperCall(invalidRosterFilter).ok, false);
+assert.match(context.validateHelperCall(invalidRosterFilter).reason, /role filter must be master or slave/);
+
+const taskStatusBlock = [
+  "ai-helper-agent-task-status-start",
+  "task-id: task-001",
+  "ai-helper-agent-task-status-end"
+].join("\n");
+const parsedTaskStatus = context.parseCallPayload(taskStatusBlock);
+assert.equal(context.containsToolLanguageHint(taskStatusBlock), true);
+assert.equal(parsedTaskStatus.kind, "agent-task-status");
+assert.equal(parsedTaskStatus.taskId, "task-001");
+assert.equal(context.validateHelperCall(parsedTaskStatus).ok, true);
+assert.equal(context.isRunnableHelperCall(parsedTaskStatus), true);
+
+const messageStatusBlock = [
+  "ai-helper-agent-task-status-start",
+  "message-id: msg-001",
+  "ai-helper-agent-task-status-end"
+].join("\n");
+const parsedMessageStatus = context.parseCallPayload(messageStatusBlock);
+assert.equal(parsedMessageStatus.messageId, "msg-001");
+assert.equal(context.validateHelperCall(parsedMessageStatus).ok, true);
+
+const missingTaskStatusId = context.parseCallPayload([
+  "ai-helper-agent-task-status-start",
+  "ai-helper-agent-task-status-end"
+].join("\n"));
+assert.equal(missingTaskStatusId.kind, "agent-task-status");
+assert.equal(context.validateHelperCall(missingTaskStatusId).ok, false);
+assert.match(context.validateHelperCall(missingTaskStatusId).reason, /requires message-id or task-id/);
+
+const rosterWithMarkerAsShell = context.parseCallPayload([
+  "ai-helper-shell-start",
+  "ai-helper-agent-roster-end",
+  "ai-helper-shell-end"
+].join("\n"));
+assert.equal(context.validateHelperCall(rosterWithMarkerAsShell).ok, false);
+assert.match(context.validateHelperCall(rosterWithMarkerAsShell).reason, /copied terminal\/output text/);
+
 const slaveInboundPrompt = context.formatInboundAgentPrompt({
   role: "slave",
   agentId: "slave-a"

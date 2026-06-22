@@ -6,6 +6,10 @@ const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
 const HELPER_AGENT_MESSAGE_START = "ai-helper-agent-message-start";
 const HELPER_AGENT_MESSAGE_END = "ai-helper-agent-message-end";
+const HELPER_AGENT_ROSTER_START = "ai-helper-agent-roster-start";
+const HELPER_AGENT_ROSTER_END = "ai-helper-agent-roster-end";
+const HELPER_AGENT_TASK_STATUS_START = "ai-helper-agent-task-status-start";
+const HELPER_AGENT_TASK_STATUS_END = "ai-helper-agent-task-status-end";
 const HELPER_FENCE_MARKER = "````";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -17,7 +21,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.7.1";
+const CONTENT_SCRIPT_VERSION = "0.8.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -484,16 +488,9 @@ async function scanForShellCall(options = {}) {
   const call = candidate.call;
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+  const repeatableAgentQuery = isRepeatableAgentQueryHelperCall(call);
   if (!force) {
-    let dedupReason = "";
-    if (processedCalls.has(callKey)) {
-      dedupReason = "processed callKey";
-    } else if (processedSemanticCalls.has(semanticCallKey)) {
-      dedupReason = "processed semantic key";
-    } else if (candidate.node instanceof Element &&
-      processedNodeSemanticKeys.get(candidate.node) === semanticCallKey) {
-      dedupReason = "processed node semantic key";
-    }
+    const dedupReason = getDuplicateHelperDedupReason(candidate, callKey, semanticCallKey, call);
     if (dedupReason) {
       rememberSuppressedCallStatus(dedupReason);
       setStatus(`Suppressed duplicate helper call: ${summarizeCommand(helperPreviewText(call))}`, "ok");
@@ -537,7 +534,11 @@ async function scanForShellCall(options = {}) {
 
   const executionCallKey = force ? buildForceCallKey(semanticCallKey) : callKey;
   if (!force) {
-    markCallProcessed(candidate, callKey, semanticCallKey);
+    if (repeatableAgentQuery) {
+      markRepeatableAgentQueryCallProcessed(callKey);
+    } else {
+      markCallProcessed(candidate, callKey, semanticCallKey);
+    }
   }
   await runAndReply(executionCallKey, call, { force });
 }
@@ -552,6 +553,10 @@ function buildSemanticCallKey(call) {
     normalizeCommand(call.content || ""),
     normalizeCommand(call.to || ""),
     normalizeCommand(call.taskId || ""),
+    normalizeCommand(call.messageId || ""),
+    normalizeCommand(call.replyTo || ""),
+    normalizeCommand(call.role || ""),
+    normalizeCommand(call.surface || ""),
     normalizeCommand(call.body || ""),
     normalizeCommand(call.cwd || ""),
     call.timeoutMs || "",
@@ -566,6 +571,23 @@ function buildCandidateCallKey(candidate, semanticCallKey) {
     candidate.index || "",
     semanticCallKey
   ].join("\n"));
+}
+
+function getDuplicateHelperDedupReason(candidate, callKey, semanticCallKey, call) {
+  if (processedCalls.has(callKey)) {
+    return "processed callKey";
+  }
+  if (isRepeatableAgentQueryHelperCall(call)) {
+    return "";
+  }
+  if (processedSemanticCalls.has(semanticCallKey)) {
+    return "processed semantic key";
+  }
+  if (candidate?.node instanceof Element &&
+    processedNodeSemanticKeys.get(candidate.node) === semanticCallKey) {
+    return "processed node semantic key";
+  }
+  return "";
 }
 
 function helperPreviewText(call) {
@@ -589,6 +611,10 @@ function markCallProcessed(candidate, callKey, semanticCallKey) {
   if (candidate.node instanceof Element) {
     processedNodeSemanticKeys.set(candidate.node, semanticCallKey);
   }
+}
+
+function markRepeatableAgentQueryCallProcessed(callKey) {
+  processedCalls.add(callKey);
 }
 
 function isSupportedPage() {
@@ -758,7 +784,9 @@ function containsToolLanguageHint(text) {
   return lower.includes(HELPER_SHELL_START) ||
     lower.includes(HELPER_FILE_START) ||
     lower.includes(HELPER_BOARD_START) ||
-    lower.includes(HELPER_AGENT_MESSAGE_START);
+    lower.includes(HELPER_AGENT_MESSAGE_START) ||
+    lower.includes(HELPER_AGENT_ROSTER_START) ||
+    lower.includes(HELPER_AGENT_TASK_STATUS_START);
 }
 
 function closestMessageContainer(node) {
@@ -875,6 +903,24 @@ function parsePlainTextHelperBlocks(text) {
         inferredEndMarker,
         ...parseAgentMessageLines(lines.slice(valueLineIndex, blockEndIndex))
       });
+    } else if (start.kind === "agent-roster") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        inferredEndMarker,
+        ...parseAgentRosterLines(lines.slice(valueLineIndex, blockEndIndex))
+      });
+    } else if (start.kind === "agent-task-status") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        inferredEndMarker,
+        ...parseAgentTaskStatusLines(lines.slice(valueLineIndex, blockEndIndex))
+      });
     } else {
       calls.push({
         kind: start.kind,
@@ -892,7 +938,7 @@ function parsePlainTextHelperBlocks(text) {
 }
 
 function findHelperEndIndex(lines, startIndex, valueLineIndex, kind, fenceEndIndex) {
-  const minEndIndex = kind === "board" ? startIndex : valueLineIndex;
+  const minEndIndex = kind === "board" || kind === "agent-roster" || kind === "agent-task-status" ? startIndex : valueLineIndex;
   return lines.findIndex((line, lineIndex) =>
     lineIndex > minEndIndex &&
     (fenceEndIndex < 0 || lineIndex < fenceEndIndex) &&
@@ -905,7 +951,7 @@ function findHelperFenceEndIndex(lines, startIndex, kind) {
     return -1;
   }
 
-  const minEndIndex = kind === "board" ? startIndex : startIndex + 1;
+  const minEndIndex = kind === "board" || kind === "agent-roster" || kind === "agent-task-status" ? startIndex : startIndex + 1;
   return lines.findIndex((line, lineIndex) =>
     lineIndex > minEndIndex &&
     line === HELPER_FENCE_MARKER
@@ -951,6 +997,14 @@ function parseHelperStartMarker(line) {
   const agentMessage = parseSpecificHelperStartMarker(text, HELPER_AGENT_MESSAGE_START, "agent-message");
   if (agentMessage.kind) {
     return agentMessage;
+  }
+  const agentRoster = parseSpecificHelperStartMarker(text, HELPER_AGENT_ROSTER_START, "agent-roster");
+  if (agentRoster.kind) {
+    return agentRoster;
+  }
+  const agentTaskStatus = parseSpecificHelperStartMarker(text, HELPER_AGENT_TASK_STATUS_START, "agent-task-status");
+  if (agentTaskStatus.kind) {
+    return agentTaskStatus;
   }
   return { kind: "", helperId: "", error: "" };
 }
@@ -1001,6 +1055,12 @@ function expectedHelperEndMarker(kind) {
   if (kind === "agent-message") {
     return HELPER_AGENT_MESSAGE_END;
   }
+  if (kind === "agent-roster") {
+    return HELPER_AGENT_ROSTER_END;
+  }
+  if (kind === "agent-task-status") {
+    return HELPER_AGENT_TASK_STATUS_END;
+  }
   return "";
 }
 
@@ -1038,6 +1098,47 @@ function parseAgentMessageLines(lines) {
   };
 }
 
+function parseSimpleHeaderLines(lines) {
+  const headers = {};
+  const malformedHeaders = [];
+  for (const line of lines) {
+    const text = String(line || "");
+    if (!text.trim()) {
+      continue;
+    }
+    const match = text.match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/);
+    if (!match) {
+      malformedHeaders.push(text);
+      continue;
+    }
+    headers[match[1].toLowerCase()] = match[2].trim();
+  }
+  return {
+    headers,
+    helperHeaderError: malformedHeaders.length > 0
+      ? `Malformed helper header: ${malformedHeaders[0]}`
+      : ""
+  };
+}
+
+function parseAgentRosterLines(lines) {
+  const parsed = parseSimpleHeaderLines(lines);
+  return {
+    role: parsed.headers.role || "",
+    surface: parsed.headers.surface || "",
+    agentHeaderError: parsed.helperHeaderError
+  };
+}
+
+function parseAgentTaskStatusLines(lines) {
+  const parsed = parseSimpleHeaderLines(lines);
+  return {
+    messageId: parsed.headers["message-id"] || parsed.headers.messageid || "",
+    taskId: parsed.headers["task-id"] || "",
+    agentHeaderError: parsed.helperHeaderError
+  };
+}
+
 function splitShellCallLines(text) {
   const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   while (lines.length > 0 && lines[lines.length - 1] === "") {
@@ -1070,12 +1171,34 @@ function isAgentMessageHelperCall(call) {
   return call?.kind === "agent-message";
 }
 
+function isAgentRosterHelperCall(call) {
+  return call?.kind === "agent-roster";
+}
+
+function isAgentTaskStatusHelperCall(call) {
+  return call?.kind === "agent-task-status";
+}
+
+function isAgentQueryHelperCall(call) {
+  return isAgentRosterHelperCall(call) || isAgentTaskStatusHelperCall(call);
+}
+
+function isRepeatableAgentQueryHelperCall(call) {
+  return isAgentQueryHelperCall(call);
+}
+
 function isRunnableHelperCall(call) {
   if (isFileHelperCall(call)) {
     return call.filename !== undefined;
   }
   if (isAgentMessageHelperCall(call)) {
     return call.to !== undefined || call.body !== undefined;
+  }
+  if (isAgentRosterHelperCall(call)) {
+    return call.role !== undefined || call.surface !== undefined;
+  }
+  if (isAgentTaskStatusHelperCall(call)) {
+    return call.messageId !== undefined || call.taskId !== undefined;
   }
   return Boolean(call?.cmd);
 }
@@ -1191,6 +1314,12 @@ function validateHelperCall(call) {
   if (isAgentMessageHelperCall(call)) {
     return validateAgentMessageCall(call);
   }
+  if (isAgentRosterHelperCall(call)) {
+    return validateAgentRosterCall(call);
+  }
+  if (isAgentTaskStatusHelperCall(call)) {
+    return validateAgentTaskStatusCall(call);
+  }
   return validateShellCall(call);
 }
 
@@ -1251,6 +1380,39 @@ function validateAgentMessageCall(call) {
   return { ok: true };
 }
 
+function validateAgentRosterCall(call) {
+  if (call?.agentHeaderError) {
+    return { ok: false, reason: call.agentHeaderError };
+  }
+  const role = normalizeCommand(call.role || "");
+  if (role && !["master", "slave"].includes(role)) {
+    return { ok: false, reason: "Agent roster role filter must be master or slave." };
+  }
+  const surface = normalizeCommand(call.surface || "");
+  if (surface && !["web", "tmux-ai"].includes(surface)) {
+    return { ok: false, reason: "Agent roster surface filter must be web or tmux-ai." };
+  }
+  return { ok: true };
+}
+
+function validateAgentTaskStatusCall(call) {
+  if (call?.agentHeaderError) {
+    return { ok: false, reason: call.agentHeaderError };
+  }
+  const messageId = normalizeCommand(call.messageId || "");
+  const taskId = normalizeCommand(call.taskId || "");
+  if (!messageId && !taskId) {
+    return { ok: false, reason: "Agent task status requires message-id or task-id." };
+  }
+  if (messageId && !AGENT_TASK_ID_PATTERN.test(messageId)) {
+    return { ok: false, reason: "Agent task status message-id must be a safe id without spaces." };
+  }
+  if (taskId && !AGENT_TASK_ID_PATTERN.test(taskId)) {
+    return { ok: false, reason: "Agent task status task-id must be a safe id without spaces." };
+  }
+  return { ok: true };
+}
+
 function validateShellCall(call) {
   const cmd = normalizeCommand(call.cmd);
   if (!cmd) {
@@ -1272,6 +1434,8 @@ function validateShellLikeCommandText(cmd) {
     isHelperEndForKind("file", line) ||
     isHelperEndForKind("board", line) ||
     isHelperEndForKind("agent-message", line) ||
+    isHelperEndForKind("agent-roster", line) ||
+    isHelperEndForKind("agent-task-status", line) ||
     UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
@@ -1309,10 +1473,10 @@ function isCopiedOutputRejectionReason(reason) {
 
 async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
-  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : "shell call";
+  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : isAgentRosterHelperCall(call) ? "agent roster query" : isAgentTaskStatusHelperCall(call) ? "agent task status query" : "shell call";
   setStatus(`Rejected ${helperName}: ${reason}`, "error");
   await insertReply([
-    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : "Shell call rejected:",
+    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : isAgentRosterHelperCall(call) ? "Agent roster query rejected:" : isAgentTaskStatusHelperCall(call) ? "Agent task status query rejected:" : "Shell call rejected:",
     "",
     "```shell-output",
     formatRejectedCallSubject(call),
@@ -1331,6 +1495,12 @@ function formatRejectedCallSubject(call) {
   }
   if (isAgentMessageHelperCall(call)) {
     return `agent-message: ${call.to || ""}`;
+  }
+  if (isAgentRosterHelperCall(call)) {
+    return "agent-roster";
+  }
+  if (isAgentTaskStatusHelperCall(call)) {
+    return `agent-task-status: ${call.messageId || call.taskId || ""}`;
   }
   return `$ ${call.cmd || ""}`;
 }
@@ -1369,6 +1539,22 @@ async function runAndReply(callId, call, options = {}) {
         call.body || "",
         "",
         "Send this message through the local agent hub and post the result back to this chat?"
+      ] : isAgentRosterHelperCall(call) ?
+      [
+        "AI requested the local agent roster.",
+        "",
+        call.role ? `role: ${call.role}` : "role: all",
+        call.surface ? `surface: ${call.surface}` : "surface: all",
+        "",
+        "Query online agents and post the roster back to this chat?"
+      ] : isAgentTaskStatusHelperCall(call) ?
+      [
+        "AI requested an agent task status.",
+        "",
+        call.messageId ? `message-id: ${call.messageId}` : "",
+        call.taskId ? `task-id: ${call.taskId}` : "",
+        "",
+        "Query task status and post the result back to this chat?"
       ] :
       [
         "AI requested a local shell command.",
@@ -1404,6 +1590,10 @@ async function runAndReply(callId, call, options = {}) {
       await sendRunBoardMessage(callId, call, force) :
       isAgentMessageHelperCall(call) ?
       await sendAgentMessage(callId, call, force) :
+      isAgentRosterHelperCall(call) ?
+      await sendAgentRosterQuery(callId, call, force) :
+      isAgentTaskStatusHelperCall(call) ?
+      await sendAgentTaskStatusQuery(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
 
     if (response?.duplicate === true && response?.skipped === true) {
@@ -1418,6 +1608,10 @@ async function runAndReply(callId, call, options = {}) {
       formatBoardOutput(call, response, startedAt) :
       isAgentMessageHelperCall(call) ?
       formatAgentMessageOutput(call, response, startedAt) :
+      isAgentRosterHelperCall(call) ?
+      formatAgentRosterOutput(call, response, startedAt) :
+      isAgentTaskStatusHelperCall(call) ?
+      formatAgentTaskStatusOutput(call, response, startedAt) :
       formatShellOutput(call, response, startedAt);
     await insertReply(reply);
     setHelperCompletionStatus(call, response);
@@ -1427,7 +1621,7 @@ async function runAndReply(callId, call, options = {}) {
       await clickSendWhenReady();
     }
   } catch (error) {
-    setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : isAgentMessageHelperCall(call) ? "Agent message" : "Shell call"} failed: ${error.message || String(error)}`, "error");
+    setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : isAgentMessageHelperCall(call) ? "Agent message" : isAgentRosterHelperCall(call) ? "Agent roster" : isAgentTaskStatusHelperCall(call) ? "Agent task status" : "Shell call"} failed: ${error.message || String(error)}`, "error");
     const failedResponse = {
       ok: false,
       error: error.message || String(error)
@@ -1438,6 +1632,10 @@ async function runAndReply(callId, call, options = {}) {
       formatBoardOutput(call, failedResponse, startedAt) :
       isAgentMessageHelperCall(call) ?
       formatAgentMessageOutput(call, failedResponse, startedAt) :
+      isAgentRosterHelperCall(call) ?
+      formatAgentRosterOutput(call, failedResponse, startedAt) :
+      isAgentTaskStatusHelperCall(call) ?
+      formatAgentTaskStatusOutput(call, failedResponse, startedAt) :
       formatShellOutput(call, failedResponse, startedAt));
     activeCallId = "";
     if (settings.autoSend !== false) {
@@ -1457,6 +1655,12 @@ function buildRunningStatus(call, force) {
   }
   if (isAgentMessageHelperCall(call)) {
     return `${force ? "Force sending" : "Sending"} agent message to ${call.to || "(missing)"}`;
+  }
+  if (isAgentRosterHelperCall(call)) {
+    return `${force ? "Force querying" : "Querying"} agent roster`;
+  }
+  if (isAgentTaskStatusHelperCall(call)) {
+    return `${force ? "Force querying" : "Querying"} agent task status`;
   }
   return `${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`;
 }
@@ -1533,6 +1737,45 @@ async function sendAgentMessage(callId, call, force) {
       promptHash: stableHash(getLastUserMessageText()),
       force
     }
+  });
+}
+
+async function sendAgentRosterQuery(_callId, call, _force) {
+  const profile = await getCurrentAgentProfile();
+  if (!profile.agentId || !profile.role || profile.role === "none") {
+    throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying the agent roster.");
+  }
+  const response = await chrome.runtime.sendMessage({ type: "agent-list" });
+  if (!response?.ok) {
+    return response;
+  }
+  let agents = Array.isArray(response.agents) ? response.agents : [];
+  const role = normalizeCommand(call.role || "");
+  const surface = normalizeCommand(call.surface || "");
+  if (role) {
+    agents = agents.filter((agent) => agent.role === role);
+  }
+  if (surface) {
+    agents = agents.filter((agent) => agent.surface === surface);
+  }
+  return {
+    ...response,
+    requester: profile,
+    agents,
+    filters: { role, surface }
+  };
+}
+
+async function sendAgentTaskStatusQuery(_callId, call, _force) {
+  const profile = await getCurrentAgentProfile();
+  if (!profile.agentId || !profile.role || profile.role === "none") {
+    throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying task status.");
+  }
+  return chrome.runtime.sendMessage({
+    type: "agent-task-status",
+    agentId: profile.agentId,
+    messageId: call.messageId || "",
+    taskId: call.taskId || ""
   });
 }
 
@@ -1888,6 +2131,16 @@ function setHelperCompletionStatus(call, response) {
     return;
   }
 
+  if (isAgentRosterHelperCall(call)) {
+    setStatus(response?.ok === false ? "Agent roster query failed" : "Agent roster query completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
+  if (isAgentTaskStatusHelperCall(call)) {
+    setStatus(response?.ok === false ? "Agent task status query failed" : "Agent task status query completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
   setStatus(response?.ok === false ? "Shell helper failed" : "Shell helper completed", response?.ok === false ? "error" : "ok");
 }
 
@@ -2016,6 +2269,7 @@ function formatFileOutput(call, response, startedAt) {
 
 function formatAgentMessageOutput(call, response, startedAt) {
   if (!response || response.ok === false) {
+    const aiNextAction = getAgentMessageAiNextAction(response);
     return [
       "Agent message failed:",
       "",
@@ -2026,6 +2280,7 @@ function formatAgentMessageOutput(call, response, startedAt) {
       `error: ${response?.error || "Unknown agent hub error."}`,
       response?.hint ? `hint: ${response.hint}` : "",
       response?.nextAction ? `nextAction: ${response.nextAction}` : "",
+      aiNextAction ? `aiNextAction: ${aiNextAction}` : "",
       "```"
     ].filter((line) => line !== "").join("\n");
   }
@@ -2046,7 +2301,155 @@ function formatAgentMessageOutput(call, response, startedAt) {
     delivery.replyScriptFile ? `replyScriptFile: ${delivery.replyScriptFile}` : "",
     delivery.replyCommand ? `replyCommand: ${delivery.replyCommand}` : "",
     delivery.nextStep ? `nextStep: ${delivery.nextStep}` : "",
+    `statusQuery:\n${formatAgentTaskStatusHelperExample(message.messageId || response.messageId || "")}`,
     `durationMs: ${response.durationMs || 0}`,
+    "```"
+  ].filter((line) => line !== "").join("\n");
+}
+
+function getAgentMessageAiNextAction(response) {
+  const code = String(response?.errorCode || "");
+  if (code === "recipient-not-registered") {
+    return "Run ai-helper-agent-roster-start with role: slave, choose an online slave id, then resend with a new helper identity.";
+  }
+  if (code === "sender-not-registered") {
+    return "Ask the user to save this page as master or slave, then rerun ai-helper-agent-roster-start.";
+  }
+  if (code === "duplicate-message-id") {
+    return "Do not reuse this message. Resend only if needed with a new task-id and helper identity.";
+  }
+  if (code.includes("reply")) {
+    return "Run ai-helper-agent-task-status-start with the original message-id or task-id, then preserve the current reply-to value before retrying.";
+  }
+  if (code === "tmux-target-unavailable" || code === "tmux-target-not-found") {
+    return "Run ai-helper-agent-roster-start with surface: tmux-ai. If no tmux-ai slave is online, ask the user to re-register the pane.";
+  }
+  return "";
+}
+
+function formatAgentTaskStatusHelperExample(messageId) {
+  return [
+    "````",
+    "ai-helper-agent-task-status-start",
+    `message-id: ${messageId || "message-id-from-agent-message-result"}`,
+    "ai-helper-agent-task-status-end",
+    "````"
+  ].join("\n");
+}
+
+function formatAgentRosterOutput(call, response, startedAt) {
+  if (!response || response.ok === false) {
+    return [
+      "Agent roster query failed:",
+      "",
+      "```shell-output",
+      "agent-roster",
+      call.role ? `role: ${call.role}` : "",
+      call.surface ? `surface: ${call.surface}` : "",
+      `startedAt: ${startedAt}`,
+      `error: ${response?.error || "Unknown agent hub error."}`,
+      response?.hint ? `hint: ${response.hint}` : "",
+      response?.nextAction ? `nextAction: ${response.nextAction}` : "",
+      `aiNextAction: ${getAgentTaskStatusAiNextAction(response)}`,
+      "```"
+    ].filter((line) => line !== "").join("\n");
+  }
+
+  const agents = Array.isArray(response.agents) ? response.agents : [];
+  return [
+    "Agent roster result:",
+    "",
+    "```shell-output",
+    "agent-roster",
+    response.requester?.agentId ? `requester: ${response.requester.agentId}` : "",
+    response.requester?.role ? `requesterRole: ${response.requester.role}` : "",
+    call.role || response.filters?.role ? `filterRole: ${call.role || response.filters.role}` : "",
+    call.surface || response.filters?.surface ? `filterSurface: ${call.surface || response.filters.surface}` : "",
+    `count: ${agents.length}`,
+    agents.length ? "\nagents:\n" + formatAgentsForShellOutput(agents) : "\nagents:\n(none)",
+    agents.some((agent) => agent.role === "slave") ? "nextAction: Send agent-message helpers to exact slave ids listed above." : "nextAction: No slave agents are online. Ask the user to open/register a slave tab or tmux-ai pane, then query roster again.",
+    "```"
+  ].filter((line) => line !== "").join("\n");
+}
+
+function getAgentTaskStatusAiNextAction(response) {
+  const code = String(response?.errorCode || "");
+  if (code === "task-not-found") {
+    return "Check the latest agent-message result for messageId. If unavailable, query roster and delegate a new task with a new task-id.";
+  }
+  if (code === "sender-not-registered") {
+    return "Ask the user to save this page as master or slave, then rerun the task-status helper.";
+  }
+  if (code === "missing-message-id") {
+    return "Rerun ai-helper-agent-task-status-start with either message-id or task-id.";
+  }
+  return "Use the latest message-id from Agent message result, or query the roster and delegate a new task.";
+}
+
+function formatAgentsForShellOutput(agents) {
+  return (Array.isArray(agents) ? agents : [])
+    .map((agent) => {
+      const parts = [
+        `- ${agent.agentId || ""}`,
+        `role=${agent.role || ""}`,
+        `surface=${agent.surface || "web"}`,
+        `replyMode=${agent.replyMode || ""}`,
+        `pending=${Number(agent.pendingCount || 0)}`,
+        `canReceiveTask=${agent.canReceiveTask === false ? "false" : agent.role === "slave" ? "true" : "false"}`,
+        `lastSeenAgeMs=${Number(agent.lastSeenAgeMs || 0)}`
+      ];
+      if (Array.isArray(agent.capabilities) && agent.capabilities.length > 0) {
+        parts.push(`capabilities=${agent.capabilities.join(",")}`);
+      }
+      if (agent.displayName && agent.displayName !== agent.agentId) {
+        parts.push(`displayName=${agent.displayName}`);
+      }
+      if (agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget) {
+        parts.push(`tmux=${agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget}`);
+      }
+      if (agent.origin) {
+        parts.push(`origin=${agent.origin}`);
+      }
+      return parts.filter(Boolean).join(" ");
+    })
+    .join("\n");
+}
+
+function formatAgentTaskStatusOutput(call, response, startedAt) {
+  if (!response || response.ok === false) {
+    return [
+      "Agent task status query failed:",
+      "",
+      "```shell-output",
+      "agent-task-status",
+      call.messageId ? `message-id: ${call.messageId}` : "",
+      call.taskId ? `task-id: ${call.taskId}` : "",
+      `startedAt: ${startedAt}`,
+      `error: ${response?.error || "Unknown agent hub error."}`,
+      response?.hint ? `hint: ${response.hint}` : "",
+      response?.nextAction ? `nextAction: ${response.nextAction}` : "",
+      "```"
+    ].filter((line) => line !== "").join("\n");
+  }
+
+  const message = response.message || {};
+  const replyMessage = response.replyMessage || {};
+  return [
+    "Agent task status result:",
+    "",
+    "```shell-output",
+    "agent-task-status",
+    `agentId: ${response.agentId || ""}`,
+    `status: ${response.status || ""}`,
+    `ageMs: ${response.ageMs || 0}`,
+    `messageId: ${message.messageId || call.messageId || ""}`,
+    message.taskId || call.taskId ? `task-id: ${message.taskId || call.taskId}` : "",
+    message.from ? `from: ${message.from}` : "",
+    message.to ? `to: ${message.to}` : "",
+    message.deliverySurface ? `delivery: ${message.deliverySurface}` : "",
+    message.replyMode ? `replyMode: ${message.replyMode}` : "",
+    replyMessage.messageId ? `replyMessageId: ${replyMessage.messageId}` : "",
+    response.nextAction ? `nextAction: ${response.nextAction}` : "",
     "```"
   ].filter((line) => line !== "").join("\n");
 }

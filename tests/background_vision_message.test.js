@@ -195,6 +195,6 @@ function currentHealthBody() {
     serverReleaseVersion: "0.6.0",
     protocolVersion: 4,
     serverProtocolVersion: 4,
-    helperProtocolVersion: 1
+    helperProtocolVersion: 2
   };
 }

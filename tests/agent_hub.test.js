@@ -37,6 +37,11 @@ response = handleAgentHubMessage({ type: "agent-list" }, 1200);
 assert.equal(response.ok, true);
 assert.deepEqual(response.agents.map((agent) => agent.agentId), ["master", "slave-a"]);
 assert.deepEqual(response.pending, {});
+assert.equal(response.agents.find((agent) => agent.agentId === "master").canReceiveTask, false);
+assert.deepEqual(response.agents.find((agent) => agent.agentId === "master").capabilities, ["agent-message", "poll-delivery", "per-agent-shell-workspace"]);
+assert.equal(response.agents.find((agent) => agent.agentId === "slave-a").canReceiveTask, true);
+assert.ok(response.agents.find((agent) => agent.agentId === "slave-a").capabilities.includes("receive-task"));
+assert.equal(response.agents.find((agent) => agent.agentId === "slave-a").lastSeenAgeMs, 100);
 
 response = handleAgentHubMessage({
   type: "agent-send",

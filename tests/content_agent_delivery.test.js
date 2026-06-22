@@ -492,6 +492,7 @@ async function testAgentMessageOutputExplainsTmuxAiDelivery() {
   assert.match(output, /replyScriptFile: \/tmp\/agent-replies\/msg-001-slave-tmux-reply\.sh/);
   assert.match(output, /replyCommand: sh '\/tmp\/agent-replies\/msg-001-slave-tmux-reply\.sh'/);
   assert.match(output, /nextStep: Write final answer/);
+  assert.match(output, /statusQuery:\n````\nai-helper-agent-task-status-start\nmessage-id: msg-001\nai-helper-agent-task-status-end\n````/);
 }
 
 async function testAgentMessageFailureOutputShowsNextAction() {
@@ -501,6 +502,7 @@ async function testAgentMessageFailureOutputShowsNextAction() {
     taskId: "task-404"
   }, {
     ok: false,
+    errorCode: "recipient-not-registered",
     error: "Agent recipient is not registered: slave-missing",
     hint: "The target agent is not online in the local agent hub.",
     nextAction: "Open the target web page or register the tmux-ai pane, then run Agent Check."
@@ -509,6 +511,128 @@ async function testAgentMessageFailureOutputShowsNextAction() {
   assert.match(output, /Agent message failed/);
   assert.match(output, /hint: The target agent is not online/);
   assert.match(output, /nextAction: Open the target web page/);
+  assert.match(output, /aiNextAction: Run ai-helper-agent-roster-start with role: slave/);
+}
+
+async function testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities() {
+  const context = loadContentContext();
+  const sentMessages = [];
+  let replyText = "";
+  let clickCount = 0;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => {
+    replyText = text;
+  };
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    return true;
+  };
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-list") {
+      return {
+        ok: true,
+        agents: [
+          { agentId: "master", role: "master", surface: "web", replyMode: "poll", pendingCount: 0, canReceiveTask: false, capabilities: ["agent-message"], lastSeenAgeMs: 12 },
+          { agentId: "slave-a", role: "slave", surface: "web", replyMode: "poll", pendingCount: 1, canReceiveTask: true, capabilities: ["receive-task", "per-agent-shell-workspace"], lastSeenAgeMs: 20 },
+          { agentId: "slave-tmux", role: "slave", surface: "tmux-ai", replyMode: "cli", pendingCount: 0, canReceiveTask: true, capabilities: ["receive-task", "short-reply-script"], lastSeenAgeMs: 0, tmuxTargetName: "Claude:0.0" }
+        ]
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  const call = context.parseCallPayload([
+    "ai-helper-agent-roster-start",
+    "role: slave",
+    "ai-helper-agent-roster-end"
+  ].join("\n"));
+  await context.runAndReply("call-roster", call);
+
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-list"]);
+  assert.equal(clickCount, 1);
+  assert.match(replyText, /Agent roster result/);
+  assert.match(replyText, /requester: master/);
+  assert.match(replyText, /filterRole: slave/);
+  assert.match(replyText, /count: 2/);
+  assert.match(replyText, /- slave-a role=slave surface=web replyMode=poll pending=1 canReceiveTask=true lastSeenAgeMs=20 capabilities=receive-task,per-agent-shell-workspace/);
+  assert.match(replyText, /- slave-tmux role=slave surface=tmux-ai replyMode=cli pending=0 canReceiveTask=true lastSeenAgeMs=0 capabilities=receive-task,short-reply-script tmux=Claude:0\.0/);
+  assert.match(replyText, /nextAction: Send agent-message helpers to exact slave ids/);
+}
+
+async function testAgentRosterHelperRequiresRegisteredPage() {
+  const context = loadContentContext();
+  let replyText = "";
+  context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => {
+    replyText = text;
+  };
+  context.clickSendWhenReady = async () => true;
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  const call = context.parseCallPayload([
+    "ai-helper-agent-roster-start",
+    "ai-helper-agent-roster-end"
+  ].join("\n"));
+
+  await context.runAndReply("call-roster-missing-agent", call);
+
+  assert.match(replyText, /Agent roster query failed/);
+  assert.match(replyText, /Current page is not configured as an agent/);
+}
+
+async function testAgentTaskStatusHelperDispatchesAndFormatsNextAction() {
+  const context = loadContentContext();
+  const sentMessages = [];
+  let replyText = "";
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => {
+    replyText = text;
+  };
+  context.clickSendWhenReady = async () => true;
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-task-status") {
+      return {
+        ok: true,
+        agentId: "master",
+        status: "waiting-for-tmux-ai-reply",
+        ageMs: 5000,
+        nextAction: "Keep the tmux-ai pane running.",
+        message: {
+          messageId: "msg-001",
+          taskId: "task-001",
+          from: "master",
+          to: "slave-tmux",
+          deliverySurface: "tmux-ai",
+          replyMode: "cli"
+        }
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  const call = context.parseCallPayload([
+    "ai-helper-agent-task-status-start",
+    "message-id: msg-001",
+    "ai-helper-agent-task-status-end"
+  ].join("\n"));
+  await context.runAndReply("call-status", call);
+
+  assert.equal(sentMessages.length, 1);
+  assert.equal(sentMessages[0].type, "agent-task-status");
+  assert.equal(sentMessages[0].agentId, "master");
+  assert.equal(sentMessages[0].messageId, "msg-001");
+  assert.equal(sentMessages[0].taskId, "");
+  assert.match(replyText, /Agent task status result/);
+  assert.match(replyText, /status: waiting-for-tmux-ai-reply/);
+  assert.match(replyText, /delivery: tmux-ai/);
+  assert.match(replyText, /replyMode: cli/);
+  assert.match(replyText, /nextAction: Keep the tmux-ai pane running/);
 }
 
 async function testAgentSetupCheckExplainsMissingTmuxAiSlave() {
@@ -585,6 +709,9 @@ async function testAgentSetupCheckExplainsReadyState() {
   await testTmuxAiRegistrationExplainsMissingTarget();
   await testAgentMessageOutputExplainsTmuxAiDelivery();
   await testAgentMessageFailureOutputShowsNextAction();
+  await testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities();
+  await testAgentRosterHelperRequiresRegisteredPage();
+  await testAgentTaskStatusHelperDispatchesAndFormatsNextAction();
   await testAgentSetupCheckExplainsMissingTmuxAiSlave();
   await testAgentSetupCheckExplainsReadyState();
   console.log("content agent delivery tests passed");

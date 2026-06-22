@@ -113,7 +113,7 @@ const context = {
       serverReleaseVersion: "0.6.0",
       protocolVersion: 4,
       serverProtocolVersion: 4,
-      helperProtocolVersion: 1
+      helperProtocolVersion: 2
     })
   }),
   setTimeout,
@@ -231,7 +231,7 @@ async function main() {
       serverReleaseVersion: "0.4.0",
       protocolVersion: 2,
       serverProtocolVersion: 2,
-      helperProtocolVersion: 1
+      helperProtocolVersion: 2
     })
   });
 

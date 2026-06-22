@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0] - 2026-06-22
+
+- Adds read-only AI-facing `ai-helper-agent-roster-*` helpers so master agents can discover online slaves, surfaces, reply modes, pending counts, and capabilities without the user copying the floating-panel roster.
+- Adds read-only `ai-helper-agent-task-status-*` helpers so master agents can inspect delegated tasks by `message-id` or `task-id` and receive actionable status/next-step output.
+- Bumps helper protocol to `2` because the AI-facing helper surface now includes agent roster and task-status query helpers.
+- Improves agent-message result and failure output with status-query hints and AI-executable recovery guidance.
+- Updates README and AI instructions so the master workflow is roster -> delegate -> status/recovery rather than assuming the user already provided a slave id.
+
 ## [0.7.1] - 2026-06-22
 
 - Updates the README multi-agent guide with copyable browser master/slave prompts, browser-tab smoke-test steps, and clearer pending-delivery behavior.

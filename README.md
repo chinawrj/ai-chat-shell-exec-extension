@@ -4,12 +4,14 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes four helper block types:
+With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes six helper block types:
 
 - Shell helper: request local terminal output from the default `ForAI` tmux session.
 - Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
 - File helper: write one file under `$HOME/Downloads`.
 - Agent message helper: send a task or result to another locally registered agent tab.
+- Agent roster helper: let an AI master query online agents before delegating.
+- Agent task-status helper: let an AI master check a delegated task by `message-id` or `task-id`.
 
 Shell helper:
 
@@ -48,9 +50,25 @@ Investigate this independently and report back.
 ai-helper-agent-message-end
 ````
 
+Agent roster helper:
+
+````
+ai-helper-agent-roster-start
+role: slave
+ai-helper-agent-roster-end
+````
+
+Agent task-status helper:
+
+````
+ai-helper-agent-task-status-start
+message-id: msg-001
+ai-helper-agent-task-status-end
+````
+
 By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
-For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-file-start:2`, or `ai-helper-agent-message-start:2`.
+For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
 The content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block.
 
@@ -205,26 +223,42 @@ Typical browser-tab workflow:
 
 1. Open an enabled master chat page, refresh it after changing extension settings, click the chat input once if the floating panel is not calibrated, set role `master`, keep or edit the id, then click `Save`.
 2. Open one or more enabled slave chat pages, refresh them after changing extension settings, set role `slave`, use stable ids such as `slave-a`, then click `Save` on each.
-3. On the master page, click `Check` or `Roster` to confirm the slaves are online before asking the master AI to delegate.
+3. On the master page, click `Check` or `Roster` if you want human-readable diagnostics. The master AI can also query the same roster itself with the helper block below.
 4. Put the master instructions from `docs/AI_INSTRUCTIONS.md` in the master chat. Put the slave instructions in each slave chat.
 
-`Roster` lists agents currently registered with the local server and pending message counts. `Check` explains common setup problems directly in the floating panel, such as an unsaved current tab, no tmux panes, no tmux-ai slave, or an unavailable local server.
+`Roster` lists agents currently registered with the local server and pending message counts. `Check` explains common setup problems directly in the floating panel, such as an unsaved current tab, no tmux panes, no tmux-ai slave, or an unavailable local server. These panel buttons are for human debugging; AI masters should use the read-only agent roster and task-status helpers.
 
 Minimal master prompt to paste into the master chat:
 
 `````text
-You are the master agent. When I ask you to delegate work to a teammate, send exactly one agent-message helper block and no prose:
+You are the master agent. Before delegating, discover online teammates by sending exactly one roster helper block and no prose:
+
+````
+ai-helper-agent-roster-start
+role: slave
+ai-helper-agent-roster-end
+````
+
+Read the Agent roster result. Choose an agent with role=slave and canReceiveTask=true. When I ask you to delegate work to a teammate, send exactly one agent-message helper block and no prose:
 
 ````
 ai-helper-agent-message-start
-to: slave-a
+to: exact-slave-id-from-roster
 task-id: task-unique-id
 
 Specific task instructions for the slave.
 ai-helper-agent-message-end
 ````
 
-Use the exact `to` agent id I give you. Include enough context for the slave. Wait for the slave result before final synthesis.
+After sending a task, keep the returned messageId. If the task takes too long, query status with:
+
+````
+ai-helper-agent-task-status-start
+message-id: message-id-from-agent-message-result
+ai-helper-agent-task-status-end
+````
+
+Include enough context for the slave. Wait for the slave result before final synthesis.
 `````
 
 Minimal browser-slave prompt to paste into each browser slave chat:
@@ -247,7 +281,27 @@ ai-helper-agent-message-end
 Preserve `reply-to` exactly when the delivered task includes it.
 `````
 
-Agent pages can send messages through the local WebSocket agent hub:
+Agent pages can query online teammates and task state through the local WebSocket agent hub:
+
+````
+ai-helper-agent-roster-start
+role: slave
+ai-helper-agent-roster-end
+````
+
+The roster output includes `agentId`, `role`, `surface`, `replyMode`, `pending`, `canReceiveTask`, `lastSeenAgeMs`, and `capabilities`. `surface=web` means the slave is another browser tab; `surface=tmux-ai` means the slave is an AI running in tmux and replying through the short reply script.
+
+For `tmux-ai`, `canReceiveTask=true` means the pane is registered as a slave. The exact tmux pane is revalidated when the master sends a task; if the pane has disappeared, the agent-message result returns `tmux-target-unavailable` with recovery guidance.
+
+````
+ai-helper-agent-task-status-start
+message-id: msg-001
+ai-helper-agent-task-status-end
+````
+
+Task-status output includes states such as `waiting-for-recipient-poll`, `delivered-waiting-for-reply`, `waiting-for-tmux-ai-reply`, and `replied-waiting-for-master`, plus a `nextAction`.
+
+Agent pages can send messages through the same hub:
 
 ````
 ai-helper-agent-message-start
@@ -274,7 +328,7 @@ Result, findings, tests run, and blockers.
 ai-helper-agent-message-end
 ````
 
-The hub rejects stale or malformed result routing with explicit diagnostics. Common failures such as missing recipient, unregistered sender, wrong master, wrong task id, stale `reply-to`, or duplicate reply include `hint` and `nextAction` fields, which are also shown in failed agent-message `shell-output`.
+The hub rejects stale or malformed result routing with explicit diagnostics. Common failures such as missing recipient, unregistered sender, wrong master, wrong task id, stale `reply-to`, or duplicate reply include `hint`, `nextAction`, and sometimes `aiNextAction` fields, which are also shown in failed agent-message `shell-output`.
 
 For long-running delegated work, the server also exposes `agent-task-status` for diagnostics. It reports whether a task is waiting for the recipient to poll, delivered and waiting for reply, waiting for a tmux-ai short-script reply, or replied but not yet picked up by the master.
 
@@ -282,8 +336,8 @@ When a registered agent page emits a normal shell helper, the server routes it t
 
 Browser-tab smoke test:
 
-1. Confirm `Roster` shows `master` and `slave-a`.
-2. Ask the master AI: `Send slave-a a task asking it to reply with exactly BROWSER_AGENT_SMOKE_OK.`
+1. Ask the master AI: `Query the agent roster, choose slave-a if it is online, then send it a task asking it to reply with exactly BROWSER_AGENT_SMOKE_OK.`
+2. Expected first result: the master emits an `ai-helper-agent-roster-start` block and receives an `Agent roster result` listing `slave-a`.
 3. Expected result: the slave page receives the task, sends an agent-message reply with `reply-to`, and the master page receives `BROWSER_AGENT_SMOKE_OK`.
 
 ### Tmux AI Agents
@@ -320,7 +374,7 @@ This is the intended simple path when the master is a web AI page and the slave 
    - click `Register`
    - click `Check` and confirm it reports a `tmux-ai` slave
 
-5. Give the master AI the minimal master prompt above or the `Multi-Agent Master` section from `docs/AI_INSTRUCTIONS.md`, then ask it to delegate a task to `slave-tmux`. The minimal prompt works for `slave-tmux` because it tells the master to use the exact `to` agent id you provide; if the AI copies the example literally, tell it to replace `slave-a` with `slave-tmux`.
+5. Give the master AI the minimal master prompt above or the `Multi-Agent Master` section from `docs/AI_INSTRUCTIONS.md`, then ask it to query the roster and delegate a task to `slave-tmux`. The roster result should list `slave-tmux` with `surface=tmux-ai` and `canReceiveTask=true`.
 
 6. The server pastes the task into Claude's tmux pane. Claude should write the result to the shown reply file and run the short `sh ...-reply.sh` command. The master page receives the result as an agent message.
 
@@ -346,9 +400,10 @@ The tmux task prompt and the Claude skill both say the same thing: do the work, 
 First tmux-ai smoke test:
 
 1. Confirm the master page is saved as agent id `master`, the master AI has received the master prompt, and `Check` reports `slave-tmux` as a `tmux-ai` slave.
-2. Ask the master AI: `Delegate to slave-tmux and ask it to reply with exactly TMUX_AI_SMOKE_OK.`
-3. Expected result: Claude in tmux receives a task prompt, writes `TMUX_AI_SMOKE_OK` to the reply file, runs the short reply script, and the master page receives `TMUX_AI_SMOKE_OK`.
-4. If Claude only says it is done in the terminal, tell it: `Use the Reply file and Reply command (short) from the task prompt. The master only receives the result after the short script returns ok: true.`
+2. Ask the master AI: `Query the agent roster, choose slave-tmux, and ask it to reply with exactly TMUX_AI_SMOKE_OK.`
+3. Expected first result: the master emits an `ai-helper-agent-roster-start` block and receives an `Agent roster result` listing `slave-tmux`.
+4. Expected final result: Claude in tmux receives a task prompt, writes `TMUX_AI_SMOKE_OK` to the reply file, runs the short reply script, and the master page receives `TMUX_AI_SMOKE_OK`.
+5. If Claude only says it is done in the terminal, tell it: `Use the Reply file and Reply command (short) from the task prompt. The master only receives the result after the short script returns ok: true.`
 
 For the opt-in real Claude end-to-end test, open Claude in a tmux pane and run:
 
@@ -457,6 +512,27 @@ ai-helper-agent-message-end
 
 Agent-message helpers route text through the local agent hub. They do not execute shell commands by themselves; if an agent needs terminal output, that agent emits a separate shell helper from its own tab.
 
+For agent roster discovery, use:
+
+````
+ai-helper-agent-roster-start
+role: slave
+surface: tmux-ai
+ai-helper-agent-roster-end
+````
+
+`role` and `surface` are optional filters. Valid roles are `master` and `slave`; valid surfaces are `web` and `tmux-ai`. The result is a `shell-output` block listing online agents and capabilities.
+
+For delegated task status, use either `message-id` or `task-id`:
+
+````
+ai-helper-agent-task-status-start
+message-id: msg-001
+ai-helper-agent-task-status-end
+````
+
+The result is a `shell-output` block with task state and `nextAction` guidance for the AI master.
+
 ## Zero-Knowledge Site Strategy
 
 The extension does not hard-code a ChatGPT, Claude, or Copilot DOM contract. The default strategy is:
@@ -471,9 +547,10 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 
 ## Safety Defaults
 
-- The extension runs only explicit shell, board, file, and agent-message helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
+- The extension runs only explicit shell, board, file, agent-message, agent-roster, and agent-task-status helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
 - Shell helper commands always run in `ForAI:host`; target lines are not part of the shell helper protocol.
 - Agent-message helpers only route messages through the local agent hub. They do not execute commands unless the receiving agent later emits its own explicit helper block.
+- Agent-roster and agent-task-status helpers are read-only local hub queries; they do not execute shell commands.
 - Reset actions in the floating panel and popup kill and recreate only the default `ForAI` session.
 - Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or `ForAI:board`, and the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.

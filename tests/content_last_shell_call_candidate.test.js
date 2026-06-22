@@ -79,6 +79,22 @@ function createHelperBlock({ cmd }) {
   ].join("\n");
 }
 
+function createAgentRosterBlock() {
+  return [
+    "ai-helper-agent-roster-start",
+    "role: slave",
+    "ai-helper-agent-roster-end"
+  ].join("\n");
+}
+
+function createAgentTaskStatusBlock() {
+  return [
+    "ai-helper-agent-task-status-start",
+    "message-id: msg-repeat",
+    "ai-helper-agent-task-status-end"
+  ].join("\n");
+}
+
 function createAssistantMessage({ text, order }) {
   return new MockNode({ text, role: "assistant", order });
 }
@@ -242,6 +258,7 @@ async function verifyForceRunUsesLatestHelper() {
     enabledHosts: ["chatgpt.com"],
     maxChainCalls: 100
   });
+  await Promise.resolve();
   const runCalls = [];
   context.getConversationRoot = () => root;
   context.updateSiteActionButton = () => {};
@@ -251,7 +268,7 @@ async function verifyForceRunUsesLatestHelper() {
   context.runAndReply = async (callId, call, options) => {
     runCalls.push({ callId, call, options });
   };
-  vm.runInContext("extensionActive = true; activeCallId = ''; initialThreadSettled = true;", context);
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(root.innerText)}; lastThreadTextAt = Date.now() - 2000;`, context);
 
   await context.scanForShellCall({ force: true });
   assert.equal(runCalls.length, 1);
@@ -292,13 +309,50 @@ async function verifyDebugPanelUpdates() {
   context.scheduleScan = () => {};
   context.resetChainForNewHumanPrompt = () => {};
   context.runAndReply = async () => {};
-  vm.runInContext("extensionActive = true; activeCallId = ''; initialThreadSettled = true;", context);
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(root.innerText)}; lastThreadTextAt = Date.now() - 2000;`, context);
 
   await context.scanForShellCall({ force: true });
 
   assert.ok(getElementByIdCalls.includes("ai-chat-shell-exec-debug-body"), "getElementById should be called with DEBUG_BODY_ID");
   assert.ok(debugBody.textContent.includes("--- cmd / content (first 800 chars) ---"), `debug body should contain cmd/content header`);
   assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);
+}
+
+async function verifyRepeatableAgentQueriesBypassSemanticDedup() {
+  const context = loadContentContext();
+  const roster = context.parseCallPayload(createAgentRosterBlock());
+  const rosterSemanticKey = context.buildSemanticCallKey(roster);
+  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(rosterSemanticKey)});`, context);
+  assert.equal(
+    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-roster-call", rosterSemanticKey, roster),
+    ""
+  );
+
+  const status = context.parseCallPayload(createAgentTaskStatusBlock());
+  const statusSemanticKey = context.buildSemanticCallKey(status);
+  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(statusSemanticKey)});`, context);
+  assert.equal(
+    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-status-call", statusSemanticKey, status),
+    ""
+  );
+
+  const shell = context.parseCallPayload(createHelperBlock({ cmd: "pwd" }));
+  const shellSemanticKey = context.buildSemanticCallKey(shell);
+  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(shellSemanticKey)});`, context);
+  assert.equal(
+    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-shell-call", shellSemanticKey, shell),
+    "processed semantic key"
+  );
+
+  assert.equal(
+    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "same-roster-call", rosterSemanticKey, roster),
+    ""
+  );
+  vm.runInContext("processedCalls.add('same-roster-call');", context);
+  assert.equal(
+    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "same-roster-call", rosterSemanticKey, roster),
+    "processed callKey"
+  );
 }
 
 async function verifyDebugPanelUpdatesDuringStreaming() {
@@ -524,6 +578,7 @@ async function verifyDebugPanelListsAllCandidates() {
 
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
+  .then(() => verifyRepeatableAgentQueriesBypassSemanticDedup())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
   .then(() => verifyDebugPanelListsAllCandidates())

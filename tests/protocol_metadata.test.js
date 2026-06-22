@@ -23,7 +23,7 @@ async function main() {
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
 
     assert.equal(server.SERVER_PROTOCOL_VERSION, 4);
-    assert.equal(server.HELPER_PROTOCOL_VERSION, 1);
+    assert.equal(server.HELPER_PROTOCOL_VERSION, 2);
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
     process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "Ghostty,Google Chrome,bad\napp";
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Ghostty"]);
@@ -36,7 +36,7 @@ async function main() {
     assert.equal(metadata.serverReleaseVersion, manifest.version);
     assert.equal(metadata.protocolVersion, 4);
     assert.equal(metadata.serverProtocolVersion, 4);
-    assert.equal(metadata.helperProtocolVersion, 1);
+    assert.equal(metadata.helperProtocolVersion, 2);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
     assert.equal(metadata.visualProtocolVersion, 1);
     assert.deepEqual(metadata.visualTmuxApps, ["Terminal", "Ghostty"]);
@@ -46,7 +46,7 @@ async function main() {
     assert.equal(health.service, "ai-chat-shell-exec-server");
     assert.equal(health.serverReleaseVersion, manifest.version);
     assert.equal(health.serverProtocolVersion, 4);
-    assert.equal(health.helperProtocolVersion, 1);
+    assert.equal(health.helperProtocolVersion, 2);
     assert.equal(health.visualProtocolVersion, 1);
     assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
     assert.equal(health.executionBackend, "tmux");
@@ -61,7 +61,7 @@ async function main() {
         serverReleaseVersion: manifest.version,
         protocolVersion: 4,
         serverProtocolVersion: 4,
-        helperProtocolVersion: 1
+        helperProtocolVersion: 2
       },
       assertHealth: (result) => {
         assert.equal(result.ok, true);
@@ -69,7 +69,7 @@ async function main() {
         assert.equal(result.helperProtocolMatches, true);
         assert.equal(result.releaseMatches, true);
         assert.equal(result.requiredServerProtocolVersion, 4);
-        assert.equal(result.requiredHelperProtocolVersion, 1);
+        assert.equal(result.requiredHelperProtocolVersion, 2);
       }
     });
 
@@ -85,7 +85,7 @@ async function main() {
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 4 and helper protocol 1/);
+        assert.match(result.error, /Expected server protocol 4 and helper protocol 2/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -105,7 +105,7 @@ async function main() {
         assert.equal(result.ok, false);
         assert.equal(result.protocolMatches, true);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /helper protocol 1/);
+        assert.match(result.error, /helper protocol 2/);
       }
     });
 

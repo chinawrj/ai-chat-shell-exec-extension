@@ -129,7 +129,7 @@ Workflow rules:
 - For shell helpers, do not include a tmux target; the command runs in `ForAI:host`.
 - For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
-- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
+- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 - Wait for shell-output before making claims about command results or file write results.
 - Do not rerun the same command or rewrite the same file unless I ask or the previous output clearly requires it.
 
@@ -147,24 +147,45 @@ Use this on the tab that the user configured as `master` in the floating panel.
 `````text
 I can coordinate helper teammates through local agent messages.
 
-When a teammate should do independent work, send it exactly one agent message helper block and no prose:
+Before delegating, discover available teammates by sending exactly one roster helper block and no prose:
+
+````
+ai-helper-agent-roster-start
+role: slave
+ai-helper-agent-roster-end
+````
+
+Read the `Agent roster result` shell-output. Choose an online agent whose `role=slave` and `canReceiveTask=true`. `surface=web` slaves receive tasks in a browser tab. `surface=tmux-ai` slaves receive tasks in tmux and reply through a short reply script.
+
+When a teammate should do independent work, send exactly one agent message helper block and no prose:
 
 ````
 ai-helper-agent-message-start
-to: slave-a
+to: exact-slave-id-from-roster
 task-id: task-unique-id
 
 Specific task instructions for the slave.
 ai-helper-agent-message-end
 ````
 
+After the message result returns, keep the `messageId`. If the task takes too long, query status with exactly one helper block and no prose:
+
+````
+ai-helper-agent-task-status-start
+message-id: message-id-from-agent-message-result
+ai-helper-agent-task-status-end
+````
+
 Rules:
-- Use one plain unlabeled four-backtick fenced block and no prose when sending an agent message.
+- Use one plain unlabeled four-backtick fenced block and no prose when sending an agent roster, agent message, or task-status helper.
 - The `to` header must name one available slave agent id.
 - Use a unique `task-id` for each delegated task.
 - Include enough context for the slave because it may not have this conversation history.
 - Ask different slaves to work on independent files or hypotheses to avoid conflicts.
 - Wait for messages from slaves before synthesizing final conclusions.
+- If an agent-message fails because the recipient is missing, run the roster helper again, choose an online slave, and resend with a new helper identity and task id.
+- Roster and task-status helpers are read-only and may be queried again when state changes or a task is long-running. If a repeated query is not executed, add a new identity suffix such as `ai-helper-agent-roster-start:2` or `ai-helper-agent-task-status-start:2`.
+- If status says `waiting-for-recipient-poll`, wait or ask the user to open/save that slave tab. If status says `waiting-for-tmux-ai-reply`, wait for the tmux AI or ask the user to inspect the tmux pane.
 - If local shell output is needed in the master tab, use the normal shell helper block; it runs in the master's own agent tmux workspace when this page is configured as an agent.
 `````
 
