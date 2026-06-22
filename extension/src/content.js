@@ -21,7 +21,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.0";
+const CONTENT_SCRIPT_VERSION = "0.8.1";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -64,6 +64,8 @@ let pageEventListenersInstalled = false;
 let lastSuppressedCallStatus = "";
 let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
+let pendingForceRunRequested = false;
+let pendingForceRunTimer = 0;
 let extensionVersionWarning = "";
 let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
@@ -128,6 +130,7 @@ function deactivateExtension() {
   pendingSelfTest = null;
   lastPointerTarget = null;
   clearTimeout(scanTimer);
+  clearPendingForceRun();
   stopAgentPolling();
   threadObserver?.disconnect();
   threadObserver = null;
@@ -392,7 +395,6 @@ function scheduleScan() {
 
 async function scanForShellCall(options = {}) {
   const force = options.force === true;
-  const forceAttempts = Number(options.forceAttempts || 0);
   if (!extensionActive) {
     return;
   }
@@ -419,14 +421,10 @@ async function scanForShellCall(options = {}) {
   }
 
   if (activeCallId) {
-    if (force && forceAttempts < 20) {
+    if (force) {
+      pendingForceRunRequested = true;
       setStatus("Waiting for current helper call, then running latest", "running");
-      clearTimeout(scanTimer);
-      scanTimer = setTimeout(() => {
-        scanForShellCall({ force: true, forceAttempts: forceAttempts + 1 }).catch((error) => {
-          setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
-        });
-      }, 500);
+      schedulePendingForceRunScan();
       return;
     }
 
@@ -471,6 +469,7 @@ async function scanForShellCall(options = {}) {
     expirePendingSelfTest();
     if (force) {
       setStatus("No helper block found on this page", "idle");
+      clearPendingForceRun();
     }
     return;
   }
@@ -486,6 +485,9 @@ async function scanForShellCall(options = {}) {
   }
 
   const call = candidate.call;
+  if (force) {
+    clearPendingForceRun();
+  }
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
   const repeatableAgentQuery = isRepeatableAgentQueryHelperCall(call);
@@ -541,6 +543,26 @@ async function scanForShellCall(options = {}) {
     }
   }
   await runAndReply(executionCallKey, call, { force });
+}
+
+function schedulePendingForceRunScan() {
+  clearTimeout(pendingForceRunTimer);
+  pendingForceRunTimer = setTimeout(() => {
+    pendingForceRunTimer = 0;
+    if (!pendingForceRunRequested || !extensionActive) {
+      return;
+    }
+    scanForShellCall({ force: true }).catch((error) => {
+      setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
+      clearPendingForceRun();
+    });
+  }, 500);
+}
+
+function clearPendingForceRun() {
+  pendingForceRunRequested = false;
+  clearTimeout(pendingForceRunTimer);
+  pendingForceRunTimer = 0;
 }
 
 function buildSemanticCallKey(call) {
@@ -3661,10 +3683,13 @@ async function registerTmuxAiSlaveFromPanel() {
 
 async function forceRunLatestShellCall() {
   pendingSelfTest = null;
+  pendingForceRunRequested = true;
   setStatus("Checking latest helper block once", "running");
   await scanForShellCall({ force: true });
   lastSuppressedCallStatus = "";
-  setForceButtonHighlight(false);
+  if (!pendingForceRunRequested) {
+    setForceButtonHighlight(false);
+  }
 }
 
 async function resetForAiTmux() {

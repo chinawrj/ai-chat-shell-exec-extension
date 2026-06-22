@@ -87,6 +87,40 @@ try {
   assert.equal(forcedLedger.calls.forced.forced, true);
 
   writeLedger({
+    forcedRunning: { state: "running", startedAt: Date.now() - 1_000 }
+  });
+  const forcedRunningContext = loadServerContext();
+  const forcedRunningClaim = forcedRunningContext.claimServerShellCall("forcedRunning", {
+    cmd: "echo force-running",
+    cwd: "/tmp",
+    target: "%4",
+    timeoutMs: 30000,
+    callMeta: { force: true }
+  });
+  assert.equal(forcedRunningClaim.action, "run");
+  const forcedRunningLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(forcedRunningLedger.calls.forcedRunning.state, "running");
+  assert.equal(forcedRunningLedger.calls.forcedRunning.forced, true);
+  assert.equal(forcedRunningLedger.calls.forcedRunning.cmdHash, forcedContext.hashText("echo force-running"));
+
+  writeLedger({});
+  const failedContext = loadServerContext();
+  const failedClaim = failedContext.claimServerShellCall("failedAfterClaim", {
+    cmd: "echo fail-after-claim",
+    cwd: "/tmp",
+    target: "%5",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(failedClaim.action, "run");
+  failedContext.failServerShellCall("failedAfterClaim", new Error("executor failed"), { durationMs: 7 });
+  const failedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(failedLedger.calls.failedAfterClaim.state, "failed");
+  assert.equal(failedLedger.calls.failedAfterClaim.exitCode, 1);
+  assert.equal(failedLedger.calls.failedAfterClaim.durationMs, 7);
+  assert.match(failedLedger.calls.failedAfterClaim.error, /executor failed/);
+
+  writeLedger({
     oldCompleted: { state: "completed", completedAt: Date.now() - (24 * 60 * 60 * 1000 + 1000) },
     freshCompleted: { state: "completed", completedAt: Date.now() - 1_000 }
   });

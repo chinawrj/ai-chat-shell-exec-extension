@@ -505,6 +505,72 @@ async function verifyDebugPanelUpdatesWhileActiveCallRunning() {
   );
 }
 
+async function verifyForceRunPersistsWhileActiveCallRunning() {
+  // Regression: clicking Force run while a previous helper is still active
+  // must not be a short-lived retry window. Long-running shell commands can
+  // exceed that window, so the force request is kept pending until the active
+  // call clears, then the latest helper is executed with force metadata.
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const timers = [];
+  context.setTimeout = (fn, ms) => {
+    timers.push({ fn, ms });
+    return timers.length;
+  };
+  context.clearTimeout = () => {};
+
+  const oldMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: "echo OLD_PENDING_FORCE" })
+  });
+  const newMessage = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd: "echo NEW_PENDING_FORCE" })
+  });
+  const root = createRoot([oldMessage, newMessage]);
+  const runCalls = [];
+  const statuses = [];
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (callId, call, options) => {
+    runCalls.push({ callId, call, options });
+  };
+  vm.runInContext(
+    `extensionActive = true; activeCallId = 'still-running'; initialThreadSettled = true; lastThreadText = ${JSON.stringify(root.innerText)}; lastThreadTextAt = Date.now() - 2000;`,
+    context
+  );
+
+  await context.scanForShellCall({ force: true });
+  assert.equal(runCalls.length, 0);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 500);
+  assert.ok(
+    statuses.some((status) => status.text === "Waiting for current helper call, then running latest"),
+    `expected waiting status, got: ${JSON.stringify(statuses)}`
+  );
+  assert.equal(vm.runInContext("pendingForceRunRequested", context), true);
+
+  vm.runInContext("activeCallId = '';", context);
+  await context.scanForShellCall({ force: true });
+  assert.equal(runCalls.length, 1);
+  assert.equal(runCalls[0].options?.force, true);
+  assert.equal(runCalls[0].call.cmd, "echo NEW_PENDING_FORCE");
+  assert.match(runCalls[0].callId, /:force:/);
+  assert.equal(vm.runInContext("pendingForceRunRequested", context), false);
+}
+
 async function verifyDebugPanelListsAllCandidates() {
   // The debug body should list every detected helper-block candidate, mark
   // the selected one with [*], and surface the candidates:<idx>/<total>
@@ -581,6 +647,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyRepeatableAgentQueriesBypassSemanticDedup())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
+  .then(() => verifyForceRunPersistsWhileActiveCallRunning())
   .then(() => verifyDebugPanelListsAllCandidates())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");

@@ -220,6 +220,39 @@ async function main() {
   assert.equal(sentPayloads[2].callMeta.force, true);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].forced, true);
 
+  const forcedShell = await context.handleRunShellMessage({
+    type: "run-shell",
+    id: "shell-force-top-level",
+    callKey: "shell-force-top-level",
+    cmd: "printf forced-shell",
+    force: true
+  });
+  assert.equal(forcedShell.ok, true);
+  assert.equal(forcedShell.skipped, undefined);
+  assert.equal(sentPayloads.length, 4);
+  assert.equal(sentPayloads[3].type, "run");
+  assert.equal(sentPayloads[3].force, true);
+  assert.equal(localStore["shellCallLedger:v1"].calls["shell-force-top-level"].forced, true);
+
+  localStore["shellCallLedger:v1"].calls["file-force-top-level"] = {
+    state: "completed",
+    completedAt: Date.now()
+  };
+  const forcedFile = await context.handleWriteFileMessage({
+    type: "write-file",
+    id: "file-force-top-level",
+    callKey: "file-force-top-level",
+    filename: "forced.txt",
+    content: "forced file",
+    force: true
+  });
+  assert.equal(forcedFile.ok, true);
+  assert.equal(forcedFile.skipped, undefined);
+  assert.equal(sentPayloads.length, 5);
+  assert.equal(sentPayloads[4].type, "write-file");
+  assert.equal(sentPayloads[4].force, true);
+  assert.equal(localStore["shellCallLedger:v1"].calls["file-force-top-level"].forced, true);
+
   const originalFetch = context.fetch;
   context.fetch = async () => ({
     ok: true,
@@ -244,7 +277,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 3);
+  assert.equal(sentPayloads.length, 5);
   assert.equal(localStore["shellCallLedger:v1"].calls["shell-protocol-mismatch"].state, "failed");
 
   await assert.rejects(
@@ -257,7 +290,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 3);
+  assert.equal(sentPayloads.length, 5);
   assert.equal(localStore["shellCallLedger:v1"].calls["file-protocol-mismatch"].state, "failed");
 
   await assert.rejects(
@@ -269,7 +302,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 3);
+  assert.equal(sentPayloads.length, 5);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-protocol-mismatch"].state, "failed");
   context.fetch = originalFetch;
 

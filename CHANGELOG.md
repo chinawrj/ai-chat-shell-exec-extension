@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1] - 2026-06-22
+
+- Fixes a Force run race where clicking the button while another helper was active could lose the forced run request after a short retry window.
+- Keeps Force run pending until the active helper finishes, then runs the latest visible helper with forced dedup metadata.
+- Normalizes background force handling for both `callMeta.force=true` and top-level `force=true` across shell, file, board, and vision messages.
+- Marks server-side post-claim execution failures as `failed` instead of leaving stale `running` ledger entries.
+
 ## [0.8.0] - 2026-06-22
 
 - Adds read-only AI-facing `ai-helper-agent-roster-*` helpers so master agents can discover online slaves, surfaces, reply modes, pending counts, and capabilities without the user copying the floating-panel roster.

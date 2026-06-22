@@ -175,7 +175,7 @@ async function handleAgentMessage(message) {
 
 async function handleWriteFileMessage(message) {
   const callKey = message.callKey || message.id || "";
-  const force = message.callMeta?.force === true;
+  const force = isForceMessage(message);
   const payload = {
     type: "write-file",
     id: message.id,
@@ -227,7 +227,7 @@ async function handleRunShellMessage(message) {
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
-  const force = message.callMeta?.force === true;
+  const force = isForceMessage(message);
   const payload = {
     type: "run",
     id: message.id,
@@ -279,7 +279,7 @@ async function handleRunBoardMessage(message) {
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
-  const force = message.callMeta?.force === true;
+  const force = isForceMessage(message);
   const payload = {
     type: "run-board",
     id: message.id,
@@ -347,7 +347,7 @@ async function handleVisionMessage(message) {
     message.cmd || ""
   ].join("\n"));
   const target = message.windowId ? `vision-window:${message.windowId}` : `tmux:${message.target || message.tmuxTarget || ""}`;
-  const force = message.callMeta?.force === true || message.force === true;
+  const force = isForceMessage(message);
   const payload = {
     ...message,
     callKey,
@@ -644,6 +644,10 @@ function hashText(input) {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16);
+}
+
+function isForceMessage(message) {
+  return message?.callMeta?.force === true || message?.force === true;
 }
 
 function listTmuxTargets() {

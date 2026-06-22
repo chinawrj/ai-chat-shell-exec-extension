@@ -478,31 +478,36 @@ async function handleMessageText(text) {
     };
   }
 
-  console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
-  const result = await runTmuxShell({
-    cmd,
-    cwd,
-    pane,
-    timeoutMs,
-    maxOutputChars
-  });
-  console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
+  try {
+    console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
+    const result = await runTmuxShell({
+      cmd,
+      cwd,
+      pane,
+      timeoutMs,
+      maxOutputChars
+    });
+    console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
-  const response = {
-    ok: true,
-    id: message.id,
-    callKey,
-    agentId: config.agentId || "",
-    cmd,
-    cwd,
-    target: pane.id,
-    targetName: pane.label,
-    timeoutMs,
-    durationMs: Date.now() - started,
-    ...result
-  };
-  completeServerShellCall(callKey, response);
-  return response;
+    const response = {
+      ok: true,
+      id: message.id,
+      callKey,
+      agentId: config.agentId || "",
+      cmd,
+      cwd,
+      target: pane.id,
+      targetName: pane.label,
+      timeoutMs,
+      durationMs: Date.now() - started,
+      ...result
+    };
+    completeServerShellCall(callKey, response);
+    return response;
+  } catch (error) {
+    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    throw error;
+  }
 }
 
 async function handleRunBoardMessage(message) {
@@ -571,28 +576,33 @@ async function handleRunBoardMessage(message) {
     };
   }
 
-  console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
-  const result = await runTmuxBoard({
-    cmd,
-    pane,
-    timeoutMs,
-    maxOutputChars
-  });
-  console.log(`[done-board] ok=${result.ok !== false} exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
+  try {
+    console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+    const result = await runTmuxBoard({
+      cmd,
+      pane,
+      timeoutMs,
+      maxOutputChars
+    });
+    console.log(`[done-board] ok=${result.ok !== false} exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
-  const response = {
-    ok: result.ok !== false,
-    id: message.id,
-    callKey,
-    cmd,
-    target: pane.id,
-    targetName: pane.label,
-    timeoutMs,
-    durationMs: Date.now() - started,
-    ...result
-  };
-  completeServerShellCall(callKey, response);
-  return response;
+    const response = {
+      ok: result.ok !== false,
+      id: message.id,
+      callKey,
+      cmd,
+      target: pane.id,
+      targetName: pane.label,
+      timeoutMs,
+      durationMs: Date.now() - started,
+      ...result
+    };
+    completeServerShellCall(callKey, response);
+    return response;
+  } catch (error) {
+    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    throw error;
+  }
 }
 
 function handleWriteFileMessage(message) {
@@ -628,25 +638,30 @@ function handleWriteFileMessage(message) {
     };
   }
 
-  const written = writeDownloadsFile(filename, content, downloadsDir);
-  const bytes = written.bytes;
-  console.log(`[write-file] path=${filePath} bytes=${bytes}`);
-  const response = {
-    ok: true,
-    id: message.id,
-    callKey,
-    filename: path.basename(filePath),
-    path: filePath,
-    bytes,
-    durationMs: Date.now() - started
-  };
-  completeServerShellCall(callKey, {
-    ...response,
-    exitCode: 0,
-    timedOut: false,
-    truncated: false
-  });
-  return response;
+  try {
+    const written = writeDownloadsFile(filename, content, downloadsDir);
+    const bytes = written.bytes;
+    console.log(`[write-file] path=${filePath} bytes=${bytes}`);
+    const response = {
+      ok: true,
+      id: message.id,
+      callKey,
+      filename: path.basename(filePath),
+      path: filePath,
+      bytes,
+      durationMs: Date.now() - started
+    };
+    completeServerShellCall(callKey, {
+      ...response,
+      exitCode: 0,
+      timedOut: false,
+      truncated: false
+    });
+    return response;
+  } catch (error) {
+    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    throw error;
+  }
 }
 
 function createAgentHubState() {
@@ -1957,6 +1972,26 @@ function completeServerShellCall(callKey, response) {
   };
   pruneServerLedger();
   saveServerLedger();
+}
+
+function failServerShellCall(callKey, error, extra = {}) {
+  serverLedger.calls ||= {};
+  serverLedger.calls[callKey] = {
+    ...(serverLedger.calls[callKey] || {}),
+    state: "failed",
+    completedAt: Date.now(),
+    exitCode: 1,
+    durationMs: extra.durationMs,
+    timedOut: false,
+    truncated: false,
+    error: summarizeError(error)
+  };
+  pruneServerLedger();
+  saveServerLedger();
+}
+
+function summarizeError(error) {
+  return String(error?.message || error || "").slice(0, 500);
 }
 
 function resolveStateDir(value) {
@@ -4400,6 +4435,7 @@ module.exports = {
   encodeTextFrame,
   extractBoardPromptSignature,
   extractTmuxRunOutput,
+  failServerShellCall,
   getDefaultStateDir,
   getStateDir,
   getStateStatus,
