@@ -21,7 +21,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.1";
+const CONTENT_SCRIPT_VERSION = "0.8.2";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -1617,12 +1617,6 @@ async function runAndReply(callId, call, options = {}) {
       isAgentTaskStatusHelperCall(call) ?
       await sendAgentTaskStatusQuery(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
-
-    if (response?.duplicate === true && response?.skipped === true) {
-      rememberSuppressedCallStatus(`server ${response?.reason || "duplicate"}`);
-      setStatus(force ? "Force run skipped by server" : "Skipped duplicate helper call", "ok");
-      return;
-    }
 
     const reply = isFileHelperCall(call) ?
       formatFileOutput(call, response, startedAt) :
@@ -3373,9 +3367,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
 function isSuppressionStatusText(text) {
   const message = String(text || "");
   return message.startsWith("Suppressed duplicate helper call") ||
-    message.startsWith("Suppressed duplicate shell call") ||
-    message === "Skipped duplicate helper call" ||
-    message === "Force run skipped by server";
+    message.startsWith("Suppressed duplicate shell call");
 }
 
 function handlePanelAction(action) {

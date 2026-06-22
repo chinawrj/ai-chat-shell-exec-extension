@@ -134,8 +134,11 @@ vm.runInContext(script, context, { filename: "background.js" });
     appName: "Ghostty",
     cmd: "printf ok"
   });
-  assert.equal(duplicateCommand.skipped, true);
-  assert.equal(sentPayloads.length, 2);
+  assert.equal(duplicateCommand.ok, true);
+  assert.equal(duplicateCommand.skipped, undefined);
+  assert.equal(sentPayloads.length, 3);
+  assert.equal(sentPayloads[2].type, "vision-visual-run-line");
+  assert.equal(sentPayloads[2].seq, 2);
 
   const listWindows = await context.handleVisionMessage({
     type: "vision-list-windows",
@@ -143,7 +146,7 @@ vm.runInContext(script, context, { filename: "background.js" });
   });
   assert.equal(listWindows.ok, false);
   assert.match(listWindows.error, /Unsupported background vision message type/);
-  assert.equal(sentPayloads.length, 2);
+  assert.equal(sentPayloads.length, 3);
 
   const lowLevelType = await context.handleVisionMessage({
     type: "vision-type",
@@ -153,7 +156,7 @@ vm.runInContext(script, context, { filename: "background.js" });
   });
   assert.equal(lowLevelType.ok, false);
   assert.match(lowLevelType.error, /Unsupported background vision message type/);
-  assert.equal(sentPayloads.length, 2);
+  assert.equal(sentPayloads.length, 3);
 
   const directTmuxRun = await context.handleVisionMessage({
     type: "vision-tmux-run-line",
@@ -163,7 +166,7 @@ vm.runInContext(script, context, { filename: "background.js" });
   });
   assert.equal(directTmuxRun.ok, false);
   assert.match(directTmuxRun.error, /Unsupported background vision message type/);
-  assert.equal(sentPayloads.length, 2);
+  assert.equal(sentPayloads.length, 3);
 
   healthBody = {
     ...currentHealthBody(),
@@ -179,7 +182,7 @@ vm.runInContext(script, context, { filename: "background.js" });
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 2);
+  assert.equal(sentPayloads.length, 3);
 
   console.log("background vision message tests passed");
 })().catch((error) => {

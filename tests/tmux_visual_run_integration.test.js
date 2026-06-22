@@ -101,8 +101,10 @@ function runTmux(socketPath, args, options = {}) {
       cmd: "printf 'VISION_TMUX_LEDGER_OK\\n'",
       timeoutMs: 10000
     });
-    assert.equal(duplicateVisualMessage.skipped, true);
-    assert.equal(duplicateVisualMessage.reason, "recently-completed");
+    assert.equal(duplicateVisualMessage.ok, true);
+    assert.equal(duplicateVisualMessage.skipped, undefined);
+    assert.equal(duplicateVisualMessage.exitCode, 0);
+    assert.equal(duplicateVisualMessage.terminalText.includes("VISION_TMUX_LEDGER_OK"), true);
   } finally {
     spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", sessionName], { encoding: "utf8" });
     if (originalSocket === undefined) {

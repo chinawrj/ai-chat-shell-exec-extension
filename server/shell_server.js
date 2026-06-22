@@ -28,8 +28,6 @@ const STATE_STDOUT_LOG_PATH = path.join(STATE_DIR, "shell-server.out.log");
 const STATE_STDERR_LOG_PATH = path.join(STATE_DIR, "shell-server.err.log");
 const STATE_REQUIRED_SUBDIRS = ["tmux-runs", "board-panes", "vision", "agent-replies", "bin"];
 const SERVER_LEDGER_LIMIT = 1000;
-const RUNNING_LOCK_GRACE_MS = 15000;
-const COMPLETED_DEDUP_TTL_MS = 60_000;
 const SERVER_LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TMUX_FIELD_SEPARATOR = "__AI_CHAT_SHELL_FIELD__";
 const TMUX_LIST_FORMAT = [
@@ -457,26 +455,6 @@ async function handleMessageText(text) {
     callMeta: message.callMeta || {},
     force
   });
-  if (claim.action === "skip") {
-    console.log(`[skip] reason=${claim.reason} callKey=${callKey} cmd=${JSON.stringify(cmd)}`);
-    return {
-      ok: true,
-      id: message.id,
-      callKey,
-      duplicate: true,
-      skipped: true,
-      reason: claim.reason,
-      cmd,
-      cwd,
-      timeoutMs,
-      durationMs: 0,
-      exitCode: 0,
-      stdout: "",
-      stderr: "",
-      truncated: false,
-      timedOut: false
-    };
-  }
 
   try {
     console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
@@ -554,27 +532,6 @@ async function handleRunBoardMessage(message) {
     callMeta: message.callMeta || {},
     force
   });
-  if (claim.action === "skip") {
-    console.log(`[skip] reason=${claim.reason} callKey=${callKey} boardCmd=${JSON.stringify(cmd)}`);
-    return {
-      ok: true,
-      id: message.id,
-      callKey,
-      duplicate: true,
-      skipped: true,
-      reason: claim.reason,
-      cmd,
-      target: pane.id,
-      targetName: pane.label,
-      timeoutMs,
-      durationMs: 0,
-      exitCode: 0,
-      stdout: "",
-      stderr: "",
-      truncated: false,
-      timedOut: false
-    };
-  }
 
   try {
     console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
@@ -622,21 +579,6 @@ function handleWriteFileMessage(message) {
     callMeta: message.callMeta || {},
     force
   });
-  if (claim.action === "skip") {
-    console.log(`[skip] reason=${claim.reason} callKey=${callKey} file=${JSON.stringify(filename)}`);
-    return {
-      ok: true,
-      id: message.id,
-      callKey,
-      duplicate: true,
-      skipped: true,
-      reason: claim.reason,
-      filename,
-      path: filePath,
-      bytes: 0,
-      durationMs: 0
-    };
-  }
 
   try {
     const written = writeDownloadsFile(filename, content, downloadsDir);
@@ -1656,20 +1598,6 @@ async function handleVisionTmuxOcrRunLineMessage(message) {
     callMeta: message.callMeta || {},
     force
   });
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      id: message.id,
-      callKey,
-      duplicate: true,
-      skipped: true,
-      reason: claim.reason,
-      cmd,
-      windowId,
-      timeoutMs,
-      durationMs: 0
-    };
-  }
   const result = await runVisionTmuxOcrLine({
     cmd,
     windowId,
@@ -1729,21 +1657,6 @@ async function handleVisionTmuxRunLineMessage(message) {
     callMeta: message.callMeta || {},
     force
   });
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      id: message.id,
-      callKey,
-      duplicate: true,
-      skipped: true,
-      reason: claim.reason,
-      cmd,
-      target: pane.id,
-      targetName: pane.label,
-      timeoutMs,
-      durationMs: 0
-    };
-  }
 
   const result = await runTmuxVisualLine({
     cmd,
@@ -1927,20 +1840,6 @@ function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(
 function claimServerShellCall(callKey, payload) {
   const now = Date.now();
   const force = payload.callMeta?.force === true || payload.force === true;
-  const existing = serverLedger.calls?.[callKey];
-  const lockTtl = Math.max(5000, Number(payload.timeoutMs || DEFAULT_TIMEOUT_MS) + RUNNING_LOCK_GRACE_MS);
-
-  if (!force) {
-    if (existing?.state === "completed") {
-      const completedAt = Number(existing.completedAt || 0);
-      if (completedAt && now - completedAt < COMPLETED_DEDUP_TTL_MS) {
-        return { action: "skip", reason: "recently-completed" };
-      }
-    }
-    if (existing?.state === "running" && now - Number(existing.startedAt || 0) < lockTtl) {
-      return { action: "skip", reason: "running" };
-    }
-  }
 
   serverLedger.calls ||= {};
   serverLedger.calls[callKey] = {

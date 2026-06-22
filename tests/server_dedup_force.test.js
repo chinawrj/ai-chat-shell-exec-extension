@@ -52,8 +52,10 @@ try {
     timeoutMs: 30000,
     callMeta: {}
   });
-  assert.equal(recentClaim.action, "skip");
-  assert.equal(recentClaim.reason, "recently-completed");
+  assert.equal(recentClaim.action, "run");
+  const recentLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(recentLedger.calls.recent.state, "running");
+  assert.equal(recentLedger.calls.recent.forced, false);
 
   writeLedger({
     stale: { state: "completed", completedAt: Date.now() - 61_000 }
@@ -67,6 +69,22 @@ try {
     callMeta: {}
   });
   assert.equal(staleClaim.action, "run");
+
+  writeLedger({
+    running: { state: "running", startedAt: Date.now() - 1_000 }
+  });
+  const runningContext = loadServerContext();
+  const runningClaim = runningContext.claimServerShellCall("running", {
+    cmd: "echo running",
+    cwd: "/tmp",
+    target: "%2",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(runningClaim.action, "run");
+  const runningLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(runningLedger.calls.running.state, "running");
+  assert.equal(runningLedger.calls.running.forced, false);
 
   writeLedger({
     forced: { state: "completed", completedAt: Date.now() - 5_000 }
@@ -129,7 +147,7 @@ try {
   assert.equal(Boolean(prunedLedger.calls.oldCompleted), false);
   assert.equal(Boolean(prunedLedger.calls.freshCompleted), true);
 
-  console.log("server dedup force tests passed");
+  console.log("server ledger non-blocking tests passed");
 } finally {
   if (originalStateDir === undefined) {
     delete process.env.AI_CHAT_SHELL_STATE_DIR;

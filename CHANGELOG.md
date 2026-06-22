@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2] - 2026-06-22
+
+- Removes backend duplicate-execution blocking from the extension background worker and local shell server.
+- Keeps browser and server ledgers as non-blocking audit records only; repeated completed or running call keys now execute again.
+- Ensures old or unexpected `duplicate/skipped` responses no longer silently suppress chat-window `shell-output` replies.
+- Keeps only the content script's minimal same-page auto-scan loop guard, with manual Force run still available.
+
 ## [0.8.1] - 2026-06-22
 
 - Fixes a Force run race where clicking the button while another helper was active could lose the forced run request after a short retry window.

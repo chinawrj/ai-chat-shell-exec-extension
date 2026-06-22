@@ -2,8 +2,6 @@ const SHELL_SERVER_URL = "ws://127.0.0.1:17371/shell";
 const SHELL_SERVER_HEALTH_URL = "http://127.0.0.1:17371/health";
 const CALL_LEDGER_KEY = "shellCallLedger:v1";
 const CALL_LEDGER_LIMIT = 500;
-const RUNNING_LOCK_GRACE_MS = 15000;
-const COMPLETED_DEDUP_TTL_MS = 60_000;
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
@@ -191,15 +189,6 @@ async function handleWriteFileMessage(message) {
     cmd: `${payload.filename || ""}\n${payload.content || ""}`,
     target: "Downloads"
   });
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      duplicate: true,
-      skipped: true,
-      callKey,
-      reason: claim.reason
-    };
-  }
 
   payload.seq = claim.seq;
   try {
@@ -242,15 +231,6 @@ async function handleRunShellMessage(message) {
   };
 
   const claim = await claimShellCall(callKey, payload);
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      duplicate: true,
-      skipped: true,
-      callKey,
-      reason: claim.reason
-    };
-  }
 
   payload.seq = claim.seq;
   try {
@@ -295,15 +275,6 @@ async function handleRunBoardMessage(message) {
     ...payload,
     target: "board"
   });
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      duplicate: true,
-      skipped: true,
-      callKey,
-      reason: claim.reason
-    };
-  }
 
   payload.seq = claim.seq;
   try {
@@ -358,15 +329,6 @@ async function handleVisionMessage(message) {
     target,
     timeoutMs: message.timeoutMs || 30000
   });
-  if (claim.action === "skip") {
-    return {
-      ok: true,
-      duplicate: true,
-      skipped: true,
-      callKey,
-      reason: claim.reason
-    };
-  }
 
   payload.seq = claim.seq;
   try {
@@ -554,20 +516,6 @@ async function claimShellCall(callKey, payload) {
   const store = await localGet(CALL_LEDGER_KEY);
   const ledger = store[CALL_LEDGER_KEY] || { nextSeq: 1, calls: {} };
   ledger.calls ||= {};
-  const existing = ledger.calls[callKey];
-  const lockTtl = Math.max(5000, Number(payload.timeoutMs || 30000) + RUNNING_LOCK_GRACE_MS);
-
-  if (!force) {
-    if (existing?.state === "completed") {
-      const completedAt = Number(existing.completedAt || 0);
-      if (completedAt && now - completedAt < COMPLETED_DEDUP_TTL_MS) {
-        return { action: "skip", reason: "recently-completed" };
-      }
-    }
-    if (existing?.state === "running" && now - Number(existing.claimedAt || 0) < lockTtl) {
-      return { action: "skip", reason: "running" };
-    }
-  }
 
   const seq = Number(ledger.nextSeq || 1);
   ledger.nextSeq = seq + 1;
