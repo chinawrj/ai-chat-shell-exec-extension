@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.3] - 2026-06-24
+
+- Treats browser-tab slaves as ready Agent Check targets, making tmux-ai optional for browser-only master/slave workflows.
+- Marks tmux-ai slaves as stale when their registered pane is no longer available.
+- Keeps page agents heartbeating while helper calls are running and surfaces repeated polling failures in the floating panel.
+- Clarifies floating-panel actions by separating `Server Check` from `Agent Check`.
+- Adds Chrome E2E coverage for browser-only Agent Check readiness, roster helpers, task-status helpers, and quoted slave reply templates.
+
 ## [0.8.2] - 2026-06-22
 
 - Removes backend duplicate-execution blocking from the extension background worker and local shell server.

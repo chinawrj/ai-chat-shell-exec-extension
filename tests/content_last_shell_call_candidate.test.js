@@ -111,6 +111,7 @@ function loadContentContext() {
   const context = {
     CSS: { escape: (value) => String(value) },
     Element: FakeElement,
+    HTMLElement: FakeElement,
     HTMLButtonElement: class HTMLButtonElement extends FakeElement {},
     HTMLInputElement: class HTMLInputElement extends FakeElement {},
     HTMLTextAreaElement: class HTMLTextAreaElement extends FakeElement {},
@@ -268,7 +269,7 @@ async function verifyForceRunUsesLatestHelper() {
   context.runAndReply = async (callId, call, options) => {
     runCalls.push({ callId, call, options });
   };
-  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(root.innerText)}; lastThreadTextAt = Date.now() - 2000;`, context);
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
 
   await context.scanForShellCall({ force: true });
   assert.equal(runCalls.length, 1);
@@ -309,7 +310,7 @@ async function verifyDebugPanelUpdates() {
   context.scheduleScan = () => {};
   context.resetChainForNewHumanPrompt = () => {};
   context.runAndReply = async () => {};
-  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(root.innerText)}; lastThreadTextAt = Date.now() - 2000;`, context);
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
 
   await context.scanForShellCall({ force: true });
 
@@ -353,6 +354,49 @@ async function verifyRepeatableAgentQueriesBypassSemanticDedup() {
     context.getDuplicateHelperDedupReason({ node: new context.Element() }, "same-roster-call", rosterSemanticKey, roster),
     "processed callKey"
   );
+}
+
+async function verifyAgentHelperInsideShellOutputIsSuppressed() {
+  const context = loadContentContext();
+  const message = createAssistantMessage({
+    order: 1,
+    text: [
+      "Agent message result:",
+      "```shell-output",
+      "statusQuery:",
+      "````",
+      "ai-helper-agent-task-status-start",
+      "message-id: msg-embedded",
+      "ai-helper-agent-task-status-end",
+      "````",
+      "```"
+    ].join("\n")
+  });
+  const root = createRoot([message]);
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+
+  const runCalls = [];
+  const statuses = [];
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (callId, call, options) => {
+    runCalls.push({ callId, call, options });
+  };
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+
+  await context.scanForShellCall();
+
+  assert.equal(runCalls.length, 0);
+  assert.match(statuses.at(-1).text, /Suppressed helper inside shell-output/);
+  assert.equal(statuses.at(-1).state, "ok");
 }
 
 async function verifyDebugPanelUpdatesDuringStreaming() {
@@ -645,6 +689,7 @@ async function verifyDebugPanelListsAllCandidates() {
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
   .then(() => verifyRepeatableAgentQueriesBypassSemanticDedup())
+  .then(() => verifyAgentHelperInsideShellOutputIsSuppressed())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
   .then(() => verifyForceRunPersistsWhileActiveCallRunning())

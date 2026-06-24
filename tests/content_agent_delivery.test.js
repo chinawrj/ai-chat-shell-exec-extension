@@ -492,7 +492,10 @@ async function testAgentMessageOutputExplainsTmuxAiDelivery() {
   assert.match(output, /replyScriptFile: \/tmp\/agent-replies\/msg-001-slave-tmux-reply\.sh/);
   assert.match(output, /replyCommand: sh '\/tmp\/agent-replies\/msg-001-slave-tmux-reply\.sh'/);
   assert.match(output, /nextStep: Write final answer/);
-  assert.match(output, /statusQuery:\n````\nai-helper-agent-task-status-start\nmessage-id: msg-001\nai-helper-agent-task-status-end\n````/);
+  assert.match(output, /statusMessageId: msg-001/);
+  assert.match(output, /statusAction: Ask for an agent task-status query/);
+  assert.doesNotMatch(output, /^ai-helper-agent-task-status-start$/m);
+  assert.doesNotMatch(output, /^ai-helper-agent-task-status-end$/m);
 }
 
 async function testAgentMessageFailureOutputShowsNextAction() {
@@ -635,7 +638,7 @@ async function testAgentTaskStatusHelperDispatchesAndFormatsNextAction() {
   assert.match(replyText, /nextAction: Keep the tmux-ai pane running/);
 }
 
-async function testAgentSetupCheckExplainsMissingTmuxAiSlave() {
+async function testAgentSetupCheckExplainsMissingSlave() {
   const context = loadContentContext();
   const statuses = [];
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
@@ -659,12 +662,48 @@ async function testAgentSetupCheckExplainsMissingTmuxAiSlave() {
   const result = await context.runAgentSetupCheck();
 
   assert.equal(result.ok, false);
+  assert.deepEqual(Array.from(result.readySlaves), []);
+  assert.match(statuses.at(-1).text, /web slaves: none/);
   assert.match(statuses.at(-1).text, /tmux-ai slaves: none/);
-  assert.match(statuses.at(-1).text, /select the AI tmux pane, then click Register/);
+  assert.match(statuses.at(-1).text, /open\/register at least one slave tab/);
   assert.equal(statuses.at(-1).state, "error");
 }
 
-async function testAgentSetupCheckExplainsReadyState() {
+async function testAgentSetupCheckAcceptsWebSlave() {
+  const context = loadContentContext();
+  const statuses = [];
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-list") {
+      return {
+        ok: true,
+        agents: [
+          { agentId: "master", role: "master", surface: "web" },
+          { agentId: "slave-a", role: "slave", surface: "web", canReceiveTask: true }
+        ]
+      };
+    }
+    if (payload.type === "tmux-list") {
+      return {
+        ok: true,
+        panes: []
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  const result = await context.runAgentSetupCheck();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(Array.from(result.readySlaves, (agent) => agent.agentId), ["slave-a"]);
+  assert.match(statuses.at(-1).text, /web slaves: slave-a/);
+  assert.match(statuses.at(-1).text, /tmux-ai slaves: none/);
+  assert.match(statuses.at(-1).text, /Ready: delegate to slave-a\. Tmux AI is optional/);
+  assert.equal(statuses.at(-1).state, "ok");
+}
+
+async function testAgentSetupCheckExplainsTmuxAiReadyState() {
   const context = loadContentContext();
   const statuses = [];
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
@@ -691,9 +730,113 @@ async function testAgentSetupCheckExplainsReadyState() {
   const result = await context.runAgentSetupCheck();
 
   assert.equal(result.ok, true);
-  assert.match(statuses.at(-1).text, /Ready: ask the master AI/);
-  assert.match(statuses.at(-1).text, /slave-tmux@Claude:0\.0/);
+  assert.deepEqual(Array.from(result.readySlaves, (agent) => agent.agentId), ["slave-tmux"]);
+  assert.deepEqual(Array.from(result.tmuxAiStaleAgents), []);
+  assert.match(statuses.at(-1).text, /tmux-ai slaves: slave-tmux@Claude:0\.0/);
+  assert.match(statuses.at(-1).text, /Ready: delegate to slave-tmux\. Tmux AI is optional/);
   assert.equal(statuses.at(-1).state, "ok");
+}
+
+async function testAgentSetupCheckMarksMissingTmuxPaneStale() {
+  const context = loadContentContext();
+  const statuses = [];
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-list") {
+      return {
+        ok: true,
+        agents: [
+          { agentId: "master", role: "master", surface: "web" },
+          { agentId: "slave-tmux", role: "slave", surface: "tmux-ai", canReceiveTask: true, tmuxTargetName: "Claude:0.0" }
+        ]
+      };
+    }
+    if (payload.type === "tmux-list") {
+      return {
+        ok: true,
+        panes: [{ address: "Other:0.0", windowName: "Other" }]
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  const result = await context.runAgentSetupCheck();
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(Array.from(result.readySlaves), []);
+  assert.deepEqual(Array.from(result.tmuxAiStaleAgents, (agent) => agent.agentId), ["slave-tmux"]);
+  assert.match(statuses.at(-1).text, /tmux-ai slaves: slave-tmux@Claude:0\.0 \(stale\)/);
+  assert.match(statuses.at(-1).text, /open\/register at least one slave tab/);
+  assert.equal(statuses.at(-1).state, "error");
+}
+
+async function testSlavePollHeartbeatsWhileShellCallIsRunning() {
+  const context = loadContentContext();
+  const sentMessages = [];
+  let releaseAgentList;
+  context.getCurrentAgentProfile = async () => ({ role: "slave", agentId: "slave-a" });
+  context.setStatus = () => {};
+  context.insertReply = async () => {};
+  context.clickSendWhenReady = async () => true;
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-list") {
+      return new Promise((resolve) => {
+        releaseAgentList = () => resolve({ ok: true, agents: [] });
+      });
+    }
+    if (payload.type === "agent-register") {
+      return { ok: true, agents: [{ agentId: "slave-a", role: "slave" }] };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+  const call = context.parseCallPayload([
+    "ai-helper-agent-roster-start",
+    "ai-helper-agent-roster-end"
+  ].join("\n"));
+  const runningCall = context.runAndReply("running-agent-roster", call);
+  await waitFor(() => releaseAgentList, "agent-list request to start");
+
+  await context.pollAndDeliverAgentMessage();
+  releaseAgentList();
+  await runningCall;
+
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-list", "agent-register"]);
+  assert.equal(sentMessages[1].agentId, "slave-a");
+  assert.equal(sentMessages[1].role, "slave");
+}
+
+async function testAgentPollFailureShowsStatusAfterRetries() {
+  const context = loadContentContext();
+  const statuses = [];
+  context.getCurrentAgentProfile = async () => ({ role: "slave", agentId: "slave-a" });
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.chrome.runtime.sendMessage = async () => {
+    throw new Error("local server offline");
+  };
+  vm.runInContext("extensionActive = false;", context);
+
+  await context.runAgentPollLoop();
+  await context.runAgentPollLoop();
+  await context.runAgentPollLoop();
+
+  assert.match(statuses.at(-1).text, /Agent polling failing: local server offline/);
+  assert.match(statuses.at(-1).text, /Click Agent Check for details/);
+  assert.equal(statuses.at(-1).state, "error");
+}
+
+async function waitFor(predicate, label) {
+  const started = Date.now();
+  while (Date.now() - started < 1000) {
+    const value = predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
 }
 
 (async () => {
@@ -712,7 +855,11 @@ async function testAgentSetupCheckExplainsReadyState() {
   await testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities();
   await testAgentRosterHelperRequiresRegisteredPage();
   await testAgentTaskStatusHelperDispatchesAndFormatsNextAction();
-  await testAgentSetupCheckExplainsMissingTmuxAiSlave();
-  await testAgentSetupCheckExplainsReadyState();
+  await testAgentSetupCheckExplainsMissingSlave();
+  await testAgentSetupCheckAcceptsWebSlave();
+  await testAgentSetupCheckExplainsTmuxAiReadyState();
+  await testAgentSetupCheckMarksMissingTmuxPaneStale();
+  await testSlavePollHeartbeatsWhileShellCallIsRunning();
+  await testAgentPollFailureShowsStatusAfterRetries();
   console.log("content agent delivery tests passed");
 })();

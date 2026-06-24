@@ -63,7 +63,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.helperProtocolVersion,
-      1,
+      2,
       `Existing shell helper protocol is ${serverHealth.helperProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -240,12 +240,58 @@ async function main() {
     return true;
   })()`);
   await waitForEvaluate(masterPage, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered master master")`, "master panel agent registration");
+  await masterPage.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector('[data-shell-tool-action="agent-check"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(masterPage, `(() => {
+    const text = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText || "";
+    return text.includes("Agent setup check:") &&
+      text.includes("web slaves: slave-a") &&
+      text.includes("tmux-ai slaves: none") &&
+      text.includes("Ready: delegate to slave-a. Tmux AI is optional.");
+  })()`, "master panel agent setup check browser-only ready state");
+
   const masterDeliveredText = await waitForEvaluateValue(masterPage, `(() => {
     const text = document.body.innerText || "";
     return text.includes(${JSON.stringify(`Message from slave-a for task ${helperAgentTaskId}:`)}) &&
       text.includes(${JSON.stringify(helperAgentBody)}) ? text : "";
   })()`, "slave reply delivered into master tab");
   assert.match(masterDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
+
+  const rosterHelperId = `roster-e2e-${Date.now()}`;
+  await masterPage.evaluate(`(() => {
+    appendAssistantToolCall([
+      ${JSON.stringify(`ai-helper-agent-roster-start:${rosterHelperId}`)},
+      "role: slave",
+      "ai-helper-agent-roster-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const rosterHelperText = await waitForEvaluateValue(masterPage, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Agent roster result:") &&
+      text.includes("filterRole: slave") &&
+      text.includes("slave-a role=slave surface=web") ? text : "";
+  })()`, "agent roster helper result from master tab");
+  assert.match(rosterHelperText, /Agent roster result:/);
+
+  const statusHelperId = `status-e2e-${Date.now()}`;
+  await masterPage.evaluate(`(() => {
+    appendAssistantToolCall([
+      ${JSON.stringify(`ai-helper-agent-task-status-start:${statusHelperId}`)},
+      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
+      "ai-helper-agent-task-status-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const statusHelperText = await waitForEvaluateValue(masterPage, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Agent task status result:") &&
+      text.includes(${JSON.stringify(`task-id: ${helperAgentTaskId}`)}) ? text : "";
+  })()`, "agent task-status helper result from master tab");
+  assert.match(statusHelperText, /Agent task status result:/);
 
   const tmuxAiTaskId = `task-tmux-ai-e2e-${Date.now()}`;
   const tmuxAiBody = `tmux AI agent task delivered from browser e2e ${tmuxAiTaskId}`;
@@ -276,7 +322,7 @@ async function main() {
     const text = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText || "";
     return text.includes("Agent setup check:") &&
       text.includes("tmux-ai slaves: slave-tmux-ai@") &&
-      text.includes("Ready: ask the master AI");
+      text.includes("Ready: delegate to slave-a, slave-tmux-ai. Tmux AI is optional.");
   })()`, "master panel agent setup check ready state");
 
   agentResponse = await sendLocalAgentRequest(masterPage, {
@@ -339,6 +385,39 @@ async function main() {
       text.includes("You are slave-a") ? text : "";
   })()`, "agent message delivered into local page composer");
   assert.match(deliveredText, new RegExp(escapeRegExp(deliveryBody)));
+  assert.match(deliveredText, /> ai-helper-agent-message-start/);
+  assert.doesNotMatch(deliveredText, /^ai-helper-agent-message-start$/m);
+
+  await page.evaluate(`(() => {
+    appendMessage("user", [
+      ${JSON.stringify(`Message from master for task ${deliveryTaskId}:`)},
+      "",
+      ${JSON.stringify(deliveryBody)},
+      "",
+      "You are slave-a. Complete the task in this chat. When finished, reply to master with this exact helper format:",
+      "",
+      "> ai-helper-agent-message-start",
+      "> to: master",
+      ${JSON.stringify(`> task-id: ${deliveryTaskId}`)},
+      ${JSON.stringify(`> reply-to: ${agentResponse.message.messageId}`)},
+      ">",
+      "> <your result>",
+      "> ai-helper-agent-message-end",
+      "",
+      "Remove the leading > quote markers when you send the final helper reply."
+    ].join("\\n"));
+    return true;
+  })()`);
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 4000))");
+  agentResponse = await sendLocalAgentRequest(masterPage, {
+    type: "agent-task-status",
+    agentId: "master",
+    taskId: deliveryTaskId
+  });
+  assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
+  assert.ok(!String(agentResponse.status || "").includes("replied"), JSON.stringify(agentResponse));
+  const masterAfterDeliveryText = await masterPage.evaluate("document.body.innerText || ''");
+  assert.ok(!masterAfterDeliveryText.includes("<your result>"), "browser slave reply template must not auto-send placeholder result to master");
 
   const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
   await page.evaluate(`(() => {

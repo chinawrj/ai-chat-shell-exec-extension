@@ -199,14 +199,14 @@ By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.micr
 The floating status panel also has calibration controls for unknown chat systems:
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
-- `Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
+- `Server Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
 - `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered helper/code block area.
 - `Clear`: remove the saved bindings for the current origin.
-- Agent controls: choose `master` or `slave`, enter an agent id, click `Save`, use `Roster` to list online agents, and use `Check` to explain whether this tab, the local agent hub, tmux panes, and tmux-ai slaves are ready.
+- Agent controls: choose `master` or `slave`, enter an agent id, click `Save`, use `Roster` to list online agents, and use `Agent Check` to explain whether this tab, the local agent hub, browser-tab slaves, tmux panes, and tmux-ai slaves are ready.
 - Tmux AI controls: from a saved master page, click `Refresh`, select the tmux pane where the AI slave is already running, enter a slave id, then click `Register`.
 
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.
@@ -223,10 +223,10 @@ Typical browser-tab workflow:
 
 1. Open an enabled master chat page, refresh it after changing extension settings, click the chat input once if the floating panel is not calibrated, set role `master`, keep or edit the id, then click `Save`.
 2. Open one or more enabled slave chat pages, refresh them after changing extension settings, set role `slave`, use stable ids such as `slave-a`, then click `Save` on each.
-3. On the master page, click `Check` or `Roster` if you want human-readable diagnostics. The master AI can also query the same roster itself with the helper block below.
+3. On the master page, click `Agent Check` or `Roster` if you want human-readable diagnostics. The master AI can also query the same roster itself with the helper block below.
 4. Put the master instructions from `docs/AI_INSTRUCTIONS.md` in the master chat. Put the slave instructions in each slave chat.
 
-`Roster` lists agents currently registered with the local server and pending message counts. `Check` explains common setup problems directly in the floating panel, such as an unsaved current tab, no tmux panes, no tmux-ai slave, or an unavailable local server. These panel buttons are for human debugging; AI masters should use the read-only agent roster and task-status helpers.
+`Roster` lists agents currently registered with the local server and pending message counts. `Agent Check` explains common setup problems directly in the floating panel, such as an unsaved current tab, no browser-tab slave, no tmux-ai slave, a stale tmux-ai pane, or an unavailable local server. Browser-tab slaves are enough for browser-only workflows; tmux-ai is optional. These panel buttons are for human debugging; AI masters should use the read-only agent roster and task-status helpers.
 
 Minimal master prompt to paste into the master chat:
 
@@ -372,7 +372,7 @@ This is the intended simple path when the master is a web AI page and the slave 
    - select the tmux pane running Claude
    - enter slave id `slave-tmux`
    - click `Register`
-   - click `Check` and confirm it reports a `tmux-ai` slave
+   - click `Agent Check` and confirm it reports a ready `tmux-ai` slave
 
 5. Give the master AI the minimal master prompt above or the `Multi-Agent Master` section from `docs/AI_INSTRUCTIONS.md`, then ask it to query the roster and delegate a task to `slave-tmux`. The roster result should list `slave-tmux` with `surface=tmux-ai` and `canReceiveTask=true`.
 
@@ -399,7 +399,7 @@ The tmux task prompt and the Claude skill both say the same thing: do the work, 
 
 First tmux-ai smoke test:
 
-1. Confirm the master page is saved as agent id `master`, the master AI has received the master prompt, and `Check` reports `slave-tmux` as a `tmux-ai` slave.
+1. Confirm the master page is saved as agent id `master`, the master AI has received the master prompt, and `Agent Check` reports `slave-tmux` as a ready `tmux-ai` slave.
 2. Ask the master AI: `Query the agent roster, choose slave-tmux, and ask it to reply with exactly TMUX_AI_SMOKE_OK.`
 3. Expected first result: the master emits an `ai-helper-agent-roster-start` block and receives an `Agent roster result` listing `slave-tmux`.
 4. Expected final result: Claude in tmux receives a task prompt, writes `TMUX_AI_SMOKE_OK` to the reply file, runs the short reply script, and the master page receives `TMUX_AI_SMOKE_OK`.
@@ -421,7 +421,7 @@ For AI-facing master/slave instruction templates, see `docs/AI_INSTRUCTIONS.md`.
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| `Check` says this tab is not saved as an agent | The page has not registered with the local hub | Select `master` or `slave`, enter an id, then click `Save`. |
+| `Agent Check` says this tab is not saved as an agent | The page has not registered with the local hub | Select `master` or `slave`, enter an id, then click `Save`. |
 | `Roster` does not show a slave tab | The slave page is closed, not enabled, or has not clicked `Save` | Open the slave page, enable the site if needed, click the composer once, then click `Save`. |
 | Master sends to a missing slave | The `to:` header does not match any registered agent id | Use `Roster` to copy the exact id, then resend with a new helper identity if needed. |
 | Slave reply is rejected as wrong route or wrong task | The reply lost or changed `reply-to`, `to`, or `task-id` | Copy the reply skeleton from the delivered task. Preserve `reply-to` exactly. |
@@ -575,7 +575,7 @@ After changing extension files:
 
 1. Reload the unpacked extension in `chrome://extensions`.
 2. Refresh every AI chat tab you want to use.
-3. Confirm the lower-right status badge shows the current extension version and that `Check` reports no content/background version mismatch.
+3. Confirm the lower-right status badge shows the current extension version and that `Server Check` reports no content/background version mismatch.
 
 After changing server files:
 
@@ -586,7 +586,7 @@ After changing server files:
    ./scripts/start_shell_server.sh
    ```
 
-3. Confirm the popup or floating-panel `Check` reports the expected server protocol and helper protocol. A stale foreground server is rejected before commands are forwarded.
+3. Confirm the popup or floating-panel `Server Check` reports the expected server protocol and helper protocol. A stale foreground server is rejected before commands are forwarded.
 
 Health check:
 

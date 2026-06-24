@@ -460,6 +460,10 @@ assert.match(slaveInboundPrompt, /to: master/);
 assert.match(slaveInboundPrompt, /task-id: task-001/);
 assert.match(slaveInboundPrompt, /reply-to: msg-001/);
 assert.match(slaveInboundPrompt, /ai-helper-agent-message-end/);
+assert.equal(slaveInboundPrompt.split("\n").includes("ai-helper-agent-message-start"), false);
+assert.equal(slaveInboundPrompt.split("\n").includes("ai-helper-agent-message-end"), false);
+assert.match(slaveInboundPrompt, /> ai-helper-agent-message-start/);
+assert.match(slaveInboundPrompt, /Remove the leading > quote markers/);
 
 const masterInboundPrompt = context.formatInboundAgentPrompt({
   role: "master",
@@ -479,7 +483,7 @@ assert.equal(context.formatAgentRosterSummary([
   { agentId: "master", role: "master", pendingCount: 0 },
   { agentId: "slave-a", role: "slave", pendingCount: 2 },
   { agentId: "slave-b", role: "slave" }
-], { "slave-b": 1 }), "master:master, slave-a:slave pending:2, slave-b:slave pending:1");
+], { "slave-b": 1 }), "master:master/web receive=no, slave-a:slave/web receive=yes pending:2, slave-b:slave/web receive=yes pending:1");
 
 const indentedMarker = context.parseCallPayload(" ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
 assert.equal(indentedMarker.cmd, "");

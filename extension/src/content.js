@@ -21,7 +21,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.2";
+const CONTENT_SCRIPT_VERSION = "0.8.3";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -71,6 +71,7 @@ let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
 let pendingAgentDeliveryMessageId = "";
 let pendingAgentDelivery = null;
+let consecutiveAgentPollFailures = 0;
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -509,6 +510,12 @@ async function scanForShellCall(options = {}) {
 
   const lastShellOutputText = getLastShellOutputText();
   const lastPromptOrOutputText = getLastUserMessageText();
+  if (!force && isShellOutputCandidate(candidate)) {
+    rememberSuppressedCallStatus("suppressed shell-output helper echo");
+    markCallProcessed(candidate, callKey, semanticCallKey);
+    setStatus(`Suppressed helper inside shell-output: ${summarizeCommand(helperPreviewText(call))}`, "ok");
+    return;
+  }
   if (!force && shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText)) {
     rememberSuppressedCallStatus("suppressed shell-output echo");
     markCallProcessed(candidate, callKey, semanticCallKey);
@@ -1295,6 +1302,17 @@ function shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutp
     (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText));
 }
 
+function isShellOutputCandidate(candidate) {
+  const text = normalizeCommand(
+    candidate?.textRoot?.innerText ||
+    candidate?.textRoot?.textContent ||
+    candidate?.node?.innerText ||
+    candidate?.node?.textContent ||
+    ""
+  );
+  return isShellOutputText(text);
+}
+
 function isSameCommandAsShellOutput(command, shellOutputText) {
   const previousCommandHash = extractCommandHashFromShellOutput(shellOutputText);
   if (previousCommandHash) {
@@ -1897,8 +1915,12 @@ async function runAgentPollLoop() {
   agentPollTimer = 0;
   try {
     await pollAndDeliverAgentMessage();
-  } catch (_unused) {
-    // Keep polling quiet; explicit Check/List actions surface diagnostics.
+    consecutiveAgentPollFailures = 0;
+  } catch (error) {
+    consecutiveAgentPollFailures += 1;
+    if (consecutiveAgentPollFailures >= 3) {
+      setStatus(`Agent polling failing: ${summarizeCommand(error?.message || String(error))}. Click Agent Check for details.`, "error");
+    }
   } finally {
     if (extensionActive) {
       agentPollTimer = window.setTimeout(runAgentPollLoop, AGENT_POLL_INTERVAL_MS);
@@ -1907,11 +1929,15 @@ async function runAgentPollLoop() {
 }
 
 async function pollAndDeliverAgentMessage() {
-  if (agentDeliveryInFlight || activeCallId) {
-    return;
-  }
   const profile = await getCurrentAgentProfile();
   if (!profile.agentId || profile.role === "none") {
+    return;
+  }
+  if (agentDeliveryInFlight) {
+    return;
+  }
+  if (activeCallId) {
+    await registerAgentProfile(profile);
     return;
   }
 
@@ -2102,13 +2128,15 @@ function formatInboundAgentPrompt(profile, message) {
       "",
       `You are ${profile.agentId}. Complete the task in this chat. If you need local shell output, use the normal ai-helper-shell block. When finished, reply to ${from} with this exact helper format:`,
       "",
-      "ai-helper-agent-message-start",
-      `to: ${from}`,
-      message.taskId ? `task-id: ${message.taskId}` : "",
-      `reply-to: ${message.messageId}`,
+      "> ai-helper-agent-message-start",
+      `> to: ${from}`,
+      message.taskId ? `> task-id: ${message.taskId}` : "",
+      `> reply-to: ${message.messageId}`,
+      ">",
+      "> <your result>",
+      "> ai-helper-agent-message-end",
       "",
-      "<your result>",
-      "ai-helper-agent-message-end"
+      "Remove the leading > quote markers when you send the final helper reply."
     ].join("\n");
   }
 
@@ -2317,7 +2345,8 @@ function formatAgentMessageOutput(call, response, startedAt) {
     delivery.replyScriptFile ? `replyScriptFile: ${delivery.replyScriptFile}` : "",
     delivery.replyCommand ? `replyCommand: ${delivery.replyCommand}` : "",
     delivery.nextStep ? `nextStep: ${delivery.nextStep}` : "",
-    `statusQuery:\n${formatAgentTaskStatusHelperExample(message.messageId || response.messageId || "")}`,
+    `statusMessageId: ${message.messageId || response.messageId || ""}`,
+    "statusAction: Ask for an agent task-status query with this message id if progress needs checking.",
     `durationMs: ${response.durationMs || 0}`,
     "```"
   ].filter((line) => line !== "").join("\n");
@@ -2341,16 +2370,6 @@ function getAgentMessageAiNextAction(response) {
     return "Run ai-helper-agent-roster-start with surface: tmux-ai. If no tmux-ai slave is online, ask the user to re-register the pane.";
   }
   return "";
-}
-
-function formatAgentTaskStatusHelperExample(messageId) {
-  return [
-    "````",
-    "ai-helper-agent-task-status-start",
-    `message-id: ${messageId || "message-id-from-agent-message-result"}`,
-    "ai-helper-agent-task-status-end",
-    "````"
-  ].join("\n");
 }
 
 function formatAgentRosterOutput(call, response, startedAt) {
@@ -2944,7 +2963,7 @@ function injectStatus() {
   actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
   for (const action of [
     { mode: "test", label: "Test" },
-    { mode: "check", label: "Check" },
+    { mode: "check", label: "Server Check" },
     {
       mode: "reset-tmux",
       label: "Reset tmux",
@@ -2997,7 +3016,7 @@ function injectStatus() {
     '<input data-shell-agent-id title="Agent id" placeholder="agentId" style="min-width:72px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
     '<button type="button" data-shell-tool-action="agent-register" title="Save this page agent role and register it with the local hub" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Save</button>',
     '<button type="button" data-shell-tool-action="agent-list" title="Show local agent roster and pending message counts" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Roster</button>',
-    '<button type="button" data-shell-tool-action="agent-check" title="Explain whether master/slave/tmux-ai setup is ready" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Check</button>'
+    '<button type="button" data-shell-tool-action="agent-check" title="Explain whether master/slave/tmux-ai setup is ready" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Agent Check</button>'
   ].join("");
   panel.appendChild(agentControls);
 
@@ -3475,10 +3494,19 @@ async function loadAgentControls() {
 
 function applyAgentRoleSuggestion(role) {
   const agentIdElement = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
-  if (!agentIdElement || normalizeCommand(agentIdElement.value || "")) {
+  if (!agentIdElement) {
+    return;
+  }
+  const current = normalizeCommand(agentIdElement.value || "");
+  if (current && !isDefaultSuggestedAgentId(current)) {
     return;
   }
   agentIdElement.value = getSuggestedAgentIdForRole(role);
+}
+
+function isDefaultSuggestedAgentId(value) {
+  const text = normalizeCommand(value || "");
+  return text === "master" || /^slave-[a-f0-9]{8}$/.test(text);
 }
 
 async function registerCurrentPageAgent() {
@@ -3486,14 +3514,16 @@ async function registerCurrentPageAgent() {
   const agentIdElement = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
   const role = normalizeCommand(roleElement?.value || "none");
   const agentId = normalizeCommand(agentIdElement?.value || "");
+  const currentProfile = await getCurrentAgentProfile();
 
   if (role === "none") {
     await setCurrentAgentProfile("none", "");
     startAgentPolling();
-    if (agentId) {
-      await chrome.runtime.sendMessage({ type: "agent-unregister", agentId });
+    const unregisterId = agentId || currentProfile.agentId || "";
+    if (unregisterId) {
+      await chrome.runtime.sendMessage({ type: "agent-unregister", agentId: unregisterId });
     }
-    setStatus("Agent mode disabled for this origin", "idle");
+    setStatus(`Agent mode disabled${unregisterId ? `; unregistered ${unregisterId}` : ""}`, "idle");
     return;
   }
 
@@ -3538,28 +3568,35 @@ async function runAgentSetupCheck() {
   const agents = Array.isArray(agentList?.agents) ? agentList.agents : [];
   const panes = Array.isArray(tmuxList?.panes) ? tmuxList.panes : Array.isArray(tmuxList?.tmuxPanes) ? tmuxList.tmuxPanes : [];
   const tmuxAiAgents = agents.filter((agent) => agent.surface === "tmux-ai");
+  const webSlaves = agents.filter((agent) => agent.role === "slave" && agent.surface !== "tmux-ai");
+  const tmuxAiReadyAgents = tmuxAiAgents.filter((agent) => isTmuxAiAgentPaneAvailable(agent, panes));
+  const tmuxAiStaleAgents = tmuxAiAgents.filter((agent) => !isTmuxAiAgentPaneAvailable(agent, panes));
+  const readySlaves = [
+    ...webSlaves,
+    ...tmuxAiReadyAgents
+  ].filter((agent) => agent.canReceiveTask !== false);
   const parts = [
     `this tab: ${profile.role && profile.role !== "none" && profile.agentId ? `${profile.role} ${profile.agentId}` : "not saved as an agent"}`,
     `agents: ${agentList?.ok ? agents.length : `unavailable (${summarizeCommand(agentList?.error || "agent-list failed")})`}`,
     `tmux panes: ${tmuxList?.ok ? panes.length : `unavailable (${summarizeCommand(tmuxList?.error || "tmux-list failed")})`}`,
-    `tmux-ai slaves: ${tmuxAiAgents.length ? tmuxAiAgents.map((agent) => `${agent.agentId}@${agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget || "tmux"}`).join(", ") : "none"}`
+    `web slaves: ${webSlaves.length ? webSlaves.map((agent) => agent.agentId).join(", ") : "none"}`,
+    `tmux-ai slaves: ${tmuxAiAgents.length ? tmuxAiAgents.map((agent) => `${agent.agentId}@${agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget || "tmux"}${isTmuxAiAgentPaneAvailable(agent, panes) ? "" : " (stale)"}`).join(", ") : "none"}`
   ];
 
-  let next = "Ready: ask the master AI to send an agent task to a tmux-ai slave.";
+  let next = "Ready: use Roster or delegate an agent task to an online slave.";
   let state = "ok";
   if (!profile.agentId || profile.role === "none") {
     next = "Next: choose role master or slave, enter an agent id, then click Save.";
     state = "error";
   } else if (!agentList?.ok) {
-    next = "Next: make sure the local shell server is running, then click Check again.";
+    next = "Next: make sure the local shell server is running, then click Agent Check again.";
     state = "error";
-  } else if (profile.role === "master" && !tmuxList?.ok) {
-    next = "Next: fix tmux-list/server access before registering tmux-ai slaves.";
-    state = "error";
-  } else if (profile.role === "master" && tmuxAiAgents.length === 0) {
-    next = panes.length
-      ? "Next: enter a tmux-ai slave id, select the AI tmux pane, then click Register."
-      : "Next: start the AI in a tmux pane, click Refresh, then Register it as tmux-ai.";
+  } else if (profile.role === "slave") {
+    next = `Ready: ${profile.agentId} is registered and polling for master tasks. Keep this tab open.`;
+  } else if (profile.role === "master" && readySlaves.length > 0) {
+    next = `Ready: delegate to ${readySlaves.map((agent) => agent.agentId).join(", ")}. Tmux AI is optional.`;
+  } else if (profile.role === "master") {
+    next = "Next: open/register at least one slave tab, or register a tmux-ai slave from this master page.";
     state = "error";
   }
 
@@ -3570,6 +3607,9 @@ async function runAgentSetupCheck() {
     agents,
     panes,
     tmuxAiAgents,
+    webSlaves,
+    readySlaves,
+    tmuxAiStaleAgents,
     next
   };
 }
@@ -3579,9 +3619,29 @@ function formatAgentRosterSummary(agents, pending) {
   return (Array.isArray(agents) ? agents : [])
     .map((agent) => {
       const count = Number(agent.pendingCount ?? pendingCounts[agent.agentId] ?? 0);
-      return `${agent.agentId}:${agent.role}${count > 0 ? ` pending:${count}` : ""}`;
+      const surface = agent.surface || "web";
+      const receive = agent.canReceiveTask === false ? "no" : agent.role === "slave" ? "yes" : "no";
+      const tmux = surface === "tmux-ai" ? ` tmux=${agent.tmuxTargetName || agent.tmuxPaneId || agent.tmuxTarget || "unknown"}` : "";
+      return `${agent.agentId}:${agent.role}/${surface} receive=${receive}${count > 0 ? ` pending:${count}` : ""}${tmux}`;
     })
     .join(", ");
+}
+
+function isTmuxAiAgentPaneAvailable(agent, panes) {
+  if (!agent || agent.surface !== "tmux-ai") {
+    return true;
+  }
+  if (!Array.isArray(panes) || panes.length === 0) {
+    return false;
+  }
+  return panes.some((pane) =>
+    [pane.id, pane.address, pane.label, pane.windowName]
+      .filter(Boolean)
+      .some((value) => value === agent.tmuxPaneId ||
+        value === agent.tmuxAddress ||
+        value === agent.tmuxTarget ||
+        value === agent.tmuxTargetName)
+  );
 }
 
 async function refreshTmuxAiTargetOptions(options = {}) {

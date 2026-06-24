@@ -13,7 +13,7 @@ See `docs/ROADMAP.md` for the longer visual-control plan.
 
 1. Direct tmux reliability
    - Keep no-target shell helpers running through `ForAI:host`.
-   - Keep startup, `Check`, doctor diagnostics, and reset behavior clear for non-vision users.
+   - Keep startup, `Server Check`, doctor diagnostics, and reset behavior clear for non-vision users.
    - Preserve concise popup/floating-panel status when vision is unused.
 
 2. Local visual adapter maintenance
