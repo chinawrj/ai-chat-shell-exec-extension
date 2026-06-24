@@ -125,6 +125,10 @@ const script = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "b
 vm.runInContext(script, context, { filename: "background.js" });
 
 async function main() {
+  assert.equal(context.getWebSocketWatchdogMs({ type: "run", timeoutMs: 1000 }), 0);
+  assert.equal(context.getWebSocketWatchdogMs({ type: "run-board", timeoutMs: 1000 }), 6000);
+  assert.equal(context.getWebSocketWatchdogMs({ type: "write-file", timeoutMs: 30000 }), 35000);
+
   const response = await context.handleWriteFileMessage({
     type: "write-file",
     id: "file-1",

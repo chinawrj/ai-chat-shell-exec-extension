@@ -617,10 +617,13 @@ function runShellViaWebSocket(payload) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const socket = new WebSocket(SHELL_SERVER_URL);
-    const timeout = setTimeout(() => {
-      finish(reject, new Error("Shell server timed out."));
-      tryClose(socket);
-    }, Math.max(5000, Number(payload.timeoutMs || 30000) + 5000));
+    const watchdogMs = getWebSocketWatchdogMs(payload);
+    const timeout = watchdogMs > 0
+      ? setTimeout(() => {
+          finish(reject, new Error("Shell server timed out."));
+          tryClose(socket);
+        }, watchdogMs)
+      : 0;
 
     socket.addEventListener("open", () => {
       socket.send(JSON.stringify(payload));
@@ -657,6 +660,13 @@ function runShellViaWebSocket(payload) {
       callback(value);
     }
   });
+}
+
+function getWebSocketWatchdogMs(payload) {
+  if (payload && payload.type === "run") {
+    return 0;
+  }
+  return Math.max(5000, Number(payload?.timeoutMs || 30000) + 5000);
 }
 
 function tryClose(socket) {

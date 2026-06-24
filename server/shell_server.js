@@ -2204,18 +2204,24 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
   const doneMarker = `__AI_CHAT_SHELL_EXEC_DONE_${runId}__`;
   const scriptPath = path.join(TMUX_SCRIPT_DIR, `${runId}.zsh`);
+  const pidPath = path.join(TMUX_SCRIPT_DIR, `${runId}.pid`);
+  const statusPath = path.join(TMUX_SCRIPT_DIR, `${runId}.status`);
   fs.mkdirSync(TMUX_SCRIPT_DIR, { recursive: true });
-  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }), { mode: 0o700 });
+  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath }), { mode: 0o700 });
 
   const started = Date.now();
+  const markerLossGraceMs = 2000;
+  let completionMissingSince = 0;
+  let unknownStateSince = 0;
+  let continuedAfterTimeout = false;
   let lastCapture = "";
   try {
     await runTmuxCommand(["send-keys", "-t", pane.id, "-l", `${SHELL_RUNNER} ${shellQuote(scriptPath)}`], { timeoutMs: 5000 });
     await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
 
-    while (Date.now() - started < timeoutMs) {
+    while (true) {
       await sleep(TMUX_POLL_INTERVAL_MS);
-      lastCapture = await captureTmuxPane(pane.id);
+      lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
       const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
       if (extracted.foundDone) {
         return {
@@ -2224,28 +2230,166 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
           stderr: "",
           truncated: extracted.truncated,
           timedOut: false,
+          continuedAfterTimeout,
           target: pane.id,
           targetName: pane.label
         };
       }
-    }
 
-    const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
-    return {
-      exitCode: 124,
-      stdout: partial.stdout,
-      stderr: "Timed out waiting for tmux command completion marker. The command may still be running in the target pane.",
-      truncated: partial.truncated,
-      timedOut: true,
-      target: pane.id,
-      targetName: pane.label
-    };
+      if (Date.now() - started < timeoutMs) {
+        continue;
+      }
+
+      const state = readTmuxShellRunState(pidPath, statusPath);
+      if (state.processAlive) {
+        continuedAfterTimeout = true;
+        completionMissingSince = 0;
+        unknownStateSince = 0;
+        continue;
+      }
+
+      if (state.completed) {
+        completionMissingSince = completionMissingSince || Date.now();
+        if (Date.now() - completionMissingSince < markerLossGraceMs) {
+          continue;
+        }
+        const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        return {
+          exitCode: state.exitCode,
+          stdout: partial.stdout,
+          stderr: "Timed out waiting for tmux completion marker after the shell process completed.",
+          truncated: partial.truncated,
+          timedOut: true,
+          timeoutReason: "completion-marker-missing",
+          processKnown: true,
+          processAlive: false,
+          processPid: state.pid || 0,
+          continuedAfterTimeout,
+          target: pane.id,
+          targetName: pane.label
+        };
+      }
+
+      if (state.processKnown) {
+        completionMissingSince = completionMissingSince || Date.now();
+        if (Date.now() - completionMissingSince < markerLossGraceMs) {
+          continue;
+        }
+        const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        return {
+          exitCode: 124,
+          stdout: partial.stdout,
+          stderr: "Timed out waiting for tmux completion marker after the shell process exited without reporting completion.",
+          truncated: partial.truncated,
+          timedOut: true,
+          timeoutReason: "process-exited-missing-completion",
+          processKnown: true,
+          processAlive: false,
+          processPid: state.pid || 0,
+          continuedAfterTimeout,
+          target: pane.id,
+          targetName: pane.label
+        };
+      }
+
+      unknownStateSince = unknownStateSince || Date.now();
+      if (Date.now() - unknownStateSince < markerLossGraceMs) {
+        continue;
+      }
+      const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+      return {
+        exitCode: 124,
+        stdout: partial.stdout,
+        stderr: "Timed out waiting for tmux command completion marker and could not confirm a running shell process.",
+        truncated: partial.truncated,
+        timedOut: true,
+        timeoutReason: "process-state-unknown",
+        processKnown: false,
+        processAlive: false,
+        processPid: 0,
+        continuedAfterTimeout,
+        target: pane.id,
+        targetName: pane.label
+      };
+    }
   } finally {
     try {
       fs.unlinkSync(scriptPath);
     } catch {
       // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
     }
+    try {
+      fs.unlinkSync(pidPath);
+    } catch {
+      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
+    }
+    try {
+      fs.unlinkSync(statusPath);
+    } catch {
+      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
+    }
+  }
+}
+
+function readTmuxShellRunState(pidPath, statusPath) {
+  const pid = readPidFile(pidPath);
+  const exitCode = readExitStatusFile(statusPath);
+  if (exitCode !== null) {
+    return {
+      completed: true,
+      exitCode,
+      pid,
+      processKnown: pid > 0,
+      processAlive: false
+    };
+  }
+  if (pid > 0) {
+    return {
+      completed: false,
+      exitCode: 124,
+      pid,
+      processKnown: true,
+      processAlive: isProcessAlive(pid)
+    };
+  }
+  return {
+    completed: false,
+    exitCode: 124,
+    pid: 0,
+    processKnown: false,
+    processAlive: false
+  };
+}
+
+function readPidFile(pidPath) {
+  try {
+    const text = fs.readFileSync(pidPath, "utf8").trim();
+    const pid = Number(text);
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function readExitStatusFile(statusPath) {
+  try {
+    const text = fs.readFileSync(statusPath, "utf8").trim();
+    if (!/^\d+$/.test(text)) {
+      return null;
+    }
+    const exitCode = Number(text);
+    return Number.isInteger(exitCode) && exitCode >= 0 ? exitCode : null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
   }
 }
 
@@ -2885,7 +3029,7 @@ function parseVisionDoneFromText(text, donePrefix) {
   };
 }
 
-function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }) {
+function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath }) {
   return [
     `#!${SHELL_RUNNER}`,
     "set +e",
@@ -2893,8 +3037,12 @@ function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker }) {
     "(",
     cwd ? `  cd -- ${shellQuote(cwd)} || exit $?` : "",
     cmd,
-    ")",
+    ") &",
+    "__ai_chat_shell_exec_pid=$!",
+    `printf '%s\\n' \"$__ai_chat_shell_exec_pid\" > ${shellQuote(pidPath)}`,
+    "wait \"$__ai_chat_shell_exec_pid\"",
     "__ai_chat_shell_exec_status=$?",
+    `printf '%s\\n' \"$__ai_chat_shell_exec_status\" > ${shellQuote(statusPath)}`,
     `printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} \"$__ai_chat_shell_exec_status\"`,
     "exit \"$__ai_chat_shell_exec_status\"",
     ""
@@ -4407,6 +4555,7 @@ module.exports = {
   handleVisionMessage,
   buildAgentReplyCommand,
   buildTmuxAiTaskPrompt,
+  buildTmuxRunScript,
   listTmuxPanes,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
@@ -4415,6 +4564,7 @@ module.exports = {
   pruneAgentMailboxItems,
   prepareStateLogFile,
   readBoardLogFromOffset,
+  readTmuxShellRunState,
   resetAgentHubForTests,
   resolveBoardPane,
   resolveDefaultShellPane,

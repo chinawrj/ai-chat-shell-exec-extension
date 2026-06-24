@@ -189,7 +189,7 @@ The toolbar popup shows whether the local server is reachable and lets you chang
 - default `ForAI` host/board/cwd state, plus a reset button for the default session
 - auto-send shell results
 - per-command browser confirmation
-- timeout, output cap, and automatic chain limit
+- shell state timeout, output cap, and automatic chain limit
 - export/import settings and per-origin calibration bindings
 
 On an enabled chat site, click the chat input once. The content script remembers the composer selector for that origin and uses it for later `shell-output` replies.
@@ -561,7 +561,7 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 - Duplicate execution is blocked before the command reaches the local server. The content script generates a stable call key from the site, latest human intent, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in the runtime state directory's `shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
 - The runtime state directory defaults to `.state/` under this project directory and is rebuildable: it stores server logs, dedupe ledger data, tmux temporary scripts, board logs, vision temp files, local test assets, and helper build artifacts. The startup script and server preflight the state directory and repair or recreate it before accepting commands. Safe conflicts are moved aside with a `.broken-*` suffix. Use `AI_CHAT_SHELL_STATE_DIR` only when you intentionally want state elsewhere.
 - The WebSocket server only accepts Chrome extension requests by default. Set `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
-- The local server clamps timeout to 1 second through 10 minutes. When a tmux command times out, the server stops waiting and reports that the command may still be running in the pane.
+- The local server clamps the shell state timeout to 1 second through 10 minutes. This is not a command runtime limit: after that window, the server keeps waiting while the tmux runner process is still alive. It returns `timedOut: true` only when the completion marker is missing and the runner process is gone or cannot be confirmed.
 - Commands longer than 8000 characters are rejected before execution.
 - Output is capped to avoid flooding the page.
 - Repeated shell output loops are suppressed when the assistant repeats the same command after receiving a shell-output reply.

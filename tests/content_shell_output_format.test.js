@@ -75,4 +75,25 @@ assert.match(multilineOutput, /^\$ printf one printf two$/m);
 assert.match(multilineOutput, /^cmdHash: [a-f0-9]+$/m);
 assert.equal(context.isSameCommandAsShellOutput(multilineCommand, multilineOutput), true);
 
+const timeoutOutput = context.formatShellOutput({ cmd: "sleep 10" }, {
+  ...response,
+  exitCode: 124,
+  processAlive: false,
+  processKnown: false,
+  stderr: "Timed out waiting for tmux command completion marker and could not confirm a running shell process.",
+  timedOut: true,
+  timeoutReason: "process-state-unknown"
+}, "2026-05-22T00:00:00.000Z");
+assert.match(timeoutOutput, /^timedOut: true$/m);
+assert.match(timeoutOutput, /^timeoutReason: process-state-unknown$/m);
+assert.match(timeoutOutput, /^processKnown: false$/m);
+assert.match(timeoutOutput, /^processAlive: false$/m);
+assert.match(timeoutOutput, /stderr:\nTimed out waiting/);
+
+const continuedOutput = context.formatShellOutput({ cmd: "sleep 2" }, {
+  ...response,
+  continuedAfterTimeout: true
+}, "2026-05-22T00:00:00.000Z");
+assert.match(continuedOutput, /^continuedAfterTimeout: true$/m);
+
 console.log("content shell-output format tests passed");

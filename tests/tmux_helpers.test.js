@@ -10,6 +10,7 @@ const {
   buildBoardTargetErrorResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
+  buildTmuxRunScript,
   extractTmuxRunOutput,
   extractBoardPromptSignature,
   getTmuxEnvSocketPath,
@@ -18,6 +19,7 @@ const {
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
   readBoardLogFromOffset,
+  readTmuxShellRunState,
   resolveBoardPane,
   resolveDefaultShellPane,
   resolveDownloadsFilePath,
@@ -106,6 +108,54 @@ fs.writeFileSync(fakeSocketPath, "");
 assert.equal(getTmuxEnvSocketPath(`${fakeSocketPath},123,0`), fakeSocketPath);
 assert.equal(getTmuxEnvSocketPath(`${fakeSocketPath}-missing,123,0`), "");
 fs.rmSync(fakeSocketDir, { recursive: true, force: true });
+
+{
+  const script = buildTmuxRunScript({
+    cmd: "printf 'ok\\n'",
+    cwd: "/tmp/project",
+    startMarker: "__START__",
+    doneMarker: "__DONE__",
+    pidPath: "/tmp/run.pid",
+    statusPath: "/tmp/run.status"
+  });
+  assert.match(script, /printf '\\n%s\\n' '__START__'/);
+  assert.match(script, /\) &/);
+  assert.match(script, /__ai_chat_shell_exec_pid=\$!/);
+  assert.match(script, /\/tmp\/run\.pid/);
+  assert.match(script, /wait "\$__ai_chat_shell_exec_pid"/);
+  assert.match(script, /\/tmp\/run\.status/);
+  assert.match(script, /__DONE__/);
+}
+
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmux-run-state-"));
+  const pidPath = path.join(stateDir, "run.pid");
+  const statusPath = path.join(stateDir, "run.status");
+  assert.deepEqual(readTmuxShellRunState(pidPath, statusPath), {
+    completed: false,
+    exitCode: 124,
+    pid: 0,
+    processKnown: false,
+    processAlive: false
+  });
+  fs.writeFileSync(pidPath, String(process.pid));
+  assert.deepEqual(readTmuxShellRunState(pidPath, statusPath), {
+    completed: false,
+    exitCode: 124,
+    pid: process.pid,
+    processKnown: true,
+    processAlive: true
+  });
+  fs.writeFileSync(statusPath, "7\n");
+  assert.deepEqual(readTmuxShellRunState(pidPath, statusPath), {
+    completed: true,
+    exitCode: 7,
+    pid: process.pid,
+    processKnown: true,
+    processAlive: false
+  });
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
 
 {
   const result = extractTmuxRunOutput([

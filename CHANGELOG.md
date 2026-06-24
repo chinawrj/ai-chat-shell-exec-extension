@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.5] - 2026-06-25
+
+- Changes ai-helper shell timeout semantics to pid/status-aware waiting: the configured shell state timeout is no longer a command runtime limit, and the server keeps waiting while the tmux runner process is still alive.
+- Adds per-run pid and completion-status files for tmux shell runs so missing completion markers can report explicit timeout/process metadata.
+- Removes the extension-side WebSocket runtime watchdog for shell `run` messages while keeping watchdogs for shorter non-shell operations.
+- Adds shell-output timeout/process-state diagnostics and relabels the popup timeout setting as `State timeout ms`.
+
 ## [0.8.4] - 2026-06-24
 
 - Keeps saved agent ids as floating-panel defaults only, so newly opened tabs on the same origin do not automatically consume master/slave messages until the user clicks Save in that tab.

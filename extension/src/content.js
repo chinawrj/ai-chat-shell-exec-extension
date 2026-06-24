@@ -21,7 +21,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.4";
+const CONTENT_SCRIPT_VERSION = "0.8.5";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -2304,6 +2304,13 @@ function formatShellOutput(call, response, startedAt) {
     `cwd: ${response.cwd || call.cwd || ""}`,
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
+    response.timedOut ? "timedOut: true" : "",
+    response.timeoutReason ? `timeoutReason: ${response.timeoutReason}` : "",
+    response.processKnown === true ? "processKnown: true" : "",
+    response.processKnown === false ? "processKnown: false" : "",
+    response.processAlive === true ? "processAlive: true" : "",
+    response.processAlive === false ? "processAlive: false" : "",
+    response.continuedAfterTimeout ? "continuedAfterTimeout: true" : "",
     response.truncated ? "truncated: true" : ""
   ].filter(Boolean);
 

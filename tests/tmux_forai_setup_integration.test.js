@@ -94,6 +94,23 @@ async function main() {
   assert.match(response.targetName, /ForAI:.* host/);
   assert.equal(response.cwd, expectedForAiCwd);
 
+  const longToken = `FORAI_LONG_${Date.now()}`;
+  const longStarted = Date.now();
+  const longResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-long-run",
+    callKey: `forai-long-run-${Date.now()}`,
+    cmd: `sleep 2\nprintf '${longToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(longResponse.ok, true, JSON.stringify(longResponse));
+  assert.equal(longResponse.exitCode, 0, JSON.stringify(longResponse));
+  assert.equal(longResponse.timedOut, false, JSON.stringify(longResponse));
+  assert.equal(longResponse.continuedAfterTimeout, true, JSON.stringify(longResponse));
+  assert.match(longResponse.stdout, new RegExp(longToken));
+  assert.ok(Date.now() - longStarted >= 1500, JSON.stringify(longResponse));
+
   const agentToken = `FORAI_AGENT_${Date.now()}`;
   const agentResponse = await handleMessageText(JSON.stringify({
     type: "run",
