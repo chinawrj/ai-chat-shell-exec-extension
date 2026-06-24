@@ -670,6 +670,15 @@ async function handleAgentHubMessageAsync(message, now = Date.now()) {
   if (type === "agent-register-tmux-ai") {
     return registerTmuxAiAgent(message, now);
   }
+  if (type === "agent-list") {
+    const pending = countPendingAgentMessages();
+    return {
+      ok: true,
+      type,
+      agents: await listAgentsWithTmuxStatus(now, pending),
+      pending
+    };
+  }
   if (type === "agent-send") {
     return sendAgentMessageAsync(message, now);
   }
@@ -982,6 +991,7 @@ async function deliverTmuxAiTask({ sender, recipient, body, taskId, messageId, n
   const panes = await listTmuxPanes();
   const pane = resolveTmuxTarget(recipient.tmuxPaneId || recipient.tmuxTarget, panes);
   if (!pane) {
+    markTmuxAiAgentStale(recipient, now, "registered tmux pane is no longer available");
     return agentHubError("tmux-target-unavailable", `Tmux target is no longer available for ${recipient.agentId}: ${recipient.tmuxTarget || recipient.tmuxPaneId || ""}`, {
       type: "agent-send",
       to: recipient.agentId,
@@ -995,6 +1005,8 @@ async function deliverTmuxAiTask({ sender, recipient, body, taskId, messageId, n
   recipient.tmuxSession = pane.session;
   recipient.tmuxWindowName = pane.windowName;
   recipient.tmuxAddress = pane.address;
+  recipient.stale = false;
+  recipient.staleReason = "";
   recipient.lastSeenAt = now;
 
   const replyBodyFile = path.join(AGENT_REPLY_DIR, `${safeFilePart(messageId)}-${safeFilePart(recipient.agentId)}.md`);
@@ -1159,9 +1171,50 @@ function listAgents(now = Date.now(), pending = countPendingAgentMessages()) {
       ...agent,
       pendingCount: pending[agent.agentId] || 0,
       lastSeenAgeMs: Math.max(0, now - Number(agent.lastSeenAt || now)),
-      canReceiveTask: agent.role === "slave",
+      canReceiveTask: agent.role === "slave" && agent.stale !== true,
       capabilities: getAgentCapabilities(agent)
     }));
+}
+
+async function listAgentsWithTmuxStatus(now = Date.now(), pending = countPendingAgentMessages()) {
+  const tmuxAgents = Array.from(agentHubState.roster.values()).filter((agent) => agent.surface === "tmux-ai");
+  if (tmuxAgents.length === 0) {
+    return listAgents(now, pending);
+  }
+  let panes = [];
+  try {
+    panes = await listTmuxPanes();
+  } catch (error) {
+    for (const agent of tmuxAgents) {
+      markTmuxAiAgentStale(agent, now, `tmux pane list failed: ${error.message || String(error)}`);
+    }
+    return listAgents(now, pending);
+  }
+  for (const agent of tmuxAgents) {
+    const pane = resolveTmuxTarget(agent.tmuxPaneId || agent.tmuxTarget || agent.tmuxAddress || "", panes);
+    if (!pane) {
+      markTmuxAiAgentStale(agent, now, "registered tmux pane is no longer available");
+      continue;
+    }
+    agent.stale = false;
+    agent.staleReason = "";
+    agent.tmuxPaneId = pane.id;
+    agent.tmuxTargetName = pane.label;
+    agent.tmuxSession = pane.session;
+    agent.tmuxWindowName = pane.windowName;
+    agent.tmuxAddress = pane.address;
+    agent.lastSeenAt = now;
+  }
+  return listAgents(now, pending);
+}
+
+function markTmuxAiAgentStale(agent, now = Date.now(), reason = "tmux pane unavailable") {
+  if (!agent || agent.surface !== "tmux-ai") {
+    return;
+  }
+  agent.stale = true;
+  agent.staleReason = reason;
+  agent.lastTmuxCheckAt = now;
 }
 
 function getAgentCapabilities(agent) {

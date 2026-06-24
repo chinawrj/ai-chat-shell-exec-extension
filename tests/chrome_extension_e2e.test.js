@@ -144,82 +144,20 @@ async function main() {
   await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status panel");
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
-  const agentTaskId = `task-e2e-${Date.now()}`;
-  const agentBody = `agent hub local page message ${agentTaskId}`;
   await page.evaluate(`(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
-    panel.querySelector("[data-shell-agent-role]").value = "master";
-    panel.querySelector("[data-shell-agent-id]").value = "master";
+    panel.querySelector("[data-shell-agent-role]").value = "slave";
+    panel.querySelector("[data-shell-agent-id]").value = "slave-a";
     panel.querySelector('[data-shell-tool-action="agent-register"]').click();
     return true;
   })()`);
-  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered master master")`, "panel agent master registration");
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered slave slave-a")`, "panel agent slave registration");
 
   let agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-register",
-    agentId: "slave-a",
-    role: "slave",
-    origin: "https://localhost:17443",
-    pathname: "/tmux-test-page.html"
+    type: "agent-list"
   });
   assert.equal(agentResponse.ok, true);
-  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "master"));
-  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a"));
-
-  agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-send",
-    from: "master",
-    to: "slave-a",
-    taskId: agentTaskId,
-    body: agentBody
-  });
-  assert.equal(agentResponse.ok, true);
-  const agentMessageId = agentResponse.message.messageId;
-  assert.equal(agentResponse.message.to, "slave-a");
-
-  agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-poll",
-    agentId: "slave-a"
-  });
-  assert.equal(agentResponse.ok, true);
-  assert.equal(agentResponse.messages.length, 1);
-  assert.equal(agentResponse.messages[0].body, agentBody);
-
-  agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-ack",
-    agentId: "slave-a",
-    messageId: agentMessageId
-  });
-  assert.equal(agentResponse.ok, true);
-
-  agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-poll",
-    agentId: "slave-a"
-  });
-  assert.equal(agentResponse.ok, true);
-  assert.equal(agentResponse.messages.length, 0);
-
-  const helperAgentTaskId = `task-helper-e2e-${Date.now()}`;
-  const helperAgentBody = `agent helper detected on local page ${helperAgentTaskId}`;
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-agent-message-start:agent-e2e",
-      "to: master",
-      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
-      "",
-      ${JSON.stringify(helperAgentBody)},
-      "ai-helper-agent-message-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
-
-  const agentHelperText = await waitForEvaluateValue(page, `(() => {
-    const text = document.body.innerText || "";
-    return text.includes("Agent message result:") &&
-      text.includes("to: master") &&
-      text.includes(${JSON.stringify(`task-id: ${helperAgentTaskId}`)}) ? text : "";
-  })()`, "agent-message helper result from extension");
-  assert.match(agentHelperText, /Agent message result:/);
+  assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a" && agent.role === "slave"));
 
   const masterPage = await openChromePage(debugPort, TEST_PAGE_URL);
   cleanup.push(() => masterPage.close());
@@ -253,12 +191,34 @@ async function main() {
       text.includes("Ready: delegate to slave-a. Tmux AI is optional.");
   })()`, "master panel agent setup check browser-only ready state");
 
-  const masterDeliveredText = await waitForEvaluateValue(masterPage, `(() => {
+  const helperAgentTaskId = `task-helper-e2e-${Date.now()}`;
+  const helperAgentBody = `master helper delegated to slave page ${helperAgentTaskId}`;
+  await masterPage.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-agent-message-start:agent-e2e",
+      "to: slave-a",
+      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
+      "",
+      ${JSON.stringify(helperAgentBody)},
+      "ai-helper-agent-message-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+
+  const agentHelperText = await waitForEvaluateValue(masterPage, `(() => {
     const text = document.body.innerText || "";
-    return text.includes(${JSON.stringify(`Message from slave-a for task ${helperAgentTaskId}:`)}) &&
+    return text.includes("Agent message result:") &&
+      text.includes("to: slave-a") &&
+      text.includes(${JSON.stringify(`task-id: ${helperAgentTaskId}`)}) ? text : "";
+  })()`, "agent-message helper result from master tab");
+  assert.match(agentHelperText, /Agent message result:/);
+
+  const slaveDeliveredText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`Message from master for task ${helperAgentTaskId}:`)}) &&
       text.includes(${JSON.stringify(helperAgentBody)}) ? text : "";
-  })()`, "slave reply delivered into master tab");
-  assert.match(masterDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
+  })()`, "master helper task delivered into slave tab");
+  assert.match(slaveDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
 
   const rosterHelperId = `roster-e2e-${Date.now()}`;
   await masterPage.evaluate(`(() => {
@@ -297,13 +257,19 @@ async function main() {
   const tmuxAiBody = `tmux AI agent task delivered from browser e2e ${tmuxAiTaskId}`;
   await masterPage.evaluate(`(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector('[data-shell-tool-action="tmux-ai-refresh"]').click();
+    return true;
+  })()`);
+  await waitForEvaluate(masterPage, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const target = panel.querySelector("[data-shell-tmux-ai-target]");
+    return Array.from(target.options).some((option) => option.value === ${JSON.stringify(`${tmuxAiSessionName}:0.0`)});
+  })()`, "tmux-ai refresh lists real tmux pane");
+  await masterPage.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     panel.querySelector("[data-shell-tmux-ai-id]").value = "slave-tmux-ai";
     const target = panel.querySelector("[data-shell-tmux-ai-target]");
-    const option = document.createElement("option");
-    option.value = ${JSON.stringify(`${tmuxAiSessionName}:0.0`)};
-    option.textContent = option.value;
-    target.appendChild(option);
-    target.value = option.value;
+    target.value = ${JSON.stringify(`${tmuxAiSessionName}:0.0`)};
     panel.querySelector('[data-shell-tool-action="tmux-ai-register"]').click();
     return true;
   })()`);

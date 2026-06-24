@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.4] - 2026-06-24
+
+- Keeps saved agent ids as floating-panel defaults only, so newly opened tabs on the same origin do not automatically consume master/slave messages until the user clicks Save in that tab.
+- Persists pending sent-but-unacked agent delivery state, so a refreshed page retries only the local ack instead of inserting or sending the same agent message again.
+- Marks missing tmux-ai panes as stale in async roster results and prevents stale tmux-ai agents from being advertised as receivable.
+- Adds clearer Agent Check and pending-delivery recovery hints for stale tmux-ai panes and missing send-button bindings.
+- Expands Chrome E2E coverage to use real floating-panel slave registration, real master `agent-message` helper delegation, and the real tmux-ai Refresh dropdown path.
+
 ## [0.8.3] - 2026-06-24
 
 - Treats browser-tab slaves as ready Agent Check targets, making tmux-ai optional for browser-only master/slave workflows.

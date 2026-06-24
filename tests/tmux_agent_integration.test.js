@@ -206,6 +206,17 @@ async function main() {
   }, 70_000);
   assert.equal(response.ok, true);
   assert.ok(response.agents.some((agent) => agent.agentId === "slave-tmux" && agent.surface === "tmux-ai"));
+
+  runTmux(["kill-session", "-t", "AgentAITest"]);
+  response = await handleAgentHubMessageAsync({
+    type: "agent-list"
+  }, 70_100);
+  assert.equal(response.ok, true);
+  const staleAgent = response.agents.find((agent) => agent.agentId === "slave-tmux");
+  assert.equal(staleAgent.surface, "tmux-ai");
+  assert.equal(staleAgent.canReceiveTask, false);
+  assert.equal(staleAgent.stale, true);
+  assert.match(staleAgent.staleReason, /tmux pane/);
 }
 
 function runTmux(args) {

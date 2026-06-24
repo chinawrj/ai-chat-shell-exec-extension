@@ -5,7 +5,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function loadContentContext() {
+function loadContentContext(options = {}) {
+  const localStore = options.localStore || {};
+  const sessionStore = options.sessionStore || {};
   const context = {
     CSS: { escape: (value) => String(value) },
     Element: class Element {},
@@ -20,7 +22,25 @@ function loadContentContext() {
       storage: {
         onChanged: { addListener() {} },
         sync: { get: async () => ({ enabled: false }) },
-        local: { get: async () => ({}) }
+        local: {
+          get: async (keys) => {
+            if (Array.isArray(keys)) {
+              return Object.fromEntries(keys.map((key) => [key, localStore[key]]));
+            }
+            if (typeof keys === "string") {
+              return { [keys]: localStore[keys] };
+            }
+            return { ...localStore };
+          },
+          set: async (values) => {
+            Object.assign(localStore, values || {});
+          },
+          remove: async (keys) => {
+            for (const key of Array.isArray(keys) ? keys : [keys]) {
+              delete localStore[key];
+            }
+          }
+        }
       }
     },
     clearTimeout,
@@ -40,13 +60,42 @@ function loadContentContext() {
     setTimeout,
     window: {
       confirm: () => true,
-      removeEventListener() {}
+      removeEventListener() {},
+      sessionStorage: {
+        getItem: (key) => Object.prototype.hasOwnProperty.call(sessionStore, key) ? sessionStore[key] : null,
+        setItem: (key, value) => {
+          sessionStore[key] = String(value);
+        },
+        removeItem: (key) => {
+          delete sessionStore[key];
+        }
+      }
     }
   };
+  context.__localStore = localStore;
+  context.__sessionStore = sessionStore;
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
   vm.runInContext(source, context, { filename: "content.js" });
   return context;
+}
+
+async function testSavedOriginProfileDoesNotAutoPollNewTab() {
+  const context = loadContentContext({
+    localStore: {
+      "agentProfile:https://chatgpt.com": { role: "master", agentId: "master" }
+    }
+  });
+  const sentMessages = [];
+  context.setStatus = () => {};
+  context.chrome.runtime.sendMessage = async (message) => {
+    sentMessages.push(message);
+    return { ok: true, messages: [] };
+  };
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.deepEqual(sentMessages, []);
 }
 
 async function testAutoReregisterWhenRosterIsLost() {
@@ -189,6 +238,7 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   assert.equal(pendingPanel.hidden, false);
   assert.match(pendingPanel.textContent, /waiting for AI page send readiness/);
   assert.match(pendingPanel.textContent, /Keep this tab open/);
+  assert.match(pendingPanel.textContent, /Bind send/);
 
   await context.pollAndDeliverAgentMessage();
   assert.equal(insertCount, 2);
@@ -313,6 +363,81 @@ async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   assert.equal(ackCount, 2);
   assert.equal(pendingPanel.hidden, true);
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack", "agent-ack"]);
+}
+
+async function testSentPendingAgentDeliverySurvivesReloadWithoutResend() {
+  const localStore = {};
+  const firstContext = loadContentContext({ localStore });
+  let firstInsertCount = 0;
+  let firstClickCount = 0;
+  let firstAckCount = 0;
+  firstContext.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  firstContext.setStatus = () => {};
+  firstContext.agentDeliveryPromptStillPresent = () => true;
+  firstContext.insertReply = async () => {
+    firstInsertCount += 1;
+  };
+  firstContext.clickSendWhenReady = async () => {
+    firstClickCount += 1;
+    return true;
+  };
+  firstContext.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        type: "agent-poll",
+        registered: true,
+        messages: [{
+          messageId: "msg-reload",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-reload",
+          body: "Ack should survive reload."
+        }]
+      };
+    }
+    if (payload.type === "agent-ack") {
+      firstAckCount += 1;
+      return { ok: false, error: "server temporarily unavailable" };
+    }
+    throw new Error(`Unexpected first payload: ${JSON.stringify(payload)}`);
+  };
+
+  await firstContext.pollAndDeliverAgentMessage();
+
+  assert.equal(firstInsertCount, 1);
+  assert.equal(firstClickCount, 1);
+  assert.equal(firstAckCount, 1);
+  assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"]);
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"].sent, true);
+
+  const secondContext = loadContentContext({ localStore });
+  const secondMessages = [];
+  let secondInsertCount = 0;
+  let secondClickCount = 0;
+  secondContext.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  secondContext.setStatus = () => {};
+  secondContext.insertReply = async () => {
+    secondInsertCount += 1;
+  };
+  secondContext.clickSendWhenReady = async () => {
+    secondClickCount += 1;
+    return true;
+  };
+  secondContext.chrome.runtime.sendMessage = async (payload) => {
+    secondMessages.push(payload);
+    if (payload.type === "agent-ack") {
+      return { ok: true, type: "agent-ack" };
+    }
+    throw new Error(`Reload should only retry ack, got: ${JSON.stringify(payload)}`);
+  };
+
+  await secondContext.pollAndDeliverAgentMessage();
+
+  assert.equal(secondInsertCount, 0);
+  assert.equal(secondClickCount, 0);
+  assert.deepEqual(secondMessages.map((payload) => payload.type), ["agent-ack"]);
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
 }
 
 async function testProfileChangeClearsLocalPendingDelivery() {
@@ -767,7 +892,8 @@ async function testAgentSetupCheckMarksMissingTmuxPaneStale() {
   assert.deepEqual(Array.from(result.readySlaves), []);
   assert.deepEqual(Array.from(result.tmuxAiStaleAgents, (agent) => agent.agentId), ["slave-tmux"]);
   assert.match(statuses.at(-1).text, /tmux-ai slaves: slave-tmux@Claude:0\.0 \(stale\)/);
-  assert.match(statuses.at(-1).text, /open\/register at least one slave tab/);
+  assert.match(statuses.at(-1).text, /stale tmux-ai slave-tmux needs a live pane/);
+  assert.match(statuses.at(-1).text, /Click Refresh, select the new tmux pane, then Register/);
   assert.equal(statuses.at(-1).state, "error");
 }
 
@@ -840,11 +966,13 @@ async function waitFor(predicate, label) {
 }
 
 (async () => {
+  await testSavedOriginProfileDoesNotAutoPollNewTab();
   await testAutoReregisterWhenRosterIsLost();
   await testUnsentAgentMessageIsNotInsertedTwice();
   await testAgentMessageStaysPendingUntilPageIsReady();
   await testAgentMessageReinsertsWhenComposerLosesPrompt();
   await testAckFailureDoesNotResendAlreadySubmittedMessage();
+  await testSentPendingAgentDeliverySurvivesReloadWithoutResend();
   await testProfileChangeClearsLocalPendingDelivery();
   await testMasterPanelRegistersTmuxAiSlave();
   await testTmuxAiRegistrationExplainsMissingMaster();
