@@ -44,3 +44,14 @@
    ```
 
 8. Create the GitHub release with the generated archives, `SHA256SUMS.txt`, and any screenshot PNGs.
+
+9. Append a final agent-run metadata section to the release log, both in `docs/release-notes/vX.Y.Z.md` and in the GitHub release body:
+
+   ```text
+   ## Agent Run
+
+   - Time: Xm Ys
+   - Token usage: N.Nk
+   ```
+
+   Use the elapsed time and token usage reported at the end of the release work. Token usage is always written in thousands with one decimal place.
