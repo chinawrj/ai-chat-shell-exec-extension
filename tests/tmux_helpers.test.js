@@ -15,6 +15,7 @@ const {
   extractBoardPromptSignature,
   getTmuxEnvSocketPath,
   getForAiTmuxConfig,
+  handleMessageText,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
@@ -68,7 +69,8 @@ assert.equal(parseTmuxPanes([
 
 const boardPanes = parseTmuxPanes([
   "%40\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
-  "%41\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh"
+  "%41\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh",
+  "%45\tForAI\t2\tboard-R1\t0\t1\t/Users/rjwang\tscreen"
 ].join("\n"));
 assert.deepEqual(getForAiTmuxConfig(), {
   sessionName: "ForAI",
@@ -80,21 +82,31 @@ assert.deepEqual(getForAiTmuxConfig(), {
 assert.equal(resolveDefaultShellPane(boardPanes).pane.id, "%41");
 assert.equal(resolveTmuxTarget("host", boardPanes).id, "%41");
 assert.equal(resolveBoardPane(boardPanes).pane.id, "%40");
+assert.equal(resolveBoardPane(boardPanes, "", "board-R1").pane.id, "%45");
 assert.equal(resolveBoardPane(boardPanes, "%41").pane.id, "%41");
 assert.equal(resolveBoardPane(boardPanes, "ForAI:0.0").pane.id, "%40");
 assert.equal(resolveBoardPane(boardPanes, "missing").pane, null);
+assert.match(resolveBoardPane(boardPanes, "", "board-SAT2").error, /No tmux pane found in ForAI:board-SAT2/);
 assert.match(resolveBoardPane(parseTmuxPanes("%42\tForAI\t1\thost\t0\t1\t/Users/rjwang\tzsh")).error, /No tmux pane/);
 assert.match(resolveBoardPane(parseTmuxPanes([
   "%43\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
   "%44\tForAI\t1\tboard\t0\t1\t/Users/rjwang\tscreen"
 ].join("\n"))).error, /Multiple tmux panes/);
 assert.equal(buildBoardHelperExample("version"), "ai-helper-board-start\nversion\nai-helper-board-end");
+assert.equal(buildBoardHelperExample("status", "board-R1"), "ai-helper-board-R1-start\nstatus\nai-helper-board-R1-end");
 assert.equal(buildBoardTargetErrorResponse({
   message: { id: "board-call-1", callKey: "board-key-1" },
   cmd: "version",
   panes: boardPanes,
   error: "No board"
 }).example, "ai-helper-board-start\nversion\nai-helper-board-end");
+assert.equal(buildBoardTargetErrorResponse({
+  message: { id: "board-call-2", callKey: "board-key-2" },
+  cmd: "status",
+  boardName: "board-R1",
+  panes: boardPanes,
+  error: "No board-R1"
+}).example, "ai-helper-board-R1-start\nstatus\nai-helper-board-R1-end");
 assert.match(buildBoardLogPath(boardPanes[0]), /ForAI_0_0__40\.log$/);
 assert.deepEqual(buildTmuxCommandArgs(["list-panes"], "/private/tmp/tmux-501/default"), [
   "-S",
@@ -212,6 +224,8 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.doesNotThrow(() => validateBoardCommand("version"));
   assert.throws(() => validateBoardCommand("version\nhelp"), /exactly one command line/);
   assert.throws(() => validateBoardCommand("ai-helper-board-start"), /copied shell-output text/);
+  assert.throws(() => validateBoardCommand("ai-helper-board-R1-start"), /copied shell-output text/);
+  assert.throws(() => validateBoardCommand("ai-helper-board-R1-end"), /copied shell-output text/);
 }
 
 {
@@ -253,4 +267,30 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   fs.rmSync(downloadsDir, { recursive: true, force: true });
 }
 
-console.log("tmux helper tests passed");
+Promise.all([
+  assert.rejects(
+    () => handleMessageText(JSON.stringify({
+      type: "run-board",
+      id: "invalid-board-name-host",
+      callKey: "invalid-board-name-host",
+      boardName: "host",
+      cmd: "version"
+    })),
+    /Board name must be empty or board-<suffix>/
+  ),
+  assert.rejects(
+    () => handleMessageText(JSON.stringify({
+      type: "run-board",
+      id: "invalid-board-name-injection",
+      callKey: "invalid-board-name-injection",
+      boardName: "board-R1;send-keys",
+      cmd: "version"
+    })),
+    /Board name must be empty or board-<suffix>/
+  )
+]).then(() => {
+  console.log("tmux helper tests passed");
+}).catch((error) => {
+  console.error(error.stack || error.message || String(error));
+  process.exitCode = 1;
+});

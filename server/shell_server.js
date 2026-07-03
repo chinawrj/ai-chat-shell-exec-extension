@@ -54,6 +54,7 @@ const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
 const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
+const BOARD_NAME_SUFFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const SHELL_RUNNER = process.env.AI_CHAT_SHELL_RUNNER || (fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh");
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
@@ -497,16 +498,18 @@ async function handleRunBoardMessage(message) {
     throw new Error(`Board command is too long (${cmd.length} chars, max ${MAX_COMMAND_CHARS}).`);
   }
   validateBoardCommand(cmd);
+  const boardName = normalizeRequestedBoardName(message.boardName || "");
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
   const layout = await ensureForAiTmuxLayout();
   const panes = layout.panes;
-  const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "");
+  const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "", boardName);
   if (!resolved.pane) {
     return buildBoardTargetErrorResponse({
       message,
       cmd,
+      boardName,
       panes,
       error: resolved.error
     });
@@ -515,6 +518,7 @@ async function handleRunBoardMessage(message) {
   const pane = resolved.pane;
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([
     "board",
+    boardName,
     pane.id,
     cmd,
     timeoutMs,
@@ -524,6 +528,7 @@ async function handleRunBoardMessage(message) {
   const force = message.callMeta?.force === true || message.force === true;
   const claim = claimServerShellCall(callKey, {
     cmd,
+    boardName,
     cwd: pane.currentPath || "",
     target: pane.id,
     timeoutMs,
@@ -534,7 +539,7 @@ async function handleRunBoardMessage(message) {
   });
 
   try {
-    console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+    console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} boardName=${boardName || "board"} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
     const result = await runTmuxBoard({
       cmd,
       pane,
@@ -548,6 +553,7 @@ async function handleRunBoardMessage(message) {
       id: message.id,
       callKey,
       cmd,
+      boardName,
       target: pane.id,
       targetName: pane.label,
       timeoutMs,
@@ -2157,6 +2163,7 @@ function validateCommand(cmd) {
     line === HELPER_FILE_END ||
     line === HELPER_BOARD_START ||
     line === HELPER_BOARD_END ||
+    /^ai-helper-board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-(?:start|end)(?::[A-Za-z0-9._:-]{1,128})?$/.test(line) ||
     UNSUPPORTED_HELPER_MARKERS.has(line) ||
     line === "stdout:" ||
     line === "stderr:" ||
@@ -2182,6 +2189,18 @@ function validateBoardCommand(cmd) {
     throw new Error("Board helper body must contain exactly one command line.");
   }
   validateCommand(normalized);
+}
+
+function normalizeRequestedBoardName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const match = raw.match(/^board-(.+)$/);
+  if (!match || !BOARD_NAME_SUFFIX_PATTERN.test(match[1])) {
+    throw new Error(`Board name must be empty or board-<suffix>, where suffix matches ${BOARD_NAME_SUFFIX_PATTERN.source}.`);
+  }
+  return raw;
 }
 
 function validateVisionTmuxCommand(cmd) {
@@ -3228,7 +3247,7 @@ function resolveTmuxTarget(target, panes) {
   return byWindowName.length === 1 ? byWindowName[0] : null;
 }
 
-function resolveBoardPane(panes, configuredTarget = "") {
+function resolveBoardPane(panes, configuredTarget = "", boardName = "") {
   const target = normalizeTmuxTarget(configuredTarget);
   if (target) {
     const pane = resolveTmuxTarget(target, panes);
@@ -3241,7 +3260,7 @@ function resolveBoardPane(panes, configuredTarget = "") {
     };
   }
 
-  return resolveDefaultBoardPane(panes);
+  return resolveDefaultBoardPane(panes, getForAiTmuxConfig(), boardName);
 }
 
 function resolveDefaultShellPane(panes, config = getForAiTmuxConfig()) {
@@ -3261,10 +3280,11 @@ function resolveDefaultShellPane(panes, config = getForAiTmuxConfig()) {
   };
 }
 
-function resolveDefaultBoardPane(panes, config = getForAiTmuxConfig()) {
+function resolveDefaultBoardPane(panes, config = getForAiTmuxConfig(), boardName = "") {
+  const targetBoardWindowName = boardName || config.boardWindowName;
   const matches = panes.filter((pane) =>
     pane.session === config.sessionName &&
-    pane.windowName === config.boardWindowName
+    pane.windowName === targetBoardWindowName
   );
   if (matches.length === 1) {
     return {
@@ -3275,12 +3295,12 @@ function resolveDefaultBoardPane(panes, config = getForAiTmuxConfig()) {
   if (matches.length > 1) {
     return {
       pane: null,
-      error: `Multiple tmux panes match ${config.sessionName}:${config.boardWindowName}. Set AI_CHAT_SHELL_BOARD_TARGET to a pane id or session:window.pane.`
+      error: `Multiple tmux panes match ${config.sessionName}:${targetBoardWindowName}. Set AI_CHAT_SHELL_BOARD_TARGET to a pane id or session:window.pane.`
     };
   }
   return {
     pane: null,
-    error: `No tmux pane found in ${config.sessionName}:${config.boardWindowName}. Run tmux setup or set AI_CHAT_SHELL_BOARD_TARGET.`
+    error: `No tmux pane found in ${config.sessionName}:${targetBoardWindowName}. Run tmux setup or set AI_CHAT_SHELL_BOARD_TARGET.`
   };
 }
 
@@ -3316,16 +3336,17 @@ function buildDefaultTargetErrorResponse(message, cmd, panes, config = getForAiT
   });
 }
 
-function buildBoardTargetErrorResponse({ message, cmd, panes, error }) {
+function buildBoardTargetErrorResponse({ message, cmd, boardName = "", panes, error }) {
   return {
     ok: false,
     id: message.id,
     callKey: message.callKey || message.id || "",
     cmd,
+    boardName,
     targetRequired: false,
     error,
     tmuxPanes: panes,
-    example: buildBoardHelperExample(cmd)
+    example: buildBoardHelperExample(cmd, boardName)
   };
 }
 
@@ -3342,11 +3363,14 @@ function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }
   };
 }
 
-function buildBoardHelperExample(cmd = "version") {
+function buildBoardHelperExample(cmd = "version", boardName = "") {
+  const boardSuffix = boardName && boardName.startsWith("board-") ? boardName.slice("board-".length) : "";
+  const startMarker = boardSuffix ? `ai-helper-board-${boardSuffix}-start` : HELPER_BOARD_START;
+  const endMarker = boardSuffix ? `ai-helper-board-${boardSuffix}-end` : HELPER_BOARD_END;
   return [
-    HELPER_BOARD_START,
+    startMarker,
     cmd || "version",
-    HELPER_BOARD_END
+    endMarker
   ].join("\n");
 }
 

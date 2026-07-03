@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.6] - 2026-07-03
+
+- Adds named board helper markers such as `ai-helper-board-R1-start` / `ai-helper-board-R1-end` so board commands can target `ForAI:board-R1`, `ForAI:board-SAT2`, and other safe `board-<suffix>` windows.
+- Keeps existing `ai-helper-board-start` helpers targeting the default `ForAI:board` window, while preserving `AI_CHAT_SHELL_BOARD_TARGET` as the highest-priority override.
+- Adds server-side `boardName` validation so WebSocket payloads cannot use named board support to select arbitrary tmux targets.
+- Expands parser, background forwarding, tmux helper, and tmux integration coverage for default and named board behavior.
+- Updates README, AI instructions, and the feature/test matrix for the named board helper protocol.
+
 ## [0.8.5] - 2026-06-25
 
 - Changes ai-helper shell timeout semantics to pid/status-aware waiting: the configured shell state timeout is no longer a command runtime limit, and the server keeps waiting while the tmux runner process is still alive.

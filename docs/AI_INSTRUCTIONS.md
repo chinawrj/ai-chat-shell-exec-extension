@@ -64,7 +64,8 @@ ai-helper-board-end
 
 Board rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
-- The first line must be `ai-helper-board-start`.
+- The first line must be `ai-helper-board-start`, or a named board marker such as `ai-helper-board-R1-start`.
+- To use another board window in the same `ForAI` tmux session, put a safe suffix after `board`, such as `ai-helper-board-R1-start` with final line `ai-helper-board-R1-end`; this sends the command to the `board-R1` window.
 - If you need the same board command to be treated as a new request, the first line may be `ai-helper-board-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The body must be exactly one non-empty board command line.
 - Do not include a tmux target, cwd, prose, terminal output, shell-output, markdown, or helper markers inside the board helper block.
@@ -127,9 +128,9 @@ Workflow rules:
 - Emit at most one helper block per assistant message.
 - Emit no prose in a message that contains a helper block.
 - For shell helpers, do not include a tmux target; the command runs in `ForAI:host`.
-- For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target.
+- For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` only when the command should go to `ForAI:board-R1`.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
-- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
+- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix after the colon in the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 - Wait for shell-output before making claims about command results or file write results.
 - Do not rerun the same command or rewrite the same file unless I ask or the previous output clearly requires it.
 
@@ -248,7 +249,7 @@ Do not treat terminal text alone as a completed reply. The master receives your 
 ## One-Off Prompt
 
 ```text
-For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the full shell command body after it, and ai-helper-shell-end as the final line; it runs in the default ForAI host tmux window and does not support a target line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
+For this conversation, I can act as your human helper when local terminal output or board output would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the full shell command body after it, and ai-helper-shell-end as the final line; it runs in the default ForAI host tmux window and does not support a target line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line; to use ForAI:board-R1, use ai-helper-board-R1-start and ai-helper-board-R1-end. If I ask you to repeat an identical helper request as a new request, you may use ai-helper-shell-start:2, ai-helper-board-start:2, ai-helper-board-R1-start:2, or another simple no-space suffix. Wait for my shell-output reply before continuing. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt

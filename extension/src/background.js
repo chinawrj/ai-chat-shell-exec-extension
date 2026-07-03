@@ -264,6 +264,7 @@ async function handleRunBoardMessage(message) {
     type: "run-board",
     id: message.id,
     callKey,
+    boardName: message.boardName || "",
     cmd: message.cmd,
     timeoutMs,
     maxOutputChars,
@@ -273,7 +274,7 @@ async function handleRunBoardMessage(message) {
 
   const claim = await claimShellCall(callKey, {
     ...payload,
-    target: "board"
+    target: payload.boardName || "board"
   });
 
   payload.seq = claim.seq;
@@ -286,7 +287,7 @@ async function handleRunBoardMessage(message) {
       durationMs: response?.durationMs,
       duplicate: response?.duplicate === true,
       skipped: response?.skipped === true,
-      target: response?.target || "board"
+      target: response?.target || payload.boardName || "board"
     });
     return response;
   } catch (error) {

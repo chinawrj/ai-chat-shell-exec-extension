@@ -66,9 +66,9 @@ message-id: msg-001
 ai-helper-agent-task-status-end
 ````
 
-By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
+By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. A named board marker such as `ai-helper-board-R1-start` targets `ForAI:board-R1` when no environment override is set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
-For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
+For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
 The content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block.
 
@@ -171,9 +171,9 @@ ai-helper-file-end
 Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - Shell helpers do not include a tmux target; the entire helper body is the shell command and runs in the default `ForAI` `host` window.
-- Board helpers must contain exactly one non-empty board command line and no target.
+- Board helpers must contain exactly one non-empty board command line and no target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` to send to the `ForAI:board-R1` window.
 - File helpers must put a single file name, not a path, on the second line.
-- If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, or `ai-helper-file-start:2`.
+- If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, or `ai-helper-file-start:2`.
 - After I send back shell-output, use that output to continue.
 - Do not repeat the same command after receiving shell-output.
 `````
@@ -471,9 +471,9 @@ version
 ai-helper-board-end
 ````
 
-The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the `board` window in the `ForAI` tmux session. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
+The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the `board` window in the `ForAI` tmux session. To send to another board window, use a safe suffix in both markers, for example `ai-helper-board-R1-start` and `ai-helper-board-R1-end` target `ForAI:board-R1`. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent.
 
-The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
+The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, `ai-helper-board-R1-start:20260529-1`, or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
 
 To write a file under `$HOME/Downloads`, use:
 
@@ -552,7 +552,7 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 - Agent-message helpers only route messages through the local agent hub. They do not execute commands unless the receiving agent later emits its own explicit helper block.
 - Agent-roster and agent-task-status helpers are read-only local hub queries; they do not execute shell commands.
 - Reset actions in the floating panel and popup kill and recreate only the default `ForAI` session.
-- Board helper blocks do not name a target. They use `AI_CHAT_SHELL_BOARD_TARGET` or `ForAI:board`, and the server refuses to send the command if the board prompt probe fails.
+- Board helper blocks do not include a raw tmux target. They use `AI_CHAT_SHELL_BOARD_TARGET`, `ForAI:board`, or a safe named board marker such as `ai-helper-board-R1-start` for `ForAI:board-R1`; the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.
 - The default auto-enabled host list contains `chatgpt.com` and `m365.cloud.microsoft`; every other site requires an explicit per-site opt-in before scanning can run.
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.

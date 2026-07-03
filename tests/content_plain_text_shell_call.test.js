@@ -237,9 +237,30 @@ const parsedBoard = context.parseCallPayload(boardBlock);
 assert.equal(context.containsToolLanguageHint(boardBlock), true);
 assert.equal(parsedBoard.kind, "board");
 assert.equal(parsedBoard.helperIdSource, "payload-hash");
+assert.equal(parsedBoard.boardName, "");
 assert.equal(parsedBoard.cmd, "version");
 assert.equal(context.validateHelperCall(parsedBoard).ok, true);
 assert.equal(context.isRunnableHelperCall(parsedBoard), true);
+assert.match(context.formatBoardApprovalTarget(parsedBoard), /^board /);
+assert.match(context.formatBoardApprovalTarget(parsedBoard), /AI_CHAT_SHELL_BOARD_TARGET/);
+
+const namedBoardBlock = [
+  "ai-helper-board-R1-start",
+  "status",
+  "ai-helper-board-R1-end"
+].join("\n");
+const parsedNamedBoard = context.parseCallPayload(namedBoardBlock);
+assert.equal(context.containsToolLanguageHint(namedBoardBlock), true);
+assert.equal(parsedNamedBoard.kind, "board");
+assert.equal(parsedNamedBoard.boardName, "board-R1");
+assert.equal(parsedNamedBoard.cmd, "status");
+assert.equal(context.validateHelperCall(parsedNamedBoard).ok, true);
+assert.match(context.formatBoardApprovalTarget(parsedNamedBoard), /^board-R1 /);
+assert.match(context.formatBoardApprovalTarget(parsedNamedBoard), /AI_CHAT_SHELL_BOARD_TARGET/);
+assert.notEqual(context.buildSemanticCallKey(parsedBoard), context.buildSemanticCallKey(parsedNamedBoard));
+
+const mismatchedNamedBoardEnd = context.parseCallPayload("ai-helper-board-R1-start\nstatus\nai-helper-board-SAT2-end");
+assert.equal(mismatchedNamedBoardEnd.cmd, "");
 
 const suffixedBoardA = context.parseCallPayload("ai-helper-board-start:board-1001\nversion\nai-helper-board-end");
 const suffixedBoardB = context.parseCallPayload("ai-helper-board-start:board-1002\nversion\nai-helper-board-end");
@@ -247,6 +268,12 @@ assert.equal(suffixedBoardA.kind, "board");
 assert.equal(suffixedBoardA.helperId, "board-1001");
 assert.equal(suffixedBoardA.helperIdSource, "marker");
 assert.notEqual(context.buildSemanticCallKey(suffixedBoardA), context.buildSemanticCallKey(suffixedBoardB));
+
+const suffixedNamedBoard = context.parseCallPayload("ai-helper-board-SAT2-start:board-2001\nversion\nai-helper-board-SAT2-end");
+assert.equal(suffixedNamedBoard.kind, "board");
+assert.equal(suffixedNamedBoard.boardName, "board-SAT2");
+assert.equal(suffixedNamedBoard.helperId, "board-2001");
+assert.equal(suffixedNamedBoard.helperIdSource, "marker");
 
 const [fencedFallbackBoard] = context.parsePlainTextHelperBlocks([
   "````",
@@ -258,6 +285,18 @@ assert.equal(fencedFallbackBoard.kind, "board");
 assert.equal(fencedFallbackBoard.inferredEndMarker, true);
 assert.equal(fencedFallbackBoard.cmd, "version");
 assert.equal(context.validateHelperCall(fencedFallbackBoard).ok, true);
+
+const [fencedFallbackNamedBoard] = context.parsePlainTextHelperBlocks([
+  "````",
+  "ai-helper-board-R1-start",
+  "status",
+  "````"
+].join("\n"));
+assert.equal(fencedFallbackNamedBoard.kind, "board");
+assert.equal(fencedFallbackNamedBoard.boardName, "board-R1");
+assert.equal(fencedFallbackNamedBoard.inferredEndMarker, true);
+assert.equal(fencedFallbackNamedBoard.cmd, "status");
+assert.equal(context.validateHelperCall(fencedFallbackNamedBoard).ok, true);
 
 const multiLineBoard = context.parseCallPayload("ai-helper-board-start\nversion\nhelp\nai-helper-board-end");
 assert.equal(multiLineBoard.kind, "board");

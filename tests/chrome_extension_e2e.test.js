@@ -273,10 +273,14 @@ async function main() {
     panel.querySelector('[data-shell-tool-action="tmux-ai-register"]').click();
     return true;
   })()`);
-  await waitForEvaluate(masterPage, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered tmux-ai slave slave-tmux-ai")`, "master panel tmux-ai slave registration");
-  agentResponse = await sendLocalAgentRequest(masterPage, {
-    type: "agent-list"
-  });
+  agentResponse = await waitForValue(async () => {
+    const response = await sendLocalAgentRequest(masterPage, {
+      type: "agent-list"
+    });
+    return response?.agents?.some((agent) => agent.agentId === "slave-tmux-ai" && agent.surface === "tmux-ai")
+      ? response
+      : null;
+  }, "master panel tmux-ai slave registration");
   assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
   assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-tmux-ai" && agent.surface === "tmux-ai"));
   await masterPage.evaluate(`(() => {

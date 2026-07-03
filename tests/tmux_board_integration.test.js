@@ -46,6 +46,7 @@ async function main() {
 
   process.env.AI_CHAT_SHELL_TMUX_SESSION = "board_success";
   runTmux(["new-session", "-d", "-s", "board_success", "-n", "board", "env PS1='BOARD> ' /bin/sh -i"]);
+  runTmux(["new-window", "-d", "-t", "board_success", "-n", "board-R1", "env PS1='R1> ' /bin/sh -i"]);
   await sleep(1000);
   const successPane = resolveBoardPane(await listTmuxPanes()).pane;
   assert.ok(successPane, "Expected a unique board pane.");
@@ -59,6 +60,19 @@ async function main() {
   assert.equal(success.timedOut, false, JSON.stringify(success));
   assert.match(success.stdout, /board-helper-ok/);
   assert.match(success.stdout, /BOARD>/);
+
+  const namedPane = resolveBoardPane(await listTmuxPanes(), "", "board-R1").pane;
+  assert.ok(namedPane, "Expected a unique named board pane.");
+  const named = await runTmuxBoard({
+    cmd: "printf 'named-board-helper-ok\\n'",
+    pane: namedPane,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  });
+  assert.equal(named.exitCode, 0, JSON.stringify(named));
+  assert.equal(named.timedOut, false, JSON.stringify(named));
+  assert.match(named.stdout, /named-board-helper-ok/);
+  assert.match(named.stdout, /R1>/);
   killSession("board_success");
 
   process.env.AI_CHAT_SHELL_TMUX_SESSION = "board_probe_fail";

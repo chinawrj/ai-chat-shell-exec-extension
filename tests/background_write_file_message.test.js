@@ -33,6 +33,7 @@ class FakeWebSocket {
             ok: true,
             id: payload.id,
             callKey: payload.callKey,
+            boardName: payload.boardName || "",
             cmd: payload.cmd,
             target: "%40",
             targetName: "ForAI:0.0 board",
@@ -197,6 +198,7 @@ async function main() {
   assert.equal(sentPayloads.length, 3);
   assert.equal(sentPayloads[2].type, "run-board");
   assert.equal(sentPayloads[2].cmd, "version");
+  assert.equal(sentPayloads[2].boardName, "");
   assert.equal(sentPayloads[2].timeoutMs, 30000);
   assert.equal(sentPayloads[2].maxOutputChars, 20000);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].state, "completed");
@@ -226,6 +228,20 @@ async function main() {
   assert.equal(sentPayloads[4].callMeta.force, true);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].forced, true);
 
+  const namedBoardResponse = await context.handleRunBoardMessage({
+    type: "run-board",
+    id: "board-r1",
+    callKey: "board-key-r1",
+    boardName: "board-R1",
+    cmd: "status"
+  });
+  assert.equal(namedBoardResponse.ok, true);
+  assert.equal(namedBoardResponse.boardName, "board-R1");
+  assert.equal(sentPayloads.length, 6);
+  assert.equal(sentPayloads[5].type, "run-board");
+  assert.equal(sentPayloads[5].boardName, "board-R1");
+  assert.equal(sentPayloads[5].cmd, "status");
+
   const forcedShell = await context.handleRunShellMessage({
     type: "run-shell",
     id: "shell-force-top-level",
@@ -235,9 +251,9 @@ async function main() {
   });
   assert.equal(forcedShell.ok, true);
   assert.equal(forcedShell.skipped, undefined);
-  assert.equal(sentPayloads.length, 6);
-  assert.equal(sentPayloads[5].type, "run");
-  assert.equal(sentPayloads[5].force, true);
+  assert.equal(sentPayloads.length, 7);
+  assert.equal(sentPayloads[6].type, "run");
+  assert.equal(sentPayloads[6].force, true);
   assert.equal(localStore["shellCallLedger:v1"].calls["shell-force-top-level"].forced, true);
 
   localStore["shellCallLedger:v1"].calls["file-force-top-level"] = {
@@ -254,9 +270,9 @@ async function main() {
   });
   assert.equal(forcedFile.ok, true);
   assert.equal(forcedFile.skipped, undefined);
-  assert.equal(sentPayloads.length, 7);
-  assert.equal(sentPayloads[6].type, "write-file");
-  assert.equal(sentPayloads[6].force, true);
+  assert.equal(sentPayloads.length, 8);
+  assert.equal(sentPayloads[7].type, "write-file");
+  assert.equal(sentPayloads[7].force, true);
   assert.equal(localStore["shellCallLedger:v1"].calls["file-force-top-level"].forced, true);
 
   const originalFetch = context.fetch;
@@ -283,7 +299,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 7);
+  assert.equal(sentPayloads.length, 8);
   assert.equal(localStore["shellCallLedger:v1"].calls["shell-protocol-mismatch"].state, "failed");
 
   await assert.rejects(
@@ -296,7 +312,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 7);
+  assert.equal(sentPayloads.length, 8);
   assert.equal(localStore["shellCallLedger:v1"].calls["file-protocol-mismatch"].state, "failed");
 
   await assert.rejects(
@@ -308,7 +324,7 @@ async function main() {
     }),
     /protocol mismatch/
   );
-  assert.equal(sentPayloads.length, 7);
+  assert.equal(sentPayloads.length, 8);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-protocol-mismatch"].state, "failed");
   context.fetch = originalFetch;
 

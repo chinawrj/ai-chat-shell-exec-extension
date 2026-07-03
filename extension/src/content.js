@@ -13,6 +13,7 @@ const HELPER_AGENT_TASK_STATUS_END = "ai-helper-agent-task-status-end";
 const HELPER_FENCE_MARKER = "````";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const BOARD_NAME_SUFFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -21,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.5";
+const CONTENT_SCRIPT_VERSION = "0.8.6";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -579,6 +580,7 @@ function buildSemanticCallKey(call) {
     location.origin,
     normalizeCommand(call.kind || "shell"),
     normalizeCommand(call.helperId || ""),
+    normalizeCommand(call.boardName || ""),
     normalizeCommand(call.cmd || ""),
     normalizeCommand(call.filename || ""),
     normalizeCommand(call.content || ""),
@@ -815,6 +817,7 @@ function containsToolLanguageHint(text) {
   return lower.includes(HELPER_SHELL_START) ||
     lower.includes(HELPER_FILE_START) ||
     lower.includes(HELPER_BOARD_START) ||
+    /ai-helper-board-[a-z0-9][a-z0-9._-]{0,63}-start/.test(lower) ||
     lower.includes(HELPER_AGENT_MESSAGE_START) ||
     lower.includes(HELPER_AGENT_ROSTER_START) ||
     lower.includes(HELPER_AGENT_TASK_STATUS_START);
@@ -890,8 +893,8 @@ function parsePlainTextHelperBlocks(text) {
       break;
     }
 
-    const fenceEndIndex = findHelperFenceEndIndex(lines, index, start.kind);
-    const endIndex = findHelperEndIndex(lines, index, valueLineIndex, start.kind, fenceEndIndex);
+    const fenceEndIndex = findHelperFenceEndIndex(lines, index, start);
+    const endIndex = findHelperEndIndex(lines, index, valueLineIndex, start, fenceEndIndex);
     const inferredEndMarker = endIndex < 0 && fenceEndIndex >= 0;
     const blockEndIndex = inferredEndMarker ? fenceEndIndex : endIndex;
     if (blockEndIndex < 0) {
@@ -903,7 +906,7 @@ function parsePlainTextHelperBlocks(text) {
       marker,
       value: lines[valueLineIndex],
       bodyLines: lines.slice(valueLineIndex + 1, blockEndIndex),
-      endMarker: expectedHelperEndMarker(start.kind)
+      endMarker: start.endMarker || expectedHelperEndMarker(start.kind)
     });
 
     if (start.kind === "file") {
@@ -923,6 +926,7 @@ function parsePlainTextHelperBlocks(text) {
         helperIdSource: start.helperId ? "marker" : "payload-hash",
         helperMarkerError: start.error || "",
         inferredEndMarker,
+        boardName: start.boardName || "",
         cmd: normalizeCommand(lines.slice(valueLineIndex, blockEndIndex).join("\n"))
       });
     } else if (start.kind === "agent-message") {
@@ -968,20 +972,22 @@ function parsePlainTextHelperBlocks(text) {
   return calls;
 }
 
-function findHelperEndIndex(lines, startIndex, valueLineIndex, kind, fenceEndIndex) {
+function findHelperEndIndex(lines, startIndex, valueLineIndex, start, fenceEndIndex) {
+  const kind = start.kind;
   const minEndIndex = kind === "board" || kind === "agent-roster" || kind === "agent-task-status" ? startIndex : valueLineIndex;
   return lines.findIndex((line, lineIndex) =>
     lineIndex > minEndIndex &&
     (fenceEndIndex < 0 || lineIndex < fenceEndIndex) &&
-    isHelperEndForKind(kind, line)
+    isHelperEndForStart(start, line)
   );
 }
 
-function findHelperFenceEndIndex(lines, startIndex, kind) {
+function findHelperFenceEndIndex(lines, startIndex, start) {
   if (startIndex <= 0 || lines[startIndex - 1] !== HELPER_FENCE_MARKER) {
     return -1;
   }
 
+  const kind = start.kind;
   const minEndIndex = kind === "board" || kind === "agent-roster" || kind === "agent-task-status" ? startIndex : startIndex + 1;
   return lines.findIndex((line, lineIndex) =>
     lineIndex > minEndIndex &&
@@ -997,7 +1003,7 @@ function parsePlainTextHelperPayload(text) {
 
   const lines = splitShellCallLines(text);
   const start = parseHelperStartMarker(lines[0]);
-  if (!start.kind || !isHelperEndForKind(start.kind, lines[lines.length - 1])) {
+  if (!start.kind || !isHelperEndForStart(start, lines[lines.length - 1])) {
     const fencedStart = lines[0] === HELPER_FENCE_MARKER ? parseHelperStartMarker(lines[1]) : { kind: "" };
     if (!fencedStart.kind || lines[lines.length - 1] !== HELPER_FENCE_MARKER) {
       return null;
@@ -1021,7 +1027,7 @@ function parseHelperStartMarker(line) {
   if (file.kind) {
     return file;
   }
-  const board = parseSpecificHelperStartMarker(text, HELPER_BOARD_START, "board");
+  const board = parseBoardHelperStartMarker(text);
   if (board.kind) {
     return board;
   }
@@ -1038,6 +1044,48 @@ function parseHelperStartMarker(line) {
     return agentTaskStatus;
   }
   return { kind: "", helperId: "", error: "" };
+}
+
+function parseBoardHelperStartMarker(text) {
+  const defaultBoard = parseSpecificHelperStartMarker(text, HELPER_BOARD_START, "board");
+  if (defaultBoard.kind) {
+    return {
+      ...defaultBoard,
+      boardName: "",
+      boardSuffix: "",
+      endMarker: HELPER_BOARD_END
+    };
+  }
+
+  const match = String(text || "").match(/^ai-helper-board-([A-Za-z0-9][A-Za-z0-9._-]{0,63})-start(?::(.*))?$/);
+  if (!match) {
+    return { kind: "", helperId: "", error: "" };
+  }
+
+  const boardSuffix = match[1];
+  const boardName = `board-${boardSuffix}`;
+  const marker = `ai-helper-board-${boardSuffix}-start`;
+  const endMarker = `ai-helper-board-${boardSuffix}-end`;
+  const helperId = String(match[2] || "").trim();
+  if (helperId && !HELPER_ID_PATTERN.test(helperId)) {
+    return {
+      kind: "board",
+      helperId: "",
+      boardName,
+      boardSuffix,
+      endMarker,
+      error: `Malformed helper identity suffix on ${marker}. Use ${marker}:<nonce> with 1-128 characters matching ${HELPER_ID_PATTERN.source}.`
+    };
+  }
+
+  return {
+    kind: "board",
+    helperId,
+    boardName,
+    boardSuffix,
+    endMarker,
+    error: BOARD_NAME_SUFFIX_PATTERN.test(boardSuffix) ? "" : `Board suffix must match ${BOARD_NAME_SUFFIX_PATTERN.source}.`
+  };
 }
 
 function parseSpecificHelperStartMarker(text, marker, kind) {
@@ -1071,6 +1119,10 @@ function buildPlainTextHelperPayloadHash({ kind, marker, value, bodyLines, endMa
 
 function isHelperEndForKind(kind, line) {
   return line === expectedHelperEndMarker(kind);
+}
+
+function isHelperEndForStart(start, line) {
+  return line === (start.endMarker || expectedHelperEndMarker(start.kind));
 }
 
 function expectedHelperEndMarker(kind) {
@@ -1381,6 +1433,10 @@ function validateFileHelperCall(call) {
 
 function validateBoardCall(call) {
   const cmd = normalizeCommand(call.cmd);
+  const boardName = normalizeCommand(call.boardName || "");
+  if (boardName && !/^board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(boardName)) {
+    return { ok: false, reason: `Board window name must be board-<suffix>, where suffix matches ${BOARD_NAME_SUFFIX_PATTERN.source}.` };
+  }
   if (!cmd) {
     return { ok: false, reason: "Board command is empty." };
   }
@@ -1475,6 +1531,7 @@ function validateShellLikeCommandText(cmd) {
     isHelperEndForKind("shell", line) ||
     isHelperEndForKind("file", line) ||
     isHelperEndForKind("board", line) ||
+    /^ai-helper-board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-end$/.test(line) ||
     isHelperEndForKind("agent-message", line) ||
     isHelperEndForKind("agent-roster", line) ||
     isHelperEndForKind("agent-task-status", line) ||
@@ -1533,7 +1590,7 @@ function formatRejectedCallSubject(call) {
     return `file: ${call.filename || ""}`;
   }
   if (isBoardHelperCall(call)) {
-    return `board: ${call.cmd || ""}`;
+    return `${call.boardName || "board"}: ${call.cmd || ""}`;
   }
   if (isAgentMessageHelperCall(call)) {
     return `agent-message: ${call.to || ""}`;
@@ -1568,9 +1625,11 @@ async function runAndReply(callId, call, options = {}) {
       [
         "AI requested a board command.",
         "",
+        `Requested board: ${formatBoardApprovalTarget(call)}`,
+        "",
         call.cmd,
         "",
-        "Send this command to the board and post the output back to this chat?"
+        "Send this command to the requested board and post the output back to this chat?"
       ] : isAgentMessageHelperCall(call) ?
       [
         "AI requested an agent message.",
@@ -1682,12 +1741,17 @@ async function runAndReply(callId, call, options = {}) {
   }
 }
 
+function formatBoardApprovalTarget(call) {
+  const boardName = normalizeCommand(call?.boardName || "board") || "board";
+  return `${boardName} (AI_CHAT_SHELL_BOARD_TARGET may override this on the local server)`;
+}
+
 function buildRunningStatus(call, force) {
   if (isFileHelperCall(call)) {
     return `${force ? "Force writing" : "Writing"} file: ${summarizeCommand(call.filename || "")}`;
   }
   if (isBoardHelperCall(call)) {
-    return `${force ? "Force sending" : "Sending"} board command: ${summarizeCommand(call.cmd)}`;
+    return `${force ? "Force sending" : "Sending"} ${call.boardName || "board"} command: ${summarizeCommand(call.cmd)}`;
   }
   if (isAgentMessageHelperCall(call)) {
     return `${force ? "Force sending" : "Sending"} agent message to ${call.to || "(missing)"}`;
@@ -1741,6 +1805,7 @@ function sendRunBoardMessage(callId, call, force) {
     type: "run-board",
     id: callId,
     callKey: callId,
+    boardName: call.boardName || "",
     cmd: call.cmd,
     timeoutMs: call.timeoutMs,
     maxOutputChars: call.maxOutputChars,
@@ -2327,12 +2392,14 @@ function formatShellOutput(call, response, startedAt) {
 
 function formatBoardOutput(call, response, startedAt) {
   const commandDisplay = formatShellOutputCommand(call.cmd);
+  const boardName = call.boardName || response?.boardName || "";
   if (!response || response.ok === false) {
     return [
       "Board command failed:",
       "",
       "```shell-output",
       `board: ${commandDisplay.text}`,
+      boardName ? `boardName: ${boardName}` : "",
       commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
       response?.target ? `target: ${response.target}` : "",
       response?.targetName ? `targetName: ${response.targetName}` : "",
@@ -2349,6 +2416,7 @@ function formatBoardOutput(call, response, startedAt) {
   const stderr = response.stderr || "";
   const meta = [
     `board: ${commandDisplay.text}`,
+    boardName ? `boardName: ${boardName}` : "",
     commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
     `target: ${response.target || ""}`,
     response.targetName ? `targetName: ${response.targetName}` : "",
