@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.7] - 2026-07-15
+
+- Moves authoritative command-duplicate adjudication to the shell server after actual tmux pane resolution, keyed by pane instance, command, and actual cwd.
+- Removes content-script semantic-command and prior-shell-output execution blocking; a new helper with identical command text is forwarded even after cancellation or failure.
+- Keeps browser request scan-debouncing and audit ledgers non-authoritative, while allowing only completed server executions to return `duplicate: true` and preserving Force run as an explicit bypass.
+- Adds regression coverage for failed retries, same-pane duplicates, different agent panes, tmux reset/recreation, board prompt failures, direct visual tmux execution, and frontend identical-command forwarding.
+- Uses collision-proof internal server attempt identities so concurrent browser requests cannot overwrite one another's execution state.
+- Keeps timed-out or otherwise unconfirmed tmux executions retryable, records the board pane's actual cwd for audit, and disables dedup when tmux pane-instance metadata is incomplete.
+- Invalidates frontend request tracking when helper DOM nodes are recycled and recognizes structurally rendered `language-shell-output` blocks even after Markdown fences disappear.
+- Disables execution dedup for generic board CLIs because textual prompts can be imitated by command output; board requests fail open instead of risking a false completed verdict.
+
 ## [0.8.6] - 2026-07-03
 
 - Adds named board helper markers such as `ai-helper-board-R1-start` / `ai-helper-board-R1-end` so board commands can target `ForAI:board-R1`, `ForAI:board-SAT2`, and other safe `board-<suffix>` windows.

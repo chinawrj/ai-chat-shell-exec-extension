@@ -102,9 +102,48 @@ function runTmux(socketPath, args, options = {}) {
       timeoutMs: 10000
     });
     assert.equal(duplicateVisualMessage.ok, true);
-    assert.equal(duplicateVisualMessage.skipped, undefined);
+    assert.equal(duplicateVisualMessage.duplicate, true);
+    assert.equal(duplicateVisualMessage.skipped, true);
+    assert.equal(duplicateVisualMessage.reason, "already-executed-on-target");
     assert.equal(duplicateVisualMessage.exitCode, 0);
-    assert.equal(duplicateVisualMessage.terminalText.includes("VISION_TMUX_LEDGER_OK"), true);
+
+    const forcedVisualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-message-forced",
+      callKey: `vision-tmux-run-message-forced-${Date.now()}`,
+      target: paneId,
+      cmd: "printf 'VISION_TMUX_LEDGER_OK\\n'",
+      timeoutMs: 10000,
+      force: true
+    });
+    assert.equal(forcedVisualMessage.ok, true, JSON.stringify(forcedVisualMessage));
+    assert.equal(forcedVisualMessage.duplicate, undefined);
+    assert.equal(forcedVisualMessage.terminalText.includes("VISION_TMUX_LEDGER_OK"), true);
+
+    const timeoutCmd = "sleep 2; printf 'VISUAL_TIMEOUT_FINISHED\\n'";
+    const timedOutVisualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-timeout-first",
+      callKey: `vision-tmux-run-timeout-first-${Date.now()}`,
+      target: paneId,
+      cmd: timeoutCmd,
+      timeoutMs: 1000
+    });
+    assert.equal(timedOutVisualMessage.ok, false, JSON.stringify(timedOutVisualMessage));
+    assert.equal(timedOutVisualMessage.timedOut, true, JSON.stringify(timedOutVisualMessage));
+    assert.equal(timedOutVisualMessage.executionCompleted, false, JSON.stringify(timedOutVisualMessage));
+
+    const timeoutRetryVisualMessage = await handleVisionMessage({
+      type: "vision-tmux-run-line",
+      id: "vision-tmux-run-timeout-retry",
+      callKey: `vision-tmux-run-timeout-retry-${Date.now()}`,
+      target: paneId,
+      cmd: timeoutCmd,
+      timeoutMs: 5000
+    });
+    assert.equal(timeoutRetryVisualMessage.duplicate, undefined, "An unconfirmed visual timeout must not become a duplicate.");
+    assert.equal(timeoutRetryVisualMessage.ok, true, JSON.stringify(timeoutRetryVisualMessage));
+    assert.equal(timeoutRetryVisualMessage.executionCompleted, true, JSON.stringify(timeoutRetryVisualMessage));
   } finally {
     spawnSync("tmux", ["-S", socketPath, "kill-session", "-t", sessionName], { encoding: "utf8" });
     if (originalSocket === undefined) {

@@ -38,7 +38,9 @@ const TMUX_LIST_FORMAT = [
   "#{pane_index}",
   "#{pane_active}",
   "#{pane_current_path}",
-  "#{pane_current_command}"
+  "#{pane_current_command}",
+  "#{session_created}",
+  "#{pid}"
 ].join(TMUX_FIELD_SEPARATOR);
 const TMUX_CAPTURE_HISTORY_LINES = 20000;
 const TMUX_POLL_INTERVAL_MS = 250;
@@ -450,12 +452,26 @@ async function handleMessageText(text) {
     cmd,
     cwd,
     target: pane.id,
+    executionTarget: buildTmuxPaneExecutionTarget(pane),
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
     callMeta: message.callMeta || {},
     force
   });
+
+  if (claim.action === "skip") {
+    console.log(`[duplicate] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+    return buildExecutedDuplicateResponse({
+      message,
+      callKey,
+      claim,
+      cmd,
+      cwd,
+      pane,
+      timeoutMs
+    });
+  }
 
   try {
     console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
@@ -481,10 +497,16 @@ async function handleMessageText(text) {
       durationMs: Date.now() - started,
       ...result
     };
-    completeServerShellCall(callKey, response);
+    if (isConfirmedTmuxExecution(result)) {
+      completeServerShellCall(claim.ledgerKey, response);
+    } else {
+      failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Shell command execution was not confirmed complete."), {
+        durationMs: Date.now() - started
+      });
+    }
     return response;
   } catch (error) {
-    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
@@ -516,6 +538,7 @@ async function handleRunBoardMessage(message) {
   }
 
   const pane = resolved.pane;
+  const cwd = pane.currentPath || "";
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([
     "board",
     boardName,
@@ -529,14 +552,32 @@ async function handleRunBoardMessage(message) {
   const claim = claimServerShellCall(callKey, {
     cmd,
     boardName,
-    cwd: pane.currentPath || "",
+    cwd,
     target: pane.id,
+    // Generic board CLIs expose only a textual prompt. Command output can
+    // spoof that prompt, so board completion is not authoritative enough for
+    // execution dedup. Keep the ledger as unscoped audit state and fail open.
+    executionTarget: "",
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
     callMeta: message.callMeta || {},
     force
   });
+
+  if (claim.action === "skip") {
+    console.log(`[duplicate-board] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+    return buildExecutedDuplicateResponse({
+      message,
+      callKey,
+      claim,
+      cmd,
+      cwd,
+      pane,
+      timeoutMs,
+      boardName
+    });
+  }
 
   try {
     console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} boardName=${boardName || "board"} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
@@ -554,16 +595,25 @@ async function handleRunBoardMessage(message) {
       callKey,
       cmd,
       boardName,
+      cwd,
       target: pane.id,
       targetName: pane.label,
       timeoutMs,
       durationMs: Date.now() - started,
       ...result
     };
-    completeServerShellCall(callKey, response);
+    if (result.executed !== true) {
+      failServerShellCall(claim.ledgerKey, new Error(result.error || result.stderr || "Board command execution was not confirmed complete."), {
+        durationMs: Date.now() - started
+      });
+    } else if (!isConfirmedTmuxExecution(result)) {
+      finishUnconfirmedServerShellCall(claim.ledgerKey, response);
+    } else {
+      completeServerShellCall(claim.ledgerKey, response);
+    }
     return response;
   } catch (error) {
-    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
@@ -599,7 +649,7 @@ function handleWriteFileMessage(message) {
       bytes,
       durationMs: Date.now() - started
     };
-    completeServerShellCall(callKey, {
+    completeServerShellCall(claim.ledgerKey, {
       ...response,
       exitCode: 0,
       timedOut: false,
@@ -607,7 +657,7 @@ function handleWriteFileMessage(message) {
     });
     return response;
   } catch (error) {
-    failServerShellCall(callKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
@@ -1675,7 +1725,7 @@ async function handleVisionTmuxOcrRunLineMessage(message) {
     maxPages,
     ...result
   };
-  completeServerShellCall(callKey, {
+  completeServerShellCall(claim.ledgerKey, {
     ...response,
     exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
     timedOut: response.timedOut === true,
@@ -1711,35 +1761,61 @@ async function handleVisionTmuxRunLineMessage(message) {
     cmd,
     cwd: pane.currentPath || "",
     target: pane.id,
+    executionTarget: buildTmuxPaneExecutionTarget(pane),
     timeoutMs,
     seq: message.seq,
     callMeta: message.callMeta || {},
     force
   });
 
-  const result = await runTmuxVisualLine({
-    cmd,
-    pane,
-    timeoutMs,
-    maxOutputChars
-  });
-  const response = {
-    ok: result.ok !== false,
-    id: message.id,
-    callKey,
-    cmd,
-    target: pane.id,
-    targetName: pane.label,
-    timeoutMs,
-    ...result
-  };
-  completeServerShellCall(callKey, {
-    ...response,
-    exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
-    timedOut: response.timedOut === true,
-    truncated: response.truncated === true
-  });
-  return response;
+  if (claim.action === "skip") {
+    return buildExecutedDuplicateResponse({
+      message,
+      callKey,
+      claim,
+      cmd,
+      cwd: pane.currentPath || "",
+      pane,
+      timeoutMs
+    });
+  }
+
+  const started = Date.now();
+  try {
+    const result = await runTmuxVisualLine({
+      cmd,
+      pane,
+      timeoutMs,
+      maxOutputChars
+    });
+    const response = {
+      ok: result.ok !== false,
+      id: message.id,
+      callKey,
+      cmd,
+      cwd: pane.currentPath || "",
+      target: pane.id,
+      targetName: pane.label,
+      timeoutMs,
+      ...result
+    };
+    if (isConfirmedTmuxExecution(result)) {
+      completeServerShellCall(claim.ledgerKey, {
+        ...response,
+        exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
+        timedOut: response.timedOut === true,
+        truncated: response.truncated === true
+      });
+    } else {
+      failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Visual tmux command execution was not confirmed complete."), {
+        durationMs: Date.now() - started
+      });
+    }
+    return response;
+  } catch (error) {
+    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
+    throw error;
+  }
 }
 
 async function runVisionTerminalSelfTest(message) {
@@ -1899,14 +1975,37 @@ function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(
 function claimServerShellCall(callKey, payload) {
   const now = Date.now();
   const force = payload.callMeta?.force === true || payload.force === true;
+  const executionKey = buildServerExecutionKey(payload);
+
+  if (!force && executionKey) {
+    const completed = Object.entries(serverLedger.calls || {}).find(([, entry]) =>
+      entry?.state === "completed" && entry.executionKey === executionKey
+    );
+    if (completed) {
+      const [previousLedgerKey, previous] = completed;
+      return {
+        action: "skip",
+        reason: "already-executed-on-target",
+        executionKey,
+        previousCallKey: previous.callKey || previousLedgerKey,
+        previous
+      };
+    }
+  }
 
   serverLedger.calls ||= {};
-  serverLedger.calls[callKey] = {
+  const attemptId = crypto.randomBytes(8).toString("hex");
+  const ledgerKey = `${callKey}:${attemptId}`;
+  serverLedger.calls[ledgerKey] = {
+    callKey,
+    attemptId,
     state: "running",
     startedAt: now,
     cmdHash: hashText(payload.cmd),
     cwd: payload.cwd,
     target: payload.target || "",
+    executionTarget: payload.executionTarget || "",
+    executionKey,
     seq: payload.seq || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
@@ -1914,13 +2013,72 @@ function claimServerShellCall(callKey, payload) {
     forced: force
   };
   saveServerLedger();
-  return { action: "run" };
+  return { action: "run", executionKey, ledgerKey, attemptId };
 }
 
-function completeServerShellCall(callKey, response) {
+function buildServerExecutionKey(payload = {}) {
+  const executionTarget = String(payload.executionTarget || "").trim();
+  if (!executionTarget) {
+    return "";
+  }
+  return hashText([
+    executionTarget,
+    String(payload.cmd || "").trim(),
+    String(payload.cwd || "").trim()
+  ].join("\n"));
+}
+
+function isConfirmedTmuxExecution(result = {}) {
+  return result.executed === true && result.executionCompleted === true;
+}
+
+function buildTmuxPaneExecutionTarget(pane = {}) {
+  if (!pane.serverPid || !pane.sessionCreated || !pane.id || !pane.address) {
+    return "";
+  }
+  return [
+    "tmux-pane",
+    getTmuxSocketPath() || "default-socket",
+    pane.serverPid,
+    pane.sessionCreated,
+    pane.id,
+    pane.address
+  ].join(":");
+}
+
+function buildExecutedDuplicateResponse({ message, callKey, claim, cmd, cwd = "", pane, timeoutMs, boardName = "" }) {
+  const previous = claim?.previous || {};
+  return {
+    ok: true,
+    id: message?.id,
+    callKey,
+    cmd,
+    boardName,
+    cwd,
+    target: pane?.id || previous.target || "",
+    targetName: pane?.label || "",
+    timeoutMs,
+    durationMs: 0,
+    exitCode: Number.isInteger(previous.exitCode) ? previous.exitCode : 0,
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    timedOut: false,
+    duplicate: true,
+    skipped: true,
+    reason: claim?.reason || "already-executed-on-target",
+    previousCallKey: claim?.previousCallKey || "",
+    previousCompletedAt: previous.completedAt || 0
+  };
+}
+
+function completeServerShellCall(ledgerKey, response) {
   serverLedger.calls ||= {};
-  serverLedger.calls[callKey] = {
-    ...(serverLedger.calls[callKey] || {}),
+  if (!ledgerKey || !serverLedger.calls[ledgerKey]) {
+    return false;
+  }
+  serverLedger.calls[ledgerKey] = {
+    ...serverLedger.calls[ledgerKey],
     state: "completed",
     completedAt: Date.now(),
     exitCode: response.exitCode,
@@ -1930,12 +2088,16 @@ function completeServerShellCall(callKey, response) {
   };
   pruneServerLedger();
   saveServerLedger();
+  return true;
 }
 
-function failServerShellCall(callKey, error, extra = {}) {
+function failServerShellCall(ledgerKey, error, extra = {}) {
   serverLedger.calls ||= {};
-  serverLedger.calls[callKey] = {
-    ...(serverLedger.calls[callKey] || {}),
+  if (!ledgerKey || !serverLedger.calls[ledgerKey]) {
+    return false;
+  }
+  serverLedger.calls[ledgerKey] = {
+    ...serverLedger.calls[ledgerKey],
     state: "failed",
     completedAt: Date.now(),
     exitCode: 1,
@@ -1946,6 +2108,26 @@ function failServerShellCall(callKey, error, extra = {}) {
   };
   pruneServerLedger();
   saveServerLedger();
+  return true;
+}
+
+function finishUnconfirmedServerShellCall(ledgerKey, response = {}) {
+  serverLedger.calls ||= {};
+  if (!ledgerKey || !serverLedger.calls[ledgerKey]) {
+    return false;
+  }
+  serverLedger.calls[ledgerKey] = {
+    ...serverLedger.calls[ledgerKey],
+    state: "unconfirmed",
+    completedAt: Date.now(),
+    exitCode: response.exitCode,
+    durationMs: response.durationMs,
+    timedOut: response.timedOut === true,
+    truncated: response.truncated === true
+  };
+  pruneServerLedger();
+  saveServerLedger();
+  return true;
 }
 
 function summarizeError(error) {
@@ -2225,8 +2407,9 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   const scriptPath = path.join(TMUX_SCRIPT_DIR, `${runId}.zsh`);
   const pidPath = path.join(TMUX_SCRIPT_DIR, `${runId}.pid`);
   const statusPath = path.join(TMUX_SCRIPT_DIR, `${runId}.status`);
+  const executedPath = path.join(TMUX_SCRIPT_DIR, `${runId}.executed`);
   fs.mkdirSync(TMUX_SCRIPT_DIR, { recursive: true });
-  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath }), { mode: 0o700 });
+  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath }), { mode: 0o700 });
 
   const started = Date.now();
   const markerLossGraceMs = 2000;
@@ -2243,7 +2426,10 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
       lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
       const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
       if (extracted.foundDone) {
+        const executed = fs.existsSync(executedPath);
         return {
+          executed,
+          executionCompleted: executed,
           exitCode: extracted.exitCode,
           stdout: extracted.stdout,
           stderr: "",
@@ -2273,7 +2459,10 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
           continue;
         }
         const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        const executed = fs.existsSync(executedPath);
         return {
+          executed,
+          executionCompleted: executed,
           exitCode: state.exitCode,
           stdout: partial.stdout,
           stderr: "Timed out waiting for tmux completion marker after the shell process completed.",
@@ -2296,6 +2485,8 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
         }
         const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
         return {
+          executed: fs.existsSync(executedPath),
+          executionCompleted: false,
           exitCode: 124,
           stdout: partial.stdout,
           stderr: "Timed out waiting for tmux completion marker after the shell process exited without reporting completion.",
@@ -2317,6 +2508,8 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
       }
       const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
       return {
+        executed: fs.existsSync(executedPath),
+        executionCompleted: false,
         exitCode: 124,
         stdout: partial.stdout,
         stderr: "Timed out waiting for tmux command completion marker and could not confirm a running shell process.",
@@ -2344,6 +2537,11 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
     }
     try {
       fs.unlinkSync(statusPath);
+    } catch {
+      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
+    }
+    try {
+      fs.unlinkSync(executedPath);
     } catch {
       // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
     }
@@ -2426,6 +2624,7 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
       stdout: "",
       stderr: "",
       error: "Board pane already has an active tmux pipe-pane; command was not sent.",
+      executed: false,
       truncated: false,
       timedOut: false,
       target: pane.id,
@@ -2458,6 +2657,7 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
         stdout: probe.stdout,
         stderr: "",
         error: "Board prompt probe failed; command was not sent.",
+        executed: false,
         truncated: probe.truncated,
         timedOut: probe.timedOut,
         target: pane.id,
@@ -2479,6 +2679,9 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
     });
 
     return {
+      executed: true,
+      executionCompleted: false,
+      completionObserved: !captured.timedOut,
       exitCode: captured.timedOut ? 124 : 0,
       stdout: captured.stdout,
       stderr: captured.timedOut ? "Timed out waiting for board prompt after command. The command may still be running in the target pane." : "",
@@ -2525,6 +2728,8 @@ async function runTmuxVisualLine({ cmd, pane, timeoutMs, maxOutputChars }) {
 
   return {
     ok: done.found,
+    executed: true,
+    executionCompleted: done.found,
     runId,
     runWindowName,
     doneWindowName: done.windowName,
@@ -3048,13 +3253,14 @@ function parseVisionDoneFromText(text, donePrefix) {
   };
 }
 
-function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath }) {
+function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath }) {
   return [
     `#!${SHELL_RUNNER}`,
     "set +e",
     `printf '\\n%s\\n' ${shellQuote(startMarker)}`,
     "(",
     cwd ? `  cd -- ${shellQuote(cwd)} || exit $?` : "",
+    executedPath ? `  printf '1\\n' > ${shellQuote(executedPath)}` : "",
     cmd,
     ") &",
     "__ai_chat_shell_exec_pid=$!",
@@ -3200,7 +3406,9 @@ function parseTmuxPanes(output) {
         paneIndex,
         active,
         currentPath,
-        currentCommand
+        currentCommand,
+        sessionCreated,
+        serverPid
       ] = parts;
       const address = `${session}:${windowIndex}.${paneIndex}`;
       return {
@@ -3212,6 +3420,8 @@ function parseTmuxPanes(output) {
         active: active === "1",
         currentPath: currentPath || "",
         currentCommand: currentCommand || "",
+        sessionCreated: sessionCreated || "",
+        serverPid: serverPid || "",
         address,
         label: `${address} ${windowName || "(unnamed)"}`
       };
@@ -4548,6 +4758,8 @@ module.exports = {
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildServerExecutionKey,
+  buildTmuxPaneExecutionTarget,
   buildHealthResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
@@ -4577,6 +4789,7 @@ module.exports = {
   handleAgentHubMessageAsync,
   handleMessageText,
   handleVisionMessage,
+  isConfirmedTmuxExecution,
   buildAgentReplyCommand,
   buildTmuxAiTaskPrompt,
   buildTmuxRunScript,

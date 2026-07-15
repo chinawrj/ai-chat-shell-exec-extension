@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.6";
+const CONTENT_SCRIPT_VERSION = "0.8.7";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -40,11 +40,13 @@ const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const MANUAL_AGENT_REQUEST = "ai-chat-shell-exec:agent-request";
 const MANUAL_AGENT_RESPONSE = "ai-chat-shell-exec:agent-response";
 const AGENT_POLL_INTERVAL_MS = 2000;
-const processedCalls = new Set();
-const processedSemanticCalls = new Set();
-// Keep dedup metadata in memory only; unlike dataset persistence this resets on content-script reinjection.
-// That can re-evaluate existing helpers, but initialThreadSettled already ignores existing history on first scan.
-const processedNodeSemanticKeys = new WeakMap();
+let helperRenderRootSequence = 0;
+const helperRenderRootIds = new WeakMap();
+const helperRenderRootGenerations = new WeakMap();
+const processedRenderedHelpers = new WeakMap();
+// Keep per-helper scan metadata in memory only. This prevents the same rendered
+// helper block from being submitted repeatedly, but it is not command dedup:
+// only the shell server can decide whether a command already ran on a tmux pane.
 let scanTimer = 0;
 let lastThreadText = "";
 let lastThreadTextAt = Date.now();
@@ -156,15 +158,47 @@ function observeThread() {
     return;
   }
 
-  threadObserver = new MutationObserver(() => {
+  threadObserver = new MutationObserver((records) => {
+    invalidateRenderedHelperTracking(records);
     scheduleScan();
   });
 
   threadObserver.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    characterData: true
+    characterData: true,
+    characterDataOldValue: true
   });
+}
+
+function invalidateRenderedHelperTracking(records) {
+  for (const record of Array.from(records || [])) {
+    if (!mutationTouchesHelperText(record)) {
+      continue;
+    }
+    let element = record.target instanceof Element ? record.target : record.target?.parentElement;
+    while (element instanceof Element) {
+      if (processedRenderedHelpers.has(element)) {
+        processedRenderedHelpers.delete(element);
+        helperRenderRootGenerations.set(element, getHelperRenderRootGeneration(element) + 1);
+      }
+      element = element.parentElement;
+    }
+  }
+}
+
+function mutationTouchesHelperText(record) {
+  if (record?.type === "characterData") {
+    return containsToolLanguageHint(record.oldValue || "") || containsToolLanguageHint(record.target?.textContent || "");
+  }
+  if (record?.type !== "childList") {
+    return false;
+  }
+  const changedNodes = [
+    ...Array.from(record?.addedNodes || []),
+    ...Array.from(record?.removedNodes || [])
+  ];
+  return changedNodes.some((node) => containsToolLanguageHint(node?.innerText || node?.textContent || ""));
 }
 
 function installPageEventListeners() {
@@ -496,10 +530,9 @@ async function scanForShellCall(options = {}) {
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
   const repeatableAgentQuery = isRepeatableAgentQueryHelperCall(call);
   if (!force) {
-    const dedupReason = getDuplicateHelperDedupReason(candidate, callKey, semanticCallKey, call);
-    if (dedupReason) {
-      rememberSuppressedCallStatus(dedupReason);
-      setStatus(`Suppressed duplicate helper call: ${summarizeCommand(helperPreviewText(call))}`, "ok");
+    const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, call);
+    if (handledReason) {
+      setStatus(`Already handled this helper block: ${summarizeCommand(helperPreviewText(call))}`, "ok");
       return;
     }
   }
@@ -511,18 +544,10 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
-  const lastShellOutputText = getLastShellOutputText();
-  const lastPromptOrOutputText = getLastUserMessageText();
   if (!force && isShellOutputCandidate(candidate)) {
     rememberSuppressedCallStatus("suppressed shell-output helper echo");
     markCallProcessed(candidate, callKey, semanticCallKey);
     setStatus(`Suppressed helper inside shell-output: ${summarizeCommand(helperPreviewText(call))}`, "ok");
-    return;
-  }
-  if (!force && shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText)) {
-    rememberSuppressedCallStatus("suppressed shell-output echo");
-    markCallProcessed(candidate, callKey, semanticCallKey);
-    setStatus(`Suppressed duplicate shell call: ${summarizeCommand(call.cmd)}`, "ok");
     return;
   }
 
@@ -598,29 +623,72 @@ function buildSemanticCallKey(call) {
 }
 
 function buildCandidateCallKey(candidate, semanticCallKey) {
+  const renderRoot = getCandidateRenderRoot(candidate);
   return stableHash([
-    location.origin,
+    getCurrentPageIdentity(),
+    getAgentTabInstanceId(),
+    getHelperRenderRootId(renderRoot),
+    getHelperRenderRootGeneration(renderRoot),
     candidate.source || "",
-    candidate.index || "",
+    candidate.blockIndex ?? candidate.index ?? "",
     semanticCallKey
   ].join("\n"));
 }
 
-function getDuplicateHelperDedupReason(candidate, callKey, semanticCallKey, call) {
-  if (processedCalls.has(callKey)) {
-    return "processed callKey";
-  }
+function getHandledHelperReason(candidate, _callKey, semanticCallKey, call) {
   if (isRepeatableAgentQueryHelperCall(call)) {
     return "";
   }
-  if (processedSemanticCalls.has(semanticCallKey)) {
-    return "processed semantic key";
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return "";
   }
-  if (candidate?.node instanceof Element &&
-    processedNodeSemanticKeys.get(candidate.node) === semanticCallKey) {
-    return "processed node semantic key";
+  const renderedHelperKey = buildRenderedHelperKey(candidate, semanticCallKey);
+  if (processedRenderedHelpers.get(renderRoot)?.has(renderedHelperKey)) {
+    return "processed rendered helper";
   }
   return "";
+}
+
+function getCandidateRenderRoot(candidate) {
+  if (candidate?.textRoot instanceof Element) {
+    return candidate.textRoot;
+  }
+  return candidate?.node instanceof Element ? candidate.node : null;
+}
+
+function getHelperRenderRootId(renderRoot) {
+  if (!(renderRoot instanceof Element)) {
+    return "no-render-root";
+  }
+  let id = helperRenderRootIds.get(renderRoot);
+  if (!id) {
+    helperRenderRootSequence += 1;
+    id = `render-${helperRenderRootSequence}`;
+    helperRenderRootIds.set(renderRoot, id);
+  }
+  return id;
+}
+
+function getHelperRenderRootGeneration(renderRoot) {
+  if (!(renderRoot instanceof Element)) {
+    return 0;
+  }
+  return helperRenderRootGenerations.get(renderRoot) || 0;
+}
+
+function getCurrentPageIdentity() {
+  return location.href || `${location.origin}${location.pathname || ""}`;
+}
+
+function buildRenderedHelperKey(candidate, semanticCallKey) {
+  return [
+    getCurrentPageIdentity(),
+    getHelperRenderRootGeneration(getCandidateRenderRoot(candidate)),
+    candidate?.source || "",
+    candidate?.blockIndex ?? candidate?.index ?? "",
+    semanticCallKey
+  ].join("\n");
 }
 
 function helperPreviewText(call) {
@@ -639,15 +707,16 @@ function buildForceCallKey(semanticCallKey) {
 }
 
 function markCallProcessed(candidate, callKey, semanticCallKey) {
-  processedCalls.add(callKey);
-  processedSemanticCalls.add(semanticCallKey);
-  if (candidate.node instanceof Element) {
-    processedNodeSemanticKeys.set(candidate.node, semanticCallKey);
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (renderRoot instanceof Element) {
+    const handled = processedRenderedHelpers.get(renderRoot) || new Set();
+    handled.add(buildRenderedHelperKey(candidate, semanticCallKey));
+    processedRenderedHelpers.set(renderRoot, handled);
   }
 }
 
-function markRepeatableAgentQueryCallProcessed(callKey) {
-  processedCalls.add(callKey);
+function markRepeatableAgentQueryCallProcessed(_callKey) {
+  // Read-only agent queries are intentionally repeatable.
 }
 
 function isSupportedPage() {
@@ -792,6 +861,8 @@ function getTextScanRoots(root) {
     "article",
     '[role="article"]',
     ".markdown",
+    "pre",
+    "code",
     "[data-testid]",
     "main > div",
     '[role="main"] > div'
@@ -807,7 +878,7 @@ function getTextScanRoots(root) {
 
   return nodes.filter((node) => !nodes.some((other) =>
     other !== node &&
-    other.contains(node) &&
+    node.contains(other) &&
     containsToolLanguageHint(other.innerText || other.textContent || "")
   ));
 }
@@ -871,9 +942,11 @@ function compareNodeOrder(a, b) {
 function extractPlainTextShellCallBlocks(root) {
   const text = root.innerText || root.textContent || "";
   const blocks = parsePlainTextHelperBlocks(text);
-  return blocks.map((call) => ({
+  return blocks.map((call, blockIndex) => ({
     call,
-    node: closestMessageContainer(root)
+    node: closestMessageContainer(root),
+    blockIndex,
+    insideShellOutput: isRenderedShellOutputRoot(root) || isHelperLineInsideShellOutput(text, call.sourceStartLine)
   }));
 }
 
@@ -965,6 +1038,11 @@ function parsePlainTextHelperBlocks(text) {
         inferredEndMarker,
         cmd: normalizeCommand(lines.slice(valueLineIndex, blockEndIndex).join("\n"))
       });
+    }
+    const addedCall = calls[calls.length - 1];
+    if (addedCall) {
+      addedCall.sourceStartLine = index;
+      addedCall.sourceEndLine = blockEndIndex;
     }
     index = blockEndIndex;
   }
@@ -1324,15 +1402,6 @@ function getLastUserMessageText() {
   return toolOutputLike.length > 0 ? toolOutputLike[toolOutputLike.length - 1] : "";
 }
 
-function getLastShellOutputText() {
-  const nodes = Array.from(document.querySelectorAll("article, [role='article'], [data-testid], main > div, body *"))
-    .filter(isVisibleElement)
-    .map((node) => normalizeCommand(node.innerText || node.textContent || ""))
-    .filter(isShellOutputText);
-
-  return nodes.length > 0 ? nodes[nodes.length - 1] : "";
-}
-
 function isShellOutputText(text) {
   const lower = String(text || "").toLowerCase();
   return lower.includes("shell call result:") ||
@@ -1342,29 +1411,55 @@ function isShellOutputText(text) {
     lower.includes("shell-output");
 }
 
-function hasExplicitHelperIdentity(call) {
-  return normalizeCommand(call?.helperIdSource || "") === "marker" &&
-    Boolean(normalizeCommand(call?.helperId || ""));
+function isShellOutputCandidate(candidate) {
+  return candidate?.insideShellOutput === true;
 }
 
-function shouldSuppressShellCallEcho(call, lastShellOutputText, lastPromptOrOutputText) {
-  if (!isShellHelperCall(call) || hasExplicitHelperIdentity(call)) {
+function isRenderedShellOutputRoot(root) {
+  if (!(root instanceof Element)) {
     return false;
   }
-
-  return (isShellOutputText(lastShellOutputText) && isSameCommandAsShellOutput(call.cmd, lastShellOutputText)) ||
-    (isShellOutputText(lastPromptOrOutputText) && isSameCommandAsShellOutput(call.cmd, lastPromptOrOutputText));
+  const selector = [
+    "code.language-shell-output",
+    'code[class*="language-shell-output"]',
+    "pre.language-shell-output",
+    'pre[class*="language-shell-output"]',
+    '[data-language="shell-output"]',
+    '[data-code-language="shell-output"]'
+  ].join(",");
+  if (root.matches?.(selector) || root.closest?.(selector)) {
+    return true;
+  }
+  const language = [
+    root.getAttribute?.("data-language") || "",
+    root.getAttribute?.("data-code-language") || "",
+    root.getAttribute?.("class") || root.className || ""
+  ].join(" ").toLowerCase();
+  return language.includes("shell-output");
 }
 
-function isShellOutputCandidate(candidate) {
-  const text = normalizeCommand(
-    candidate?.textRoot?.innerText ||
-    candidate?.textRoot?.textContent ||
-    candidate?.node?.innerText ||
-    candidate?.node?.textContent ||
-    ""
-  );
-  return isShellOutputText(text);
+function isHelperLineInsideShellOutput(text, helperStartLine) {
+  const lines = splitShellCallLines(text);
+  const stopAt = Number.isInteger(helperStartLine) ? helperStartLine : -1;
+  if (stopAt < 0) {
+    return false;
+  }
+  let inside = false;
+  let shellOutputFence = "";
+  for (let index = 0; index <= stopAt && index < lines.length; index += 1) {
+    const line = String(lines[index] || "").trim().toLowerCase();
+    const opening = line.match(/^(`{3,})shell-output(?:\s.*)?$/);
+    if (!inside && opening) {
+      inside = true;
+      shellOutputFence = opening[1];
+      continue;
+    }
+    if (inside && line === shellOutputFence) {
+      inside = false;
+      shellOutputFence = "";
+    }
+  }
+  return inside;
 }
 
 function isSameCommandAsShellOutput(command, shellOutputText) {
@@ -1680,9 +1775,9 @@ async function runAndReply(callId, call, options = {}) {
   chainCallCount += 1;
   setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
-  // Remember which semantic call we actually attempted to run, so the debug
-  // panel can show whether the next detected candidate matches it (i.e. the
-  // ledger/dedup will treat the next scan as a duplicate of this one).
+  // Remember which semantic call we attempted so the debug panel can correlate
+  // the latest helper with the last submission. This is diagnostic only; the
+  // shell server is the sole authority for command duplicate decisions.
   lastExecutedSemanticKey = buildSemanticCallKey(call);
   try {
     const response = isFileHelperCall(call) ?
@@ -2307,6 +2402,11 @@ function setHelperCompletionStatus(call, response) {
   }
 
   if (isBoardHelperCall(call)) {
+    if (response?.duplicate === true && response?.skipped === true) {
+      rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
+      setStatus(`Server confirmed duplicate board command on ${response.targetName || response.target || "the resolved tmux pane"}`, "ok");
+      return;
+    }
     setStatus(response?.ok === false ? "Board helper failed" : "Board helper completed", response?.ok === false ? "error" : "ok");
     return;
   }
@@ -2323,6 +2423,12 @@ function setHelperCompletionStatus(call, response) {
 
   if (isAgentTaskStatusHelperCall(call)) {
     setStatus(response?.ok === false ? "Agent task status query failed" : "Agent task status query completed", response?.ok === false ? "error" : "ok");
+    return;
+  }
+
+  if (response?.duplicate === true && response?.skipped === true) {
+    rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
+    setStatus(`Server confirmed duplicate shell command on ${response.targetName || response.target || "the resolved tmux pane"}`, "ok");
     return;
   }
 
@@ -2369,6 +2475,10 @@ function formatShellOutput(call, response, startedAt) {
     `cwd: ${response.cwd || call.cwd || ""}`,
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
+    response.duplicate === true ? "duplicate: true" : "",
+    response.skipped === true ? "skipped: true" : "",
+    response.reason ? `reason: ${response.reason}` : "",
+    response.previousCallKey ? `previousCallKey: ${response.previousCallKey}` : "",
     response.timedOut ? "timedOut: true" : "",
     response.timeoutReason ? `timeoutReason: ${response.timeoutReason}` : "",
     response.processKnown === true ? "processKnown: true" : "",
@@ -2422,6 +2532,10 @@ function formatBoardOutput(call, response, startedAt) {
     response.targetName ? `targetName: ${response.targetName}` : "",
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
+    response.duplicate === true ? "duplicate: true" : "",
+    response.skipped === true ? "skipped: true" : "",
+    response.reason ? `reason: ${response.reason}` : "",
+    response.previousCallKey ? `previousCallKey: ${response.previousCallKey}` : "",
     response.timedOut ? "timedOut: true" : "",
     response.truncated ? "truncated: true" : ""
   ].filter(Boolean);
@@ -3543,8 +3657,8 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
 
 function isSuppressionStatusText(text) {
   const message = String(text || "");
-  return message.startsWith("Suppressed duplicate helper call") ||
-    message.startsWith("Suppressed duplicate shell call");
+  return message.startsWith("Server confirmed duplicate shell command") ||
+    message.startsWith("Server confirmed duplicate board command");
 }
 
 function handlePanelAction(action) {

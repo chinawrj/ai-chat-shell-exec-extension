@@ -454,6 +454,25 @@ async function main() {
   assert.match(finalText, new RegExp(`targetName: ${escapeRegExp(expectedDefaultSession)}:.* ${escapeRegExp(expectedDefaultHostWindow)}`));
   assert.match(finalText, new RegExp(escapeRegExp(`stdout:\n${token}`)));
 
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
+      ${JSON.stringify(command)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const duplicateText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("duplicate: true") &&
+      text.includes("skipped: true") &&
+      text.includes("reason: already-executed-on-target") &&
+      text.includes(${JSON.stringify(command)}) ? text : "";
+  })()`, "new identical helper reaches server duplicate adjudication");
+  assert.match(duplicateText, /duplicate: true/);
+  assert.match(duplicateText, /skipped: true/);
+  assert.match(duplicateText, /reason: already-executed-on-target/);
+
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "shell-helper-result.png"));
   }

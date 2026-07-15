@@ -148,9 +148,7 @@ assert.equal(repeatedUnsuffixedA.helperIdSource, "payload-hash");
 assert.equal(repeatedUnsuffixedA.helperId, repeatedUnsuffixedB.helperId);
 assert.equal(context.buildSemanticCallKey(repeatedUnsuffixedA), context.buildSemanticCallKey(repeatedUnsuffixedB));
 
-const previousPwdOutput = "Shell call result:\n\n```shell-output\n$ pwd\ntarget: %24\nexitCode: 0\n```";
-assert.equal(context.shouldSuppressShellCallEcho(repeatedUnsuffixedA, previousPwdOutput, ""), true);
-assert.equal(context.shouldSuppressShellCallEcho(suffixedShellA, previousPwdOutput, ""), false);
+assert.equal(typeof context.shouldSuppressShellCallEcho, "undefined", "The frontend must not dedup commands from shell-output history.");
 
 const heredocShell = context.parseCallPayload([
   "ai-helper-shell-start",

@@ -96,4 +96,16 @@ const continuedOutput = context.formatShellOutput({ cmd: "sleep 2" }, {
 }, "2026-05-22T00:00:00.000Z");
 assert.match(continuedOutput, /^continuedAfterTimeout: true$/m);
 
+const duplicateOutput = context.formatShellOutput({ cmd: "pwd" }, {
+  ...response,
+  duplicate: true,
+  skipped: true,
+  reason: "already-executed-on-target",
+  previousCallKey: "previous-call"
+}, "2026-05-22T00:00:00.000Z");
+assert.match(duplicateOutput, /^duplicate: true$/m);
+assert.match(duplicateOutput, /^skipped: true$/m);
+assert.match(duplicateOutput, /^reason: already-executed-on-target$/m);
+assert.match(duplicateOutput, /^previousCallKey: previous-call$/m);
+
 console.log("content shell-output format tests passed");

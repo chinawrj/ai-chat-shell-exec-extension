@@ -94,6 +94,48 @@ async function main() {
   assert.match(response.targetName, /ForAI:.* host/);
   assert.equal(response.cwd, expectedForAiCwd);
 
+  const dedupToken = `FORAI_TARGET_DEDUP_${Date.now()}`;
+  const dedupFile = path.join(expectedForAiCwd, `target-dedup-${Date.now()}.txt`);
+  const dedupCommand = `printf '${dedupToken}\\n' >> ${shellQuote(dedupFile)}`;
+  const firstDedupResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-target-dedup-first",
+    callKey: `forai-target-dedup-first-${Date.now()}`,
+    cmd: dedupCommand,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(firstDedupResponse.ok, true, JSON.stringify(firstDedupResponse));
+  assert.equal(firstDedupResponse.duplicate, undefined, JSON.stringify(firstDedupResponse));
+
+  const duplicateDedupResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-target-dedup-second",
+    callKey: `forai-target-dedup-second-${Date.now()}`,
+    cmd: dedupCommand,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(duplicateDedupResponse.ok, true, JSON.stringify(duplicateDedupResponse));
+  assert.equal(duplicateDedupResponse.duplicate, true, JSON.stringify(duplicateDedupResponse));
+  assert.equal(duplicateDedupResponse.skipped, true, JSON.stringify(duplicateDedupResponse));
+  assert.equal(duplicateDedupResponse.reason, "already-executed-on-target");
+  assert.equal(fs.readFileSync(dedupFile, "utf8"), `${dedupToken}\n`);
+
+  const otherPaneDedupResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-target-dedup-agent",
+    callKey: `forai-target-dedup-agent-${Date.now()}`,
+    agentId: "slave-a",
+    cmd: dedupCommand,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(otherPaneDedupResponse.ok, true, JSON.stringify(otherPaneDedupResponse));
+  assert.equal(otherPaneDedupResponse.duplicate, undefined, JSON.stringify(otherPaneDedupResponse));
+  assert.match(otherPaneDedupResponse.targetName, /ForAI-slave-a:.* host/);
+  assert.equal(fs.readFileSync(dedupFile, "utf8"), `${dedupToken}\n${dedupToken}\n`);
+
   const longToken = `FORAI_LONG_${Date.now()}`;
   const longStarted = Date.now();
   const longResponse = await handleMessageText(JSON.stringify({
@@ -185,6 +227,18 @@ async function main() {
   assert.equal(reset.cwd, expectedForAiCwd);
   assert.equal(reset.defaultTargetCwd, expectedForAiCwd);
   assert.equal(reset.boardTargetCwd, expectedForAiCwd);
+
+  const resetPaneDedupResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-target-dedup-reset",
+    callKey: `forai-target-dedup-reset-${Date.now()}`,
+    cmd: dedupCommand,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(resetPaneDedupResponse.ok, true, JSON.stringify(resetPaneDedupResponse));
+  assert.equal(resetPaneDedupResponse.duplicate, undefined, JSON.stringify(resetPaneDedupResponse));
+  assert.equal(fs.readFileSync(dedupFile, "utf8"), `${dedupToken}\n${dedupToken}\n${dedupToken}\n`);
 
   const resetToken = `FORAI_RESET_${Date.now()}`;
   const resetResponse = await handleMessageText(JSON.stringify({

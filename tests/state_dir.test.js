@@ -70,7 +70,8 @@ try {
   });
   assert.equal(claim.action, "run");
   const recoveredLedger = JSON.parse(fs.readFileSync(path.join(corruptLedgerDir, "shell-ledger.json"), "utf8"));
-  assert.equal(recoveredLedger.calls["recover-ledger"].state, "running");
+  assert.equal(recoveredLedger.calls[claim.ledgerKey].state, "running");
+  assert.equal(recoveredLedger.calls[claim.ledgerKey].callKey, "recover-ledger");
 
   const ledgerDirState = path.join(tmpRoot, "ledger-dir-state");
   const ledgerDirContext = loadServerContext(ledgerDirState);

@@ -13,7 +13,7 @@ Security fixes are currently made against the latest public release only.
 - Commands must name an existing tmux target; missing or unknown targets are rejected.
 - The local server listens only on `127.0.0.1:17371`.
 - The local server accepts the pinned Chrome extension origin by default.
-- Duplicate calls are blocked in both browser storage and the server ledger.
+- The browser never adjudicates command duplicates from command text or prior output. It only prevents repeated DOM scans from resubmitting the exact same rendered helper request, including tracking DOM-node recycling and structurally rendered `shell-output`. The shell server makes the final decision after resolving the actual tmux pane, and only a command with a server-controlled completion proof on that pane instance and actual cwd can be considered duplicate. Running, timed-out/unconfirmed, failed, unavailable-target, and incomplete-pane-identity attempts remain runnable. Generic board prompts are spoofable, so board execution dedup is disabled and fails open; Force run explicitly bypasses a completed verdict where authoritative dedup is available.
 - Command length, timeout, and output size are capped.
 
 These controls reduce accidental execution, but they do not make untrusted commands safe.

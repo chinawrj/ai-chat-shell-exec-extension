@@ -21,9 +21,13 @@ assert.doesNotMatch(source, /Math\.random\(\)/);
 assert.match(source, /runAndReply\(executionCallKey,\s*call,\s*\{\s*force\s*\}\)/);
 assert.match(source, /No helper block found on this page/);
 assert.match(source, /setHelperCompletionStatus\(call,\s*response\);\s*activeCallId = "";/);
-assert.match(source, /const processedNodeSemanticKeys = new WeakMap\(\);/);
-assert.match(source, /processedNodeSemanticKeys\.set\(candidate\.node,\s*semanticCallKey\);/);
-assert.match(source, /processedNodeSemanticKeys\.get\(candidate\.node\) === semanticCallKey/);
+assert.match(source, /const processedRenderedHelpers = new WeakMap\(\);/);
+assert.match(source, /function buildRenderedHelperKey\(candidate, semanticCallKey\)/);
+assert.match(source, /candidate\?\.blockIndex \?\? candidate\?\.index/);
+assert.doesNotMatch(source, /processedSemanticCalls/);
+assert.doesNotMatch(source, /processedCalls/);
+assert.doesNotMatch(source, /processedNodeSemanticKeys/);
+assert.doesNotMatch(source, /shouldSuppressShellCallEcho/);
 assert.doesNotMatch(source, /dataset\.aiChatShell(CallKey|SemanticKey)/);
 
 console.log("content force-run tests passed");

@@ -8,6 +8,7 @@ const {
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildTmuxPaneExecutionTarget,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
   buildTmuxRunScript,
@@ -16,6 +17,7 @@ const {
   getTmuxEnvSocketPath,
   getForAiTmuxConfig,
   handleMessageText,
+  isConfirmedTmuxExecution,
   normalizeBoardOutput,
   outputEndsWithBoardPrompt,
   parseTmuxPanes,
@@ -44,6 +46,8 @@ assert.deepEqual(panes[0], {
   active: true,
   currentPath: "/Users/rjwang/work/project",
   currentCommand: "zsh",
+  sessionCreated: "",
+  serverPid: "",
   address: "espcam:0.0",
   label: "espcam:0.0 build"
 });
@@ -66,6 +70,31 @@ assert.equal(parseTmuxPanes([
   "/tmp",
   "zsh"
 ].join("__AI_CHAT_SHELL_FIELD__"))[0].address, "main:2.1");
+const paneWithInstance = parseTmuxPanes([
+  "%30",
+  "main",
+  "2",
+  "dev",
+  "1",
+  "0",
+  "/tmp",
+  "zsh",
+  "1784112000",
+  "43210"
+].join("__AI_CHAT_SHELL_FIELD__"))[0];
+assert.equal(paneWithInstance.sessionCreated, "1784112000");
+assert.equal(paneWithInstance.serverPid, "43210");
+assert.equal(buildTmuxPaneExecutionTarget(panes[0]), "", "Missing pane-instance metadata must disable dedup rather than reuse an ambiguous identity.");
+assert.equal(buildTmuxPaneExecutionTarget({ ...paneWithInstance, sessionCreated: "" }), "");
+assert.equal(buildTmuxPaneExecutionTarget({ ...paneWithInstance, serverPid: "" }), "");
+assert.notEqual(
+  buildTmuxPaneExecutionTarget(paneWithInstance),
+  buildTmuxPaneExecutionTarget({ ...paneWithInstance, serverPid: "43211" }),
+  "A recreated tmux server/pane instance must not inherit completed executions."
+);
+assert.equal(isConfirmedTmuxExecution({ executed: true, executionCompleted: true, exitCode: 7 }), true);
+assert.equal(isConfirmedTmuxExecution({ executed: true, executionCompleted: false, timedOut: true }), false);
+assert.equal(isConfirmedTmuxExecution({ executed: false, executionCompleted: true }), false);
 
 const boardPanes = parseTmuxPanes([
   "%40\tForAI\t0\tboard\t0\t1\t/Users/rjwang\tscreen",
@@ -128,7 +157,8 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
     startMarker: "__START__",
     doneMarker: "__DONE__",
     pidPath: "/tmp/run.pid",
-    statusPath: "/tmp/run.status"
+    statusPath: "/tmp/run.status",
+    executedPath: "/tmp/run.executed"
   });
   assert.match(script, /printf '\\n%s\\n' '__START__'/);
   assert.match(script, /\) &/);
@@ -136,6 +166,8 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.match(script, /\/tmp\/run\.pid/);
   assert.match(script, /wait "\$__ai_chat_shell_exec_pid"/);
   assert.match(script, /\/tmp\/run\.status/);
+  assert.match(script, /\/tmp\/run\.executed/);
+  assert.ok(script.indexOf("/tmp/run.executed") < script.indexOf("printf 'ok\\n'"));
   assert.match(script, /__DONE__/);
 }
 

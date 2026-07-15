@@ -41,85 +41,171 @@ function loadServerContext() {
 }
 
 try {
-  writeLedger({
-    recent: { state: "completed", completedAt: Date.now() - 10_000 }
-  });
-  const recentContext = loadServerContext();
-  const recentClaim = recentContext.claimServerShellCall("recent", {
-    cmd: "echo recent",
+  writeLedger({});
+  const completedContext = loadServerContext();
+  const firstClaim = completedContext.claimServerShellCall("first-pane-a", {
+    cmd: "echo same-command",
     cwd: "/tmp",
     target: "%1",
+    executionTarget: "tmux-pane:server-a:%1",
     timeoutMs: 30000,
     callMeta: {}
   });
-  assert.equal(recentClaim.action, "run");
-  const recentLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.equal(recentLedger.calls.recent.state, "running");
-  assert.equal(recentLedger.calls.recent.forced, false);
-
-  writeLedger({
-    stale: { state: "completed", completedAt: Date.now() - 61_000 }
+  assert.equal(firstClaim.action, "run");
+  completedContext.completeServerShellCall(firstClaim.ledgerKey, {
+    exitCode: 0,
+    durationMs: 4,
+    timedOut: false,
+    truncated: false
   });
-  const staleContext = loadServerContext();
-  const staleClaim = staleContext.claimServerShellCall("stale", {
-    cmd: "echo stale",
+  const duplicateClaim = completedContext.claimServerShellCall("second-pane-a", {
+    cmd: "echo same-command",
+    cwd: "/tmp",
+    target: "%1",
+    executionTarget: "tmux-pane:server-a:%1",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(duplicateClaim.action, "skip");
+  assert.equal(duplicateClaim.reason, "already-executed-on-target");
+  assert.equal(duplicateClaim.previousCallKey, "first-pane-a");
+  const completedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(completedLedger.calls[firstClaim.ledgerKey].state, "completed");
+  assert.equal(completedLedger.calls[firstClaim.ledgerKey].callKey, "first-pane-a");
+  assert.equal(Object.values(completedLedger.calls).some((entry) => entry.callKey === "second-pane-a"), false);
+
+  const otherPaneClaim = completedContext.claimServerShellCall("first-pane-b", {
+    cmd: "echo same-command",
     cwd: "/tmp",
     target: "%2",
+    executionTarget: "tmux-pane:server-a:%2",
     timeoutMs: 30000,
     callMeta: {}
   });
-  assert.equal(staleClaim.action, "run");
+  assert.equal(otherPaneClaim.action, "run");
 
-  writeLedger({
-    running: { state: "running", startedAt: Date.now() - 1_000 }
+  const otherCwdClaim = completedContext.claimServerShellCall("other-cwd-pane-a", {
+    cmd: "echo same-command",
+    cwd: "/var/tmp",
+    target: "%1",
+    executionTarget: "tmux-pane:server-a:%1",
+    timeoutMs: 30000,
+    callMeta: {}
   });
+  assert.equal(otherCwdClaim.action, "run");
+
+  writeLedger({});
   const runningContext = loadServerContext();
-  const runningClaim = runningContext.claimServerShellCall("running", {
+  const runningClaim = runningContext.claimServerShellCall("running-first", {
     cmd: "echo running",
     cwd: "/tmp",
     target: "%2",
+    executionTarget: "tmux-pane:server-a:%2",
     timeoutMs: 30000,
     callMeta: {}
   });
   assert.equal(runningClaim.action, "run");
-  const runningLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.equal(runningLedger.calls.running.state, "running");
-  assert.equal(runningLedger.calls.running.forced, false);
-
-  writeLedger({
-    forced: { state: "completed", completedAt: Date.now() - 5_000 }
+  const concurrentClaim = runningContext.claimServerShellCall("running-second", {
+    cmd: "echo running",
+    cwd: "/tmp",
+    target: "%2",
+    executionTarget: "tmux-pane:server-a:%2",
+    timeoutMs: 30000,
+    callMeta: {}
   });
-  const seededForcedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.ok(Date.now() - seededForcedLedger.calls.forced.completedAt < 60_000);
+  assert.equal(concurrentClaim.action, "run", "A merely claimed/running command is not an executed duplicate.");
+  const runningLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(runningLedger.calls[runningClaim.ledgerKey].state, "running");
+  assert.equal(runningLedger.calls[concurrentClaim.ledgerKey].state, "running");
+
+  writeLedger({});
+  const collidingContext = loadServerContext();
+  const collidingPaneA = collidingContext.claimServerShellCall("same-client-key", {
+    cmd: "echo colliding",
+    cwd: "/tmp",
+    target: "%10",
+    executionTarget: "tmux-pane:server-a:%10",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  const collidingPaneB = collidingContext.claimServerShellCall("same-client-key", {
+    cmd: "echo colliding",
+    cwd: "/tmp",
+    target: "%11",
+    executionTarget: "tmux-pane:server-a:%11",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.notEqual(collidingPaneA.ledgerKey, collidingPaneB.ledgerKey);
+  collidingContext.completeServerShellCall(collidingPaneA.ledgerKey, {
+    exitCode: 0,
+    durationMs: 1,
+    timedOut: false,
+    truncated: false
+  });
+  const paneBWhileRunning = collidingContext.claimServerShellCall("same-client-key", {
+    cmd: "echo colliding",
+    cwd: "/tmp",
+    target: "%11",
+    executionTarget: "tmux-pane:server-a:%11",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(paneBWhileRunning.action, "run", "Completing pane A must not mark a colliding pane B attempt completed.");
+  const paneADuplicate = collidingContext.claimServerShellCall("same-client-key", {
+    cmd: "echo colliding",
+    cwd: "/tmp",
+    target: "%10",
+    executionTarget: "tmux-pane:server-a:%10",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(paneADuplicate.action, "skip");
+
+  writeLedger({});
   const forcedContext = loadServerContext();
-  const forcedClaim = forcedContext.claimServerShellCall("forced", {
+  const forcedOriginal = forcedContext.claimServerShellCall("forced-original", {
     cmd: "echo force",
     cwd: "/tmp",
     target: "%3",
+    executionTarget: "tmux-pane:server-a:%3",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  forcedContext.completeServerShellCall(forcedOriginal.ledgerKey, {
+    exitCode: 0,
+    durationMs: 1,
+    timedOut: false,
+    truncated: false
+  });
+  const forcedClaim = forcedContext.claimServerShellCall("forced-rerun", {
+    cmd: "echo force",
+    cwd: "/tmp",
+    target: "%3",
+    executionTarget: "tmux-pane:server-a:%3",
     timeoutMs: 30000,
     callMeta: { force: true }
   });
   assert.equal(forcedClaim.action, "run");
   const forcedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.equal(forcedLedger.calls.forced.state, "running");
-  assert.equal(forcedLedger.calls.forced.forced, true);
+  assert.equal(forcedLedger.calls[forcedClaim.ledgerKey].state, "running");
+  assert.equal(forcedLedger.calls[forcedClaim.ledgerKey].forced, true);
 
-  writeLedger({
-    forcedRunning: { state: "running", startedAt: Date.now() - 1_000 }
-  });
+  writeLedger({});
   const forcedRunningContext = loadServerContext();
   const forcedRunningClaim = forcedRunningContext.claimServerShellCall("forcedRunning", {
     cmd: "echo force-running",
     cwd: "/tmp",
     target: "%4",
+    executionTarget: "tmux-pane:server-a:%4",
     timeoutMs: 30000,
     callMeta: { force: true }
   });
   assert.equal(forcedRunningClaim.action, "run");
   const forcedRunningLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.equal(forcedRunningLedger.calls.forcedRunning.state, "running");
-  assert.equal(forcedRunningLedger.calls.forcedRunning.forced, true);
-  assert.equal(forcedRunningLedger.calls.forcedRunning.cmdHash, forcedContext.hashText("echo force-running"));
+  assert.equal(forcedRunningLedger.calls[forcedRunningClaim.ledgerKey].state, "running");
+  assert.equal(forcedRunningLedger.calls[forcedRunningClaim.ledgerKey].forced, true);
+  assert.equal(forcedRunningLedger.calls[forcedRunningClaim.ledgerKey].cmdHash, forcedRunningContext.hashText("echo force-running"));
 
   writeLedger({});
   const failedContext = loadServerContext();
@@ -127,16 +213,26 @@ try {
     cmd: "echo fail-after-claim",
     cwd: "/tmp",
     target: "%5",
+    executionTarget: "tmux-pane:server-a:%5",
     timeoutMs: 30000,
     callMeta: {}
   });
   assert.equal(failedClaim.action, "run");
-  failedContext.failServerShellCall("failedAfterClaim", new Error("executor failed"), { durationMs: 7 });
+  failedContext.failServerShellCall(failedClaim.ledgerKey, new Error("executor failed"), { durationMs: 7 });
   const failedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
-  assert.equal(failedLedger.calls.failedAfterClaim.state, "failed");
-  assert.equal(failedLedger.calls.failedAfterClaim.exitCode, 1);
-  assert.equal(failedLedger.calls.failedAfterClaim.durationMs, 7);
-  assert.match(failedLedger.calls.failedAfterClaim.error, /executor failed/);
+  assert.equal(failedLedger.calls[failedClaim.ledgerKey].state, "failed");
+  assert.equal(failedLedger.calls[failedClaim.ledgerKey].exitCode, 1);
+  assert.equal(failedLedger.calls[failedClaim.ledgerKey].durationMs, 7);
+  assert.match(failedLedger.calls[failedClaim.ledgerKey].error, /executor failed/);
+  const retryAfterFailure = failedContext.claimServerShellCall("retryAfterFailure", {
+    cmd: "echo fail-after-claim",
+    cwd: "/tmp",
+    target: "%5",
+    executionTarget: "tmux-pane:server-a:%5",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(retryAfterFailure.action, "run", "Failed commands must remain retryable.");
 
   writeLedger({
     oldCompleted: { state: "completed", completedAt: Date.now() - (24 * 60 * 60 * 1000 + 1000) },
@@ -147,7 +243,7 @@ try {
   assert.equal(Boolean(prunedLedger.calls.oldCompleted), false);
   assert.equal(Boolean(prunedLedger.calls.freshCompleted), true);
 
-  console.log("server ledger non-blocking tests passed");
+  console.log("server target-aware execution dedup tests passed");
 } finally {
   if (originalStateDir === undefined) {
     delete process.env.AI_CHAT_SHELL_STATE_DIR;

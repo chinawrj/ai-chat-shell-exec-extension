@@ -21,10 +21,10 @@ Use a plain unlabeled code fence (four backticks) exactly, with no text before o
 The first line must be ai-helper-shell-start.
 The following line must be a single shell command. It runs in the default `ForAI` `host` tmux window.
 The final line must be exactly ai-helper-shell-end.
-If you need to ask for the same command text again as a new request, you may add a simple no-space identity suffix to the first line, such as ai-helper-shell-start:2.
+An optional no-space identity suffix such as ai-helper-shell-start:2 may be used for request diagnostics. It is not required when retrying a command that failed before execution, and it does not force rerun a command already executed on the resolved tmux pane.
 
 After I send back shell-output, use that output to continue.
-Do not repeat the same command after receiving shell-output.
+Do not repeat the same command after shell-output confirms execution. If shell-output says the command was not executed, you may emit a new retry helper without changing the command or adding an identity suffix.
 `````
 
 ## Recommended
@@ -44,13 +44,13 @@ ai-helper-shell-end
 Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - The first line must be `ai-helper-shell-start`.
-- If you need the same command payload to be treated as a new request, the first line may be `ai-helper-shell-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
+- The first line may include an optional request identity, `ai-helper-shell-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp. This identity is diagnostic only: a new retry helper is forwarded without it, and it does not bypass server-confirmed execution dedup.
 - Do not include a tmux target. Every line between the start marker and end marker is the shell command body.
 - The command runs in the `host` window of the `ForAI` tmux session.
 - The final line must be exactly `ai-helper-shell-end`.
 - Do not wrap shell-output, terminal output, markdown, explanations, or prompts inside the helper block.
 - Wait for my shell-output reply before interpreting results or asking for the next command.
-- Do not repeat a command after receiving shell-output for that command.
+- Do not repeat a command after shell-output confirms execution. If the result explicitly says it was not executed, a new identical retry helper is allowed and will be sent to the shell server.
 - If a command is destructive, modifies many files, deletes data, installs software, changes credentials, or sends private data to a network service, ask for confirmation in prose instead of emitting a helper block.
 
 When board output would help, ask me for one board command by replying with exactly one fenced code block and no prose.
@@ -130,9 +130,9 @@ Workflow rules:
 - For shell helpers, do not include a tmux target; the command runs in `ForAI:host`.
 - For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` only when the command should go to `ForAI:board-R1`.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
-- If you intentionally need to repeat an identical helper request as a new request, add a simple no-space suffix after the colon in the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
+- You may add a simple no-space request identity after the colon in a start marker, such as `ai-helper-shell-start:2` or `ai-helper-board-R1-start:2`, for diagnostics. It is optional and does not bypass a server-confirmed completed execution; ask the user to use Force run when an already executed command must intentionally run again.
 - Wait for shell-output before making claims about command results or file write results.
-- Do not rerun the same command or rewrite the same file unless I ask or the previous output clearly requires it.
+- Do not rerun a successfully executed command or rewrite the same file unless I ask or the previous output clearly requires it. Commands reported as not executed may be retried with a new helper.
 
 Safety rules:
 - Ask before destructive commands such as rm -rf, git reset --hard, force pushes, credential changes, package publishing, or broad permission changes.

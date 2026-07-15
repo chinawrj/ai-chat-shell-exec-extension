@@ -173,9 +173,9 @@ Rules:
 - Shell helpers do not include a tmux target; the entire helper body is the shell command and runs in the default `ForAI` `host` window.
 - Board helpers must contain exactly one non-empty board command line and no target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` to send to the `ForAI:board-R1` window.
 - File helpers must put a single file name, not a path, on the second line.
-- If I ask you to repeat an identical helper request as a new request, add a simple no-space suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, or `ai-helper-file-start:2`.
+- A simple no-space suffix such as `ai-helper-shell-start:2` may be used as an optional request identity for diagnostics. It is not required for a new retry helper and does not force rerun a command that the server already executed on the resolved tmux pane.
 - After I send back shell-output, use that output to continue.
-- Do not repeat the same command after receiving shell-output.
+- Do not repeat a command after shell-output confirms execution. A command explicitly reported as not executed may be retried with a new identical helper.
 `````
 
 Then run the floating panel's `Test` button once on each AI chat site. `Test` validates the basic shell-helper path; multi-agent and tmux-ai paths have separate smoke tests below.
@@ -201,7 +201,7 @@ The floating status panel also has calibration controls for unknown chat systems
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
 - `Server Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
-- `Force run`: manually recheck the current page once and execute the latest helper block, bypassing duplicate suppression when needed.
+- `Force run`: manually recheck the current page once and explicitly rerun the latest helper block, bypassing the shell server's completed-execution duplicate decision.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered helper/code block area.
@@ -558,13 +558,13 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 - Browser confirmation is off by default for hands-free operation. Set `requireApproval` to `true` in extension storage if you want a prompt before each command.
 - The extension and server reject obvious copied `shell-output` text, terminal prompts such as `$ ...`, and markdown wrappers before execution.
 - Automatic chained helper calls are capped by `maxChainCalls` in extension storage. The default is 100, and the popup enforces only a minimum of 1. New human prompts reset the chain count; tool result replies do not.
-- Duplicate execution is blocked before the command reaches the local server. The content script generates a stable call key from the site, latest human intent, command, cwd, timeout, and output cap; the background worker claims that key with an internal sequence number. The local server keeps a second persistent ledger in the runtime state directory's `shell-ledger.json`, so refreshing a chat page or reloading the extension does not rerun an already completed call.
+- Command duplicate decisions belong exclusively to the local shell server after it resolves the actual tmux pane. The execution fingerprint contains the tmux pane instance, full command, and actual cwd. Only a prior command with a server-controlled completion proof on that same pane instance can return `duplicate: true`; browser-side sightings, confirmation cancellation, target/health/transport failures, server failures, timeouts with unconfirmed completion, and `running` claims are not execution duplicates. Generic board CLIs expose only a textual prompt, which command output can imitate, so board requests deliberately fail open and are never suppressed as execution duplicates. Each server attempt has an internal collision-proof identity, independent of browser call keys. If pane-instance metadata is incomplete, dedup also fails open. The content script only prevents the exact same rendered helper request from being resubmitted by repeated DOM scans, while a new helper containing identical command text is still forwarded. The background ledger remains a non-blocking audit trail. `Force run` explicitly bypasses the server decision.
 - The runtime state directory defaults to `.state/` under this project directory and is rebuildable: it stores server logs, dedupe ledger data, tmux temporary scripts, board logs, vision temp files, local test assets, and helper build artifacts. The startup script and server preflight the state directory and repair or recreate it before accepting commands. Safe conflicts are moved aside with a `.broken-*` suffix. Use `AI_CHAT_SHELL_STATE_DIR` only when you intentionally want state elsewhere.
 - The WebSocket server only accepts Chrome extension requests by default. Set `AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS=1` only for local development tests.
 - The local server clamps the shell state timeout to 1 second through 10 minutes. This is not a command runtime limit: after that window, the server keeps waiting while the tmux runner process is still alive. It returns `timedOut: true` only when the completion marker is missing and the runner process is gone or cannot be confirmed.
 - Commands longer than 8000 characters are rejected before execution.
 - Output is capped to avoid flooding the page.
-- Repeated shell output loops are suppressed when the assistant repeats the same command after receiving a shell-output reply.
+- Repeated command loops are adjudicated by the shell server against completed execution history for the resolved tmux pane; the page does not infer execution from prior `shell-output` text.
 - A small status badge appears in the lower-right corner while the content script is active.
 
 Treat shell calls as remote code execution on your machine. Review the security notes in `SECURITY.md` before sharing this with other users.

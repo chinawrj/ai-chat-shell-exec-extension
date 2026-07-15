@@ -21,9 +21,12 @@ async function main() {
   try {
     const server = require(path.join(repoRoot, "server", "shell_server.js"));
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
+    const doctorSource = fs.readFileSync(path.join(repoRoot, "scripts", "doctor.sh"), "utf8");
 
     assert.equal(server.SERVER_PROTOCOL_VERSION, 4);
     assert.equal(server.HELPER_PROTOCOL_VERSION, 2);
+    assert.match(doctorSource, new RegExp(`EXPECTED_SERVER_PROTOCOL_VERSION=${server.SERVER_PROTOCOL_VERSION}(?:\\n|$)`));
+    assert.match(doctorSource, new RegExp(`EXPECTED_HELPER_PROTOCOL_VERSION=${server.HELPER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
     process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "Ghostty,Google Chrome,bad\napp";
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Ghostty"]);

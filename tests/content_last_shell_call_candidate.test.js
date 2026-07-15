@@ -147,6 +147,7 @@ function loadContentContext() {
       removeEventListener() {}
     },
     location: {
+      href: "https://chatgpt.com/",
       hostname: "chatgpt.com",
       origin: "https://chatgpt.com",
       pathname: "/",
@@ -269,6 +270,9 @@ async function verifyForceRunUsesLatestHelper() {
   context.runAndReply = async (callId, call, options) => {
     runCalls.push({ callId, call, options });
   };
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
   vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
 
   await context.scanForShellCall({ force: true });
@@ -319,41 +323,177 @@ async function verifyDebugPanelUpdates() {
   assert.ok(debugBody.textContent.includes(cmd), `debug body should contain the cmd '${cmd}'`);
 }
 
-async function verifyRepeatableAgentQueriesBypassSemanticDedup() {
+async function verifyFrontendDoesNotDedupCommands() {
   const context = loadContentContext();
   const roster = context.parseCallPayload(createAgentRosterBlock());
   const rosterSemanticKey = context.buildSemanticCallKey(roster);
-  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(rosterSemanticKey)});`, context);
   assert.equal(
-    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-roster-call", rosterSemanticKey, roster),
+    context.getHandledHelperReason({ node: new context.Element() }, "new-roster-call", rosterSemanticKey, roster),
     ""
   );
 
   const status = context.parseCallPayload(createAgentTaskStatusBlock());
   const statusSemanticKey = context.buildSemanticCallKey(status);
-  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(statusSemanticKey)});`, context);
   assert.equal(
-    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-status-call", statusSemanticKey, status),
+    context.getHandledHelperReason({ node: new context.Element() }, "new-status-call", statusSemanticKey, status),
     ""
   );
 
   const shell = context.parseCallPayload(createHelperBlock({ cmd: "pwd" }));
   const shellSemanticKey = context.buildSemanticCallKey(shell);
-  vm.runInContext(`processedSemanticCalls.add(${JSON.stringify(shellSemanticKey)});`, context);
+  const firstShellCandidate = { node: new context.Element() };
+  context.markCallProcessed(firstShellCandidate, "first-shell-call", shellSemanticKey);
   assert.equal(
-    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "new-shell-call", shellSemanticKey, shell),
-    "processed semantic key"
+    context.getHandledHelperReason({ node: new context.Element() }, "new-shell-call", shellSemanticKey, shell),
+    "",
+    "A new helper request with identical command text must reach the shell server."
+  );
+  assert.equal(
+    context.getHandledHelperReason(firstShellCandidate, "first-shell-call", shellSemanticKey, shell),
+    "processed rendered helper",
+    "The exact same rendered helper request remains scan-debounced."
+  );
+}
+
+async function verifyMixedShellOutputAndNewHelperRunsNormally() {
+  const context = loadContentContext();
+  const cmd = "echo MIXED_NORMAL_SCAN";
+  const message = createAssistantMessage({
+    order: 1,
+    text: `${quotedShellOutput}\n${createHelperBlock({ cmd })}`
+  });
+  const root = createRoot([message]);
+  const runCalls = [];
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (callId, call) => runCalls.push({ callId, call });
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+
+  await context.scanForShellCall();
+  assert.equal(runCalls.length, 1, "A closed historical shell-output must not suppress a later helper in the same message.");
+  assert.equal(runCalls[0].call.cmd, cmd);
+}
+
+async function verifyVirtualizedReplacementAndSharedContainerRemainRunnable() {
+  const context = loadContentContext();
+  const cmd = "echo RENDER_IDENTITY";
+  const firstMessage = createAssistantMessage({ order: 1, text: createHelperBlock({ cmd }) });
+  let root = createRoot([firstMessage]);
+  const runCalls = [];
+  const statuses = [];
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (callId, call) => runCalls.push({ callId, call });
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  await context.scanForShellCall();
+
+  const replacementMessage = createAssistantMessage({ order: 1, text: createHelperBlock({ cmd }) });
+  root = createRoot([replacementMessage]);
+  context.document.body = root;
+  vm.runInContext(`extensionActive = true; activeCallId = ''; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  const replacementCandidate = context.getLastShellCallCandidate(root);
+  const replacementSemantic = context.buildSemanticCallKey(replacementCandidate.call);
+  const replacementCallKey = context.buildCandidateCallKey(replacementCandidate, replacementSemantic);
+  assert.equal(context.getHandledHelperReason(replacementCandidate, replacementCallKey, replacementSemantic, replacementCandidate.call), "");
+  await context.scanForShellCall();
+  assert.equal(runCalls.length, 2, `A virtualized replacement helper at the same scan index is a new rendered request. Statuses: ${JSON.stringify(statuses)}`);
+
+  const recycledCandidate = context.getLastShellCallCandidate(root);
+  const recycledSemantic = context.buildSemanticCallKey(recycledCandidate.call);
+  context.markCallProcessed(recycledCandidate, "recycled-first", recycledSemantic);
+  const recycledCallKeyBefore = context.buildCandidateCallKey(recycledCandidate, recycledSemantic);
+  context.invalidateRenderedHelperTracking([{
+    type: "childList",
+    target: replacementMessage,
+    oldValue: replacementMessage.textContent,
+    addedNodes: [{ textContent: replacementMessage.textContent }],
+    removedNodes: [{ textContent: replacementMessage.textContent }]
+  }]);
+  const recycledCallKeyAfter = context.buildCandidateCallKey(recycledCandidate, recycledSemantic);
+  assert.notEqual(recycledCallKeyAfter, recycledCallKeyBefore, "Recycling a helper DOM node must create a new request attempt identity.");
+  assert.equal(
+    context.getHandledHelperReason(recycledCandidate, recycledCallKeyAfter, recycledSemantic, recycledCandidate.call),
+    "",
+    "A recycled DOM Element containing a new identical helper must reach the server."
   );
 
+  context.markCallProcessed(recycledCandidate, "recycled-again", recycledSemantic);
+  const unrelatedCallKeyBefore = context.buildCandidateCallKey(recycledCandidate, recycledSemantic);
+  context.invalidateRenderedHelperTracking([{
+    type: "childList",
+    target: replacementMessage,
+    oldValue: null,
+    addedNodes: [{ textContent: "copy button" }],
+    removedNodes: []
+  }]);
+  const unrelatedCallKeyAfter = context.buildCandidateCallKey(recycledCandidate, recycledSemantic);
+  assert.equal(unrelatedCallKeyAfter, unrelatedCallKeyBefore, "Unrelated UI decoration must not create a new helper attempt.");
   assert.equal(
-    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "same-roster-call", rosterSemanticKey, roster),
-    ""
+    context.getHandledHelperReason(recycledCandidate, unrelatedCallKeyAfter, recycledSemantic, recycledCandidate.call),
+    "processed rendered helper",
+    "Unrelated DOM mutations must not resubmit an unchanged helper."
   );
-  vm.runInContext("processedCalls.add('same-roster-call');", context);
+
+  const shared = new MockNode({
+    order: 2,
+    role: "",
+    text: `${createHelperBlock({ cmd })}\n${createHelperBlock({ cmd })}`
+  });
+  const sharedRoot = createRoot([shared]);
+  const sharedCandidates = context.extractShellCallCandidates(sharedRoot);
+  assert.equal(sharedCandidates.length, 2);
+  const firstSemantic = context.buildSemanticCallKey(sharedCandidates[0].call);
+  context.markCallProcessed(sharedCandidates[0], "shared-first", firstSemantic);
+  const secondSemantic = context.buildSemanticCallKey(sharedCandidates[1].call);
   assert.equal(
-    context.getDuplicateHelperDedupReason({ node: new context.Element() }, "same-roster-call", rosterSemanticKey, roster),
-    "processed callKey"
+    context.getHandledHelperReason(sharedCandidates[1], "shared-second", secondSemantic, sharedCandidates[1].call),
+    "",
+    "Two identical helpers in one shared container are distinct rendered requests."
   );
+
+  context.location.pathname = "/c/new-conversation";
+  context.location.href = "https://chatgpt.com/c/new-conversation?turn=2#latest";
+  assert.equal(
+    context.getHandledHelperReason(sharedCandidates[0], "spa-new", firstSemantic, sharedCandidates[0].call),
+    "",
+    "The same first helper in a new SPA conversation must not inherit old request tracking."
+  );
+}
+
+async function verifyRenderedShellOutputStructureIsSuppressed() {
+  const context = loadContentContext();
+  const message = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: "echo MUST_NOT_RUN_FROM_RENDERED_OUTPUT" })
+  });
+  message.className = "language-shell-output";
+  const root = createRoot([message]);
+  const candidate = context.getLastShellCallCandidate(root);
+  assert.ok(candidate);
+  assert.equal(candidate.insideShellOutput, true, "Rendered code DOM must preserve shell-output provenance even after Markdown fences disappear.");
+
+  const runCalls = [];
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (...args) => runCalls.push(args);
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  await context.scanForShellCall();
+  assert.equal(runCalls.length, 0, "A helper rendered inside language-shell-output code must never execute.");
 }
 
 async function verifyAgentHelperInsideShellOutputIsSuppressed() {
@@ -397,6 +537,57 @@ async function verifyAgentHelperInsideShellOutputIsSuppressed() {
   assert.equal(runCalls.length, 0);
   assert.match(statuses.at(-1).text, /Suppressed helper inside shell-output/);
   assert.equal(statuses.at(-1).state, "ok");
+}
+
+async function verifyNewIdenticalHelperAfterFailedAttemptRuns() {
+  const context = loadContentContext();
+  const cmd = "echo RETRY_AFTER_SERVER_FAILURE";
+  const firstMessage = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd })
+  });
+  let root = createRoot([firstMessage]);
+  const runCalls = [];
+  const statuses = [];
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.runAndReply = async (callId, call, options) => {
+    // The scanner must not infer command execution from this attempt. In the
+    // real path runAndReply may receive a health/target/server failure.
+    runCalls.push({ callId, call, options });
+  };
+  vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+
+  await context.scanForShellCall();
+  assert.equal(runCalls.length, 1);
+
+  const secondMessage = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd })
+  });
+  root = createRoot([firstMessage, secondMessage]);
+  context.document.body = root;
+  vm.runInContext(`extensionActive = true; activeCallId = ''; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+
+  const retryCandidates = context.extractShellCallCandidates(root);
+  assert.equal(retryCandidates.length, 2);
+  const retryCandidate = context.getLastShellCallCandidate(root);
+  const retrySemanticKey = context.buildSemanticCallKey(retryCandidate.call);
+  const retryCallKey = context.buildCandidateCallKey(retryCandidate, retrySemanticKey);
+  assert.equal(context.getHandledHelperReason(retryCandidate, retryCallKey, retrySemanticKey, retryCandidate.call), "");
+
+  await context.scanForShellCall();
+  assert.equal(runCalls.length, 2, `A new identical helper after an unexecuted attempt must be submitted to the server. Statuses: ${JSON.stringify(statuses)}`);
+  assert.notEqual(runCalls[0].callId, runCalls[1].callId);
 }
 
 async function verifyDebugPanelUpdatesDuringStreaming() {
@@ -688,8 +879,12 @@ async function verifyDebugPanelListsAllCandidates() {
 
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
-  .then(() => verifyRepeatableAgentQueriesBypassSemanticDedup())
+  .then(() => verifyFrontendDoesNotDedupCommands())
+  .then(() => verifyMixedShellOutputAndNewHelperRunsNormally())
+  .then(() => verifyVirtualizedReplacementAndSharedContainerRemainRunnable())
+  .then(() => verifyRenderedShellOutputStructureIsSuppressed())
   .then(() => verifyAgentHelperInsideShellOutputIsSuppressed())
+  .then(() => verifyNewIdenticalHelperAfterFailedAttemptRuns())
   .then(() => verifyDebugPanelUpdatesDuringStreaming())
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
   .then(() => verifyForceRunPersistsWhileActiveCallRunning())
