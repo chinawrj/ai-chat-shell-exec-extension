@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.9] - 2026-07-15
+
+- Serializes shell helper runners per resolved tmux pane so a helper submitted after refreshing a page cannot be typed into a pane still occupied by the old page's long-running command.
+- Starts each queued helper's shell state timeout only after that helper reaches the front of its pane queue, preventing false `process-state-unknown` timeouts and deletion of scripts that have not started yet.
+- Keeps different tmux panes independent, allowing agent panes to execute concurrently while the default `ForAI:host` pane is busy.
+- Keys queues by the stable tmux server and pane ids so moving or renumbering a busy pane cannot bypass serialization; Terminal vision self-tests share the same pane queue.
+- Revalidates the tmux socket, server instance, and pane id after queue wait, failing safely instead of executing against a replacement pane after tmux reset.
+- Adds `queued` and `queuedMs` shell-output diagnostics.
+- Adds real tmux and Chromium page-refresh regression coverage for long-running commands followed by new helpers.
+
 ## [0.8.8] - 2026-07-15
 
 - Makes tmux shell helpers return immediately when the user interrupts an actually started command with Ctrl+C instead of waiting for the shell state timeout.

@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.8";
+const CONTENT_SCRIPT_VERSION = "0.8.9";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -2495,6 +2495,8 @@ function formatShellOutput(call, response, startedAt) {
     response.previousInterruptSignal ? `previousInterruptSignal: ${response.previousInterruptSignal}` : "",
     response.interrupted === true ? "interrupted: true" : "",
     response.interruptSignal ? `interruptSignal: ${response.interruptSignal}` : "",
+    response.queued === true ? "queued: true" : "",
+    Number.isFinite(response.queuedMs) ? `queuedMs: ${response.queuedMs}` : "",
     response.timedOut ? "timedOut: true" : "",
     response.completionMarkerMissing ? "completionMarkerMissing: true" : "",
     response.timeoutReason ? `timeoutReason: ${response.timeoutReason}` : "",

@@ -8,6 +8,7 @@ const { spawnSync } = require("node:child_process");
 
 const {
   ensureForAiTmuxLayout,
+  getTmuxShellPaneQueueDepth,
   handleMessageText,
   listTmuxPanes,
   resolveBoardPane,
@@ -153,6 +154,79 @@ async function main() {
   assert.match(longResponse.stdout, new RegExp(longToken));
   assert.ok(Date.now() - longStarted >= 1500, JSON.stringify(longResponse));
 
+  const refreshOldToken = `FORAI_REFRESH_OLD_${Date.now()}`;
+  const refreshNewToken = `FORAI_REFRESH_NEW_${Date.now()}`;
+  const refreshOldPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-refresh-old-page",
+    callKey: `forai-refresh-old-page-${Date.now()}`,
+    cmd: `printf '${refreshOldToken}\\n'; sleep 4; printf 'FORAI_REFRESH_OLD_DONE\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  const refreshHostPane = resolveDefaultShellPane(await listTmuxPanes()).pane;
+  await waitForTmuxPaneText(refreshHostPane.id, refreshOldToken, 5000);
+  const movedWindowIndex = refreshHostPane.windowIndex === "9" ? "8" : "9";
+  runTmux([
+    "move-window",
+    "-s",
+    `${refreshHostPane.session}:${refreshHostPane.windowIndex}`,
+    "-t",
+    `${refreshHostPane.session}:${movedWindowIndex}`
+  ]);
+  const movedRefreshHostPane = resolveDefaultShellPane(await listTmuxPanes()).pane;
+  assert.equal(movedRefreshHostPane.id, refreshHostPane.id, "move-window must preserve the physical pane id used by the queue.");
+  assert.notEqual(movedRefreshHostPane.address, refreshHostPane.address, "The regression requires the same busy pane to have a changed tmux address.");
+  assert.equal(movedRefreshHostPane.serverPid, refreshHostPane.serverPid);
+
+  let refreshNewSettled = false;
+  const refreshNewStarted = Date.now();
+  const refreshNewPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-refresh-new-page",
+    callKey: `forai-refresh-new-page-${Date.now()}`,
+    cmd: `printf '${refreshNewToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  })).finally(() => {
+    refreshNewSettled = true;
+  });
+
+  const otherPaneWhileQueuedPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-refresh-other-pane",
+    callKey: `forai-refresh-other-pane-${Date.now()}`,
+    agentId: "slave-a",
+    cmd: "printf 'FORAI_REFRESH_OTHER_PANE\\n'",
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  const firstConcurrentCompletion = await Promise.race([
+    otherPaneWhileQueuedPromise.then((response) => ({ kind: "other-pane", response })),
+    refreshOldPromise.then((response) => ({ kind: "busy-pane", response }))
+  ]);
+  assert.equal(firstConcurrentCompletion.kind, "other-pane", JSON.stringify(firstConcurrentCompletion.response));
+  const otherPaneWhileQueued = firstConcurrentCompletion.response;
+  assert.equal(otherPaneWhileQueued.exitCode, 0, JSON.stringify(otherPaneWhileQueued));
+  assert.equal(otherPaneWhileQueued.queued, false, JSON.stringify(otherPaneWhileQueued));
+
+  await sleep(1200);
+  assert.equal(refreshNewSettled, false, "The refreshed-page helper must remain queued instead of timing out before its runner starts.");
+  const queuedPaneText = runTmux(["capture-pane", "-p", "-S", "-200", "-t", refreshHostPane.id]);
+  assert.doesNotMatch(queuedPaneText, new RegExp(refreshNewToken), "The queued runner must not be typed into the busy pane.");
+
+  const refreshOldResponse = await refreshOldPromise;
+  const refreshNewResponse = await refreshNewPromise;
+  assert.equal(refreshOldResponse.exitCode, 0, JSON.stringify(refreshOldResponse));
+  assert.equal(refreshNewResponse.exitCode, 0, JSON.stringify(refreshNewResponse));
+  assert.equal(refreshNewResponse.executed, true, JSON.stringify(refreshNewResponse));
+  assert.equal(refreshNewResponse.executionCompleted, true, JSON.stringify(refreshNewResponse));
+  assert.equal(refreshNewResponse.timedOut, false, JSON.stringify(refreshNewResponse));
+  assert.equal(refreshNewResponse.queued, true, JSON.stringify(refreshNewResponse));
+  assert.ok(refreshNewResponse.queuedMs >= 2500, JSON.stringify(refreshNewResponse));
+  assert.ok(Date.now() - refreshNewStarted >= 3000, JSON.stringify(refreshNewResponse));
+  assert.match(refreshNewResponse.stdout, new RegExp(refreshNewToken));
+
   const interruptToken = `FORAI_INTERRUPT_${Date.now()}`;
   const interruptCommand = `printf '${interruptToken}\\n'; sleep 60; printf 'INTERRUPT_SHOULD_NOT_FINISH\\n'`;
   const interruptPromise = handleMessageText(JSON.stringify({
@@ -165,6 +239,20 @@ async function main() {
   }));
   const defaultHostPane = resolveDefaultShellPane(await listTmuxPanes()).pane;
   await waitForTmuxPaneText(defaultHostPane.id, interruptToken, 5000);
+  const interruptFollowerToken = `FORAI_INTERRUPT_FOLLOWER_${Date.now()}`;
+  const interruptFollowerPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-interrupt-follower",
+    callKey: `forai-interrupt-follower-${Date.now()}`,
+    cmd: `printf '${interruptFollowerToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  await waitForCondition(
+    () => getTmuxShellPaneQueueDepth(defaultHostPane) >= 2,
+    5000,
+    "Ctrl+C follower to enter the same-pane queue"
+  );
   const interruptedAt = Date.now();
   runTmux(["send-keys", "-t", defaultHostPane.id, "C-c"]);
   const interruptResponse = await Promise.race([
@@ -184,6 +272,16 @@ async function main() {
   assert.match(interruptResponse.stdout, new RegExp(interruptToken));
   assert.doesNotMatch(interruptResponse.stdout, /INTERRUPT_SHOULD_NOT_FINISH/);
   assert.ok(Date.now() - interruptedAt < 2000, JSON.stringify(interruptResponse));
+  const interruptFollowerResponse = await Promise.race([
+    interruptFollowerPromise,
+    sleep(3000).then(() => {
+      throw new Error("Queued shell helper did not start promptly after Ctrl+C released its pane.");
+    })
+  ]);
+  assert.equal(interruptFollowerResponse.exitCode, 0, JSON.stringify(interruptFollowerResponse));
+  assert.equal(interruptFollowerResponse.queued, true, JSON.stringify(interruptFollowerResponse));
+  assert.equal(interruptFollowerResponse.timedOut, false, JSON.stringify(interruptFollowerResponse));
+  assert.match(interruptFollowerResponse.stdout, new RegExp(interruptFollowerToken));
 
   const interruptedDuplicate = await handleMessageText(JSON.stringify({
     type: "run",
@@ -198,6 +296,65 @@ async function main() {
   assert.equal(interruptedDuplicate.exitCode, 130, JSON.stringify(interruptedDuplicate));
   assert.equal(interruptedDuplicate.previousInterrupted, true, JSON.stringify(interruptedDuplicate));
   assert.equal(interruptedDuplicate.previousInterruptSignal, "INT", JSON.stringify(interruptedDuplicate));
+
+  const stalePaneOldToken = `FORAI_STALE_PANE_OLD_${Date.now()}`;
+  const stalePaneNewToken = `FORAI_STALE_PANE_NEW_${Date.now()}`;
+  const stalePaneOldPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-stale-pane-old",
+    callKey: `forai-stale-pane-old-${Date.now()}`,
+    cmd: `printf '${stalePaneOldToken}\\n'; sleep 60`,
+    timeoutMs: 30000,
+    maxOutputChars: 20000
+  }));
+  const stalePaneBeforeReset = resolveDefaultShellPane(await listTmuxPanes()).pane;
+  await waitForTmuxPaneText(stalePaneBeforeReset.id, stalePaneOldToken, 5000);
+  const stalePaneQueuedResultPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-stale-pane-queued",
+    callKey: `forai-stale-pane-queued-${Date.now()}`,
+    cmd: `printf '${stalePaneNewToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  })).then(
+    (response) => ({ response, error: null }),
+    (error) => ({ response: null, error })
+  );
+  await waitForCondition(
+    () => getTmuxShellPaneQueueDepth(stalePaneBeforeReset) >= 2,
+    5000,
+    "stale-pane follower to enter the same-pane queue before tmux reset"
+  );
+  runTmux(["kill-server"]);
+  await ensureForAiTmuxLayout();
+  const stalePaneAfterReset = resolveDefaultShellPane(await listTmuxPanes()).pane;
+  assert.notEqual(stalePaneAfterReset.serverPid, stalePaneBeforeReset.serverPid, "The stale-pane regression requires a new tmux server instance.");
+  await Promise.race([
+    stalePaneOldPromise,
+    sleep(3000).then(() => {
+      throw new Error("Old shell helper did not settle after its tmux server was killed.");
+    })
+  ]);
+  const stalePaneQueuedResult = await Promise.race([
+    stalePaneQueuedResultPromise,
+    sleep(3000).then(() => {
+      throw new Error("Queued shell helper did not fail promptly after its tmux pane instance was replaced.");
+    })
+  ]);
+  assert.equal(stalePaneQueuedResult.response, null, JSON.stringify(stalePaneQueuedResult.response));
+  assert.match(stalePaneQueuedResult.error?.message || "", /different tmux server instance|no longer exists/);
+
+  const stalePaneRetry = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-stale-pane-retry",
+    callKey: `forai-stale-pane-retry-${Date.now()}`,
+    cmd: `printf '${stalePaneNewToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(stalePaneRetry.exitCode, 0, JSON.stringify(stalePaneRetry));
+  assert.equal(stalePaneRetry.queued, false, JSON.stringify(stalePaneRetry));
+  assert.match(stalePaneRetry.stdout, new RegExp(stalePaneNewToken));
 
   const agentToken = `FORAI_AGENT_${Date.now()}`;
   const agentResponse = await handleMessageText(JSON.stringify({
@@ -335,6 +492,17 @@ async function waitForTmuxPaneText(paneId, text, timeoutMs) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForCondition(check, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) {
+      return;
+    }
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${label}.`);
 }
 
 function restoreEnv(name, value) {

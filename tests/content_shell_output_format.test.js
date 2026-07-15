@@ -96,6 +96,14 @@ const continuedOutput = context.formatShellOutput({ cmd: "sleep 2" }, {
 }, "2026-05-22T00:00:00.000Z");
 assert.match(continuedOutput, /^continuedAfterTimeout: true$/m);
 
+const queuedOutput = context.formatShellOutput({ cmd: "printf queued" }, {
+  ...response,
+  queued: true,
+  queuedMs: 2450
+}, "2026-05-22T00:00:00.000Z");
+assert.match(queuedOutput, /^queued: true$/m);
+assert.match(queuedOutput, /^queuedMs: 2450$/m);
+
 const interruptedOutput = context.formatShellOutput({ cmd: "sleep 60" }, {
   ...response,
   exitCode: 130,

@@ -80,6 +80,8 @@ let stateLoggingConfigured = false;
 let stateLogStreams = null;
 let serverLedger = loadServerLedger();
 let agentHubState = createAgentHubState();
+const tmuxShellPaneQueues = new Map();
+const tmuxShellPaneQueueDepths = new Map();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -475,7 +477,7 @@ async function handleMessageText(text) {
 
   try {
     console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
-    const result = await runTmuxShell({
+    const result = await runTmuxShellQueued({
       cmd,
       cwd,
       pane,
@@ -509,6 +511,99 @@ async function handleMessageText(text) {
     failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
+}
+
+async function runTmuxShellQueued(options) {
+  return withTmuxShellPaneQueue(options, async (queueContext) => {
+    const currentPane = await verifyTmuxShellPaneBeforeDispatch(options?.pane, queueContext);
+    return runTmuxShell({
+      ...options,
+      pane: currentPane
+    });
+  });
+}
+
+async function withTmuxShellPaneQueue(options, task) {
+  const socketPath = getTmuxSocketPath() || "default-socket";
+  const queueKey = buildTmuxShellQueueKey(options?.pane, socketPath);
+  const previousSlot = tmuxShellPaneQueues.get(queueKey);
+  const queuedAt = Date.now();
+  let releaseSlot;
+  const currentSlot = new Promise((resolve) => {
+    releaseSlot = resolve;
+  });
+  tmuxShellPaneQueues.set(queueKey, currentSlot);
+  tmuxShellPaneQueueDepths.set(queueKey, Number(tmuxShellPaneQueueDepths.get(queueKey) || 0) + 1);
+
+  try {
+    if (previousSlot) {
+      console.log(`[queued] target=${options?.pane?.id || ""} cmd=${JSON.stringify(options?.cmd || "")}`);
+      await previousSlot;
+    }
+    const queuedMs = Date.now() - queuedAt;
+    const result = await task({
+      queued: Boolean(previousSlot),
+      queuedMs,
+      socketPath
+    });
+    return {
+      ...result,
+      queued: Boolean(previousSlot),
+      queuedMs
+    };
+  } finally {
+    releaseSlot();
+    if (tmuxShellPaneQueues.get(queueKey) === currentSlot) {
+      tmuxShellPaneQueues.delete(queueKey);
+    }
+    const remainingDepth = Number(tmuxShellPaneQueueDepths.get(queueKey) || 1) - 1;
+    if (remainingDepth > 0) {
+      tmuxShellPaneQueueDepths.set(queueKey, remainingDepth);
+    } else {
+      tmuxShellPaneQueueDepths.delete(queueKey);
+    }
+  }
+}
+
+function buildTmuxShellQueueKey(pane = {}, socketPath = getTmuxSocketPath() || "default-socket") {
+  return [
+    socketPath,
+    pane.serverPid || "unknown-server",
+    pane.id || pane.address || pane.label || "unknown-pane"
+  ].join(":");
+}
+
+function getTmuxShellPaneQueueDepth(pane = {}, socketPath = getTmuxSocketPath() || "default-socket") {
+  return Number(tmuxShellPaneQueueDepths.get(buildTmuxShellQueueKey(pane, socketPath)) || 0);
+}
+
+async function verifyTmuxShellPaneBeforeDispatch(expectedPane = {}, queueContext = {}) {
+  const expectedSocket = queueContext.socketPath || "default-socket";
+  const currentSocket = getTmuxSocketPath() || "default-socket";
+  if (currentSocket !== expectedSocket) {
+    throw new Error("Queued tmux target socket changed before execution. Submit the helper again against the current target.");
+  }
+  if (!expectedPane.id) {
+    throw new Error("Queued tmux target is missing its immutable pane id. Submit the helper again.");
+  }
+
+  const currentPane = (await listTmuxPanes()).find((pane) => pane.id === expectedPane.id);
+  if (!currentPane) {
+    throw new Error(`Queued tmux pane ${expectedPane.id} no longer exists. Submit the helper again against the current target.`);
+  }
+
+  const expectedServerPid = String(expectedPane.serverPid || "");
+  const currentServerPid = String(currentPane.serverPid || "");
+  if (
+    (expectedServerPid || currentServerPid) &&
+    (!expectedServerPid || !currentServerPid || expectedServerPid !== currentServerPid)
+  ) {
+    throw new Error(`Queued tmux pane ${expectedPane.id} belongs to a different tmux server instance. Submit the helper again against the current target.`);
+  }
+  if (queueContext.queued && !expectedServerPid) {
+    throw new Error(`Cannot safely verify queued tmux pane ${expectedPane.id} because server instance metadata is missing. Submit the helper again.`);
+  }
+  return currentPane;
 }
 
 async function handleRunBoardMessage(message) {
@@ -1830,6 +1925,17 @@ async function runVisionTerminalSelfTest(message) {
   if (!pane) {
     return visionError("missing-tmux-pane", "No tmux pane is available for Terminal vision self-test.");
   }
+
+  return withTmuxShellPaneQueue({
+    pane,
+    cmd: "vision-terminal-self-test"
+  }, async (queueContext) => {
+    const currentPane = await verifyTmuxShellPaneBeforeDispatch(pane, queueContext);
+    return runVisionTerminalSelfTestInPane(message, currentPane, started);
+  });
+}
+
+async function runVisionTerminalSelfTestInPane(message, pane, started) {
 
   await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
   await sleep(250);
@@ -4814,6 +4920,7 @@ module.exports = {
   buildBoardTargetErrorResponse,
   buildServerExecutionKey,
   buildTmuxPaneExecutionTarget,
+  buildTmuxShellQueueKey,
   buildHealthResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
@@ -4830,6 +4937,7 @@ module.exports = {
   getStateDir,
   getStateStatus,
   getTmuxEnvSocketPath,
+  getTmuxShellPaneQueueDepth,
   getTmuxSocketPath,
   ensureForAiTmuxLayout,
   ensureStateDirReady,
@@ -4866,6 +4974,7 @@ module.exports = {
   runTmuxVisualLine,
   runTmuxBoard,
   runTmuxShell,
+  runTmuxShellQueued,
   startServer,
   stitchOcrPages,
   validateBoardCommand,
@@ -4873,6 +4982,7 @@ module.exports = {
   validateVisionTmuxCommand,
   validateVisionKey,
   validateVisionTextInput,
+  verifyTmuxShellPaneBeforeDispatch,
   visionOcrOutputText,
   visionOcrRows,
   visionOcrStatusText,

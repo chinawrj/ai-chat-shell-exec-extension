@@ -413,6 +413,64 @@ async function main() {
   });
   assert.equal(agentResponse.ok, true);
 
+  const refreshMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-refresh-e2e-${process.pid}-${Date.now()}.txt`);
+  const refreshOldToken = `ai-chat-shell-refresh-old-${Date.now()}`;
+  const refreshNewToken = `ai-chat-shell-refresh-new-${Date.now()}`;
+  cleanup.push(() => fs.rmSync(refreshMarkerPath, { force: true }));
+  const refreshOldCommand = [
+    `printf 'started\\n' > ${shellQuote(refreshMarkerPath)}`,
+    `printf '${refreshOldToken}\\n'`,
+    "sleep 15",
+    `printf 'done\\n' >> ${shellQuote(refreshMarkerPath)}`
+  ].join("; ");
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    appendAssistantToolCall([
+      "ai-helper-shell-start:refresh-old-page",
+      ${JSON.stringify(refreshOldCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitFor(
+    () => fs.existsSync(refreshMarkerPath) && fs.readFileSync(refreshMarkerPath, "utf8").includes("started"),
+    "long helper to start before page refresh"
+  );
+
+  const refreshedUrl = `${TEST_PAGE_URL}?refresh=${Date.now()}`;
+  await page.send("Page.navigate", { url: refreshedUrl });
+  await waitForEvaluate(page, `location.href === ${JSON.stringify(refreshedUrl)}`, "refreshed test page navigation");
+  await waitForEvaluate(page, "document.readyState === 'complete'", "refreshed test page load");
+  await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status after refresh");
+  await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
+
+  const refreshNewCommand = `printf '${refreshNewToken}'`;
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    appendAssistantToolCall([
+      "ai-helper-shell-start:refresh-new-page",
+      ${JSON.stringify(refreshNewCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const refreshText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Shell call result:") &&
+      text.includes("queued: true") &&
+      text.includes("queuedMs:") &&
+      text.includes(${JSON.stringify(`stdout:\n${refreshNewToken}`)}) ? text : "";
+  })()`, "new helper result after refreshing during a long shell command");
+  assert.match(refreshText, /^queued: true$/m);
+  assert.match(refreshText, /^queuedMs: \d+$/m);
+  assert.equal(fs.readFileSync(refreshMarkerPath, "utf8"), "started\ndone\n");
+
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;
   const command = `printf ${token}`;
@@ -902,6 +960,10 @@ function sleep(ms) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
 async function sendLocalAgentRequest(page, payload) {

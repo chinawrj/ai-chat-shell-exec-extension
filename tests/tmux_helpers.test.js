@@ -9,6 +9,7 @@ const {
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
   buildTmuxPaneExecutionTarget,
+  buildTmuxShellQueueKey,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
   buildTmuxRunScript,
@@ -91,6 +92,33 @@ assert.notEqual(
   buildTmuxPaneExecutionTarget(paneWithInstance),
   buildTmuxPaneExecutionTarget({ ...paneWithInstance, serverPid: "43211" }),
   "A recreated tmux server/pane instance must not inherit completed executions."
+);
+assert.equal(buildTmuxShellQueueKey(paneWithInstance), buildTmuxShellQueueKey({ ...paneWithInstance }));
+assert.notEqual(
+  buildTmuxShellQueueKey(paneWithInstance),
+  buildTmuxShellQueueKey({ ...paneWithInstance, id: "%31", address: "main:2.2" }),
+  "Different tmux panes must not share the shell execution queue."
+);
+assert.equal(
+  buildTmuxShellQueueKey(paneWithInstance),
+  buildTmuxShellQueueKey({
+    ...paneWithInstance,
+    sessionCreated: "1784112001",
+    windowIndex: "9",
+    address: "main:9.1",
+    label: "main:9.1 dev"
+  }),
+  "Moving the same immutable tmux pane must not let it bypass its execution queue."
+);
+assert.notEqual(
+  buildTmuxShellQueueKey(paneWithInstance),
+  buildTmuxShellQueueKey({ ...paneWithInstance, serverPid: "43211" }),
+  "A pane id reused by a new tmux server must not inherit an old execution queue."
+);
+assert.equal(
+  buildTmuxShellQueueKey({ ...paneWithInstance, serverPid: "", address: "main:2.1" }),
+  buildTmuxShellQueueKey({ ...paneWithInstance, serverPid: "", address: "main:9.1" }),
+  "Missing server metadata must conservatively keep the same pane id serialized across address changes."
 );
 assert.equal(isConfirmedTmuxExecution({ executed: true, executionCompleted: true, exitCode: 7 }), true);
 assert.equal(isConfirmedTmuxExecution({ executed: true, executionCompleted: false, timedOut: true }), false);
