@@ -2068,7 +2068,9 @@ function buildExecutedDuplicateResponse({ message, callKey, claim, cmd, cwd = ""
     skipped: true,
     reason: claim?.reason || "already-executed-on-target",
     previousCallKey: claim?.previousCallKey || "",
-    previousCompletedAt: previous.completedAt || 0
+    previousCompletedAt: previous.completedAt || 0,
+    previousInterrupted: previous.interrupted === true,
+    previousInterruptSignal: previous.interruptSignal || ""
   };
 }
 
@@ -2084,7 +2086,9 @@ function completeServerShellCall(ledgerKey, response) {
     exitCode: response.exitCode,
     durationMs: response.durationMs,
     timedOut: response.timedOut === true,
-    truncated: response.truncated === true
+    truncated: response.truncated === true,
+    interrupted: response.interrupted === true,
+    interruptSignal: response.interruptSignal || ""
   };
   pruneServerLedger();
   saveServerLedger();
@@ -2408,12 +2412,22 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   const pidPath = path.join(TMUX_SCRIPT_DIR, `${runId}.pid`);
   const statusPath = path.join(TMUX_SCRIPT_DIR, `${runId}.status`);
   const executedPath = path.join(TMUX_SCRIPT_DIR, `${runId}.executed`);
+  const interruptedPath = path.join(TMUX_SCRIPT_DIR, `${runId}.interrupted`);
   fs.mkdirSync(TMUX_SCRIPT_DIR, { recursive: true });
-  fs.writeFileSync(scriptPath, buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath }), { mode: 0o700 });
+  fs.writeFileSync(scriptPath, buildTmuxRunScript({
+    cmd,
+    cwd,
+    startMarker,
+    doneMarker,
+    pidPath,
+    statusPath,
+    executedPath,
+    interruptedPath
+  }), { mode: 0o700 });
 
   const started = Date.now();
   const markerLossGraceMs = 2000;
-  let completionMissingSince = 0;
+  let processExitMissingSince = 0;
   let unknownStateSince = 0;
   let continuedAfterTimeout = false;
   let lastCapture = "";
@@ -2427,14 +2441,47 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
       const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
       if (extracted.foundDone) {
         const executed = fs.existsSync(executedPath);
+        const interruptSignal = readTmuxShellInterruptSignal(interruptedPath);
         return {
           executed,
           executionCompleted: executed,
+          interrupted: Boolean(interruptSignal),
+          interruptSignal,
           exitCode: extracted.exitCode,
           stdout: extracted.stdout,
-          stderr: "",
+          stderr: formatTmuxShellInterruptMessage(interruptSignal),
           truncated: extracted.truncated,
           timedOut: false,
+          continuedAfterTimeout,
+          target: pane.id,
+          targetName: pane.label
+        };
+      }
+
+      const state = readTmuxShellRunState(pidPath, statusPath);
+      if (state.completed) {
+        // The status file is a server-controlled completion acknowledgement.
+        // Give the terminal one short flush window for the done marker, then
+        // return immediately even if pane capture lost that marker.
+        await sleep(50);
+        lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
+        const finalExtracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        const executed = fs.existsSync(executedPath);
+        const interruptSignal = readTmuxShellInterruptSignal(interruptedPath);
+        return {
+          executed,
+          executionCompleted: executed,
+          interrupted: Boolean(interruptSignal),
+          interruptSignal,
+          exitCode: finalExtracted.foundDone ? finalExtracted.exitCode : state.exitCode,
+          stdout: finalExtracted.stdout,
+          stderr: formatTmuxShellInterruptMessage(interruptSignal),
+          truncated: finalExtracted.truncated,
+          timedOut: false,
+          completionMarkerMissing: !finalExtracted.foundDone,
+          processKnown: true,
+          processAlive: false,
+          processPid: state.pid || 0,
           continuedAfterTimeout,
           target: pane.id,
           targetName: pane.label
@@ -2445,42 +2492,16 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
         continue;
       }
 
-      const state = readTmuxShellRunState(pidPath, statusPath);
       if (state.processAlive) {
         continuedAfterTimeout = true;
-        completionMissingSince = 0;
+        processExitMissingSince = 0;
         unknownStateSince = 0;
         continue;
       }
 
-      if (state.completed) {
-        completionMissingSince = completionMissingSince || Date.now();
-        if (Date.now() - completionMissingSince < markerLossGraceMs) {
-          continue;
-        }
-        const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
-        const executed = fs.existsSync(executedPath);
-        return {
-          executed,
-          executionCompleted: executed,
-          exitCode: state.exitCode,
-          stdout: partial.stdout,
-          stderr: "Timed out waiting for tmux completion marker after the shell process completed.",
-          truncated: partial.truncated,
-          timedOut: true,
-          timeoutReason: "completion-marker-missing",
-          processKnown: true,
-          processAlive: false,
-          processPid: state.pid || 0,
-          continuedAfterTimeout,
-          target: pane.id,
-          targetName: pane.label
-        };
-      }
-
       if (state.processKnown) {
-        completionMissingSince = completionMissingSince || Date.now();
-        if (Date.now() - completionMissingSince < markerLossGraceMs) {
+        processExitMissingSince = processExitMissingSince || Date.now();
+        if (Date.now() - processExitMissingSince < markerLossGraceMs) {
           continue;
         }
         const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
@@ -2545,7 +2566,29 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
     } catch {
       // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
     }
+    try {
+      fs.unlinkSync(interruptedPath);
+    } catch {
+      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
+    }
   }
+}
+
+function readTmuxShellInterruptSignal(interruptedPath) {
+  try {
+    return fs.readFileSync(interruptedPath, "utf8").trim().toUpperCase();
+  } catch {
+    return "";
+  }
+}
+
+function formatTmuxShellInterruptMessage(signal) {
+  if (!signal) {
+    return "";
+  }
+  return signal === "INT"
+    ? "Command interrupted by Ctrl+C (SIGINT)."
+    : `Command interrupted by SIG${signal}.`;
 }
 
 function readTmuxShellRunState(pidPath, statusPath) {
@@ -3253,20 +3296,31 @@ function parseVisionDoneFromText(text, donePrefix) {
   };
 }
 
-function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath }) {
+function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath, interruptedPath }) {
   return [
     `#!${SHELL_RUNNER}`,
     "set +e",
+    interruptedPath ? "__ai_chat_shell_exec_finish_signal() {" : "",
+    interruptedPath ? "  __ai_chat_shell_exec_signal=$1" : "",
+    interruptedPath ? "  __ai_chat_shell_exec_status=$2" : "",
+    interruptedPath ? "  trap - INT TERM HUP" : "",
+    interruptedPath ? `  printf '%s\\n' \"$__ai_chat_shell_exec_signal\" > ${shellQuote(interruptedPath)}` : "",
+    interruptedPath ? `  printf '%s\\n' \"$__ai_chat_shell_exec_status\" > ${shellQuote(statusPath)}` : "",
+    interruptedPath ? `  printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} \"$__ai_chat_shell_exec_status\"` : "",
+    interruptedPath ? "  exit \"$__ai_chat_shell_exec_status\"" : "",
+    interruptedPath ? "}" : "",
+    interruptedPath ? "trap '__ai_chat_shell_exec_finish_signal INT 130' INT" : "",
+    interruptedPath ? "trap '__ai_chat_shell_exec_finish_signal TERM 143' TERM" : "",
+    interruptedPath ? "trap '__ai_chat_shell_exec_finish_signal HUP 129' HUP" : "",
     `printf '\\n%s\\n' ${shellQuote(startMarker)}`,
+    `printf '%s\\n' \"$$\" > ${shellQuote(pidPath)}`,
     "(",
     cwd ? `  cd -- ${shellQuote(cwd)} || exit $?` : "",
     executedPath ? `  printf '1\\n' > ${shellQuote(executedPath)}` : "",
     cmd,
-    ") &",
-    "__ai_chat_shell_exec_pid=$!",
-    `printf '%s\\n' \"$__ai_chat_shell_exec_pid\" > ${shellQuote(pidPath)}`,
-    "wait \"$__ai_chat_shell_exec_pid\"",
+    ")",
     "__ai_chat_shell_exec_status=$?",
+    interruptedPath ? "trap - INT TERM HUP" : "",
     `printf '%s\\n' \"$__ai_chat_shell_exec_status\" > ${shellQuote(statusPath)}`,
     `printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} \"$__ai_chat_shell_exec_status\"`,
     "exit \"$__ai_chat_shell_exec_status\"",

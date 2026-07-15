@@ -158,15 +158,21 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
     doneMarker: "__DONE__",
     pidPath: "/tmp/run.pid",
     statusPath: "/tmp/run.status",
-    executedPath: "/tmp/run.executed"
+    executedPath: "/tmp/run.executed",
+    interruptedPath: "/tmp/run.interrupted"
   });
   assert.match(script, /printf '\\n%s\\n' '__START__'/);
-  assert.match(script, /\) &/);
-  assert.match(script, /__ai_chat_shell_exec_pid=\$!/);
+  assert.match(script, /__ai_chat_shell_exec_finish_signal/);
+  assert.match(script, /finish_signal INT 130/);
+  assert.match(script, /finish_signal TERM 143/);
+  assert.match(script, /finish_signal HUP 129/);
+  assert.doesNotMatch(script, /\) &/);
+  assert.doesNotMatch(script, /__ai_chat_shell_exec_pid=\$!/);
   assert.match(script, /\/tmp\/run\.pid/);
-  assert.match(script, /wait "\$__ai_chat_shell_exec_pid"/);
+  assert.match(script, /"\$\$" > '\/tmp\/run\.pid'/);
   assert.match(script, /\/tmp\/run\.status/);
   assert.match(script, /\/tmp\/run\.executed/);
+  assert.match(script, /\/tmp\/run\.interrupted/);
   assert.ok(script.indexOf("/tmp/run.executed") < script.indexOf("printf 'ok\\n'"));
   assert.match(script, /__DONE__/);
 }

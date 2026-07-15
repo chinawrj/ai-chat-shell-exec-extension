@@ -50,7 +50,7 @@ Rules:
 - The final line must be exactly `ai-helper-shell-end`.
 - Do not wrap shell-output, terminal output, markdown, explanations, or prompts inside the helper block.
 - Wait for my shell-output reply before interpreting results or asking for the next command.
-- Do not repeat a command after shell-output confirms execution. If the result explicitly says it was not executed, a new identical retry helper is allowed and will be sent to the shell server.
+- Do not repeat a command after shell-output confirms execution. `interrupted: true` means the command did execute and the user stopped it; do not retry it automatically, and ask the user to use Force run if they intentionally want the same command again. If the result explicitly says it was not executed, a new identical retry helper is allowed and will be sent to the shell server.
 - If a command is destructive, modifies many files, deletes data, installs software, changes credentials, or sends private data to a network service, ask for confirmation in prose instead of emitting a helper block.
 
 When board output would help, ask me for one board command by replying with exactly one fenced code block and no prose.
@@ -132,7 +132,7 @@ Workflow rules:
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
 - You may add a simple no-space request identity after the colon in a start marker, such as `ai-helper-shell-start:2` or `ai-helper-board-R1-start:2`, for diagnostics. It is optional and does not bypass a server-confirmed completed execution; ask the user to use Force run when an already executed command must intentionally run again.
 - Wait for shell-output before making claims about command results or file write results.
-- Do not rerun a successfully executed command or rewrite the same file unless I ask or the previous output clearly requires it. Commands reported as not executed may be retried with a new helper.
+- Do not rerun a successfully executed or user-interrupted command or rewrite the same file unless I ask or the previous output clearly requires it. `interrupted: true` is executed history and requires an intentional Force run; commands reported as not executed may be retried with a new helper.
 
 Safety rules:
 - Ask before destructive commands such as rm -rf, git reset --hard, force pushes, credential changes, package publishing, or broad permission changes.

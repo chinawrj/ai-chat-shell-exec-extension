@@ -74,6 +74,50 @@ try {
   assert.equal(completedLedger.calls[firstClaim.ledgerKey].callKey, "first-pane-a");
   assert.equal(Object.values(completedLedger.calls).some((entry) => entry.callKey === "second-pane-a"), false);
 
+  writeLedger({});
+  const interruptedContext = loadServerContext();
+  const interruptedClaim = interruptedContext.claimServerShellCall("interrupted-first", {
+    cmd: "sleep 60",
+    cwd: "/tmp",
+    target: "%1",
+    executionTarget: "tmux-pane:server-a:%1",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  interruptedContext.completeServerShellCall(interruptedClaim.ledgerKey, {
+    exitCode: 130,
+    durationMs: 800,
+    timedOut: false,
+    truncated: false,
+    interrupted: true,
+    interruptSignal: "INT"
+  });
+  const duplicateAfterInterrupt = interruptedContext.claimServerShellCall("interrupted-second", {
+    cmd: "sleep 60",
+    cwd: "/tmp",
+    target: "%1",
+    executionTarget: "tmux-pane:server-a:%1",
+    timeoutMs: 30000,
+    callMeta: {}
+  });
+  assert.equal(duplicateAfterInterrupt.action, "skip", "An actually started command interrupted by Ctrl+C is executed history.");
+  const interruptedDuplicateResponse = interruptedContext.buildExecutedDuplicateResponse({
+    message: { id: "interrupted-second" },
+    callKey: "interrupted-second",
+    claim: duplicateAfterInterrupt,
+    cmd: "sleep 60",
+    cwd: "/tmp",
+    pane: { id: "%1", label: "ForAI:host.0" },
+    timeoutMs: 30000
+  });
+  assert.equal(interruptedDuplicateResponse.exitCode, 130);
+  assert.equal(interruptedDuplicateResponse.previousInterrupted, true);
+  assert.equal(interruptedDuplicateResponse.previousInterruptSignal, "INT");
+  const interruptedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  assert.equal(interruptedLedger.calls[interruptedClaim.ledgerKey].state, "completed");
+  assert.equal(interruptedLedger.calls[interruptedClaim.ledgerKey].interrupted, true);
+  assert.equal(interruptedLedger.calls[interruptedClaim.ledgerKey].interruptSignal, "INT");
+
   const otherPaneClaim = completedContext.claimServerShellCall("first-pane-b", {
     cmd: "echo same-command",
     cwd: "/tmp",

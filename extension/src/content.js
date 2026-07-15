@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.7";
+const CONTENT_SCRIPT_VERSION = "0.8.8";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -2432,6 +2432,18 @@ function setHelperCompletionStatus(call, response) {
     return;
   }
 
+  if (response?.interrupted === true) {
+    setStatus(
+      response.interruptSignal === "INT"
+        ? "Shell helper interrupted by Ctrl+C"
+        : response.interruptSignal
+          ? `Shell helper interrupted by SIG${response.interruptSignal}`
+          : "Shell helper interrupted",
+      "ok"
+    );
+    return;
+  }
+
   setStatus(response?.ok === false ? "Shell helper failed" : "Shell helper completed", response?.ok === false ? "error" : "ok");
 }
 
@@ -2479,7 +2491,12 @@ function formatShellOutput(call, response, startedAt) {
     response.skipped === true ? "skipped: true" : "",
     response.reason ? `reason: ${response.reason}` : "",
     response.previousCallKey ? `previousCallKey: ${response.previousCallKey}` : "",
+    response.previousInterrupted === true ? "previousInterrupted: true" : "",
+    response.previousInterruptSignal ? `previousInterruptSignal: ${response.previousInterruptSignal}` : "",
+    response.interrupted === true ? "interrupted: true" : "",
+    response.interruptSignal ? `interruptSignal: ${response.interruptSignal}` : "",
     response.timedOut ? "timedOut: true" : "",
+    response.completionMarkerMissing ? "completionMarkerMissing: true" : "",
     response.timeoutReason ? `timeoutReason: ${response.timeoutReason}` : "",
     response.processKnown === true ? "processKnown: true" : "",
     response.processKnown === false ? "processKnown: false" : "",

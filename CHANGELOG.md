@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.8] - 2026-07-15
+
+- Makes tmux shell helpers return immediately when the user interrupts an actually started command with Ctrl+C instead of waiting for the shell state timeout.
+- Reports interruption explicitly as `exitCode: 130`, `interrupted: true`, and `interruptSignal: INT`, without mislabeling it as a timeout.
+- Treats a command that reached the shell and was then interrupted as executed history eligible for same-pane, same-cwd, same-command server dedup; interruption before actual execution remains retryable.
+- Keeps the tmux runner and command in the foreground process group, removing the background-child behavior that could leave the server waiting after Ctrl+C.
+- Adds real isolated-tmux regression coverage for bounded Ctrl+C response latency and the subsequent authoritative duplicate verdict, plus ledger and shell-output diagnostics coverage.
+
 ## [0.8.7] - 2026-07-15
 
 - Moves authoritative command-duplicate adjudication to the shell server after actual tmux pane resolution, keyed by pane instance, command, and actual cwd.

@@ -153,6 +153,52 @@ async function main() {
   assert.match(longResponse.stdout, new RegExp(longToken));
   assert.ok(Date.now() - longStarted >= 1500, JSON.stringify(longResponse));
 
+  const interruptToken = `FORAI_INTERRUPT_${Date.now()}`;
+  const interruptCommand = `printf '${interruptToken}\\n'; sleep 60; printf 'INTERRUPT_SHOULD_NOT_FINISH\\n'`;
+  const interruptPromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-interrupt-run",
+    callKey: `forai-interrupt-run-${Date.now()}`,
+    cmd: interruptCommand,
+    timeoutMs: 30000,
+    maxOutputChars: 20000
+  }));
+  const defaultHostPane = resolveDefaultShellPane(await listTmuxPanes()).pane;
+  await waitForTmuxPaneText(defaultHostPane.id, interruptToken, 5000);
+  const interruptedAt = Date.now();
+  runTmux(["send-keys", "-t", defaultHostPane.id, "C-c"]);
+  const interruptResponse = await Promise.race([
+    interruptPromise,
+    sleep(3000).then(() => {
+      throw new Error("Ctrl+C shell helper did not return within 3 seconds.");
+    })
+  ]);
+  assert.equal(interruptResponse.ok, true, JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.exitCode, 130, JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.interrupted, true, JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.interruptSignal, "INT", JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.executed, true, JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.executionCompleted, true, JSON.stringify(interruptResponse));
+  assert.equal(interruptResponse.timedOut, false, JSON.stringify(interruptResponse));
+  assert.match(interruptResponse.stderr, /Ctrl\+C \(SIGINT\)/);
+  assert.match(interruptResponse.stdout, new RegExp(interruptToken));
+  assert.doesNotMatch(interruptResponse.stdout, /INTERRUPT_SHOULD_NOT_FINISH/);
+  assert.ok(Date.now() - interruptedAt < 2000, JSON.stringify(interruptResponse));
+
+  const interruptedDuplicate = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-interrupt-duplicate",
+    callKey: `forai-interrupt-duplicate-${Date.now()}`,
+    cmd: interruptCommand,
+    timeoutMs: 30000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(interruptedDuplicate.duplicate, true, JSON.stringify(interruptedDuplicate));
+  assert.equal(interruptedDuplicate.skipped, true, JSON.stringify(interruptedDuplicate));
+  assert.equal(interruptedDuplicate.exitCode, 130, JSON.stringify(interruptedDuplicate));
+  assert.equal(interruptedDuplicate.previousInterrupted, true, JSON.stringify(interruptedDuplicate));
+  assert.equal(interruptedDuplicate.previousInterruptSignal, "INT", JSON.stringify(interruptedDuplicate));
+
   const agentToken = `FORAI_AGENT_${Date.now()}`;
   const agentResponse = await handleMessageText(JSON.stringify({
     type: "run",
@@ -267,6 +313,28 @@ async function main() {
 
 function commandExists(command) {
   return spawnSync("sh", ["-c", `command -v ${command}`], { encoding: "utf8" }).status === 0;
+}
+
+function runTmux(args) {
+  const result = spawnSync("tmux", ["-S", socketPath, ...args], { encoding: "utf8" });
+  assert.equal(result.status, 0, `tmux ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
+  return result.stdout;
+}
+
+async function waitForTmuxPaneText(paneId, text, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const captured = runTmux(["capture-pane", "-p", "-S", "-200", "-t", paneId]);
+    if (captured.includes(text)) {
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error(`Timed out waiting for tmux pane ${paneId} to contain ${text}.`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function restoreEnv(name, value) {
