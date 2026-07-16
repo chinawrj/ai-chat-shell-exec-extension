@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const assert = require("node:assert/strict");
-const { decodeTextFrames, encodeTextFrame } = require("../server/shell_server.js");
+const { decodeTextFrames, encodeTextFrame, writeWebSocketResponse } = require("../server/shell_server.js");
 
 function maskedClientFrame(text) {
   const payload = Buffer.from(text, "utf8");
@@ -88,6 +88,30 @@ function decodeIncrementally(frame, chunkSizes) {
   const decoded = decodeTextFrames(frame);
   assert.deepEqual(decoded.messages, ["server response"]);
   assert.equal(decoded.remaining.length, 0);
+}
+
+{
+  let ended = false;
+  assert.equal(writeWebSocketResponse({
+    destroyed: true,
+    writable: false,
+    end() {
+      ended = true;
+    }
+  }, { ok: true }), false);
+  assert.equal(ended, false, "A late result must not write to a disconnected client socket.");
+}
+
+{
+  assert.doesNotThrow(() => {
+    assert.equal(writeWebSocketResponse({
+      destroyed: false,
+      writable: true,
+      end() {
+        throw new Error("simulated reset");
+      }
+    }, { ok: true }), false);
+  }, "A client reset during the late response must not escape into the server process.");
 }
 
 console.log("server websocket frame tests passed");

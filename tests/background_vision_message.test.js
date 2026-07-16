@@ -85,6 +85,7 @@ const context = {
     }
   },
   clearTimeout,
+  clearInterval,
   console,
   fetch: async () => ({
     ok: true,
@@ -92,6 +93,7 @@ const context = {
     text: async () => JSON.stringify(healthBody)
   }),
   setTimeout,
+  setInterval,
   WebSocket: FakeWebSocket
 };
 
@@ -196,8 +198,8 @@ function currentHealthBody() {
     allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
     releaseVersion: "0.6.0",
     serverReleaseVersion: "0.6.0",
-    protocolVersion: 4,
-    serverProtocolVersion: 4,
+    protocolVersion: 6,
+    serverProtocolVersion: 6,
     helperProtocolVersion: 2
   };
 }

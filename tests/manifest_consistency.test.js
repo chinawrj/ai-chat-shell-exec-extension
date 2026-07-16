@@ -15,6 +15,8 @@ assert.equal(rootManifest.manifest_version, extensionManifest.manifest_version);
 assert.equal(rootManifest.name, extensionManifest.name);
 assert.equal(rootManifest.description, extensionManifest.description);
 assert.equal(rootManifest.version, extensionManifest.version);
+assert.equal(rootManifest.minimum_chrome_version, extensionManifest.minimum_chrome_version);
+assert.equal(Number(rootManifest.minimum_chrome_version), 116);
 assert.equal(rootManifest.key, extensionManifest.key);
 assert.deepEqual(rootManifest.permissions, extensionManifest.permissions);
 assert.deepEqual(rootManifest.host_permissions, extensionManifest.host_permissions);
@@ -54,7 +56,7 @@ assert.match(contentSource, /Extension v\$\{getDisplayVersion\(\)\}; \$\{formatS
 assert.match(backgroundSource, /message\.type === "extension-version"/);
 assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /message\.type === "tmux-reset-forai"/);
-assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 4/);
+assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 6/);
 assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 2/);
 assert.match(backgroundSource, /startsWith\("vision-"\)/);
 assert.match(backgroundSource, /function handleVisionMessage\(/);

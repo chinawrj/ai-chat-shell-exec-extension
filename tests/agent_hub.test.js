@@ -58,6 +58,32 @@ assert.equal(response.message.to, "slave-a");
 assert.equal(response.message.taskId, "task-001");
 assert.equal(response.message.ackedAt, 0);
 
+const firstTaskEnvelope = response.message;
+response = handleAgentHubMessage({
+  type: "agent-send",
+  from: "master",
+  to: "slave-a",
+  taskId: "task-001",
+  body: "Inspect the parser and report back.",
+  messageId: "msg-001"
+}, 1301);
+assert.equal(response.ok, true);
+assert.equal(response.idempotent, true);
+assert.equal(response.message, firstTaskEnvelope, "An exact response-loss retry must return the original mailbox envelope.");
+assert.equal(response.message.createdAt, 1300);
+
+response = handleAgentHubMessage({
+  type: "agent-send",
+  from: "master",
+  to: "slave-a",
+  taskId: "task-001",
+  body: "Changed payload must conflict.",
+  messageId: "msg-001"
+}, 1302);
+assert.equal(response.ok, false);
+assert.equal(response.errorCode, "duplicate-message-id");
+assert.match(response.error, /different payload/);
+
 response = handleAgentHubMessage({ type: "agent-list" }, 1400);
 assert.deepEqual(response.pending, { "slave-a": 1 });
 assert.equal(response.agents.find((agent) => agent.agentId === "slave-a").pendingCount, 1);
@@ -92,6 +118,32 @@ assert.equal(response.ok, true);
 assert.equal(response.message.replyTo, "msg-001");
 assert.equal(response.message.deliverySurface, "web");
 assert.equal(response.message.replyMode, "poll");
+
+const firstReplyEnvelope = response.message;
+response = handleAgentHubMessage({
+  type: "agent-send",
+  from: "slave-a",
+  to: "master",
+  taskId: "task-001",
+  replyTo: "msg-001",
+  body: "Parser inspected; no issue found.",
+  messageId: "reply-msg-001"
+}, 1651);
+assert.equal(response.ok, true);
+assert.equal(response.idempotent, true);
+assert.equal(response.message, firstReplyEnvelope, "An exact reply retry must not trip duplicate-reply validation.");
+
+response = handleAgentHubMessage({
+  type: "agent-send",
+  from: "slave-a",
+  to: "master",
+  taskId: "task-001",
+  replyTo: "msg-001",
+  body: "Changed reply payload must conflict.",
+  messageId: "reply-msg-001"
+}, 1652);
+assert.equal(response.ok, false);
+assert.equal(response.errorCode, "duplicate-message-id");
 
 response = handleAgentHubMessage({
   type: "agent-poll",

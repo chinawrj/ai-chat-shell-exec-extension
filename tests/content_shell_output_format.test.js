@@ -123,13 +123,16 @@ const duplicateOutput = context.formatShellOutput({ cmd: "pwd" }, {
   reason: "already-executed-on-target",
   previousCallKey: "previous-call",
   previousInterrupted: true,
-  previousInterruptSignal: "INT"
+  previousInterruptSignal: "INT",
+  replayedOutput: true,
+  recovered: true,
+  cancelledBeforeExecution: true,
+  retryable: true
 }, "2026-05-22T00:00:00.000Z");
-assert.match(duplicateOutput, /^duplicate: true$/m);
-assert.match(duplicateOutput, /^skipped: true$/m);
-assert.match(duplicateOutput, /^reason: already-executed-on-target$/m);
-assert.match(duplicateOutput, /^previousCallKey: previous-call$/m);
-assert.match(duplicateOutput, /^previousInterrupted: true$/m);
-assert.match(duplicateOutput, /^previousInterruptSignal: INT$/m);
+assert.equal(
+  duplicateOutput,
+  "",
+  "Even if a future caller bypasses runAndReply's guard, authoritative duplicate diagnostics must not be formatted for the model."
+);
 
 console.log("content shell-output format tests passed");

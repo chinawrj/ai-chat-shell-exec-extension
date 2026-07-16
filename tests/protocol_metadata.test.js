@@ -23,7 +23,7 @@ async function main() {
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
     const doctorSource = fs.readFileSync(path.join(repoRoot, "scripts", "doctor.sh"), "utf8");
 
-    assert.equal(server.SERVER_PROTOCOL_VERSION, 4);
+    assert.equal(server.SERVER_PROTOCOL_VERSION, 6);
     assert.equal(server.HELPER_PROTOCOL_VERSION, 2);
     assert.match(doctorSource, new RegExp(`EXPECTED_SERVER_PROTOCOL_VERSION=${server.SERVER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_HELPER_PROTOCOL_VERSION=${server.HELPER_PROTOCOL_VERSION}(?:\\n|$)`));
@@ -37,8 +37,8 @@ async function main() {
     const metadata = server.getProtocolMetadata();
     assert.equal(metadata.releaseVersion, manifest.version);
     assert.equal(metadata.serverReleaseVersion, manifest.version);
-    assert.equal(metadata.protocolVersion, 4);
-    assert.equal(metadata.serverProtocolVersion, 4);
+    assert.equal(metadata.protocolVersion, 6);
+    assert.equal(metadata.serverProtocolVersion, 6);
     assert.equal(metadata.helperProtocolVersion, 2);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
     assert.equal(metadata.visualProtocolVersion, 1);
@@ -48,7 +48,7 @@ async function main() {
     assert.equal(health.ok, true);
     assert.equal(health.service, "ai-chat-shell-exec-server");
     assert.equal(health.serverReleaseVersion, manifest.version);
-    assert.equal(health.serverProtocolVersion, 4);
+    assert.equal(health.serverProtocolVersion, 6);
     assert.equal(health.helperProtocolVersion, 2);
     assert.equal(health.visualProtocolVersion, 1);
     assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
@@ -62,8 +62,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 4,
-        serverProtocolVersion: 4,
+        protocolVersion: 6,
+        serverProtocolVersion: 6,
         helperProtocolVersion: 2
       },
       assertHealth: (result) => {
@@ -71,7 +71,7 @@ async function main() {
         assert.equal(result.protocolMatches, true);
         assert.equal(result.helperProtocolMatches, true);
         assert.equal(result.releaseMatches, true);
-        assert.equal(result.requiredServerProtocolVersion, 4);
+        assert.equal(result.requiredServerProtocolVersion, 6);
         assert.equal(result.requiredHelperProtocolVersion, 2);
       }
     });
@@ -88,7 +88,7 @@ async function main() {
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 4 and helper protocol 2/);
+        assert.match(result.error, /Expected server protocol 6 and helper protocol 2/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -100,8 +100,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 4,
-        serverProtocolVersion: 4,
+        protocolVersion: 6,
+        serverProtocolVersion: 6,
         helperProtocolVersion: 0
       },
       assertHealth: (result) => {
@@ -119,8 +119,8 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 4,
-        serverProtocolVersion: 4
+        protocolVersion: 6,
+        serverProtocolVersion: 6
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);

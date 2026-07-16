@@ -16,6 +16,7 @@ const {
   extractTmuxRunOutput,
   extractBoardPromptSignature,
   getTmuxEnvSocketPath,
+  getTmuxPaneReadiness,
   getForAiTmuxConfig,
   handleMessageText,
   isConfirmedTmuxExecution,
@@ -49,6 +50,8 @@ assert.deepEqual(panes[0], {
   currentCommand: "zsh",
   sessionCreated: "",
   serverPid: "",
+  panePid: "",
+  paneTty: "",
   address: "espcam:0.0",
   label: "espcam:0.0 build"
 });
@@ -81,17 +84,42 @@ const paneWithInstance = parseTmuxPanes([
   "/tmp",
   "zsh",
   "1784112000",
-  "43210"
+  "43210",
+  "54321",
+  "/dev/ttys001"
 ].join("__AI_CHAT_SHELL_FIELD__"))[0];
 assert.equal(paneWithInstance.sessionCreated, "1784112000");
 assert.equal(paneWithInstance.serverPid, "43210");
+assert.equal(paneWithInstance.panePid, "54321");
+assert.equal(paneWithInstance.paneTty, "/dev/ttys001");
 assert.equal(buildTmuxPaneExecutionTarget(panes[0]), "", "Missing pane-instance metadata must disable dedup rather than reuse an ambiguous identity.");
 assert.equal(buildTmuxPaneExecutionTarget({ ...paneWithInstance, sessionCreated: "" }), "");
 assert.equal(buildTmuxPaneExecutionTarget({ ...paneWithInstance, serverPid: "" }), "");
+assert.equal(buildTmuxPaneExecutionTarget({ ...paneWithInstance, panePid: "" }), "");
 assert.notEqual(
   buildTmuxPaneExecutionTarget(paneWithInstance),
   buildTmuxPaneExecutionTarget({ ...paneWithInstance, serverPid: "43211" }),
   "A recreated tmux server/pane instance must not inherit completed executions."
+);
+assert.notEqual(
+  buildTmuxPaneExecutionTarget(paneWithInstance),
+  buildTmuxPaneExecutionTarget({ ...paneWithInstance, panePid: "54322" }),
+  "A respawned pane shell must not inherit completed executions from the prior shell process."
+);
+assert.equal(
+  buildTmuxPaneExecutionTarget(paneWithInstance),
+  buildTmuxPaneExecutionTarget({
+    ...paneWithInstance,
+    windowIndex: "9",
+    address: "main:9.1",
+    label: "main:9.1 dev"
+  }),
+  "Moving the same immutable tmux pane must preserve its authoritative duplicate fingerprint."
+);
+assert.notEqual(
+  buildTmuxPaneExecutionTarget(paneWithInstance),
+  buildTmuxPaneExecutionTarget({ ...paneWithInstance, id: "%31" }),
+  "Different immutable pane ids must not share an authoritative duplicate fingerprint."
 );
 assert.equal(buildTmuxShellQueueKey(paneWithInstance), buildTmuxShellQueueKey({ ...paneWithInstance }));
 assert.notEqual(
@@ -334,6 +362,36 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
 }
 
 Promise.all([
+  getTmuxPaneReadiness({
+    id: "%missing-pid",
+    currentCommand: "zsh",
+    panePid: "",
+    paneTty: "/dev/ttys999"
+  }).then((readiness) => {
+    assert.equal(readiness.known, false);
+    assert.equal(readiness.ready, false);
+    assert.match(readiness.error, /pane_pid/);
+  }),
+  getTmuxPaneReadiness({
+    id: "%missing-tty",
+    currentCommand: "zsh",
+    panePid: String(process.pid),
+    paneTty: ""
+  }).then((readiness) => {
+    assert.equal(readiness.known, false);
+    assert.equal(readiness.ready, false);
+    assert.match(readiness.error, /pane_tty/);
+  }),
+  getTmuxPaneReadiness({
+    id: "%missing-command",
+    currentCommand: "",
+    panePid: String(process.pid),
+    paneTty: "/dev/ttys999"
+  }).then((readiness) => {
+    assert.equal(readiness.known, false);
+    assert.equal(readiness.ready, false);
+    assert.match(readiness.error, /pane_current_command/);
+  }),
   assert.rejects(
     () => handleMessageText(JSON.stringify({
       type: "run-board",

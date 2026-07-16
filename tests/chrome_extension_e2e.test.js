@@ -14,6 +14,7 @@ const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
 const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
 const E2E_TIMEOUT_MS = 45000;
+const MIN_CHROMIUM_MAJOR = 116;
 const FORCE_HEADLESS = process.env.AI_SHELL_E2E_HEADLESS === "1";
 const STARTUP_SETTLE_MS = 4200;
 const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
@@ -41,7 +42,7 @@ main()
 
 async function main() {
   const chromePath = findChrome();
-  assert.ok(chromePath, "Chrome e2e requires google-chrome, google-chrome-stable, chromium, or chromium-browser on PATH.");
+  assert.ok(chromePath, `Chrome e2e requires a Chromium-family browser version ${MIN_CHROMIUM_MAJOR}+.`);
   assert.ok(commandExists("tmux"), "Chrome e2e requires tmux on PATH.");
   assert.ok(fs.existsSync(EXTENSION_DIR), `Missing extension directory: ${EXTENSION_DIR}`);
   const browserEnv = await setupBrowserEnvironment(chromePath);
@@ -58,7 +59,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      4,
+      6,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -131,7 +132,6 @@ async function main() {
   cleanup.push(() => stopProcess(chrome));
 
   const debugPort = await waitForChromeDebugPort(profileDir);
-  await waitForExtensionTarget(debugPort);
   const pageWsUrl = await waitForChromePageWebSocket(debugPort, "about:blank");
   const page = await CdpClient.connect(pageWsUrl);
   cleanup.push(() => page.close());
@@ -142,6 +142,10 @@ async function main() {
   await waitForEvaluate(page, "document.readyState === 'complete'", "test page load");
   await waitForEvaluate(page, "document.body.innerText.includes('tmux ai-helper test')", "tmux test page content");
   await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status panel");
+  // MV3 service workers start lazily in a clean profile. Loading the matched
+  // page first wakes this extension without relying on an already-installed
+  // copy in the user's normal browser profile.
+  await waitForExtensionTarget(debugPort);
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
   await page.evaluate(`(() => {
@@ -158,6 +162,39 @@ async function main() {
   });
   assert.equal(agentResponse.ok, true);
   assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a" && agent.role === "slave"));
+
+  const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
+  await page.evaluate(`(() => {
+    document.getElementById("command").value = ${JSON.stringify(`printf ${agentTmuxToken}`)};
+    appendAssistantToolCall([
+      "ai-helper-shell-start:agent-tmux-e2e",
+      ${JSON.stringify(`printf ${agentTmuxToken}`)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const agentTmuxText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Shell call result:") &&
+      text.includes("targetName: ForAI-slave-a") &&
+      text.includes(${JSON.stringify(`stdout:\n${agentTmuxToken}`)}) ? text : "";
+  })()`, "agent shell helper uses per-agent tmux");
+  assert.match(agentTmuxText, /targetName: ForAI-slave-a/);
+  try {
+    await waitForEvaluate(page, `(() => {
+      const composer = document.getElementById("composer");
+      const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .some((node) => (node.innerText || "").includes(${JSON.stringify(agentTmuxToken)}));
+      return submitted && !(composer?.innerText || "").trim();
+    })()`, "agent shell output to be submitted before agent delivery tests");
+  } catch (error) {
+    const deliveryState = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      panel: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "")
+    }))()`);
+    throw new Error(`${error.message}; deliveryState=${JSON.stringify(deliveryState)}`);
+  }
 
   const masterPage = await openChromePage(debugPort, TEST_PAGE_URL);
   cleanup.push(() => masterPage.close());
@@ -348,12 +385,22 @@ async function main() {
     composer.dispatchEvent(new Event("input", { bubbles: true }));
     return true;
   })()`, "focus composer for agent delivery");
-  const deliveredText = await waitForEvaluateValue(page, `(() => {
-    const text = document.body.innerText || "";
-    return text.includes(${JSON.stringify(`Message from master for task ${deliveryTaskId}:`)}) &&
-      text.includes(${JSON.stringify(deliveryBody)}) &&
-      text.includes("You are slave-a") ? text : "";
-  })()`, "agent message delivered into local page composer");
+  let deliveredText;
+  try {
+    deliveredText = await waitForEvaluateValue(page, `(() => {
+      const text = document.body.innerText || "";
+      return text.includes(${JSON.stringify(`Message from master for task ${deliveryTaskId}:`)}) &&
+        text.includes(${JSON.stringify(deliveryBody)}) &&
+        text.includes("You are slave-a") ? text : "";
+    })()`, "agent message delivered into local page composer");
+  } catch (error) {
+    const deliveryState = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      panel: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "")
+    }))()`);
+    throw new Error(`${error.message}; deliveryState=${JSON.stringify(deliveryState)}`);
+  }
   assert.match(deliveredText, new RegExp(escapeRegExp(deliveryBody)));
   assert.match(deliveredText, /> ai-helper-agent-message-start/);
   assert.doesNotMatch(deliveredText, /^ai-helper-agent-message-start$/m);
@@ -389,29 +436,13 @@ async function main() {
   const masterAfterDeliveryText = await masterPage.evaluate("document.body.innerText || ''");
   assert.ok(!masterAfterDeliveryText.includes("<your result>"), "browser slave reply template must not auto-send placeholder result to master");
 
-  const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
   await page.evaluate(`(() => {
-    document.getElementById("command").value = ${JSON.stringify(`printf ${agentTmuxToken}`)};
-    appendAssistantToolCall([
-      "ai-helper-shell-start:agent-tmux-e2e",
-      ${JSON.stringify(`printf ${agentTmuxToken}`)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    panel.querySelector("[data-shell-agent-role]").value = "none";
+    panel.querySelector('[data-shell-tool-action="agent-register"]').click();
     return true;
   })()`);
-  const agentTmuxText = await waitForEvaluateValue(page, `(() => {
-    const text = document.body.innerText || "";
-    return text.includes("Shell call result:") &&
-      text.includes("targetName: ForAI-slave-a") &&
-      text.includes(${JSON.stringify(`stdout:\n${agentTmuxToken}`)}) ? text : "";
-  })()`, "agent shell helper uses per-agent tmux");
-  assert.match(agentTmuxText, /targetName: ForAI-slave-a/);
-
-  agentResponse = await sendLocalAgentRequest(page, {
-    type: "agent-unregister",
-    agentId: "slave-a"
-  });
-  assert.equal(agentResponse.ok, true);
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Agent mode disabled")`, "page agent mode to disable before non-agent refresh tests");
 
   const refreshMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-refresh-e2e-${process.pid}-${Date.now()}.txt`);
   const refreshOldToken = `ai-chat-shell-refresh-old-${Date.now()}`;
@@ -420,7 +451,7 @@ async function main() {
   const refreshOldCommand = [
     `printf 'started\\n' > ${shellQuote(refreshMarkerPath)}`,
     `printf '${refreshOldToken}\\n'`,
-    "sleep 15",
+    "sleep 12",
     `printf 'done\\n' >> ${shellQuote(refreshMarkerPath)}`
   ].join("; ");
   await page.evaluate(`(() => {
@@ -435,10 +466,21 @@ async function main() {
     ].join("\\n"), "text");
     return true;
   })()`);
-  await waitFor(
-    () => fs.existsSync(refreshMarkerPath) && fs.readFileSync(refreshMarkerPath, "utf8").includes("started"),
-    "long helper to start before page refresh"
-  );
+  try {
+    await waitFor(
+      () => fs.existsSync(refreshMarkerPath) && fs.readFileSync(refreshMarkerPath, "utf8").includes("started"),
+      "long helper to start before page refresh"
+    );
+  } catch (error) {
+    const diagnostics = await collectDiagnostics(page, debugPort, {
+      chrome,
+      token: refreshOldToken,
+      paneId,
+      command: refreshOldCommand,
+      sessionName
+    });
+    throw new Error(`${error.message}\n\n${diagnostics}`);
+  }
 
   const refreshedUrl = `${TEST_PAGE_URL}?refresh=${Date.now()}`;
   await page.send("Page.navigate", { url: refreshedUrl });
@@ -470,6 +512,68 @@ async function main() {
   assert.match(refreshText, /^queued: true$/m);
   assert.match(refreshText, /^queuedMs: \d+$/m);
   assert.equal(fs.readFileSync(refreshMarkerPath, "utf8"), "started\ndone\n");
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(refreshNewToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "queued post-refresh shell result to be submitted before duplicate recovery checks");
+
+  const refreshMarkerMtimeMs = fs.statSync(refreshMarkerPath).mtimeMs;
+  const refreshDuplicateUiBefore = await page.evaluate(`(() => ({
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    composer: document.getElementById("composer")?.innerText || ""
+  }))()`);
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:refresh-old-output-replay",
+      ${JSON.stringify(refreshOldCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(refreshOldToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "unpresented pre-refresh execution result to be cleanly recovered without re-execution");
+  const refreshDuplicateUiAfter = await page.evaluate(`(() => ({
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    composer: document.getElementById("composer")?.innerText || "",
+    userText: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "").join("\\n")
+  }))()`);
+  assert.equal(refreshDuplicateUiAfter.userCount, refreshDuplicateUiBefore.userCount + 1, "An executed result that was never presented must be recovered exactly once after refresh");
+  assert.equal(refreshDuplicateUiAfter.composer, "", "The cleanly recovered result must finish leaving the composer");
+  assert.ok(refreshDuplicateUiAfter.userText.includes(refreshOldToken));
+  assert.ok(!refreshDuplicateUiAfter.userText.includes("duplicate: true"));
+  assert.ok(!refreshDuplicateUiAfter.userText.includes("skipped: true"));
+  assert.ok(!refreshDuplicateUiAfter.userText.includes("reason: already-executed-on-target"));
+  assert.ok(!refreshDuplicateUiAfter.userText.includes("replayedOutput: true"));
+  assert.equal(fs.statSync(refreshMarkerPath).mtimeMs, refreshMarkerMtimeMs, "duplicate adjudication must not execute the old command again");
+
+  const heartbeatToken = `ai-chat-shell-heartbeat-${Date.now()}`;
+  const heartbeatCommand = `sleep 32; printf '${heartbeatToken}'`;
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:mv3-heartbeat-long-run",
+      ${JSON.stringify(heartbeatCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const heartbeatText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Shell call result:") &&
+      text.includes(${JSON.stringify(`stdout:\n${heartbeatToken}`)}) ? text : "";
+  })()`, "shell helper result after crossing the MV3 30-second idle threshold");
+  assert.ok(heartbeatText.includes(`stdout:\n${heartbeatToken}`));
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(heartbeatToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "heartbeat shell result to be submitted before the next helper");
 
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;
@@ -511,7 +615,17 @@ async function main() {
   assert.match(finalText, /```shell-output/);
   assert.match(finalText, new RegExp(`targetName: ${escapeRegExp(expectedDefaultSession)}:.* ${escapeRegExp(expectedDefaultHostWindow)}`));
   assert.match(finalText, new RegExp(escapeRegExp(`stdout:\n${token}`)));
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(token)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "shell result to be submitted before duplicate adjudication");
 
+  const duplicateUiBefore = await page.evaluate(`(() => ({
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    composer: document.getElementById("composer")?.innerText || ""
+  }))()`);
   await page.evaluate(`(() => {
     appendAssistantToolCall([
       ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
@@ -520,16 +634,21 @@ async function main() {
     ].join("\\n"), "text");
     return true;
   })()`);
-  const duplicateText = await waitForEvaluateValue(page, `(() => {
-    const text = document.body.innerText || "";
-    return text.includes("duplicate: true") &&
-      text.includes("skipped: true") &&
-      text.includes("reason: already-executed-on-target") &&
-      text.includes(${JSON.stringify(command)}) ? text : "";
-  })()`, "new identical helper reaches server duplicate adjudication");
-  assert.match(duplicateText, /duplicate: true/);
-  assert.match(duplicateText, /skipped: true/);
-  assert.match(duplicateText, /reason: already-executed-on-target/);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const text = panel?.innerText || "";
+    return text.includes("Server confirmed duplicate shell command") ||
+      text.includes("lastSkippedReason: server already-executed-on-target");
+  })()`, "new identical helper to receive authoritative local-only duplicate adjudication");
+  const duplicateUiAfter = await page.evaluate(`(() => ({
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    composer: document.getElementById("composer")?.innerText || "",
+    userText: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "").join("\\n")
+  }))()`);
+  assert.equal(duplicateUiAfter.userCount, duplicateUiBefore.userCount, "authoritative duplicate metadata must not be submitted to the model");
+  assert.equal(duplicateUiAfter.composer, duplicateUiBefore.composer, "authoritative duplicate metadata must not enter the composer");
+  assert.ok(!duplicateUiAfter.userText.includes("duplicate: true"));
+  assert.ok(!duplicateUiAfter.userText.includes("reason: already-executed-on-target"));
 
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "shell-helper-result.png"));
@@ -586,16 +705,16 @@ async function main() {
 
 function findChrome() {
   const envPath = process.env.CHROME_BIN || process.env.GOOGLE_CHROME_BIN;
-  if (envPath && fs.existsSync(envPath)) {
+  if (envPath && fs.existsSync(envPath) && isSupportedChromiumBinary(envPath)) {
     return envPath;
   }
   const playwrightChromium = findPlaywrightChromium();
-  if (playwrightChromium) {
+  if (playwrightChromium && isSupportedChromiumBinary(playwrightChromium)) {
     return playwrightChromium;
   }
   for (const command of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]) {
     const result = spawnSync("which", [command], { encoding: "utf8" });
-    if (result.status === 0 && result.stdout.trim()) {
+    if (result.status === 0 && result.stdout.trim() && isSupportedChromiumBinary(result.stdout.trim())) {
       return result.stdout.trim();
     }
   }
@@ -605,11 +724,20 @@ function findChrome() {
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
   ]) {
-    if (fs.existsSync(appPath)) {
+    if (fs.existsSync(appPath) && isSupportedChromiumBinary(appPath)) {
       return appPath;
     }
   }
   return "";
+}
+
+function isSupportedChromiumBinary(binaryPath) {
+  const result = spawnSync(binaryPath, ["--version"], {
+    encoding: "utf8",
+    timeout: 3000
+  });
+  const match = `${result.stdout || ""} ${result.stderr || ""}`.match(/\b(\d+)\./);
+  return result.status === 0 && Number(match?.[1] || 0) >= MIN_CHROMIUM_MAJOR;
 }
 
 function findPlaywrightChromium() {
@@ -842,6 +970,7 @@ async function waitForExtensionTarget(debugPort) {
 async function collectDiagnostics(page, debugPort, details) {
   const bodyText = await page.evaluate("(document.body && document.body.innerText || '').slice(0, 6000)").catch((error) => `body unavailable: ${error.message}`);
   const statusText = await page.evaluate(`document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || ""`).catch((error) => `status unavailable: ${error.message}`);
+  const helperDebugText = await page.evaluate(`document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || ""`).catch((error) => `helper debug unavailable: ${error.message}`);
   const targets = await fetchHttpJson(`http://127.0.0.1:${debugPort}/json/list`).catch((error) => [{ error: error.message }]);
   const health = await getShellServerHealth().catch((error) => ({ error: error.message }));
   const tmuxPanes = runTmuxBestEffort(["list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{window_name} #{pane_current_command}"]);
@@ -853,6 +982,7 @@ async function collectDiagnostics(page, debugPort, details) {
     `command: ${details.command}`,
     `session: ${details.sessionName}`,
     `extension status: ${statusText || "(empty)"}`,
+    `helper scanner debug: ${helperDebugText || "(empty)"}`,
     `shell server health: ${JSON.stringify(health)}`,
     `tmux panes:\n${tmuxPanes || "(unavailable)"}`,
     `chrome targets:\n${targetUrls}`,
@@ -1010,6 +1140,7 @@ class CdpClient {
         return;
       }
       this.pending.delete(message.id);
+      clearTimeout(pending.timeout);
       if (message.error) {
         pending.reject(new Error(`${message.error.message || "CDP error"} (${message.error.code || "unknown"})`));
       } else {
@@ -1018,6 +1149,7 @@ class CdpClient {
     });
     ws.addEventListener("close", () => {
       for (const pending of this.pending.values()) {
+        clearTimeout(pending.timeout);
         pending.reject(new Error("CDP websocket closed"));
       }
       this.pending.clear();
@@ -1038,7 +1170,12 @@ class CdpClient {
     this.nextId += 1;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} timed out`));
+      }, E2E_TIMEOUT_MS);
+      timeout.unref?.();
+      this.pending.set(id, { resolve, reject, timeout });
       this.ws.send(payload);
     });
   }

@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const {
   handleMessageText,
   listTmuxPanes,
@@ -65,6 +65,98 @@ async function main() {
   assert.equal(success.executionCompleted, false);
   assert.equal(success.completionObserved, true);
 
+  const promptReturnedOwner = Buffer.from(JSON.stringify({
+    version: 1,
+    token: `board-prompt-returned-${Date.now()}`,
+    socketPath,
+    serverPid: String(successPane.serverPid || ""),
+    paneId: successPane.id,
+    kind: "board",
+    processPid: process.pid,
+    boardState: "prompt-returned",
+    createdAt: Date.now()
+  }), "utf8").toString("base64url");
+  runTmux(["set-option", "-p", "-t", successPane.id, "@ai_chat_shell_exec_owner", promptReturnedOwner]);
+  const afterPromptReturnedLease = await runTmuxBoard({
+    cmd: "printf 'board-prompt-returned-lease-ok\\n'",
+    pane: successPane,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  });
+  assert.match(afterPromptReturnedLease.stdout, /board-prompt-returned-lease-ok/);
+
+  const stalePreflightOwner = Buffer.from(JSON.stringify({
+    version: 1,
+    token: `board-stale-preflight-${Date.now()}`,
+    socketPath,
+    serverPid: String(successPane.serverPid || ""),
+    paneId: successPane.id,
+    kind: "board",
+    createdAt: Date.now() - 6000
+  }), "utf8").toString("base64url");
+  runTmux(["set-option", "-p", "-t", successPane.id, "@ai_chat_shell_exec_owner", stalePreflightOwner]);
+  const afterStalePreflight = await runTmuxBoard({
+    cmd: "printf 'board-stale-preflight-recovered\\n'",
+    pane: successPane,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  });
+  assert.match(afterStalePreflight.stdout, /board-stale-preflight-recovered/);
+
+  const stalePreparedLog = path.join(tmpDir, "stale-prepared-board.log");
+  fs.writeFileSync(stalePreparedLog, "");
+  const stalePreparedOwner = Buffer.from(JSON.stringify({
+    version: 1,
+    token: `board-stale-prepared-${Date.now()}`,
+    socketPath,
+    serverPid: String(successPane.serverPid || ""),
+    paneId: successPane.id,
+    kind: "board",
+    createdAt: Date.now() - 6000,
+    processPid: 99999999,
+    boardLogPath: stalePreparedLog,
+    boardOffset: 0,
+    boardPrompt: "BOARD>",
+    boardShellPrompt: true,
+    boardState: "prepared"
+  }), "utf8").toString("base64url");
+  runTmux(["set-option", "-p", "-t", successPane.id, "@ai_chat_shell_exec_owner", stalePreparedOwner]);
+  const afterStalePrepared = await runTmuxBoard({
+    cmd: "printf 'board-stale-prepared-recovered\\n'",
+    pane: successPane,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  });
+  assert.match(afterStalePrepared.stdout, /board-stale-prepared-recovered/);
+
+  const staleSentLog = path.join(tmpDir, "stale-sent-board.log");
+  fs.writeFileSync(staleSentLog, "completed output\nBOARD> ");
+  const oldLogTime = new Date(Date.now() - 2000);
+  fs.utimesSync(staleSentLog, oldLogTime, oldLogTime);
+  const staleSentOwner = Buffer.from(JSON.stringify({
+    version: 1,
+    token: `board-stale-sent-${Date.now()}`,
+    socketPath,
+    serverPid: String(successPane.serverPid || ""),
+    paneId: successPane.id,
+    kind: "board",
+    createdAt: Date.now() - 6000,
+    processPid: process.pid,
+    boardLogPath: staleSentLog,
+    boardOffset: 0,
+    boardPrompt: "BOARD>",
+    boardShellPrompt: true,
+    boardState: "sent"
+  }), "utf8").toString("base64url");
+  runTmux(["set-option", "-p", "-t", successPane.id, "@ai_chat_shell_exec_owner", staleSentOwner]);
+  const afterStaleSent = await runTmuxBoard({
+    cmd: "printf 'board-stale-sent-recovered\\n'",
+    pane: successPane,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  });
+  assert.match(afterStaleSent.stdout, /board-stale-sent-recovered/);
+
   const handledSuccess = await handleMessageText(JSON.stringify({
     type: "run-board",
     id: "board-handler-success-first",
@@ -121,7 +213,6 @@ async function main() {
   }));
   assert.equal(timedOutBoard.timedOut, true, JSON.stringify(timedOutBoard));
   assert.equal(timedOutBoard.executionCompleted, false, JSON.stringify(timedOutBoard));
-  await sleep(2500);
   const timeoutRetry = await handleMessageText(JSON.stringify({
     type: "run-board",
     id: "board-handler-timeout-retry",
@@ -134,6 +225,79 @@ async function main() {
   assert.equal(timeoutRetry.executionCompleted, false, JSON.stringify(timeoutRetry));
   assert.equal(timeoutRetry.completionObserved, true, JSON.stringify(timeoutRetry));
 
+  const serializationPath = path.join(tmpDir, "board-serialization-order.txt");
+  const serializedLeaderStartedAt = Date.now();
+  const serializedLeader = handleMessageText(JSON.stringify({
+    type: "run-board",
+    id: "board-handler-serialized-leader",
+    callKey: `board-handler-serialized-leader-${Date.now()}`,
+    cmd: `printf 'leader-start\\n' >> ${serializationPath}; sleep 2; printf 'leader-end\\n' >> ${serializationPath}`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }));
+  await sleep(1200);
+  const serializedFollowerStartedAt = Date.now();
+  const serializedFollower = handleMessageText(JSON.stringify({
+    type: "run-board",
+    id: "board-handler-serialized-follower",
+    callKey: `board-handler-serialized-follower-${Date.now()}`,
+    cmd: `printf 'follower\\n' >> ${serializationPath}`,
+    timeoutMs: 5000,
+    maxOutputChars: 20000
+  }));
+  const [leaderResult, followerResult] = await Promise.all([serializedLeader, serializedFollower]);
+  assert.equal(leaderResult.timedOut, true, JSON.stringify(leaderResult));
+  assert.equal(leaderResult.completionObserved, true, JSON.stringify(leaderResult));
+  assert.equal(followerResult.ok, true, JSON.stringify(followerResult));
+  assert.equal(
+    fs.readFileSync(serializationPath, "utf8"),
+    "leader-start\nleader-end\nfollower\n",
+    "A follower must not be injected after the response timeout while the first board command still owns the pane."
+  );
+  assert.ok(
+    Date.now() - serializedFollowerStartedAt >= 1500,
+    "The follower should remain queued until the long-running leader returns to its prompt."
+  );
+  assert.ok(Date.now() - serializedLeaderStartedAt >= 2000);
+
+  const restartOrderPath = path.join(tmpDir, "board-restart-order.txt");
+  const childScript = [
+    `const { runTmuxBoard } = require(${JSON.stringify(path.join(__dirname, "../server/shell_server.js"))});`,
+    `const pane = ${JSON.stringify(successPane)};`,
+    `runTmuxBoard({ cmd: ${JSON.stringify(`printf 'restart-leader-start\\n' >> ${restartOrderPath}; sleep 2; printf 'restart-leader-end\\n' >> ${restartOrderPath}`)}, pane, timeoutMs: 1000, maxOutputChars: 20000 })`,
+    `.then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });`
+  ].join("\n");
+  const previousOwner = spawn(process.execPath, ["-e", childScript], {
+    env: {
+      ...process.env,
+      AI_CHAT_SHELL_TMUX_SOCKET: socketPath,
+      AI_CHAT_SHELL_TMUX_SESSION: "board_success"
+    },
+    stdio: "ignore"
+  });
+  await waitForFileContains(restartOrderPath, "restart-leader-start", 10000);
+  previousOwner.kill("SIGKILL");
+  await waitForChildExit(previousOwner);
+  const restartFollowerStartedAt = Date.now();
+  const restartFollower = await handleMessageText(JSON.stringify({
+    type: "run-board",
+    id: "board-handler-restart-follower",
+    callKey: `board-handler-restart-follower-${Date.now()}`,
+    cmd: `printf 'restart-follower\\n' >> ${restartOrderPath}`,
+    timeoutMs: 5000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(restartFollower.ok, true, JSON.stringify(restartFollower));
+  assert.equal(
+    fs.readFileSync(restartOrderPath, "utf8"),
+    "restart-leader-start\nrestart-leader-end\nrestart-follower\n",
+    "A fresh server process must adopt the persistent board lease and wait for the old command's prompt."
+  );
+  assert.ok(
+    Date.now() - restartFollowerStartedAt >= 1500,
+    "Persistent board ownership should survive the process that originally dispatched the command."
+  );
+
   const promptSpoofCommand = "printf 'BOARD> '; sleep 2; printf 'ACTUALLY_DONE\\n'";
   const promptSpoofFirst = await handleMessageText(JSON.stringify({
     type: "run-board",
@@ -144,8 +308,8 @@ async function main() {
     maxOutputChars: 20000
   }));
   assert.equal(promptSpoofFirst.executionCompleted, false, JSON.stringify(promptSpoofFirst));
-  assert.ok(promptSpoofFirst.durationMs < 1800, "The spoofed prompt was observed before the two-second command actually completed.");
-  await sleep(2500);
+  assert.ok(promptSpoofFirst.durationMs >= 2000, "Prompt-like command output must not release a shell-backed board pane before its foreground process exits.");
+  assert.match(promptSpoofFirst.stdout, /ACTUALLY_DONE/);
   const promptSpoofRetry = await handleMessageText(JSON.stringify({
     type: "run-board",
     id: "board-handler-prompt-spoof-retry",
@@ -253,4 +417,26 @@ function commandExists(command) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForFileContains(filePath, needle, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath) && fs.readFileSync(filePath, "utf8").includes(needle)) {
+      return;
+    }
+    await sleep(50);
+  }
+  throw new Error(`Timed out waiting for ${needle} in ${filePath}.`);
+}
+
+function waitForChildExit(child) {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", resolve);
+    child.once("error", reject);
+  });
 }

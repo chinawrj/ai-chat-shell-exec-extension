@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.9.0] - 2026-07-16
+
+- Persists per-pane runner ownership in tmux so a restarted shell server adopts or waits for the existing runner instead of injecting a second command into a busy pane; manually started child processes are held until their foreground process group exits or is interrupted.
+- Detects nested `zsh/sh -c` foreground jobs from the pane PID/TTY process tree, fails closed with a retryable result when that readiness metadata cannot be proved, and submits each literal command plus Enter in one tmux client transaction so a server crash cannot leave a half-entered helper launcher. A blocking builtin executed by the root interactive shell itself is not externally distinguishable from its prompt without shell-hook integration, so it must be placed in a script/child shell or run in a dedicated pane.
+- Moves authoritative cwd capture and duplicate claims to the actual queue head, after pane-idle and pane-instance revalidation, and keeps direct Terminal vision runs in the same non-preemptive pane queue.
+- Persists a non-authoritative queued reservation before a request waits for its pane, binds that reservation to persistent pane ownership before queue-head adjudication, and preserves all nonterminal ledger attempts under count pruning. Read-only status recovery can therefore find queued/running work across a server crash without granting it duplicate authority; actual cwd and the execution fingerprint are attached only at the revalidated queue head, and a late handler failure cannot downgrade an already completed attempt.
+- Returns pre-execution Ctrl+C promptly as exit 130 but retryable, while preserving post-execution Ctrl+C as completed history eligible for authoritative server dedup.
+- Stores bounded completed shell results in the server ledger and adds a read-only status query so a surviving page can recover from MV3 service-worker/channel loss without sending the command again; a full page reload instead relies on the persistent pane lease plus authoritative backend adjudication and clean result recovery when the helper is rendered again.
+- Gives each real execution a canonical `executionId` plus a server presentation receipt: already-presented duplicates stay entirely in the local panel, while a result never presented before refresh is restored as a clean original result without `duplicate`, `skipped`, replay, or reason diagnostics entering the model.
+- Extends authoritative pane fingerprints with the current pane shell PID so `tmux respawn-pane` cannot inherit stale duplicate history, fails dedup open when that identity is missing, and makes canonical presentation receipts monotonic for read-only recovery of already-persisted duplicate attempts.
+- Persists bounded per-tab pending shell/board replies before composer delivery, retries only that local delivery after composer/send failures or same-page reload, and never resends the same rendered command after a backend response.
+- Keeps long WebSocket operations alive with 20-second heartbeats and requires Chrome 116+, whose extension service workers support this lifecycle pattern.
+- Isolates helper calls across SPA navigation, reload, and enable/disable lifecycle changes; ignores hidden stale streaming controls and lets an unexpected helper cancel a pending self-test instead of permanently consuming the helper.
+- Releases the frontend execution lock as soon as a result is inserted, and makes composer auto-send verify exact text ownership immediately before every click/form/keyboard side effect so overwritten drafts cannot be sent.
+- Keeps an assistant helper unconsumed while an agent message owns the composer, recognizes agent prompts that the page/user already submitted so they are acked without reinsertion, and makes page-agent profile changes immediately cancel the old delivery lifecycle.
+- Serializes board delivery with the same immutable-pane/persistent-owner mechanism, replaces the mutating prompt probe with a stable read-only check, and retains the lease past a response timeout. Shell-backed board panes add foreground-process-group proof; a generic non-shell TUI exposes only spoofable prompt text, so its prompt-based serialization is best effort and is never duplicate authority.
+- Recovers long board results through a kind-scoped read-only status query after runtime loss without resending `run-board`; captured prompt-return results remain replayable but keep an empty execution key and can never suppress a later explicit board command.
+- Makes identical agent-message response-loss retries idempotent without redelivering to web or tmux-ai recipients, while payload changes under the same message id remain conflicts; rejected-helper feedback now shares the exact composer FIFO and draft-preservation safeguards.
+- Recovers stale pre-dispatch direct-visual leases without executing buffered text, keeps Terminal vision self-test ownership across its OCR phase, ignores late client-socket resets, and bounds total replay payload retained in the persistent ledger.
+- Bumps the server protocol to 6 and adds real tmux, server-restart, result-recovery, Ctrl+C, browser-refresh, clean unpresented-result replay, local-only delivered-duplicate, board status recovery, and over-30-second Chromium regressions.
+
 ## [0.8.9] - 2026-07-15
 
 - Serializes shell helper runners per resolved tmux pane so a helper submitted after refreshing a page cannot be typed into a pane still occupied by the old page's long-running command.

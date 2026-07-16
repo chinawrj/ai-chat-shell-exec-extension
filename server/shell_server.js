@@ -15,7 +15,7 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_COMMAND_CHARS = 8000;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 4;
+const SERVER_PROTOCOL_VERSION = 6;
 const HELPER_PROTOCOL_VERSION = 2;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -29,6 +29,8 @@ const STATE_STDERR_LOG_PATH = path.join(STATE_DIR, "shell-server.err.log");
 const STATE_REQUIRED_SUBDIRS = ["tmux-runs", "board-panes", "vision", "agent-replies", "bin"];
 const SERVER_LEDGER_LIMIT = 1000;
 const SERVER_LEDGER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SERVER_LEDGER_OUTPUT_LIMIT = 200000;
+const SERVER_LEDGER_REPLAY_BUDGET_BYTES = 10 * 1024 * 1024;
 const TMUX_FIELD_SEPARATOR = "__AI_CHAT_SHELL_FIELD__";
 const TMUX_LIST_FORMAT = [
   "#{pane_id}",
@@ -40,10 +42,16 @@ const TMUX_LIST_FORMAT = [
   "#{pane_current_path}",
   "#{pane_current_command}",
   "#{session_created}",
-  "#{pid}"
+  "#{pid}",
+  "#{pane_pid}",
+  "#{pane_tty}"
 ].join(TMUX_FIELD_SEPARATOR);
 const TMUX_CAPTURE_HISTORY_LINES = 20000;
 const TMUX_POLL_INTERVAL_MS = 250;
+const TMUX_PANE_OWNER_OPTION = "@ai_chat_shell_exec_owner";
+const TMUX_PANE_OWNER_VERSION = 1;
+const TMUX_PANE_OWNER_LAUNCH_GRACE_MS = 5000;
+const INTERACTIVE_SHELL_COMMANDS = new Set(["bash", "dash", "fish", "ksh", "sh", "zsh"]);
 const DEFAULT_TMUX_SESSION_NAME = "ForAI";
 const DEFAULT_HOST_WINDOW_NAME = "host";
 const DEFAULT_BOARD_WINDOW_NAME = "board";
@@ -134,6 +142,13 @@ server.on("upgrade", (req, socket) => {
   let frameBuffer = Buffer.alloc(0);
   let requestInFlight = false;
 
+  socket.on("error", (error) => {
+    // A page refresh or service-worker restart may close the client while the
+    // tmux command is still running. The command lifecycle belongs to the
+    // server ledger, so a late socket error must never terminate the server.
+    console.log(`[socket] client disconnected: ${error.message || String(error)}`);
+  });
+
   socket.on("data", (chunk) => {
     if (requestInFlight) {
       return;
@@ -152,27 +167,37 @@ server.on("upgrade", (req, socket) => {
       requestInFlight = true;
       handleMessageText(message)
         .then((response) => {
-          socket.write(encodeTextFrame(JSON.stringify(response)));
-          socket.end();
+          writeWebSocketResponse(socket, response);
         })
         .catch((error) => {
           console.error(`[error] ${error.message || String(error)}`);
-          socket.write(encodeTextFrame(JSON.stringify({
+          writeWebSocketResponse(socket, {
             ok: false,
             error: error.message || String(error)
-          })));
-          socket.end();
+          });
         });
     } catch (error) {
       console.error(`[error] ${error.message || String(error)}`);
-      socket.write(encodeTextFrame(JSON.stringify({
+      writeWebSocketResponse(socket, {
         ok: false,
         error: error.message || String(error)
-      })));
-      socket.end();
+      });
     }
   });
 });
+
+function writeWebSocketResponse(socket, response) {
+  if (!socket || socket.destroyed || socket.writable !== true) {
+    return false;
+  }
+  try {
+    socket.end(encodeTextFrame(JSON.stringify(response)));
+    return true;
+  } catch (error) {
+    console.log(`[socket] response could not be delivered: ${error.message || String(error)}`);
+    return false;
+  }
+}
 
 if (require.main === module) {
   startServer();
@@ -392,6 +417,14 @@ async function handleMessageText(text) {
     });
   }
 
+  if (message.type === "run-status") {
+    return handleRunStatusMessage(message);
+  }
+
+  if (message.type === "run-result-presented") {
+    return handleRunResultPresentedMessage(message);
+  }
+
   if (message.type === "tmux-ensure") {
     return withProtocolMetadata(await ensureForAiTmuxLayout());
   }
@@ -440,85 +473,117 @@ async function handleMessageText(text) {
     return buildDefaultTargetErrorResponse(message, cmd, panes, config);
   }
 
-  const cwd = resolveCwd(message.cwd, pane.currentPath);
+  const started = Date.now();
+  const force = message.callMeta?.force === true || message.force === true;
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([
     pane.id,
     cmd,
-    cwd,
+    String(message.cwd || ""),
     timeoutMs,
     maxOutputChars
   ].join("\n")));
-  const started = Date.now();
-  const force = message.callMeta?.force === true || message.force === true;
-  const claim = claimServerShellCall(callKey, {
+  const reservation = reserveServerShellCall(callKey, {
+    kind: "shell",
     cmd,
-    cwd,
     target: pane.id,
-    executionTarget: buildTmuxPaneExecutionTarget(pane),
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
     callMeta: message.callMeta || {},
     force
   });
-
-  if (claim.action === "skip") {
-    console.log(`[duplicate] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
-    return buildExecutedDuplicateResponse({
-      message,
-      callKey,
-      claim,
-      cmd,
-      cwd,
-      pane,
-      timeoutMs
-    });
-  }
-
+  let claim = null;
   try {
-    console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${pane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
-    const result = await runTmuxShellQueued({
+    return await withTmuxShellPaneQueue({
       cmd,
-      cwd,
       pane,
-      timeoutMs,
-      maxOutputChars
-    });
-    console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
-
-    const response = {
-      ok: true,
-      id: message.id,
-      callKey,
-      agentId: config.agentId || "",
-      cmd,
-      cwd,
-      target: pane.id,
-      targetName: pane.label,
-      timeoutMs,
-      durationMs: Date.now() - started,
-      ...result
-    };
-    if (isConfirmedTmuxExecution(result)) {
-      completeServerShellCall(claim.ledgerKey, response);
-    } else {
-      failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Shell command execution was not confirmed complete."), {
-        durationMs: Date.now() - started
+      ledgerKey: reservation.ledgerKey
+    }, async (queueContext) => {
+      const currentPane = queueContext.currentPane;
+      await updatePersistentTmuxPaneOwner(queueContext.owner, {
+        ledgerKey: reservation.ledgerKey
       });
-    }
-    return response;
+      const cwd = resolveCwd(message.cwd, currentPane.currentPath);
+      claim = adjudicateReservedServerShellCall(reservation.ledgerKey, {
+        cmd,
+        cwd,
+        target: currentPane.id,
+        executionTarget: buildTmuxPaneExecutionTarget(currentPane),
+        timeoutMs,
+        maxOutputChars,
+        seq: message.seq,
+        callMeta: message.callMeta || {},
+        force
+      });
+
+      if (claim.action === "skip") {
+        console.log(`[duplicate] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${currentPane.id} cmd=${JSON.stringify(cmd)}`);
+        const response = buildExecutedDuplicateResponse({
+          message,
+          callKey,
+          claim,
+          cmd,
+          cwd,
+          pane: currentPane,
+          timeoutMs
+        });
+        completeServerShellCall(reservation.ledgerKey, {
+          ...response,
+          queued: queueContext.queued,
+          queuedMs: queueContext.queuedMs
+        });
+        return response;
+      }
+
+      console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${currentPane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
+      const result = await runTmuxShell({
+        cmd,
+        cwd,
+        pane: currentPane,
+        timeoutMs,
+        maxOutputChars,
+        ownerContext: queueContext.owner,
+        ledgerKey: claim.ledgerKey
+      });
+      console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
+
+      const response = {
+        ok: true,
+        id: message.id,
+        callKey,
+        executionId: claim.attemptId,
+        agentId: config.agentId || "",
+        cmd,
+        cwd,
+        target: currentPane.id,
+        targetName: currentPane.label,
+        timeoutMs,
+        durationMs: Date.now() - started,
+        ...result,
+        queued: queueContext.queued,
+        queuedMs: queueContext.queuedMs
+      };
+      if (isConfirmedTmuxExecution(result)) {
+        completeServerShellCall(claim.ledgerKey, response);
+      } else {
+        failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Shell command execution was not confirmed complete."), {
+          durationMs: Date.now() - started
+        });
+      }
+      return response;
+    });
   } catch (error) {
-    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(claim?.ledgerKey || reservation.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
 
 async function runTmuxShellQueued(options) {
   return withTmuxShellPaneQueue(options, async (queueContext) => {
-    const currentPane = await verifyTmuxShellPaneBeforeDispatch(options?.pane, queueContext);
     return runTmuxShell({
       ...options,
-      pane: currentPane
+      pane: queueContext.currentPane,
+      ownerContext: queueContext.owner
     });
   });
 }
@@ -540,17 +605,43 @@ async function withTmuxShellPaneQueue(options, task) {
       console.log(`[queued] target=${options?.pane?.id || ""} cmd=${JSON.stringify(options?.cmd || "")}`);
       await previousSlot;
     }
-    const queuedMs = Date.now() - queuedAt;
-    const result = await task({
-      queued: Boolean(previousSlot),
-      queuedMs,
-      socketPath
+    const currentPane = await verifyTmuxShellPaneBeforeDispatch(options?.pane, { socketPath, queued: Boolean(previousSlot) });
+    const owner = await acquirePersistentTmuxPaneOwner(currentPane, {
+      socketPath,
+      kind: options?.kind || "shell",
+      cmd: options?.cmd || "",
+      ledgerKey: options?.ledgerKey || options?.reservationLedgerKey || ""
     });
-    return {
-      ...result,
-      queued: Boolean(previousSlot),
-      queuedMs
-    };
+    try {
+      const queuedMs = Date.now() - queuedAt;
+      const result = await task({
+        queued: Boolean(previousSlot) || owner.waited,
+        queuedMs,
+        socketPath,
+        currentPane: owner.pane,
+        owner
+      });
+      return {
+        ...result,
+        queued: Boolean(previousSlot) || owner.waited,
+        queuedMs
+      };
+    } finally {
+      let released = false;
+      try {
+        released = await releasePersistentTmuxPaneOwner(owner);
+      } catch (error) {
+        console.error(`[tmux-owner] failed to release owner for ${currentPane.id}: ${error.message || String(error)}`);
+      }
+      if (released) {
+        cleanupPersistentTmuxOwnerFiles(owner);
+      } else {
+        // A surviving pane option is the recovery lease. Keep its pid/status/
+        // executed files intact so a later server can settle it without
+        // destroying authoritative completion proof.
+        console.error(`[tmux-owner] retained recovery files because owner release was not confirmed for ${currentPane.id}`);
+      }
+    }
   } finally {
     releaseSlot();
     if (tmuxShellPaneQueues.get(queueKey) === currentSlot) {
@@ -587,7 +678,7 @@ async function verifyTmuxShellPaneBeforeDispatch(expectedPane = {}, queueContext
     throw new Error("Queued tmux target is missing its immutable pane id. Submit the helper again.");
   }
 
-  const currentPane = (await listTmuxPanes()).find((pane) => pane.id === expectedPane.id);
+  const currentPane = (await listTmuxPanes({ quiet: queueContext.quiet === true })).find((pane) => pane.id === expectedPane.id);
   if (!currentPane) {
     throw new Error(`Queued tmux pane ${expectedPane.id} no longer exists. Submit the helper again against the current target.`);
   }
@@ -604,6 +695,488 @@ async function verifyTmuxShellPaneBeforeDispatch(expectedPane = {}, queueContext
     throw new Error(`Cannot safely verify queued tmux pane ${expectedPane.id} because server instance metadata is missing. Submit the helper again.`);
   }
   return currentPane;
+}
+
+async function acquirePersistentTmuxPaneOwner(expectedPane, { socketPath, kind = "shell", cmd = "", ledgerKey = "" } = {}) {
+  let waited = false;
+  let readySince = 0;
+  let lastWaitLogAt = 0;
+  let lastWaitCommand = "";
+  while (true) {
+    const pane = await verifyTmuxShellPaneBeforeDispatch(expectedPane, { socketPath, queued: waited, quiet: waited });
+    const existing = await readPersistentTmuxPaneOwner(pane);
+    if (existing) {
+      const readiness = await getTmuxPaneReadiness(pane);
+      if (!readiness.known) {
+        throw new Error(`Cannot safely wait behind the existing tmux pane owner for ${pane.id}: ${readiness.error || "process-group metadata is unavailable"}. Submit the helper again after tmux pane metadata is available.`);
+      }
+      waited = true;
+      readySince = 0;
+      const settled = await settlePersistentTmuxPaneOwner(existing, pane, socketPath);
+      if (!settled) {
+        await sleep(TMUX_POLL_INTERVAL_MS);
+      }
+      continue;
+    }
+
+    if (kind !== "board") {
+      const readiness = await getTmuxPaneReadiness(pane);
+      if (!readiness.known) {
+        throw new Error(`Cannot safely verify that tmux pane ${pane.id} is idle: ${readiness.error || "process-group metadata is unavailable"}. Submit the helper again after tmux pane metadata is available.`);
+      }
+      if (!readiness.ready) {
+        waited = true;
+        readySince = 0;
+        const currentCommand = pane.currentCommand || "";
+        if (currentCommand !== lastWaitCommand || Date.now() - lastWaitLogAt >= 5000) {
+          console.log(`[tmux-owner] waiting for foreground command target=${pane.id} currentCommand=${JSON.stringify(currentCommand)}`);
+          lastWaitCommand = currentCommand;
+          lastWaitLogAt = Date.now();
+        }
+        await sleep(TMUX_POLL_INTERVAL_MS);
+        continue;
+      }
+    }
+    readySince = readySince || Date.now();
+    if (Date.now() - readySince < TMUX_POLL_INTERVAL_MS) {
+      await sleep(TMUX_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    const owner = {
+      version: TMUX_PANE_OWNER_VERSION,
+      token: crypto.randomBytes(16).toString("hex"),
+      socketPath,
+      serverPid: String(pane.serverPid || ""),
+      paneId: pane.id,
+      kind,
+      cmdHash: cmd ? hashText(cmd) : "",
+      ledgerKey,
+      createdAt: Date.now()
+    };
+    if (await tryClaimPersistentTmuxPaneOwner(pane, owner)) {
+      return {
+        ...owner,
+        pane,
+        waited
+      };
+    }
+    waited = true;
+    await sleep(TMUX_POLL_INTERVAL_MS);
+  }
+}
+
+async function isTmuxPaneReadyForHelper(pane = {}) {
+  return (await getTmuxPaneReadiness(pane)).ready;
+}
+
+async function getTmuxPaneReadiness(pane = {}) {
+  const command = path.basename(String(pane.currentCommand || "").replace(/^-/, ""));
+  if (!command) {
+    return { known: false, ready: false, error: "pane_current_command is missing" };
+  }
+  if (!INTERACTIVE_SHELL_COMMANDS.has(command) && command !== path.basename(SHELL_RUNNER)) {
+    return { known: true, ready: false, error: "a foreground command owns the pane" };
+  }
+  if (!pane.panePid) {
+    return { known: false, ready: false, error: "pane_pid is missing" };
+  }
+  if (!normalizeProcessTty(pane.paneTty)) {
+    return { known: false, ready: false, error: "pane_tty is missing" };
+  }
+  const processGroups = await readTmuxPaneProcessGroups(pane.panePid, pane.paneTty);
+  if (!processGroups.known) {
+    return { known: false, ready: false, error: "foreground process-group identity is unavailable" };
+  }
+  return {
+    known: true,
+    ready: processGroups.shellPgid === processGroups.foregroundPgid,
+    error: processGroups.shellPgid === processGroups.foregroundPgid ? "" : "a foreground process group owns the pane"
+  };
+}
+
+async function readTmuxPaneProcessGroups(panePid, paneTty = "") {
+  const pid = Number(panePid || 0);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { known: false, shellPgid: 0, foregroundPgid: 0 };
+  }
+
+  const normalizedTty = normalizeProcessTty(paneTty);
+  if (!normalizedTty) {
+    return { known: false, shellPgid: 0, foregroundPgid: 0 };
+  }
+  let result = normalizedTty
+    ? await runCommandRaw("ps", ["-t", normalizedTty, "-o", "pid=,ppid=,pgid=,tpgid=,tty=,comm="], {
+      timeoutMs: 2000,
+      maxOutputChars: 20000
+    })
+    : { ok: false, stdout: "" };
+  if (!result.ok || !String(result.stdout || "").trim()) {
+    // `ps -t` differs slightly across Darwin and procps. The all-process
+    // fallback keeps the readiness proof portable while filtering strictly by
+    // the tmux pane's controlling tty below.
+    result = await runCommandRaw("ps", ["-axo", "pid=,ppid=,pgid=,tpgid=,tty=,comm="], {
+      timeoutMs: 2000,
+      maxOutputChars: 1000000
+    });
+  }
+
+  const rows = parseProcessGroupRows(result.stdout).filter((row) =>
+    !normalizedTty || normalizeProcessTty(row.tty) === normalizedTty
+  );
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  let shellProcess = byPid.get(pid) || null;
+  if (!shellProcess && rows.length > 0) {
+    shellProcess = rows.find((row) =>
+      INTERACTIVE_SHELL_COMMANDS.has(path.basename(row.command).replace(/^-/, "")) &&
+      !byPid.has(row.ppid)
+    ) || null;
+  }
+  if (shellProcess) {
+    // pane_pid is normally tmux's first child, but walk tty-local parents so a
+    // platform/version that reports the foreground child shell cannot make a
+    // nested `zsh -c` or `sh script` look like the interactive prompt.
+    const visited = new Set();
+    while (byPid.has(shellProcess.ppid) && !visited.has(shellProcess.pid)) {
+      visited.add(shellProcess.pid);
+      shellProcess = byPid.get(shellProcess.ppid);
+    }
+  }
+
+  const foregroundPgid = rows.find((row) => row.tpgid > 0)?.tpgid || 0;
+  const shellPgid = shellProcess?.pgid || 0;
+  return {
+    known: result.ok && shellPgid > 0 && foregroundPgid > 0,
+    shellPgid,
+    foregroundPgid
+  };
+}
+
+function normalizeProcessTty(value) {
+  return String(value || "").trim().replace(/^\/dev\//, "");
+}
+
+function parseProcessGroupRows(output) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(\d+)\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(\S+)\s+(.+)$/);
+      return match ? {
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        pgid: Number(match[3]),
+        tpgid: Number(match[4]),
+        tty: match[5],
+        command: match[6]
+      } : null;
+    })
+    .filter(Boolean);
+}
+
+async function readPersistentTmuxPaneOwner(pane = {}) {
+  if (!pane.id) {
+    return null;
+  }
+  const result = await runTmuxCommandRaw([
+    "show-options",
+    "-p",
+    "-v",
+    "-t",
+    pane.id,
+    TMUX_PANE_OWNER_OPTION
+  ], { timeoutMs: 5000 });
+  const encoded = String(result.stdout || "").trim();
+  if (!result.ok || !encoded) {
+    return null;
+  }
+  try {
+    const owner = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    return owner && typeof owner === "object" && owner.token ? owner : null;
+  } catch (_error) {
+    return {
+      token: "invalid-owner-value",
+      invalid: true,
+      encoded
+    };
+  }
+}
+
+function encodePersistentTmuxPaneOwner(owner) {
+  const persisted = { ...owner };
+  delete persisted.pane;
+  delete persisted.waited;
+  return Buffer.from(JSON.stringify(persisted), "utf8").toString("base64url");
+}
+
+async function tryClaimPersistentTmuxPaneOwner(pane, owner) {
+  const encoded = encodePersistentTmuxPaneOwner(owner);
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},}`;
+  const setCommand = `set-option -p -t ${shellQuote(pane.id)} ${TMUX_PANE_OWNER_OPTION} ${shellQuote(encoded)}`;
+  await runTmuxCommand(["if-shell", "-F", "-t", pane.id, condition, setCommand, ""], { timeoutMs: 5000 });
+  const current = await readPersistentTmuxPaneOwner(pane);
+  return current?.token === owner.token;
+}
+
+async function updatePersistentTmuxPaneOwner(ownerContext, patch = {}) {
+  if (!ownerContext?.pane?.id || !ownerContext.token) {
+    return ownerContext;
+  }
+  const next = {
+    ...ownerContext,
+    ...patch
+  };
+  const currentEncoded = encodePersistentTmuxPaneOwner(ownerContext);
+  const nextEncoded = encodePersistentTmuxPaneOwner(next);
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},${currentEncoded}}`;
+  const setCommand = `set-option -p -t ${shellQuote(ownerContext.pane.id)} ${TMUX_PANE_OWNER_OPTION} ${shellQuote(nextEncoded)}`;
+  await runTmuxCommand(["if-shell", "-F", "-t", ownerContext.pane.id, condition, setCommand, ""], { timeoutMs: 5000 });
+  const current = await readPersistentTmuxPaneOwner(ownerContext.pane);
+  if (current?.token !== ownerContext.token) {
+    throw new Error(`Lost persistent tmux pane ownership for ${ownerContext.pane.id} before dispatch.`);
+  }
+  Object.assign(ownerContext, patch);
+  return ownerContext;
+}
+
+async function releasePersistentTmuxPaneOwner(ownerContext) {
+  if (!ownerContext?.pane?.id || !ownerContext.token) {
+    return false;
+  }
+  return clearPersistentTmuxPaneOwner(ownerContext.pane, ownerContext);
+}
+
+async function clearPersistentTmuxPaneOwner(pane, owner) {
+  const encoded = owner.encoded || encodePersistentTmuxPaneOwner(owner);
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},${encoded}}`;
+  const unsetCommand = `set-option -p -u -t ${shellQuote(pane.id)} ${TMUX_PANE_OWNER_OPTION}`;
+  await runTmuxCommand(["if-shell", "-F", "-t", pane.id, condition, unsetCommand, ""], { timeoutMs: 5000 });
+  const current = await readPersistentTmuxPaneOwner(pane);
+  return !current || current.token !== owner.token;
+}
+
+async function settlePersistentTmuxPaneOwner(owner, pane, socketPath) {
+  if (
+    owner.invalid ||
+    owner.socketPath !== socketPath ||
+    String(owner.serverPid || "") !== String(pane.serverPid || "") ||
+    owner.paneId !== pane.id
+  ) {
+    await clearPersistentTmuxPaneOwner(pane, owner);
+    return true;
+  }
+
+  if (owner.kind === "shell" && owner.pidPath && owner.statusPath) {
+    const state = readTmuxShellRunState(owner.pidPath, owner.statusPath);
+    if (state.completed) {
+      await recoverCompletedPersistentTmuxOwner(owner, state, pane);
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      cleanupPersistentTmuxOwnerFiles(owner);
+      return true;
+    }
+    if (state.processKnown && state.processAlive) {
+      return false;
+    }
+    if (state.processKnown) {
+      failPersistentTmuxOwnerLedger(owner, "Recovered tmux helper process exited without a completion proof.");
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      cleanupPersistentTmuxOwnerFiles(owner);
+      return true;
+    }
+  }
+
+  if (owner.kind === "vision-self-test") {
+    if (isProcessAlive(owner.processPid)) {
+      return false;
+    }
+    failPersistentTmuxOwnerLedger(owner, "The process owning the Terminal vision self-test exited before releasing the tmux pane.");
+    await clearPersistentTmuxPaneOwner(pane, owner);
+    cleanupPersistentTmuxOwnerFiles(owner);
+    return true;
+  }
+
+  if (owner.kind === "board") {
+    const timing = getBoardTimingConfig();
+    const ownerAgeMs = Date.now() - Number(owner.createdAt || 0);
+    const latest = owner.boardLogPath
+      ? readBoardLogFromOffset(owner.boardLogPath, owner.boardOffset, DEFAULT_MAX_OUTPUT_CHARS)
+      : null;
+    if (owner.boardState === "prompt-returned") {
+      await stopTmuxPanePipe(pane.id).catch(() => null);
+      completeRecoveredBoardOwner(owner, pane, latest);
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      return true;
+    }
+    if (!owner.boardLogPath) {
+      if (ownerAgeMs < TMUX_PANE_OWNER_LAUNCH_GRACE_MS) {
+        return false;
+      }
+      failPersistentTmuxOwnerLedger(owner, "Recovered board request exited during preflight before command dispatch.");
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      return true;
+    }
+    if (
+      owner.boardState !== "sent" &&
+      ownerAgeMs >= TMUX_PANE_OWNER_LAUNCH_GRACE_MS &&
+      Number(latest?.bytesRead || 0) === 0
+    ) {
+      // `prepared` is persisted before the single tmux transaction that both
+      // changes it to `sent` and submits literal+Enter. Therefore zero output
+      // in any earlier state proves that no atomic dispatch was committed.
+      await stopTmuxPanePipe(pane.id).catch(() => null);
+      failPersistentTmuxOwnerLedger(owner, "Recovered board request exited before atomic command dispatch.");
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      return true;
+    }
+    const idleForMs = owner.boardLogPath ? Date.now() - getFileMtimeMs(owner.boardLogPath) : 0;
+    const promptReturned = Boolean(
+      latest?.bytesRead > 0 &&
+      outputEndsWithBoardPrompt(latest.normalized, owner.boardPrompt) &&
+      idleForMs >= timing.promptIdleMs &&
+      await isBoardPaneReadyAfterCommand(pane, owner.boardShellPrompt === true)
+    );
+    if (!promptReturned) {
+      // The old server may have died immediately before or after the atomic
+      // literal+Enter dispatch. Without a returned prompt there is no safe
+      // distinction, so retain the pane lease instead of risking another send.
+      return false;
+    }
+    await stopTmuxPanePipe(pane.id).catch(() => null);
+    completeRecoveredBoardOwner(owner, pane, latest);
+    await clearPersistentTmuxPaneOwner(pane, owner);
+    return true;
+  }
+
+  if (owner.kind === "visual" && owner.donePrefix) {
+    const windowName = await getTmuxWindowName(pane.id).catch(() => "");
+    const persistedStatus = owner.statusPath ? readExitStatusFile(owner.statusPath) : null;
+    const executed = Boolean(owner.executedPath && fs.existsSync(owner.executedPath));
+    if (windowName.startsWith(owner.donePrefix) || persistedStatus !== null) {
+      const parsed = parseTmuxVisualDoneWindowName(windowName, owner.donePrefix);
+      if (executed && owner.ledgerKey) {
+        completeServerShellCall(owner.ledgerKey, {
+          exitCode: persistedStatus === null ? parsed.exitCode : persistedStatus,
+          durationMs: Date.now() - Number(owner.createdAt || Date.now()),
+          timedOut: false,
+          truncated: false
+        });
+      } else if (!executed) {
+        failPersistentTmuxOwnerLedger(owner, "Recovered visual tmux helper completed without an executed marker.");
+      }
+      await clearPersistentTmuxPaneOwner(pane, owner);
+      cleanupPersistentTmuxOwnerFiles(owner);
+      return true;
+    }
+    if (Date.now() - Number(owner.createdAt || 0) < TMUX_PANE_OWNER_LAUNCH_GRACE_MS) {
+      return false;
+    }
+    if (!await isTmuxPaneReadyForHelper(pane)) {
+      return false;
+    }
+    if (!executed) {
+      // A previous server may have died after buffering the visual launcher but
+      // before Enter. With no executed proof and an idle foreground shell, the
+      // buffered line is stale and must be cancelled before releasing the pane.
+      await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
+    }
+    failPersistentTmuxOwnerLedger(
+      owner,
+      executed
+        ? "Recovered visual tmux helper returned to the prompt without a completion proof."
+        : "Recovered visual tmux helper became stale before execution was confirmed."
+    );
+    await clearPersistentTmuxPaneOwner(pane, owner);
+    cleanupPersistentTmuxOwnerFiles(owner);
+    return true;
+  }
+
+  if (Date.now() - Number(owner.createdAt || 0) < TMUX_PANE_OWNER_LAUNCH_GRACE_MS) {
+    return false;
+  }
+  if (!await isTmuxPaneReadyForHelper(pane)) {
+    return false;
+  }
+  failPersistentTmuxOwnerLedger(owner, "Persistent tmux helper ownership became stale before execution was confirmed.");
+  await clearPersistentTmuxPaneOwner(pane, owner);
+  cleanupPersistentTmuxOwnerFiles(owner);
+  return true;
+}
+
+function completeRecoveredBoardOwner(owner, pane, latest) {
+  if (!owner?.ledgerKey || !latest || Number(latest.bytesRead || 0) <= 0) {
+    failPersistentTmuxOwnerLedger(owner, "Recovered board command returned without captured output.");
+    return false;
+  }
+  const entry = serverLedger.calls?.[owner.ledgerKey] || {};
+  const durationMs = Date.now() - Number(owner.createdAt || Date.now());
+  const crossedTimeout = Number(entry.timeoutMs || 0) > 0 && durationMs >= Number(entry.timeoutMs);
+  return completeServerShellCall(owner.ledgerKey, {
+    ok: true,
+    exitCode: crossedTimeout ? 124 : 0,
+    stdout: latest.stdout,
+    stderr: crossedTimeout
+      ? "The board command exceeded its response timeout, but the pane lease remained active until the prompt returned."
+      : "",
+    durationMs,
+    timedOut: crossedTimeout,
+    truncated: latest.truncated === true,
+    executed: true,
+    executionCompleted: false,
+    completionObserved: true,
+    queued: entry.queued === true,
+    queuedMs: Number(entry.queuedMs || 0),
+    target: pane.id,
+    targetName: pane.label || ""
+  });
+}
+
+async function recoverCompletedPersistentTmuxOwner(owner, state, pane) {
+  if (!owner.ledgerKey || !owner.executedPath || !fs.existsSync(owner.executedPath)) {
+    failPersistentTmuxOwnerLedger(owner, "Recovered tmux helper completed without an executed marker.");
+    return;
+  }
+  const interruptSignal = readTmuxShellInterruptSignal(owner.interruptedPath);
+  const captured = owner.startMarker && owner.doneMarker
+    ? await captureTmuxPane(pane.id).catch(() => "")
+    : "";
+  const extracted = owner.startMarker && owner.doneMarker
+    ? extractTmuxRunOutput(captured, owner.startMarker, owner.doneMarker, owner.maxOutputChars || DEFAULT_MAX_OUTPUT_CHARS)
+    : { stdout: "", truncated: false, foundDone: false };
+  completeServerShellCall(owner.ledgerKey, {
+    exitCode: state.exitCode,
+    stdout: extracted.stdout,
+    stderr: formatTmuxShellInterruptMessage(interruptSignal),
+    durationMs: Date.now() - Number(owner.createdAt || Date.now()),
+    timedOut: false,
+    truncated: extracted.truncated === true,
+    executed: true,
+    executionCompleted: true,
+    completionMarkerMissing: extracted.foundDone !== true,
+    interrupted: Boolean(interruptSignal),
+    interruptSignal
+  });
+}
+
+function failPersistentTmuxOwnerLedger(owner, message) {
+  if (owner.ledgerKey) {
+    failServerShellCall(owner.ledgerKey, new Error(message), {
+      durationMs: Date.now() - Number(owner.createdAt || Date.now())
+    });
+  }
+}
+
+function cleanupPersistentTmuxOwnerFiles(owner = {}) {
+  for (const filePath of [owner.scriptPath, owner.launcherPath, owner.pidPath, owner.statusPath, owner.executedPath, owner.interruptedPath]) {
+    if (!filePath) {
+      continue;
+    }
+    try {
+      fs.unlinkSync(filePath);
+    } catch (_error) {
+      // Best-effort recovery cleanup.
+    }
+  }
 }
 
 async function handleRunBoardMessage(message) {
@@ -644,15 +1217,11 @@ async function handleRunBoardMessage(message) {
   ].join("\n")));
   const started = Date.now();
   const force = message.callMeta?.force === true || message.force === true;
-  const claim = claimServerShellCall(callKey, {
+  const reservation = reserveServerShellCall(callKey, {
+    kind: "board",
     cmd,
     boardName,
-    cwd,
     target: pane.id,
-    // Generic board CLIs expose only a textual prompt. Command output can
-    // spoof that prompt, so board completion is not authoritative enough for
-    // execution dedup. Keep the ledger as unscoped audit state and fail open.
-    executionTarget: "",
     timeoutMs,
     maxOutputChars,
     seq: message.seq,
@@ -660,27 +1229,23 @@ async function handleRunBoardMessage(message) {
     force
   });
 
-  if (claim.action === "skip") {
-    console.log(`[duplicate-board] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
-    return buildExecutedDuplicateResponse({
-      message,
-      callKey,
-      claim,
-      cmd,
-      cwd,
-      pane,
-      timeoutMs,
-      boardName
-    });
-  }
-
   try {
     console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} boardName=${boardName || "board"} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
     const result = await runTmuxBoard({
       cmd,
       pane,
       timeoutMs,
-      maxOutputChars
+      maxOutputChars,
+      reservationLedgerKey: reservation.ledgerKey,
+      claimPayload: {
+        cmd,
+        boardName,
+        timeoutMs,
+        maxOutputChars,
+        seq: message.seq,
+        callMeta: message.callMeta || {},
+        force
+      }
     });
     console.log(`[done-board] ok=${result.ok !== false} exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
@@ -688,6 +1253,7 @@ async function handleRunBoardMessage(message) {
       ok: result.ok !== false,
       id: message.id,
       callKey,
+      executionId: reservation.attemptId,
       cmd,
       boardName,
       cwd,
@@ -698,17 +1264,18 @@ async function handleRunBoardMessage(message) {
       ...result
     };
     if (result.executed !== true) {
-      failServerShellCall(claim.ledgerKey, new Error(result.error || result.stderr || "Board command execution was not confirmed complete."), {
+      failServerShellCall(reservation.ledgerKey, new Error(result.error || result.stderr || "Board command execution was not confirmed complete."), {
         durationMs: Date.now() - started
       });
-    } else if (!isConfirmedTmuxExecution(result)) {
-      finishUnconfirmedServerShellCall(claim.ledgerKey, response);
     } else {
-      completeServerShellCall(claim.ledgerKey, response);
+      // A returned board prompt is sufficient to deliver this attempt's
+      // captured result, but generic board prompts remain deliberately
+      // ineligible for execution dedup (executionKey is always empty).
+      completeServerShellCall(reservation.ledgerKey, response);
     }
     return response;
   } catch (error) {
-    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(reservation.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
@@ -904,15 +1471,22 @@ async function registerTmuxAiAgent(message, now = Date.now()) {
 function sendAgentMessage(message, now = Date.now()) {
   const from = validateAgentId(message.from || message.agentId, "from");
   const to = validateAgentId(message.to, "to");
-  if (!touchAgent(from, now)) {
-    return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-send", from });
-  }
   const body = String(message.body || "");
   if (!body.trim()) {
     return agentHubError("missing-body", "Missing agent message body.", { type: "agent-send" });
   }
   if (body.length > AGENT_MESSAGE_MAX_CHARS) {
     return agentHubError("message-too-large", `Agent message body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-send" });
+  }
+  const taskId = normalizeAgentTaskId(message.taskId || "");
+  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
+  const replyTo = normalizeAgentMessageId(message.replyTo || "");
+  const existingResponse = resolveExistingAgentSend({ messageId, from, to, taskId, replyTo, body });
+  if (existingResponse) {
+    return existingResponse;
+  }
+  if (!touchAgent(from, now)) {
+    return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-send", from });
   }
   if (!agentHubState.roster.has(to)) {
     return agentHubError("recipient-not-registered", `Agent recipient is not registered: ${to}`, { type: "agent-send", to });
@@ -922,12 +1496,6 @@ function sendAgentMessage(message, now = Date.now()) {
     return agentHubError("tmux-ai-send-requires-async", "tmux-ai delivery requires the async agent hub path.", { type: "agent-send", to });
   }
 
-  const taskId = normalizeAgentTaskId(message.taskId || "");
-  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
-  if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
-    return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-send", messageId });
-  }
-  const replyTo = normalizeAgentMessageId(message.replyTo || "");
   const replyValidation = validatePollAgentReplyTo({ from, to, replyTo, taskId, now });
   if (!replyValidation.ok) {
     return replyValidation;
@@ -940,6 +1508,7 @@ function sendAgentMessage(message, now = Date.now()) {
     taskId,
     replyTo,
     body,
+    hubMessageType: "agent-send",
     createdAt: now,
     ackedAt: 0,
     deliverySurface: "web",
@@ -955,6 +1524,31 @@ function sendAgentMessage(message, now = Date.now()) {
     ok: true,
     type: "agent-send",
     message: envelope
+  };
+}
+
+function resolveExistingAgentSend({ messageId, from, to, taskId, replyTo = "", body }) {
+  const existing = agentHubState.mailbox.find((item) => item.messageId === messageId);
+  if (!existing) {
+    return null;
+  }
+  const identical = existing.from === from &&
+    existing.to === to &&
+    String(existing.taskId || "") === String(taskId || "") &&
+    String(existing.replyTo || "") === String(replyTo || "") &&
+    String(existing.body || "") === String(body || "") &&
+    existing.hubMessageType !== "agent-reply";
+  if (!identical) {
+    return agentHubError("duplicate-message-id", `Agent message already exists with different payload: ${messageId}`, {
+      type: "agent-send",
+      messageId
+    });
+  }
+  return {
+    ok: true,
+    type: "agent-send",
+    message: existing,
+    idempotent: true
   };
 }
 
@@ -1069,6 +1663,20 @@ function getAgentTaskStatusNextAction(status, task) {
 async function sendAgentMessageAsync(message, now = Date.now()) {
   const from = validateAgentId(message.from || message.agentId, "from");
   const to = validateAgentId(message.to, "to");
+  const body = String(message.body || "");
+  if (!body.trim()) {
+    return agentHubError("missing-body", "Missing agent message body.", { type: "agent-send" });
+  }
+  if (body.length > AGENT_MESSAGE_MAX_CHARS) {
+    return agentHubError("message-too-large", `Agent message body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-send" });
+  }
+  const taskId = normalizeAgentTaskId(message.taskId || "");
+  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
+  const replyTo = normalizeAgentMessageId(message.replyTo || "");
+  const existingResponse = resolveExistingAgentSend({ messageId, from, to, taskId, replyTo, body });
+  if (existingResponse) {
+    return existingResponse;
+  }
   const sender = agentHubState.roster.get(from);
   if (!sender) {
     return agentHubError("sender-not-registered", `Agent sender is not registered: ${from}`, { type: "agent-send", from });
@@ -1082,19 +1690,6 @@ async function sendAgentMessageAsync(message, now = Date.now()) {
     return sendAgentMessage(message, now);
   }
 
-  const body = String(message.body || "");
-  if (!body.trim()) {
-    return agentHubError("missing-body", "Missing agent message body.", { type: "agent-send" });
-  }
-  if (body.length > AGENT_MESSAGE_MAX_CHARS) {
-    return agentHubError("message-too-large", `Agent message body is too large (${body.length} chars, max ${AGENT_MESSAGE_MAX_CHARS}).`, { type: "agent-send" });
-  }
-  const taskId = normalizeAgentTaskId(message.taskId || "");
-  const messageId = normalizeAgentMessageId(message.messageId || `msg-${now}-${crypto.randomBytes(6).toString("hex")}`);
-  if (agentHubState.mailbox.some((item) => item.messageId === messageId)) {
-    return agentHubError("duplicate-message-id", `Agent message already exists: ${messageId}`, { type: "agent-send", messageId });
-  }
-
   const delivery = await deliverTmuxAiTask({ sender, recipient, body, taskId, messageId, now });
   if (!delivery.ok) {
     return delivery;
@@ -1105,7 +1700,9 @@ async function sendAgentMessageAsync(message, now = Date.now()) {
     from,
     to,
     taskId,
+    replyTo,
     body,
+    hubMessageType: "agent-send",
     createdAt: now,
     ackedAt: now,
     deliveredAt: now,
@@ -1259,6 +1856,7 @@ function replyAgentMessage(message, now = Date.now()) {
     taskId,
     replyTo,
     body,
+    hubMessageType: "agent-reply",
     createdAt: now,
     ackedAt: 0,
     deliverySurface: "web",
@@ -1844,6 +2442,8 @@ async function handleVisionTmuxRunLineMessage(message) {
     return visionError("invalid-target", `Unknown or ambiguous tmux target: ${target}`, { tmuxPanes: panes });
   }
 
+  const force = message.callMeta?.force === true || message.force === true;
+  const started = Date.now();
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([
     "vision-tmux",
     pane.id,
@@ -1851,64 +2451,95 @@ async function handleVisionTmuxRunLineMessage(message) {
     timeoutMs,
     maxOutputChars
   ].join("\n")));
-  const force = message.callMeta?.force === true || message.force === true;
-  const claim = claimServerShellCall(callKey, {
+  const reservation = reserveServerShellCall(callKey, {
+    kind: "visual",
     cmd,
-    cwd: pane.currentPath || "",
     target: pane.id,
-    executionTarget: buildTmuxPaneExecutionTarget(pane),
     timeoutMs,
+    maxOutputChars,
     seq: message.seq,
     callMeta: message.callMeta || {},
     force
   });
-
-  if (claim.action === "skip") {
-    return buildExecutedDuplicateResponse({
-      message,
-      callKey,
-      claim,
-      cmd,
-      cwd: pane.currentPath || "",
-      pane,
-      timeoutMs
-    });
-  }
-
-  const started = Date.now();
+  let claim = null;
   try {
-    const result = await runTmuxVisualLine({
+    return await withTmuxShellPaneQueue({
       cmd,
       pane,
-      timeoutMs,
-      maxOutputChars
+      kind: "visual",
+      ledgerKey: reservation.ledgerKey
+    }, async (queueContext) => {
+      const currentPane = queueContext.currentPane;
+      await updatePersistentTmuxPaneOwner(queueContext.owner, {
+        ledgerKey: reservation.ledgerKey
+      });
+      const cwd = currentPane.currentPath || "";
+      claim = adjudicateReservedServerShellCall(reservation.ledgerKey, {
+        cmd,
+        cwd,
+        target: currentPane.id,
+        executionTarget: buildTmuxPaneExecutionTarget(currentPane),
+        timeoutMs,
+        seq: message.seq,
+        callMeta: message.callMeta || {},
+        force
+      });
+
+      if (claim.action === "skip") {
+        const response = buildExecutedDuplicateResponse({
+          message,
+          callKey,
+          claim,
+          cmd,
+          cwd,
+          pane: currentPane,
+          timeoutMs
+        });
+        completeServerShellCall(reservation.ledgerKey, {
+          ...response,
+          queued: queueContext.queued,
+          queuedMs: queueContext.queuedMs
+        });
+        return response;
+      }
+
+      const result = await runTmuxVisualLine({
+        cmd,
+        pane: currentPane,
+        timeoutMs,
+        maxOutputChars,
+        ownerContext: queueContext.owner,
+        ledgerKey: claim.ledgerKey
+      });
+      const response = {
+        ok: result.ok !== false,
+        id: message.id,
+        callKey,
+        cmd,
+        cwd,
+        target: currentPane.id,
+        targetName: currentPane.label,
+        timeoutMs,
+        ...result,
+        queued: queueContext.queued,
+        queuedMs: queueContext.queuedMs
+      };
+      if (isConfirmedTmuxExecution(result)) {
+        completeServerShellCall(claim.ledgerKey, {
+          ...response,
+          exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
+          timedOut: response.timedOut === true,
+          truncated: response.truncated === true
+        });
+      } else {
+        failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Visual tmux command execution was not confirmed complete."), {
+          durationMs: Date.now() - started
+        });
+      }
+      return response;
     });
-    const response = {
-      ok: result.ok !== false,
-      id: message.id,
-      callKey,
-      cmd,
-      cwd: pane.currentPath || "",
-      target: pane.id,
-      targetName: pane.label,
-      timeoutMs,
-      ...result
-    };
-    if (isConfirmedTmuxExecution(result)) {
-      completeServerShellCall(claim.ledgerKey, {
-        ...response,
-        exitCode: Number.isInteger(response.exitCode) ? response.exitCode : (response.ok ? 0 : 1),
-        timedOut: response.timedOut === true,
-        truncated: response.truncated === true
-      });
-    } else {
-      failServerShellCall(claim.ledgerKey, new Error(result.stderr || "Visual tmux command execution was not confirmed complete."), {
-        durationMs: Date.now() - started
-      });
-    }
-    return response;
   } catch (error) {
-    failServerShellCall(claim.ledgerKey, error, { durationMs: Date.now() - started });
+    failServerShellCall(claim?.ledgerKey || reservation.ledgerKey, error, { durationMs: Date.now() - started });
     throw error;
   }
 }
@@ -1931,11 +2562,11 @@ async function runVisionTerminalSelfTest(message) {
     cmd: "vision-terminal-self-test"
   }, async (queueContext) => {
     const currentPane = await verifyTmuxShellPaneBeforeDispatch(pane, queueContext);
-    return runVisionTerminalSelfTestInPane(message, currentPane, started);
+    return runVisionTerminalSelfTestInPane(message, currentPane, started, queueContext.owner);
   });
 }
 
-async function runVisionTerminalSelfTestInPane(message, pane, started) {
+async function runVisionTerminalSelfTestInPane(message, pane, started, ownerContext = null) {
 
   await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
   await sleep(250);
@@ -1957,11 +2588,23 @@ async function runVisionTerminalSelfTestInPane(message, pane, started) {
     cwd,
     pane,
     timeoutMs,
-    maxOutputChars: 20000
+    maxOutputChars: 20000,
+    ownerContext
   });
   if (prep.ok === false || prep.exitCode !== 0) {
     return visionError("tmux-prep-failed", prep.stderr || "Could not prepare the tmux pane for vision self-test.", { prep });
   }
+
+
+  // The OCR/window interaction below can outlive the shell preparation by
+  // many seconds. Persist the live server process as the lease owner so a
+  // freshly started handler cannot mistake the now-idle prompt for a free
+  // pane and overlap another helper with this self-test.
+  await updatePersistentTmuxPaneOwner(ownerContext, {
+    kind: "vision-self-test",
+    processPid: process.pid,
+    selfTestStartedAt: Date.now()
+  });
 
   const windowInfo = message.windowId
     ? await getVisionTerminalWindowById(parseVisionWindowId(message.windowId))
@@ -2078,6 +2721,105 @@ function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(
   return resolved;
 }
 
+function reserveServerShellCall(callKey, payload = {}) {
+  const now = Date.now();
+  const force = payload.callMeta?.force === true || payload.force === true;
+  const attemptId = crypto.randomBytes(8).toString("hex");
+  const ledgerKey = `${callKey}:${attemptId}`;
+  serverLedger.calls ||= {};
+  serverLedger.calls[ledgerKey] = {
+    callKey,
+    attemptId,
+    executionId: "",
+    kind: normalizeServerCallKind(payload.kind),
+    state: "running",
+    phase: "queued",
+    startedAt: now,
+    queuedAt: now,
+    queued: true,
+    cmdHash: hashText(payload.cmd),
+    cwd: "",
+    target: payload.target || "",
+    executionTarget: "",
+    executionKey: "",
+    timeoutMs: payload.timeoutMs,
+    maxOutputChars: payload.maxOutputChars,
+    seq: payload.seq || "",
+    origin: payload.callMeta?.origin || "",
+    pathname: payload.callMeta?.pathname || "",
+    promptHash: payload.callMeta?.promptHash || "",
+    forced: force,
+    handlerProcessPid: process.pid
+  };
+  saveServerLedger();
+  return { action: "reserved", ledgerKey, attemptId };
+}
+
+function adjudicateReservedServerShellCall(ledgerKey, payload = {}) {
+  serverLedger.calls ||= {};
+  const reservation = serverLedger.calls[ledgerKey];
+  if (!ledgerKey || !reservation || reservation.state !== "running") {
+    throw new Error("Queued shell call reservation is missing or no longer running.");
+  }
+
+  const force = payload.callMeta?.force === true || payload.force === true;
+  const executionKey = buildServerExecutionKey(payload);
+  if (!force && executionKey) {
+    const completed = Object.entries(serverLedger.calls).find(([candidateKey, entry]) =>
+      candidateKey !== ledgerKey && entry?.state === "completed" && entry.executionKey === executionKey
+    );
+    if (completed) {
+      const [previousLedgerKey, previous] = completed;
+      serverLedger.calls[ledgerKey] = {
+        ...reservation,
+        phase: "duplicate",
+        authoritativeAt: Date.now(),
+        cwd: payload.cwd,
+        target: payload.target || "",
+        executionTarget: payload.executionTarget || "",
+        executionKey,
+        executionId: previous.executionId || previous.attemptId || "",
+        forced: false
+      };
+      saveServerLedger();
+      return {
+        action: "skip",
+        reason: "already-executed-on-target",
+        executionKey,
+        ledgerKey,
+        attemptId: reservation.attemptId,
+        previousCallKey: previous.callKey || previousLedgerKey,
+        previous
+      };
+    }
+  }
+
+  serverLedger.calls[ledgerKey] = {
+    ...reservation,
+    phase: "running",
+    authoritativeAt: Date.now(),
+    cwd: payload.cwd,
+    target: payload.target || "",
+    executionTarget: payload.executionTarget || "",
+    executionKey,
+    executionId: reservation.attemptId,
+    timeoutMs: payload.timeoutMs,
+    maxOutputChars: payload.maxOutputChars,
+    seq: payload.seq || reservation.seq || "",
+    origin: payload.callMeta?.origin || reservation.origin || "",
+    pathname: payload.callMeta?.pathname || reservation.pathname || "",
+    promptHash: payload.callMeta?.promptHash || reservation.promptHash || "",
+    forced: force
+  };
+  saveServerLedger();
+  return {
+    action: "run",
+    executionKey,
+    ledgerKey,
+    attemptId: reservation.attemptId
+  };
+}
+
 function claimServerShellCall(callKey, payload) {
   const now = Date.now();
   const force = payload.callMeta?.force === true || payload.force === true;
@@ -2105,6 +2847,7 @@ function claimServerShellCall(callKey, payload) {
   serverLedger.calls[ledgerKey] = {
     callKey,
     attemptId,
+    executionId: attemptId,
     state: "running",
     startedAt: now,
     cmdHash: hashText(payload.cmd),
@@ -2112,6 +2855,8 @@ function claimServerShellCall(callKey, payload) {
     target: payload.target || "",
     executionTarget: payload.executionTarget || "",
     executionKey,
+    timeoutMs: payload.timeoutMs,
+    maxOutputChars: payload.maxOutputChars,
     seq: payload.seq || "",
     origin: payload.callMeta?.origin || "",
     pathname: payload.callMeta?.pathname || "",
@@ -2139,7 +2884,7 @@ function isConfirmedTmuxExecution(result = {}) {
 }
 
 function buildTmuxPaneExecutionTarget(pane = {}) {
-  if (!pane.serverPid || !pane.sessionCreated || !pane.id || !pane.address) {
+  if (!pane.serverPid || !pane.sessionCreated || !pane.id || !pane.panePid) {
     return "";
   }
   return [
@@ -2148,16 +2893,19 @@ function buildTmuxPaneExecutionTarget(pane = {}) {
     pane.serverPid,
     pane.sessionCreated,
     pane.id,
-    pane.address
+    pane.panePid
   ].join(":");
 }
 
 function buildExecutedDuplicateResponse({ message, callKey, claim, cmd, cwd = "", pane, timeoutMs, boardName = "" }) {
   const previous = claim?.previous || {};
+  const replayedOutput = previous.resultStored === true;
+  const executionId = previous.executionId || previous.attemptId || "";
   return {
     ok: true,
     id: message?.id,
     callKey,
+    executionId,
     cmd,
     boardName,
     cwd,
@@ -2166,12 +2914,17 @@ function buildExecutedDuplicateResponse({ message, callKey, claim, cmd, cwd = ""
     timeoutMs,
     durationMs: 0,
     exitCode: Number.isInteger(previous.exitCode) ? previous.exitCode : 0,
-    stdout: "",
-    stderr: "",
-    truncated: false,
+    stdout: replayedOutput ? String(previous.stdout || "") : "",
+    stderr: replayedOutput ? String(previous.stderr || "") : "",
+    truncated: replayedOutput && previous.truncated === true,
     timedOut: false,
+    executed: true,
+    executionCompleted: true,
     duplicate: true,
     skipped: true,
+    replayedOutput,
+    previousResultPresented: previous.resultPresented === true,
+    resultPresented: previous.resultPresented === true,
     reason: claim?.reason || "already-executed-on-target",
     previousCallKey: claim?.previousCallKey || "",
     previousCompletedAt: previous.completedAt || 0,
@@ -2185,20 +2938,64 @@ function completeServerShellCall(ledgerKey, response) {
   if (!ledgerKey || !serverLedger.calls[ledgerKey]) {
     return false;
   }
+  const stdout = limitServerLedgerOutput(response.stdout);
+  const stderr = limitServerLedgerOutput(response.stderr);
   serverLedger.calls[ledgerKey] = {
     ...serverLedger.calls[ledgerKey],
     state: "completed",
+    phase: "completed",
+    executionId: response.executionId || serverLedger.calls[ledgerKey].executionId || serverLedger.calls[ledgerKey].attemptId || "",
     completedAt: Date.now(),
+    ok: response.ok !== false,
     exitCode: response.exitCode,
+    resultStored: true,
+    stdout: stdout.text,
+    stderr: stderr.text,
     durationMs: response.durationMs,
     timedOut: response.timedOut === true,
-    truncated: response.truncated === true,
+    truncated: response.truncated === true || stdout.truncated || stderr.truncated,
+    executed: response.executed !== false,
+    executionCompleted: response.executionCompleted !== false,
+    completionObserved: response.completionObserved === true,
+    completionMarkerMissing: response.completionMarkerMissing === true,
     interrupted: response.interrupted === true,
-    interruptSignal: response.interruptSignal || ""
+    interruptSignal: response.interruptSignal || "",
+    cancelledBeforeExecution: response.cancelledBeforeExecution === true,
+    retryable: response.retryable === true,
+    queued: response.queued === true,
+    queuedMs: Number(response.queuedMs || 0),
+    continuedAfterTimeout: response.continuedAfterTimeout === true,
+    processKnown: response.processKnown === true,
+    processAlive: response.processAlive === true,
+    processPid: Number(response.processPid || 0),
+    timeoutReason: response.timeoutReason || "",
+    duplicate: response.duplicate === true,
+    skipped: response.skipped === true,
+    replayedOutput: response.replayedOutput === true,
+    resultPresented: response.resultPresented === true || serverLedger.calls[ledgerKey].resultPresented === true,
+    previousResultPresented: response.previousResultPresented === true,
+    reason: response.reason || "",
+    previousCallKey: response.previousCallKey || "",
+    previousCompletedAt: Number(response.previousCompletedAt || 0),
+    previousInterrupted: response.previousInterrupted === true,
+    previousInterruptSignal: response.previousInterruptSignal || "",
+    target: response.target || serverLedger.calls[ledgerKey].target || "",
+    targetName: response.targetName || ""
   };
   pruneServerLedger();
   saveServerLedger();
   return true;
+}
+
+function limitServerLedgerOutput(value) {
+  const text = String(value || "");
+  if (text.length <= SERVER_LEDGER_OUTPUT_LIMIT) {
+    return { text, truncated: false };
+  }
+  return {
+    text: text.slice(0, SERVER_LEDGER_OUTPUT_LIMIT),
+    truncated: true
+  };
 }
 
 function failServerShellCall(ledgerKey, error, extra = {}) {
@@ -2206,9 +3003,16 @@ function failServerShellCall(ledgerKey, error, extra = {}) {
   if (!ledgerKey || !serverLedger.calls[ledgerKey]) {
     return false;
   }
+  if (serverLedger.calls[ledgerKey].state === "completed") {
+    // Completion proof is monotonic. A late owner-recovery error, socket
+    // failure, or cleanup race must never erase duplicate authority for a
+    // command the server already proved completed.
+    return false;
+  }
   serverLedger.calls[ledgerKey] = {
     ...serverLedger.calls[ledgerKey],
     state: "failed",
+    phase: "failed",
     completedAt: Date.now(),
     exitCode: 1,
     durationMs: extra.durationMs,
@@ -2229,6 +3033,7 @@ function finishUnconfirmedServerShellCall(ledgerKey, response = {}) {
   serverLedger.calls[ledgerKey] = {
     ...serverLedger.calls[ledgerKey],
     state: "unconfirmed",
+    phase: "unconfirmed",
     completedAt: Date.now(),
     exitCode: response.exitCode,
     durationMs: response.durationMs,
@@ -2238,6 +3043,174 @@ function finishUnconfirmedServerShellCall(ledgerKey, response = {}) {
   pruneServerLedger();
   saveServerLedger();
   return true;
+}
+
+async function handleRunStatusMessage(message) {
+  const callKey = String(message?.callKey || "").trim();
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(callKey)) {
+    throw new Error("Missing or invalid shell callKey for status recovery.");
+  }
+
+  const kind = normalizeServerCallKind(message?.kind);
+  let located = findLatestServerCallByCallKey(callKey, kind);
+  if (
+    located?.entry?.state === "running" &&
+    located.entry.phase === "queued" &&
+    located.entry.handlerProcessPid &&
+    !isProcessAlive(located.entry.handlerProcessPid)
+  ) {
+    failServerShellCall(located.ledgerKey, new Error("The shell server exited while this request was still queued; no command was dispatched."));
+    located = findLatestServerCallByCallKey(callKey, kind);
+  }
+  if (located?.entry?.state === "running") {
+    await recoverPersistentOwnerForLedgerKey(located.ledgerKey).catch(() => false);
+    located = findLatestServerCallByCallKey(callKey, kind);
+  }
+
+  if (!located) {
+    return withProtocolMetadata({
+      ok: true,
+      type: "run-status",
+      callKey,
+      kind,
+      found: false,
+      state: "not-found"
+    });
+  }
+
+  const { ledgerKey, entry } = located;
+  const response = {
+    ok: true,
+    type: "run-status",
+    callKey,
+    kind,
+    attemptId: entry.attemptId || ledgerKey,
+    found: true,
+    state: entry.state || "running",
+    phase: entry.phase || entry.state || "running",
+    queued: entry.queued === true,
+    startedAt: Number(entry.startedAt || 0),
+    completedAt: Number(entry.completedAt || 0)
+  };
+  if (entry.state === "completed" && entry.resultStored === true) {
+    response.result = buildStoredShellResult(entry);
+  } else if (entry.state === "failed" || entry.state === "unconfirmed") {
+    response.error = entry.error || (entry.state === "unconfirmed"
+      ? "Shell execution did not produce an authoritative completion proof."
+      : "Shell execution failed.");
+  }
+  return withProtocolMetadata(response);
+}
+
+function handleRunResultPresentedMessage(message) {
+  const executionId = String(message?.executionId || "").trim();
+  if (!/^[a-f0-9]{16}$/i.test(executionId)) {
+    throw new Error("Missing or invalid executionId for result presentation receipt.");
+  }
+  const presentedAt = Date.now();
+  let matched = 0;
+  for (const [ledgerKey, entry] of Object.entries(serverLedger.calls || {})) {
+    const canonicalId = String(entry?.executionId || entry?.attemptId || "");
+    if (canonicalId !== executionId) {
+      continue;
+    }
+    serverLedger.calls[ledgerKey] = {
+      ...entry,
+      executionId,
+      resultPresented: true,
+      resultPresentedAt: presentedAt
+    };
+    matched += 1;
+  }
+  if (matched > 0) {
+    saveServerLedger();
+  }
+  return withProtocolMetadata({
+    ok: true,
+    type: "run-result-presented",
+    executionId,
+    found: matched > 0,
+    matched
+  });
+}
+
+function findLatestServerCallByCallKey(callKey, kind = "shell") {
+  const matches = Object.entries(serverLedger.calls || {})
+    .filter(([, entry]) => entry?.callKey === callKey && normalizeServerCallKind(entry?.kind) === kind)
+    .sort(([, left], [, right]) => Number(right.startedAt || 0) - Number(left.startedAt || 0));
+  if (matches.length === 0) {
+    return null;
+  }
+  const [ledgerKey, entry] = matches[0];
+  return { ledgerKey, entry };
+}
+
+function buildStoredShellResult(entry = {}) {
+  return {
+    ok: entry.ok !== false,
+    callKey: entry.callKey || "",
+    executionId: entry.executionId || entry.attemptId || "",
+    resultPresented: entry.resultPresented === true,
+    cwd: entry.cwd || "",
+    target: entry.target || "",
+    targetName: entry.targetName || "",
+    timeoutMs: Number(entry.timeoutMs || 0),
+    exitCode: Number.isInteger(entry.exitCode) ? entry.exitCode : 0,
+    stdout: String(entry.stdout || ""),
+    stderr: String(entry.stderr || ""),
+    durationMs: Number(entry.durationMs || 0),
+    timedOut: entry.timedOut === true,
+    truncated: entry.truncated === true,
+    executed: entry.executed === true,
+    executionCompleted: entry.executionCompleted === true,
+    completionObserved: entry.completionObserved === true,
+    completionMarkerMissing: entry.completionMarkerMissing === true,
+    interrupted: entry.interrupted === true,
+    interruptSignal: entry.interruptSignal || "",
+    cancelledBeforeExecution: entry.cancelledBeforeExecution === true,
+    retryable: entry.retryable === true,
+    queued: entry.queued === true,
+    queuedMs: Number(entry.queuedMs || 0),
+    continuedAfterTimeout: entry.continuedAfterTimeout === true,
+    processKnown: entry.processKnown === true,
+    processAlive: entry.processAlive === true,
+    processPid: Number(entry.processPid || 0),
+    timeoutReason: entry.timeoutReason || "",
+    duplicate: entry.duplicate === true,
+    skipped: entry.skipped === true,
+    replayedOutput: entry.replayedOutput === true,
+    // A presentation receipt is canonical across the whole duplicate chain.
+    // A duplicate entry may have persisted `previousResultPresented: false`
+    // before another request presented the same execution. Status recovery
+    // must observe that later monotonic receipt instead of replaying the result
+    // to the model again.
+    previousResultPresented: entry.previousResultPresented === true || entry.resultPresented === true,
+    reason: entry.reason || "",
+    previousCallKey: entry.previousCallKey || "",
+    previousCompletedAt: Number(entry.previousCompletedAt || 0),
+    previousInterrupted: entry.previousInterrupted === true,
+    previousInterruptSignal: entry.previousInterruptSignal || "",
+    recovered: true
+  };
+}
+
+function normalizeServerCallKind(value) {
+  const kind = String(value || "shell").trim().toLowerCase();
+  return ["shell", "board", "visual"].includes(kind) ? kind : "shell";
+}
+
+async function recoverPersistentOwnerForLedgerKey(ledgerKey) {
+  const socketPath = getTmuxSocketPath() || "default-socket";
+  const panes = await listTmuxPanes({ quiet: true });
+  for (const pane of panes) {
+    const owner = await readPersistentTmuxPaneOwner(pane);
+    if (owner?.ledgerKey !== ledgerKey) {
+      continue;
+    }
+    await settlePersistentTmuxPaneOwner(owner, pane, socketPath);
+    return true;
+  }
+  return false;
 }
 
 function summarizeError(error) {
@@ -2405,16 +3378,41 @@ function saveServerLedger() {
 function pruneServerLedger() {
   pruneExpiredCompletedCalls(serverLedger);
   const entries = Object.entries(serverLedger.calls || {});
-  if (entries.length <= SERVER_LEDGER_LIMIT) {
-    return;
+  if (entries.length > SERVER_LEDGER_LIMIT) {
+    const removable = entries
+      .filter(([, entry]) => ["completed", "failed", "unconfirmed"].includes(entry?.state))
+      .sort(([, a], [, b]) => Number(b.completedAt || b.startedAt || 0) - Number(a.completedAt || a.startedAt || 0))
+      .reverse();
+    const removeCount = Math.min(entries.length - SERVER_LEDGER_LIMIT, removable.length);
+    removable
+      .slice(0, removeCount)
+      .forEach(([key]) => {
+        delete serverLedger.calls[key];
+      });
   }
+  enforceServerLedgerReplayBudget(serverLedger);
+}
 
-  entries
-    .sort(([, a], [, b]) => Number(b.completedAt || b.startedAt || 0) - Number(a.completedAt || a.startedAt || 0))
-    .slice(SERVER_LEDGER_LIMIT)
-    .forEach(([key]) => {
-      delete serverLedger.calls[key];
-    });
+function enforceServerLedgerReplayBudget(ledger) {
+  let retainedBytes = 0;
+  const completed = Object.values(ledger.calls || {})
+    .filter((entry) => entry?.state === "completed" && entry.resultStored === true)
+    .sort((left, right) => Number(right.completedAt || 0) - Number(left.completedAt || 0));
+  for (const entry of completed) {
+    const replayBytes = Buffer.byteLength(String(entry.stdout || ""), "utf8") +
+      Buffer.byteLength(String(entry.stderr || ""), "utf8");
+    if (retainedBytes + replayBytes <= SERVER_LEDGER_REPLAY_BUDGET_BYTES) {
+      retainedBytes += replayBytes;
+      continue;
+    }
+    // Keep executionKey/completion proof for authoritative duplicate
+    // adjudication, but expire only the replay payload to bound synchronous
+    // ledger rewrites and startup parsing.
+    entry.stdout = "";
+    entry.stderr = "";
+    entry.resultStored = false;
+    entry.resultExpired = true;
+  }
 }
 
 function pruneExpiredCompletedCalls(ledger) {
@@ -2510,11 +3508,12 @@ function validateVisionTmuxCommand(cmd) {
   return normalized;
 }
 
-async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
+async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerContext = null, ledgerKey = "" }) {
   const runId = crypto.randomBytes(8).toString("hex");
   const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
   const doneMarker = `__AI_CHAT_SHELL_EXEC_DONE_${runId}__`;
   const scriptPath = path.join(TMUX_SCRIPT_DIR, `${runId}.zsh`);
+  const launcherPath = path.join(TMUX_SCRIPT_DIR, `${runId}.launcher.sh`);
   const pidPath = path.join(TMUX_SCRIPT_DIR, `${runId}.pid`);
   const statusPath = path.join(TMUX_SCRIPT_DIR, `${runId}.status`);
   const executedPath = path.join(TMUX_SCRIPT_DIR, `${runId}.executed`);
@@ -2530,6 +3529,28 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
     executedPath,
     interruptedPath
   }), { mode: 0o700 });
+  fs.writeFileSync(launcherPath, buildTmuxRunLauncherScript({
+    scriptPath,
+    pidPath,
+    statusPath,
+    executedPath,
+    interruptedPath,
+    doneMarker
+  }), { mode: 0o700 });
+
+  await updatePersistentTmuxPaneOwner(ownerContext, {
+    kind: "shell",
+    ledgerKey,
+    startMarker,
+    doneMarker,
+    maxOutputChars,
+    scriptPath,
+    launcherPath,
+    pidPath,
+    statusPath,
+    executedPath,
+    interruptedPath
+  });
 
   const started = Date.now();
   const markerLossGraceMs = 2000;
@@ -2538,8 +3559,7 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
   let continuedAfterTimeout = false;
   let lastCapture = "";
   try {
-    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", `${SHELL_RUNNER} ${shellQuote(scriptPath)}`], { timeoutMs: 5000 });
-    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
+    await sendTmuxLiteralLine(pane.id, `/bin/sh ${shellQuote(launcherPath)}`);
 
     while (true) {
       await sleep(TMUX_POLL_INTERVAL_MS);
@@ -2551,6 +3571,8 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
         return {
           executed,
           executionCompleted: executed,
+          cancelledBeforeExecution: !executed && Boolean(interruptSignal),
+          retryable: !executed,
           interrupted: Boolean(interruptSignal),
           interruptSignal,
           exitCode: extracted.exitCode,
@@ -2577,6 +3599,8 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
         return {
           executed,
           executionCompleted: executed,
+          cancelledBeforeExecution: !executed && Boolean(interruptSignal),
+          retryable: !executed,
           interrupted: Boolean(interruptSignal),
           interruptSignal,
           exitCode: finalExtracted.foundDone ? finalExtracted.exitCode : state.exitCode,
@@ -2652,30 +3676,15 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars }) {
       };
     }
   } finally {
-    try {
-      fs.unlinkSync(scriptPath);
-    } catch {
-      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
-    }
-    try {
-      fs.unlinkSync(pidPath);
-    } catch {
-      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
-    }
-    try {
-      fs.unlinkSync(statusPath);
-    } catch {
-      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
-    }
-    try {
-      fs.unlinkSync(executedPath);
-    } catch {
-      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
-    }
-    try {
-      fs.unlinkSync(interruptedPath);
-    } catch {
-      // Best-effort cleanup; stale files are harmless and remain under the runtime state directory.
+    if (!ownerContext) {
+      cleanupPersistentTmuxOwnerFiles({
+        scriptPath,
+        launcherPath,
+        pidPath,
+        statusPath,
+        executedPath,
+        interruptedPath
+      });
     }
   }
 }
@@ -2759,7 +3768,39 @@ function isProcessAlive(pid) {
   }
 }
 
-async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
+async function runTmuxBoard(options) {
+  return withTmuxShellPaneQueue({
+    cmd: options?.cmd,
+    pane: options?.pane,
+    kind: "board",
+    ledgerKey: options?.reservationLedgerKey || options?.ledgerKey || ""
+  }, async (queueContext) => {
+    const ledgerKey = options?.reservationLedgerKey || options?.ledgerKey || "";
+    if (options?.reservationLedgerKey) {
+      await updatePersistentTmuxPaneOwner(queueContext.owner, { ledgerKey });
+      adjudicateReservedServerShellCall(ledgerKey, {
+        ...(options.claimPayload || {}),
+        cwd: queueContext.currentPane.currentPath || "",
+        target: queueContext.currentPane.id,
+        // Generic board prompts are serialization evidence only and never
+        // establish execution duplicate authority.
+        executionTarget: ""
+      });
+    }
+    const result = await runTmuxBoardInPane({
+      ...options,
+      pane: queueContext.currentPane,
+      ownerContext: queueContext.owner,
+      ledgerKey
+    });
+    return {
+      ...result,
+      cwd: queueContext.currentPane.currentPath || ""
+    };
+  });
+}
+
+async function runTmuxBoardInPane({ cmd, pane, timeoutMs, maxOutputChars, ownerContext = null, ledgerKey = "" }) {
   const timing = getBoardTimingConfig();
   const logPath = buildBoardLogPath(pane);
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
@@ -2781,61 +3822,69 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
     };
   }
 
-  const deadline = Date.now() + timeoutMs;
+  const boardShellPrompt = INTERACTIVE_SHELL_COMMANDS.has(
+    path.basename(String(pane.currentCommand || "")).replace(/^-/, "")
+  );
   let pipeStarted = false;
   try {
-    await startTmuxPanePipe(pane.id, logPath);
-    pipeStarted = true;
-    await sleep(timing.pollMs);
-
-    const probeOffset = getFileSize(logPath);
-    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
-    const probe = await waitForBoardIdle({
-      logPath,
-      offset: probeOffset,
-      deadline,
-      idleMs: timing.probeIdleMs,
-      pollMs: timing.pollMs,
-      maxOutputChars
-    });
-    const prompt = extractBoardPromptSignature(probe.normalized);
+    const prompt = await readStableBoardPrompt(pane, timing);
     if (!prompt) {
       return {
         ok: false,
         exitCode: 1,
-        stdout: probe.stdout,
+        stdout: "",
         stderr: "",
         error: "Board prompt probe failed; command was not sent.",
         executed: false,
-        truncated: probe.truncated,
-        timedOut: probe.timedOut,
+        truncated: false,
+        timedOut: false,
         target: pane.id,
         targetName: pane.label
       };
     }
 
+    await startTmuxPanePipe(pane.id, logPath);
+    pipeStarted = true;
+    await sleep(timing.pollMs);
+
     const commandOffset = getFileSize(logPath);
-    await runTmuxCommand(["send-keys", "-t", pane.id, "-l", cmd], { timeoutMs: 5000 });
-    await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
-    const captured = await waitForBoardPrompt({
+    await updatePersistentTmuxPaneOwner(ownerContext, {
+      kind: "board",
+      ledgerKey,
+      processPid: process.pid,
+      boardLogPath: logPath,
+      boardPrompt: prompt,
+      boardShellPrompt,
+      boardOffset: commandOffset,
+      boardState: "prepared"
+    });
+    await updatePersistentTmuxPaneOwnerAndSendLine(ownerContext, {
+      boardState: "sent"
+    }, cmd);
+    const captured = await waitForBoardPromptAndPaneReady({
+      pane,
       logPath,
       offset: commandOffset,
       prompt,
-      deadline,
+      timeoutMs,
       idleMs: timing.promptIdleMs,
       pollMs: timing.pollMs,
-      maxOutputChars
+      maxOutputChars,
+      requireShellReady: boardShellPrompt
+    });
+    await updatePersistentTmuxPaneOwner(ownerContext, {
+      boardState: "prompt-returned"
     });
 
     return {
       executed: true,
       executionCompleted: false,
-      completionObserved: !captured.timedOut,
-      exitCode: captured.timedOut ? 124 : 0,
+      completionObserved: true,
+      exitCode: captured.crossedTimeout ? 124 : 0,
       stdout: captured.stdout,
-      stderr: captured.timedOut ? "Timed out waiting for board prompt after command. The command may still be running in the target pane." : "",
+      stderr: captured.crossedTimeout ? "The board command exceeded its response timeout, but the pane lease remained active until the prompt returned." : "",
       truncated: captured.truncated,
-      timedOut: captured.timedOut,
+      timedOut: captured.crossedTimeout,
       target: pane.id,
       targetName: pane.label
     };
@@ -2850,47 +3899,144 @@ async function runTmuxBoard({ cmd, pane, timeoutMs, maxOutputChars }) {
   }
 }
 
-async function runTmuxVisualLine({ cmd, pane, timeoutMs, maxOutputChars }) {
+async function readStableBoardPrompt(pane, timing) {
+  if (INTERACTIVE_SHELL_COMMANDS.has(path.basename(String(pane.currentCommand || "")).replace(/^-/, "")) &&
+      !await isTmuxPaneReadyForHelper(pane)) {
+    return "";
+  }
+  const first = normalizeBoardOutput(await captureTmuxPane(pane.id, DEFAULT_MAX_OUTPUT_CHARS));
+  await sleep(timing.probeIdleMs);
+  const currentPane = await verifyTmuxShellPaneBeforeDispatch(pane, {
+    socketPath: getTmuxSocketPath() || "default-socket",
+    quiet: true
+  });
+  if (INTERACTIVE_SHELL_COMMANDS.has(path.basename(String(currentPane.currentCommand || "")).replace(/^-/, "")) &&
+      !await isTmuxPaneReadyForHelper(currentPane)) {
+    return "";
+  }
+  const second = normalizeBoardOutput(await captureTmuxPane(pane.id, DEFAULT_MAX_OUTPUT_CHARS));
+  if (first !== second) {
+    return "";
+  }
+  const prompt = extractBoardPromptSignature(second);
+  return looksLikeBoardPrompt(prompt) ? prompt : "";
+}
+
+function looksLikeBoardPrompt(prompt) {
+  const text = String(prompt || "").trim();
+  return text.length > 0 && text.length <= 200 && /(?:[$#%>]|[›❯λ])$/.test(text);
+}
+
+async function waitForBoardPromptAndPaneReady({ pane, logPath, offset, prompt, timeoutMs, idleMs, pollMs, maxOutputChars, requireShellReady = false }) {
+  const startedAt = Date.now();
+  let lastSize = getFileSize(logPath);
+  let lastChangeAt = Date.now();
+  let latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+  let lastPaneCheckAt = 0;
+
+  while (true) {
+    await sleep(pollMs);
+    if (Date.now() - lastPaneCheckAt >= 1000) {
+      await verifyTmuxShellPaneBeforeDispatch(pane, {
+        socketPath: getTmuxSocketPath() || "default-socket",
+        queued: true,
+        quiet: true
+      });
+      lastPaneCheckAt = Date.now();
+    }
+    latest = readBoardLogFromOffset(logPath, offset, maxOutputChars);
+    if (latest.size !== lastSize) {
+      lastSize = latest.size;
+      lastChangeAt = Date.now();
+    }
+    if (latest.bytesRead > 0 &&
+        outputEndsWithBoardPrompt(latest.normalized, prompt) &&
+        Date.now() - lastChangeAt >= idleMs) {
+      const currentPane = await verifyTmuxShellPaneBeforeDispatch(pane, {
+        socketPath: getTmuxSocketPath() || "default-socket",
+        queued: true,
+        quiet: true
+      });
+      if (await isBoardPaneReadyAfterCommand(currentPane, requireShellReady)) {
+        return {
+          ...latest,
+          crossedTimeout: Date.now() - startedAt >= timeoutMs
+        };
+      }
+    }
+  }
+}
+
+async function isBoardPaneReadyAfterCommand(pane, requireShellReady = false) {
+  const command = path.basename(String(pane.currentCommand || "")).replace(/^-/, "");
+  if (!requireShellReady && !INTERACTIVE_SHELL_COMMANDS.has(command)) {
+    // Generic board TUIs do not expose an authoritative completion primitive.
+    // Their stable returned input prompt is sufficient for serialization, but
+    // remains deliberately insufficient for execution deduplication.
+    return true;
+  }
+  return isTmuxPaneReadyForHelper(pane);
+}
+
+async function runTmuxVisualLine({ cmd, pane, timeoutMs, maxOutputChars, ownerContext = null, ledgerKey = "" }) {
   const started = Date.now();
   const runId = randomOcrSafeToken(8);
   const runWindowName = `${VISION_TMUX_RUN_PREFIX}_RUN_${runId}`;
   const donePrefix = `${VISION_TMUX_RUN_PREFIX}_DONE_${runId}_`;
-  const runLine = buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix });
+  const statusPath = path.join(TMUX_SCRIPT_DIR, `${runId}.visual.status`);
+  const executedPath = path.join(TMUX_SCRIPT_DIR, `${runId}.visual.executed`);
+  fs.mkdirSync(TMUX_SCRIPT_DIR, { recursive: true });
+  const runLine = buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix, statusPath, executedPath });
 
-  await runTmuxCommand(["send-keys", "-t", pane.id, "C-c"], { timeoutMs: 5000 }).catch(() => null);
-  await sleep(150);
-  await runTmuxCommand(["send-keys", "-t", pane.id, "C-l"], { timeoutMs: 5000 });
-  await runTmuxCommand(["clear-history", "-t", pane.id], { timeoutMs: 5000 });
-  await runTmuxCommand(["rename-window", "-t", pane.id, runWindowName], { timeoutMs: 5000 });
-  await runTmuxCommand(["send-keys", "-t", pane.id, "-l", runLine], { timeoutMs: 5000 });
-  await runTmuxCommand(["send-keys", "-t", pane.id, "Enter"], { timeoutMs: 5000 });
-
-  const done = await waitForTmuxWindowDone({
-    target: pane.id,
-    donePrefix,
-    timeoutMs
-  });
-  const terminalText = await captureTmuxPane(pane.id, maxOutputChars);
-  const parsed = parseTmuxVisualDoneWindowName(done.windowName, donePrefix);
-  const lineCount = terminalText ? terminalText.split("\n").length : 0;
-  const charCount = terminalText.length;
-
-  return {
-    ok: done.found,
-    executed: true,
-    executionCompleted: done.found,
-    runId,
+  await updatePersistentTmuxPaneOwner(ownerContext, {
+    kind: "visual",
+    ledgerKey,
     runWindowName,
-    doneWindowName: done.windowName,
-    exitCode: done.found ? parsed.exitCode : 124,
-    terminalText,
-    lineCount,
-    charCount,
-    truncated: done.truncated || charCount >= maxOutputChars,
-    timedOut: !done.found,
-    stderr: done.found ? "" : "Timed out waiting for tmux window done marker. The command may still be running in the target pane.",
-    durationMs: Date.now() - started
-  };
+    donePrefix,
+    statusPath,
+    executedPath
+  });
+
+  try {
+    await runTmuxCommand(["send-keys", "-t", pane.id, "C-l"], { timeoutMs: 5000 });
+    await runTmuxCommand(["clear-history", "-t", pane.id], { timeoutMs: 5000 });
+    await runTmuxCommand(["rename-window", "-t", pane.id, runWindowName], { timeoutMs: 5000 });
+    await sendTmuxLiteralLine(pane.id, runLine);
+
+    const done = await waitForTmuxWindowDone({
+      target: pane.id,
+      donePrefix,
+      timeoutMs,
+      statusPath
+    });
+    const terminalText = await captureTmuxPane(pane.id, maxOutputChars);
+    const parsed = parseTmuxVisualDoneWindowName(done.windowName, donePrefix);
+    const lineCount = terminalText ? terminalText.split("\n").length : 0;
+    const charCount = terminalText.length;
+
+    return {
+      ok: done.found,
+      executed: fs.existsSync(executedPath),
+      executionCompleted: done.found && fs.existsSync(executedPath),
+      runId,
+      runWindowName,
+      doneWindowName: done.windowName,
+      exitCode: done.found ? (Number.isInteger(done.exitCode) ? done.exitCode : parsed.exitCode) : 124,
+      terminalText,
+      lineCount,
+      charCount,
+      truncated: done.truncated || charCount >= maxOutputChars,
+      timedOut: !done.found,
+      continuedAfterTimeout: done.continuedAfterTimeout === true,
+      completionMarkerMissing: done.completionMarkerMissing === true,
+      stderr: done.found ? "" : "Timed out waiting for tmux window done marker. The command may still be running in the target pane.",
+      durationMs: Date.now() - started
+    };
+  } finally {
+    if (!ownerContext) {
+      cleanupPersistentTmuxOwnerFiles({ statusPath, executedPath });
+    }
+  }
 }
 
 async function runVisionTmuxOcrLine({ cmd, windowId, timeoutMs, maxPages, pageDelayMs, appName = "" }) {
@@ -3012,13 +4158,15 @@ function buildTmuxVisualOcrRunLine({ cmd, runWindowName, donePrefix, startMarker
   ].join("; ");
 }
 
-function buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix }) {
+function buildTmuxVisualRunLine({ cmd, runWindowName, donePrefix, statusPath = "", executedPath = "" }) {
   return [
     `tmux rename-window ${shellQuote(runWindowName)}`,
+    executedPath ? `printf '1\\n' > ${shellQuote(executedPath)}` : "",
     `/bin/sh -c ${shellQuote(cmd)}`,
     "__AI_VISION_EXIT_CODE=$?",
+    statusPath ? `printf '%s\\n' "$__AI_VISION_EXIT_CODE" > ${shellQuote(statusPath)}` : "",
     `tmux rename-window \"${donePrefix}\${__AI_VISION_EXIT_CODE}\"`
-  ].join("; ");
+  ].filter(Boolean).join("; ");
 }
 
 async function getVisionTmuxWindowById(windowId, { appName = "" } = {}) {
@@ -3071,25 +4219,44 @@ async function getVisionTmuxWindowById(windowId, { appName = "" } = {}) {
   };
 }
 
-async function waitForTmuxWindowDone({ target, donePrefix, timeoutMs }) {
+async function waitForTmuxWindowDone({ target, donePrefix, timeoutMs, statusPath = "" }) {
   const started = Date.now();
   let lastWindowName = "";
-  while (Date.now() - started < timeoutMs) {
+  let continuedAfterTimeout = false;
+  while (true) {
     await sleep(TMUX_POLL_INTERVAL_MS);
     lastWindowName = await getTmuxWindowName(target);
     if (lastWindowName.startsWith(donePrefix)) {
       return {
         found: true,
         windowName: lastWindowName,
-        truncated: false
+        truncated: false,
+        continuedAfterTimeout
       };
     }
+    const status = statusPath ? readExitStatusFile(statusPath) : null;
+    if (status !== null) {
+      return {
+        found: true,
+        windowName: lastWindowName,
+        exitCode: status,
+        truncated: false,
+        continuedAfterTimeout,
+        completionMarkerMissing: true
+      };
+    }
+    if (Date.now() - started >= timeoutMs) {
+      continuedAfterTimeout = true;
+      if (!statusPath) {
+        return {
+          found: false,
+          windowName: lastWindowName,
+          truncated: false,
+          continuedAfterTimeout
+        };
+      }
+    }
   }
-  return {
-    found: false,
-    windowName: lastWindowName,
-    truncated: false
-  };
 }
 
 async function getTmuxWindowName(target) {
@@ -3434,10 +4601,48 @@ function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, status
   ].filter((line) => line !== "").join("\n");
 }
 
-async function listTmuxPanes() {
+function buildTmuxRunLauncherScript({ scriptPath, pidPath, statusPath, interruptedPath, doneMarker }) {
+  return [
+    "#!/bin/sh",
+    "set +e",
+    "__ai_chat_shell_launcher_finish() {",
+    "  __ai_chat_shell_launcher_signal=$1",
+    "  __ai_chat_shell_launcher_status=$2",
+    "  trap - INT TERM HUP",
+    `  if [ ! -e ${shellQuote(statusPath)} ]; then`,
+    `    printf '%s\\n' "$__ai_chat_shell_launcher_signal" > ${shellQuote(interruptedPath)}`,
+    `    printf '%s\\n' "$__ai_chat_shell_launcher_status" > ${shellQuote(statusPath)}`,
+    `    printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} "$__ai_chat_shell_launcher_status"`,
+    "  fi",
+    "  exit \"$__ai_chat_shell_launcher_status\"",
+    "}",
+    "trap '__ai_chat_shell_launcher_finish INT 130' INT",
+    "trap '__ai_chat_shell_launcher_finish TERM 143' TERM",
+    "trap '__ai_chat_shell_launcher_finish HUP 129' HUP",
+    `printf '%s\\n' "$$" > ${shellQuote(pidPath)}`,
+    `${shellQuote(SHELL_RUNNER)} ${shellQuote(scriptPath)}`,
+    "__ai_chat_shell_launcher_status=$?",
+    "trap - INT TERM HUP",
+    `if [ ! -e ${shellQuote(statusPath)} ]; then`,
+    "  case \"$__ai_chat_shell_launcher_status\" in",
+    `    130) printf 'INT\\n' > ${shellQuote(interruptedPath)} ;;`,
+    `    143) printf 'TERM\\n' > ${shellQuote(interruptedPath)} ;;`,
+    `    129) printf 'HUP\\n' > ${shellQuote(interruptedPath)} ;;`,
+    "  esac",
+    `  printf '%s\\n' "$__ai_chat_shell_launcher_status" > ${shellQuote(statusPath)}`,
+    `  printf '\\n%s:%s\\n' ${shellQuote(doneMarker)} "$__ai_chat_shell_launcher_status"`,
+    "fi",
+    "exit \"$__ai_chat_shell_launcher_status\"",
+    ""
+  ].join("\n");
+}
+
+async function listTmuxPanes({ quiet = false } = {}) {
   const result = await runTmuxCommand(["list-panes", "-a", "-F", TMUX_LIST_FORMAT], { timeoutMs: 5000 });
   const panes = parseTmuxPanes(result.stdout);
-  console.log(`[tmux-list] socket=${getTmuxSocketPath() || "(default)"} panes=${panes.length} stdoutChars=${result.stdout.length}`);
+  if (!quiet) {
+    console.log(`[tmux-list] socket=${getTmuxSocketPath() || "(default)"} panes=${panes.length} stdoutChars=${result.stdout.length}`);
+  }
   return panes;
 }
 
@@ -3568,7 +4773,9 @@ function parseTmuxPanes(output) {
         currentPath,
         currentCommand,
         sessionCreated,
-        serverPid
+        serverPid,
+        panePid,
+        paneTty
       ] = parts;
       const address = `${session}:${windowIndex}.${paneIndex}`;
       return {
@@ -3582,6 +4789,8 @@ function parseTmuxPanes(output) {
         currentCommand: currentCommand || "",
         sessionCreated: sessionCreated || "",
         serverPid: serverPid || "",
+        panePid: panePid || "",
+        paneTty: paneTty || "",
         address,
         label: `${address} ${windowName || "(unnamed)"}`
       };
@@ -4156,6 +5365,14 @@ function getFileSize(filePath) {
   }
 }
 
+function getFileMtimeMs(filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 function getEnvClampedNumber(name, min, max, fallback) {
   return clampNumber(process.env[name], min, max, fallback);
 }
@@ -4630,6 +5847,52 @@ function runTmuxCommand(args, options) {
   return runCommand("tmux", buildTmuxCommandArgs(args), options);
 }
 
+function buildTmuxLiteralLineArgs(paneId, text) {
+  return [
+    "send-keys", "-t", paneId, "-l", String(text || ""),
+    ";",
+    "send-keys", "-t", paneId, "Enter"
+  ];
+}
+
+function sendTmuxLiteralLine(paneId, text) {
+  // One tmux client request makes the literal payload and Enter inseparable
+  // from the shell server's perspective. In particular, a Node/server crash
+  // cannot leave a dangerous helper launcher buffered at the prompt.
+  return runTmuxCommand(buildTmuxLiteralLineArgs(paneId, text), { timeoutMs: 5000 });
+}
+
+async function updatePersistentTmuxPaneOwnerAndSendLine(ownerContext, patch, text) {
+  if (!ownerContext?.pane?.id || !ownerContext.token) {
+    throw new Error("Cannot atomically dispatch without persistent tmux pane ownership.");
+  }
+  const next = {
+    ...ownerContext,
+    ...patch
+  };
+  const currentEncoded = encodePersistentTmuxPaneOwner(ownerContext);
+  const nextEncoded = encodePersistentTmuxPaneOwner(next);
+  const paneId = ownerContext.pane.id;
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},${currentEncoded}}`;
+  const dispatchCommand = [
+    `set-option -p -t ${shellQuote(paneId)} ${TMUX_PANE_OWNER_OPTION} ${shellQuote(nextEncoded)}`,
+    `send-keys -t ${shellQuote(paneId)} -l ${shellQuote(String(text || ""))}`,
+    `send-keys -t ${shellQuote(paneId)} Enter`
+  ].join(" ; ");
+  await runTmuxCommand([
+    "if-shell", "-F", "-t", paneId,
+    condition,
+    dispatchCommand,
+    ""
+  ], { timeoutMs: 5000 });
+  const current = await readPersistentTmuxPaneOwner(ownerContext.pane);
+  if (!current || encodePersistentTmuxPaneOwner(current) !== nextEncoded) {
+    throw new Error(`Lost persistent tmux pane ownership for ${paneId} before atomic dispatch.`);
+  }
+  Object.assign(ownerContext, patch);
+  return ownerContext;
+}
+
 function runTmuxCommandRaw(args, options) {
   return runCommandRaw("tmux", buildTmuxCommandArgs(args), options);
 }
@@ -4915,6 +6178,7 @@ function resolveCwd(rawCwd, fallbackCwd = "") {
 module.exports = {
   HELPER_PROTOCOL_VERSION,
   SERVER_PROTOCOL_VERSION,
+  acquirePersistentTmuxPaneOwner,
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
@@ -4924,6 +6188,7 @@ module.exports = {
   buildHealthResponse,
   buildDefaultTargetErrorResponse,
   buildTmuxCommandArgs,
+  buildTmuxLiteralLineArgs,
   buildTmuxVisualOcrRunLine,
   buildMissingTargetResponse,
   cleanVisionTmuxOcrText,
@@ -4937,6 +6202,7 @@ module.exports = {
   getStateDir,
   getStateStatus,
   getTmuxEnvSocketPath,
+  getTmuxPaneReadiness,
   getTmuxShellPaneQueueDepth,
   getTmuxSocketPath,
   ensureForAiTmuxLayout,
@@ -4964,6 +6230,7 @@ module.exports = {
   prepareStateLogFile,
   readBoardLogFromOffset,
   readTmuxShellRunState,
+  releasePersistentTmuxPaneOwner,
   resetAgentHubForTests,
   resolveBoardPane,
   resolveDefaultShellPane,
@@ -4988,5 +6255,6 @@ module.exports = {
   visionOcrStatusText,
   visionOcrText,
   visionTextIncludes,
+  writeWebSocketResponse,
   writeDownloadsFile
 };

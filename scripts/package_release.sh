@@ -23,11 +23,14 @@ if [[ "${ALLOW_DIRTY:-0}" != "1" ]] && [[ -n "$(git ls-files --others --exclude-
   exit 1
 fi
 
-if [[ -n "$VERSION_INPUT" ]]; then
-  VERSION="${VERSION_INPUT#v}"
-else
-  VERSION="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("extension/manifest.json", "utf8")).version)')"
+MANIFEST_VERSION="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("extension/manifest.json", "utf8")).version)')"
+
+if [[ -n "$VERSION_INPUT" ]] && [[ "${VERSION_INPUT#v}" != "$MANIFEST_VERSION" ]]; then
+  echo "Requested release version ${VERSION_INPUT#v} does not match extension manifest version $MANIFEST_VERSION." >&2
+  exit 1
 fi
+
+VERSION="$MANIFEST_VERSION"
 
 TAG="v$VERSION"
 PACKAGE_BASENAME="ai-chat-shell-exec-extension-$TAG"

@@ -8,8 +8,9 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 4;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 6;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 2;
+const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
   "vision-health",
   "vision-list-tmux-windows",
@@ -118,6 +119,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "run-board") {
     handleRunBoardMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
+  if (message.type === "run-shell-status") {
+    handleRunShellStatusMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
+  if (message.type === "run-board-status") {
+    handleRunBoardStatusMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
+  if (message.type === "run-result-presented") {
+    handleRunResultPresentedMessage(message)
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -252,6 +283,80 @@ async function handleRunShellMessage(message) {
     });
     throw error;
   }
+}
+
+async function handleRunShellStatusMessage(message) {
+  const callKey = String(message.callKey || "").trim();
+  if (!callKey) {
+    throw new Error("Missing shell callKey for status recovery.");
+  }
+  await requireShellServerReady();
+  const response = await runShellViaWebSocket({
+    type: "run-status",
+    id: message.id || callKey,
+    callKey,
+    timeoutMs: 5000
+  });
+  if (response?.found === true && response.state === "completed") {
+    await markShellCall(callKey, "completed", {
+      completedAt: response.completedAt || Date.now(),
+      recovered: true,
+      exitCode: response.result?.exitCode,
+      durationMs: response.result?.durationMs
+    });
+  } else if (response?.found === true && response.state === "failed") {
+    await markShellCall(callKey, "failed", {
+      completedAt: response.completedAt || Date.now(),
+      recovered: true,
+      error: response.error || "Server attempt failed."
+    });
+  }
+  return response;
+}
+
+async function handleRunBoardStatusMessage(message) {
+  const callKey = String(message.callKey || "").trim();
+  if (!callKey) {
+    throw new Error("Missing board callKey for status recovery.");
+  }
+  await requireShellServerReady();
+  const response = await runShellViaWebSocket({
+    type: "run-status",
+    id: message.id || callKey,
+    callKey,
+    kind: "board",
+    timeoutMs: 5000
+  });
+  if (response?.found === true && response.state === "completed") {
+    await markShellCall(callKey, "completed", {
+      completedAt: response.completedAt || Date.now(),
+      recovered: true,
+      exitCode: response.result?.exitCode,
+      durationMs: response.result?.durationMs,
+      target: response.result?.target || ""
+    });
+  } else if (response?.found === true && response.state === "failed") {
+    await markShellCall(callKey, "failed", {
+      completedAt: response.completedAt || Date.now(),
+      recovered: true,
+      error: response.error || "Server board attempt failed."
+    });
+  }
+  return response;
+}
+
+async function handleRunResultPresentedMessage(message) {
+  const executionId = String(message.executionId || "").trim();
+  if (!/^[a-f0-9]{16}$/i.test(executionId)) {
+    throw new Error("Missing or invalid executionId for result presentation receipt.");
+  }
+  await requireShellServerReady();
+  return runShellViaWebSocket({
+    type: "run-result-presented",
+    id: message.id || `${executionId}:presented`,
+    executionId,
+    timeoutMs: 5000
+  });
 }
 
 async function handleRunBoardMessage(message) {
@@ -617,6 +722,7 @@ function resetForAiTmuxTargets() {
 function runShellViaWebSocket(payload) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let heartbeatTimer = 0;
     const socket = new WebSocket(SHELL_SERVER_URL);
     const watchdogMs = getWebSocketWatchdogMs(payload);
     const timeout = watchdogMs > 0
@@ -627,7 +733,27 @@ function runShellViaWebSocket(payload) {
       : 0;
 
     socket.addEventListener("open", () => {
-      socket.send(JSON.stringify(payload));
+      try {
+        socket.send(JSON.stringify(payload));
+      } catch (error) {
+        clearTimeout(timeout);
+        finish(reject, error);
+        tryClose(socket);
+        return;
+      }
+      if (shouldKeepWebSocketAlive(payload)) {
+        heartbeatTimer = setInterval(() => {
+          if (!settled && socket.readyState === 1) {
+            try {
+              socket.send(JSON.stringify({ type: "keepalive" }));
+            } catch (error) {
+              clearTimeout(timeout);
+              finish(reject, error);
+              tryClose(socket);
+            }
+          }
+        }, WEBSOCKET_HEARTBEAT_INTERVAL_MS);
+      }
     });
 
     socket.addEventListener("message", (event) => {
@@ -658,13 +784,23 @@ function runShellViaWebSocket(payload) {
         return;
       }
       settled = true;
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+      heartbeatTimer = 0;
       callback(value);
     }
   });
 }
 
+function shouldKeepWebSocketAlive(payload) {
+  return payload?.type === "run" ||
+    payload?.type === "run-board" ||
+    VISION_COMMAND_MESSAGE_TYPES.has(payload?.type);
+}
+
 function getWebSocketWatchdogMs(payload) {
-  if (payload && payload.type === "run") {
+  if (payload && (payload.type === "run" || payload.type === "run-board")) {
     return 0;
   }
   return Math.max(5000, Number(payload?.timeoutMs || 30000) + 5000);

@@ -12,7 +12,7 @@ const ROOT_DIR = path.join(__dirname, "..");
 const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
 const TEST_PAGE_URL = process.env.AI_CHAT_SHELL_REAL_CLAUDE_TEST_URL || "https://localhost:17443/tmux-test-page.html";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
-const EXPECTED_SERVER_PROTOCOL = 4;
+const EXPECTED_SERVER_PROTOCOL = 5;
 const DEFAULT_TIMEOUT_MS = Number(process.env.AI_CHAT_SHELL_REAL_CLAUDE_TIMEOUT_MS || 240000);
 const ENABLED = process.env.AI_CHAT_SHELL_REAL_CLAUDE_E2E === "1";
 const AUTO_APPROVE = process.env.AI_CHAT_SHELL_REAL_CLAUDE_AUTO_APPROVE !== "0";

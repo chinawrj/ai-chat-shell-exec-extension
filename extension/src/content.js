@@ -22,13 +22,14 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.8.9";
+const CONTENT_SCRIPT_VERSION = "0.9.0";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
 const AGENT_PENDING_DELIVERY_PREFIX = "agentPendingDelivery:";
+const HELPER_PENDING_DELIVERY_PREFIX = "helperPendingDelivery:v1:";
 const AGENT_SESSION_PROFILE_KEY = "aiChatShellExecAgentProfile";
 const AGENT_SESSION_TAB_ID_KEY = "aiChatShellExecAgentTabId";
 const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
@@ -40,6 +41,15 @@ const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const MANUAL_AGENT_REQUEST = "ai-chat-shell-exec:agent-request";
 const MANUAL_AGENT_RESPONSE = "ai-chat-shell-exec:agent-response";
 const AGENT_POLL_INTERVAL_MS = 2000;
+const RUN_STATUS_POLL_INTERVAL_MS = 1000;
+const RUN_STATUS_MAX_NOT_FOUND = 5;
+const RUN_STATUS_MAX_TRANSPORT_FAILURES = 5;
+const PENDING_HELPER_DELIVERY_MAX_ENTRIES = 12;
+const PRESENTED_HELPER_EXECUTION_MAX_ENTRIES = 128;
+const PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS = 500_000;
+const PENDING_HELPER_DELIVERY_MAX_TOTAL_CHARS = 4_000_000;
+const PENDING_HELPER_DELIVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const PENDING_HELPER_DELIVERY_RETRY_MS = 2000;
 let helperRenderRootSequence = 0;
 const helperRenderRootIds = new WeakMap();
 const helperRenderRootGenerations = new WeakMap();
@@ -51,6 +61,12 @@ let scanTimer = 0;
 let lastThreadText = "";
 let lastThreadTextAt = Date.now();
 let activeCallId = "";
+let activeCallToken = null;
+let pageLifecycleGeneration = 0;
+let observedPageIdentity = "";
+let composerDeliverySequence = 0;
+let composerDeliveryTail = Promise.resolve();
+let activeComposerDeliveryToken = null;
 let chainCallCount = 0;
 let lastUserMessageText = "";
 let lastDisabledStatusAt = 0;
@@ -73,10 +89,18 @@ let pendingForceRunTimer = 0;
 let extensionVersionWarning = "";
 let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
+let agentDeliveryGeneration = 0;
+let activeAgentDeliveryToken = null;
 let pendingAgentDeliveryMessageId = "";
 let pendingAgentDelivery = null;
 let pendingAgentDeliveryLoaded = false;
 let consecutiveAgentPollFailures = 0;
+let pendingHelperDeliveries = new Map();
+let locallyPresentedHelperExecutions = new Map();
+let pendingHelperDeliveriesLoadedKey = "";
+let pendingHelperDeliveryRetryTimer = 0;
+let pendingHelperDeliveryRetryInFlight = false;
+let pendingHelperDeliveryStorageTail = Promise.resolve();
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -120,18 +144,27 @@ async function activateExtension() {
   }
 
   extensionActive = true;
+  beginPageLifecycle();
   initialThreadSettled = false;
   injectStatus();
   await loadLocalProfiles();
+  await loadPendingHelperDeliveriesForCurrentPage();
   observeThread();
   installPageEventListeners();
   startAgentPolling();
+  schedulePendingHelperDeliveryRetry();
   scheduleScan();
 }
 
 function deactivateExtension() {
+  const hadActiveLifecycle = Boolean(activeCallToken || threadObserver || document.getElementById(STATUS_ID));
   extensionActive = false;
-  activeCallId = "";
+  if (hadActiveLifecycle) {
+    beginPageLifecycle();
+  } else {
+    activeCallId = "";
+    activeCallToken = null;
+  }
   bindingMode = "";
   pendingSelfTest = null;
   lastPointerTarget = null;
@@ -436,6 +469,9 @@ async function scanForShellCall(options = {}) {
   if (!extensionActive) {
     return;
   }
+  refreshPageLifecycle();
+  await loadPendingHelperDeliveriesForCurrentPage();
+  schedulePendingHelperDeliveryRetry();
 
   if (!force) {
     expirePendingSelfTest();
@@ -518,6 +554,12 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
+  if (!force && pendingAgentDelivery && pendingAgentDelivery.sent !== true) {
+    setStatus("Helper detected; waiting for the pending agent message to leave the composer", "running");
+    scheduleScan();
+    return;
+  }
+
   if (!force) {
     expirePendingSelfTest();
   }
@@ -538,10 +580,8 @@ async function scanForShellCall(options = {}) {
   }
 
   if (!force && pendingSelfTest && !isExpectedSelfTestCall(call)) {
-    markCallProcessed(candidate, callKey, semanticCallKey);
-    const expected = pendingSelfTest.command;
-    setStatus(`Self-test ignored unexpected shell call; waiting for ${summarizeCommand(expected)}`, "running");
-    return;
+    pendingSelfTest = null;
+    setStatus("Self-test cancelled; running the latest helper request", "running");
   }
 
   if (!force && isShellOutputCandidate(candidate)) {
@@ -577,7 +617,10 @@ async function scanForShellCall(options = {}) {
       markCallProcessed(candidate, callKey, semanticCallKey);
     }
   }
-  await runAndReply(executionCallKey, call, { force });
+  const outcome = await runAndReply(executionCallKey, call, { force });
+  if (!force && outcome?.retryable === true) {
+    unmarkCallProcessed(candidate, semanticCallKey);
+  }
 }
 
 function schedulePendingForceRunScan() {
@@ -681,6 +724,444 @@ function getCurrentPageIdentity() {
   return location.href || `${location.origin}${location.pathname || ""}`;
 }
 
+function beginPageLifecycle() {
+  cancelPendingHelperDeliveryRetry();
+  pendingHelperDeliveries = new Map();
+  locallyPresentedHelperExecutions = new Map();
+  pendingHelperDeliveriesLoadedKey = "";
+  pageLifecycleGeneration += 1;
+  observedPageIdentity = getCurrentPageIdentity();
+  activeCallId = "";
+  activeCallToken = null;
+  initialThreadSettled = false;
+  lastThreadText = "";
+  lastThreadTextAt = Date.now();
+  chainCallCount = 0;
+  lastUserMessageText = "";
+  pendingSelfTest = null;
+  cancelAgentDeliveryLifecycle();
+  migratePendingAgentDeliveryToCurrentPage();
+  clearPendingForceRun();
+}
+
+function refreshPageLifecycle() {
+  const pageIdentity = getCurrentPageIdentity();
+  if (!observedPageIdentity) {
+    observedPageIdentity = pageIdentity;
+    return;
+  }
+  if (pageIdentity !== observedPageIdentity) {
+    beginPageLifecycle();
+  }
+}
+
+function pendingHelperDeliveryStorageKey(pageIdentity = getCurrentPageIdentity()) {
+  return `${HELPER_PENDING_DELIVERY_PREFIX}${getAgentTabInstanceId()}:${pageIdentity}`;
+}
+
+async function loadPendingHelperDeliveriesForCurrentPage() {
+  const storageKey = pendingHelperDeliveryStorageKey();
+  if (pendingHelperDeliveriesLoadedKey === storageKey) {
+    return;
+  }
+  await pendingHelperDeliveryStorageTail.catch(() => {});
+  pendingHelperDeliveries = new Map();
+  locallyPresentedHelperExecutions = new Map();
+  pendingHelperDeliveriesLoadedKey = storageKey;
+  try {
+    const stored = await chrome.storage.local.get([storageKey]);
+    const snapshot = stored?.[storageKey];
+    if (snapshot?.pageIdentity !== getCurrentPageIdentity() || !Array.isArray(snapshot.entries)) {
+      return;
+    }
+    const entries = prunePendingHelperDeliveryEntries(snapshot.entries)
+      .map((entry) => ({ ...entry, restored: true }));
+    for (const entry of entries) {
+      pendingHelperDeliveries.set(entry.callId, entry);
+    }
+    const presentedExecutions = pruneLocallyPresentedHelperExecutions(snapshot.presentedExecutions);
+    for (const presented of presentedExecutions) {
+      locallyPresentedHelperExecutions.set(presented.executionId, presented.presentedAt);
+    }
+    for (const entry of entries) {
+      if ((entry.phase === "submitted" || entry.phase === "presented") && isCanonicalExecutionId(entry.executionId)) {
+        locallyPresentedHelperExecutions.set(entry.executionId, Number(entry.updatedAt || entry.createdAt || Date.now()));
+      }
+    }
+    if (entries.length !== snapshot.entries.length ||
+        presentedExecutions.length !== (Array.isArray(snapshot.presentedExecutions) ? snapshot.presentedExecutions.length : 0)) {
+      await persistPendingHelperDeliveries(storageKey);
+    }
+  } catch (_unused) {
+    // A storage failure must not turn local result delivery into another run.
+  }
+}
+
+function isCanonicalExecutionId(value) {
+  return /^[a-f0-9]{16}$/i.test(String(value || ""));
+}
+
+function pruneLocallyPresentedHelperExecutions(entries, now = Date.now()) {
+  const byExecutionId = new Map();
+  for (const entry of Array.from(entries || [])) {
+    const executionId = String(entry?.executionId || "");
+    const presentedAt = Number(entry?.presentedAt || 0);
+    if (!isCanonicalExecutionId(executionId) || !Number.isFinite(presentedAt) ||
+        presentedAt <= 0 || now - presentedAt > PENDING_HELPER_DELIVERY_MAX_AGE_MS) {
+      continue;
+    }
+    byExecutionId.set(executionId, Math.max(presentedAt, Number(byExecutionId.get(executionId) || 0)));
+  }
+  return Array.from(byExecutionId, ([executionId, presentedAt]) => ({ executionId, presentedAt }))
+    .sort((a, b) => a.presentedAt - b.presentedAt)
+    .slice(-PRESENTED_HELPER_EXECUTION_MAX_ENTRIES);
+}
+
+function hasLocallyPresentedHelperExecution(executionId) {
+  return isCanonicalExecutionId(executionId) && locallyPresentedHelperExecutions.has(String(executionId));
+}
+
+async function rememberLocallyPresentedHelperExecution(entry) {
+  const executionId = String(entry?.executionId || "");
+  if (!isCanonicalExecutionId(executionId)) {
+    return;
+  }
+  locallyPresentedHelperExecutions.set(executionId, Date.now());
+  const pruned = pruneLocallyPresentedHelperExecutions(
+    Array.from(locallyPresentedHelperExecutions, ([id, presentedAt]) => ({ executionId: id, presentedAt }))
+  );
+  locallyPresentedHelperExecutions = new Map(pruned.map(({ executionId: id, presentedAt }) => [id, presentedAt]));
+  await persistPendingHelperDeliveries();
+}
+
+function prunePendingHelperDeliveryEntries(entries, now = Date.now()) {
+  const valid = Array.from(entries || [])
+    .filter((entry) => isStoredPendingHelperDelivery(entry, now))
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+  while (valid.length > PENDING_HELPER_DELIVERY_MAX_ENTRIES) {
+    valid.shift();
+  }
+  let totalChars = valid.reduce((sum, entry) => sum + String(entry.reply || "").length, 0);
+  while (valid.length > 1 && totalChars > PENDING_HELPER_DELIVERY_MAX_TOTAL_CHARS) {
+    const removed = valid.shift();
+    totalChars -= String(removed?.reply || "").length;
+  }
+  return valid;
+}
+
+function isStoredPendingHelperDelivery(entry, now = Date.now()) {
+  return Boolean(
+    entry &&
+    typeof entry === "object" &&
+    typeof entry.callId === "string" &&
+    entry.callId &&
+    (entry.kind === "shell" || entry.kind === "board") &&
+    entry.call &&
+    typeof entry.call === "object" &&
+    typeof entry.reply === "string" &&
+    entry.reply &&
+    entry.pageIdentity === getCurrentPageIdentity() &&
+    Number.isFinite(Number(entry.createdAt)) &&
+    now - Number(entry.createdAt) <= PENDING_HELPER_DELIVERY_MAX_AGE_MS
+  );
+}
+
+function boundPendingHelperReply(reply) {
+  const text = String(reply || "");
+  if (text.length <= PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS) {
+    return text;
+  }
+  const marker = "\n[pending helper reply truncated by local persistence bound]";
+  return `${text.slice(0, PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS - marker.length)}${marker}`;
+}
+
+function snapshotPendingHelperCall(call) {
+  return {
+    kind: isBoardHelperCall(call) ? "board" : "shell",
+    cmd: String(call?.cmd || ""),
+    cwd: String(call?.cwd || ""),
+    boardName: String(call?.boardName || ""),
+    helperId: String(call?.helperId || "")
+  };
+}
+
+function snapshotPendingHelperResponse(response) {
+  const source = response && typeof response === "object" ? response : {};
+  return {
+    ok: source.ok,
+    exitCode: source.exitCode,
+    interrupted: source.interrupted === true,
+    interruptSignal: String(source.interruptSignal || ""),
+    target: String(source.target || ""),
+    targetName: String(source.targetName || ""),
+    stdout: String(source.stdout || "").slice(0, 4096)
+  };
+}
+
+async function rememberPendingHelperDelivery(callId, call, response, reply, settings) {
+  await loadPendingHelperDeliveriesForCurrentPage();
+  const now = Date.now();
+  const executionId = String(response?.executionId || response?.receipt?.executionId || "");
+  if (isCanonicalExecutionId(executionId)) {
+    const existing = Array.from(pendingHelperDeliveries.values())
+      .find((pending) => pending.executionId === executionId);
+    if (existing) {
+      existing.updatedAt = now;
+      await persistPendingHelperDeliveries();
+      return existing;
+    }
+  }
+  const entry = {
+    callId,
+    executionId,
+    kind: isBoardHelperCall(call) ? "board" : "shell",
+    call: snapshotPendingHelperCall(call),
+    response: snapshotPendingHelperResponse(response),
+    reply: boundPendingHelperReply(reply),
+    autoSend: settings?.autoSend !== false,
+    pageIdentity: getCurrentPageIdentity(),
+    phase: "queued",
+    submittedMessageCountBefore: countSubmittedMessagesMatching(reply),
+    createdAt: now,
+    updatedAt: now,
+    attempts: 0,
+    lastError: "",
+    restored: false
+  };
+  pendingHelperDeliveries.set(callId, entry);
+  const pruned = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()));
+  pendingHelperDeliveries = new Map(pruned.map((pending) => [pending.callId, pending]));
+  await persistPendingHelperDeliveries();
+  return pendingHelperDeliveries.get(callId) || entry;
+}
+
+function persistPendingHelperDeliveries(storageKey = pendingHelperDeliveriesLoadedKey || pendingHelperDeliveryStorageKey()) {
+  const entries = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()))
+    .map(({ restored: _restored, deliveryInFlight: _deliveryInFlight, ...entry }) => entry);
+  const presentedExecutions = pruneLocallyPresentedHelperExecutions(
+    Array.from(locallyPresentedHelperExecutions, ([executionId, presentedAt]) => ({ executionId, presentedAt }))
+  );
+  const snapshot = {
+    version: 1,
+    pageIdentity: entries[0]?.pageIdentity || getCurrentPageIdentity(),
+    updatedAt: Date.now(),
+    entries,
+    presentedExecutions
+  };
+  pendingHelperDeliveryStorageTail = pendingHelperDeliveryStorageTail
+    .catch(() => {})
+    .then(() => entries.length > 0 || presentedExecutions.length > 0
+      ? chrome.storage.local.set({ [storageKey]: snapshot })
+      : chrome.storage.local.remove([storageKey]));
+  return pendingHelperDeliveryStorageTail.catch(() => {});
+}
+
+async function clearPendingHelperDelivery(entry) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return;
+  }
+  pendingHelperDeliveries.delete(entry.callId);
+  await persistPendingHelperDeliveries();
+}
+
+async function acknowledgePendingHelperResultPresented(entry) {
+  const executionId = String(entry?.executionId || "");
+  if (!isCanonicalExecutionId(executionId)) {
+    return true;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "run-result-presented",
+      executionId
+    });
+    return response?.ok === true && response?.found !== false;
+  } catch (_unused) {
+    return false;
+  }
+}
+
+function setPendingHelperDeliveryStatus(entry) {
+  const label = entry?.kind === "board" ? "Board helper" : "Shell helper";
+  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The command will not be sent again.`, "running");
+}
+
+async function attemptPendingHelperDelivery(entry, settings = null) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry || entry.pageIdentity !== getCurrentPageIdentity()) {
+    return false;
+  }
+  if (entry.deliveryInFlight === true) {
+    return false;
+  }
+  entry.deliveryInFlight = true;
+  try {
+    if (entry.phase === "submitted" || entry.phase === "presented" ||
+        countSubmittedMessagesMatching(entry.reply) > Number(entry.submittedMessageCountBefore || 0)) {
+      entry.phase = entry.phase === "presented" ? "presented" : "submitted";
+      entry.updatedAt = Date.now();
+      await rememberLocallyPresentedHelperExecution(entry);
+      const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
+      if (receiptAcknowledged) {
+        await clearPendingHelperDelivery(entry);
+      } else {
+        entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
+        await persistPendingHelperDeliveries();
+        schedulePendingHelperDeliveryRetry();
+      }
+      setHelperCompletionStatus(entry.call, entry.response);
+      return true;
+    }
+    if (entry.restored === true && entry.phase === "inserted" && !initialThreadSettled) {
+      setPendingHelperDeliveryStatus(entry);
+      schedulePendingHelperDeliveryRetry();
+      return false;
+    }
+    const deliverySettings = settings || await chrome.storage.sync.get(["autoSend"]);
+    const callToken = {
+      callId: entry.callId,
+      pageIdentity: entry.pageIdentity,
+      generation: pageLifecycleGeneration,
+      phase: "pending-reply"
+    };
+    entry.attempts = Number(entry.attempts || 0) + 1;
+    entry.updatedAt = Date.now();
+    const delivered = await deliverHelperReply(callToken, entry.reply, deliverySettings, async () => {
+      entry.phase = "inserted";
+      entry.updatedAt = Date.now();
+      entry.lastError = "";
+      await persistPendingHelperDeliveries();
+      setHelperCompletionStatus(entry.call, entry.response);
+    });
+    if (delivered) {
+      entry.phase = deliverySettings.autoSend === false ? "presented" : "submitted";
+      entry.updatedAt = Date.now();
+      await persistPendingHelperDeliveries();
+      await rememberLocallyPresentedHelperExecution(entry);
+      const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
+      if (receiptAcknowledged) {
+        await clearPendingHelperDelivery(entry);
+      } else {
+        entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
+        await persistPendingHelperDeliveries();
+        schedulePendingHelperDeliveryRetry();
+      }
+      return true;
+    }
+    entry.lastError = "chat composer insertion or send is not complete";
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    setPendingHelperDeliveryStatus(entry);
+    schedulePendingHelperDeliveryRetry();
+    return false;
+  } finally {
+    entry.deliveryInFlight = false;
+  }
+}
+
+async function retryPendingHelperDeliveries() {
+  if (pendingHelperDeliveryRetryInFlight || !extensionActive) {
+    return;
+  }
+  await loadPendingHelperDeliveriesForCurrentPage();
+  const entries = Array.from(pendingHelperDeliveries.values())
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+  if (entries.length === 0) {
+    return;
+  }
+  pendingHelperDeliveryRetryInFlight = true;
+  try {
+    const settings = await chrome.storage.sync.get(["autoSend"]);
+    for (const entry of entries) {
+      const delivered = await attemptPendingHelperDelivery(entry, settings);
+      if (!delivered) {
+        break;
+      }
+    }
+  } finally {
+    pendingHelperDeliveryRetryInFlight = false;
+  }
+  if (pendingHelperDeliveries.size > 0) {
+    schedulePendingHelperDeliveryRetry();
+  }
+}
+
+function schedulePendingHelperDeliveryRetry(delayMs = PENDING_HELPER_DELIVERY_RETRY_MS) {
+  if (!extensionActive || pendingHelperDeliveries.size === 0 || pendingHelperDeliveryRetryTimer) {
+    return;
+  }
+  pendingHelperDeliveryRetryTimer = setTimeout(() => {
+    pendingHelperDeliveryRetryTimer = 0;
+    retryPendingHelperDeliveries().catch(() => {
+      schedulePendingHelperDeliveryRetry();
+    });
+  }, delayMs);
+}
+
+function cancelPendingHelperDeliveryRetry() {
+  clearTimeout(pendingHelperDeliveryRetryTimer);
+  pendingHelperDeliveryRetryTimer = 0;
+}
+
+async function withComposerDeliveryLease(metadata, task) {
+  const previous = composerDeliveryTail.catch(() => {});
+  let releaseQueue;
+  const gate = new Promise((resolve) => {
+    releaseQueue = resolve;
+  });
+  composerDeliveryTail = previous.then(() => gate);
+  await previous;
+
+  composerDeliverySequence += 1;
+  const token = {
+    sequence: composerDeliverySequence,
+    kind: metadata.kind || "composer",
+    pageIdentity: metadata.pageIdentity || getCurrentPageIdentity(),
+    generation: Number.isInteger(metadata.generation) ? metadata.generation : pageLifecycleGeneration,
+    agentToken: metadata.agentToken || null
+  };
+  activeComposerDeliveryToken = token;
+  try {
+    return await task(token);
+  } finally {
+    if (activeComposerDeliveryToken === token) {
+      activeComposerDeliveryToken = null;
+    }
+    releaseQueue();
+  }
+}
+
+function isComposerDeliveryTokenCurrent(token) {
+  return activeComposerDeliveryToken === token &&
+    pageLifecycleGeneration === token?.generation &&
+    getCurrentPageIdentity() === token?.pageIdentity &&
+    (!token?.agentToken || isAgentDeliveryTokenCurrent(token.agentToken));
+}
+
+function cancelAgentDeliveryLifecycle() {
+  agentDeliveryGeneration += 1;
+  agentDeliveryInFlight = false;
+  activeAgentDeliveryToken = null;
+}
+
+function migratePendingAgentDeliveryToCurrentPage() {
+  pendingAgentDeliveryLoaded = false;
+  if (!pendingAgentDelivery) {
+    return;
+  }
+  const previousStorageKey = pendingAgentDelivery.storageKey || agentPendingDeliveryKey();
+  const nextStorageKey = agentPendingDeliveryKey();
+  pendingAgentDelivery.storageKey = nextStorageKey;
+  pendingAgentDelivery.pageIdentity = getCurrentPageIdentity();
+  pendingAgentDelivery.pageGeneration = pageLifecycleGeneration;
+  if (pendingAgentDelivery.sent !== true) {
+    pendingAgentDelivery.inserted = false;
+    pendingAgentDelivery.lastError = "page changed before delivery completed";
+  }
+  if (previousStorageKey !== nextStorageKey) {
+    chrome.storage.local.remove([previousStorageKey]).catch(() => {});
+  }
+  persistPendingAgentDelivery();
+}
+
 function buildRenderedHelperKey(candidate, semanticCallKey) {
   return [
     getCurrentPageIdentity(),
@@ -712,6 +1193,21 @@ function markCallProcessed(candidate, callKey, semanticCallKey) {
     const handled = processedRenderedHelpers.get(renderRoot) || new Set();
     handled.add(buildRenderedHelperKey(candidate, semanticCallKey));
     processedRenderedHelpers.set(renderRoot, handled);
+  }
+}
+
+function unmarkCallProcessed(candidate, semanticCallKey) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return;
+  }
+  const handled = processedRenderedHelpers.get(renderRoot);
+  if (!handled) {
+    return;
+  }
+  handled.delete(buildRenderedHelperKey(candidate, semanticCallKey));
+  if (handled.size === 0) {
+    processedRenderedHelpers.delete(renderRoot);
   }
 }
 
@@ -777,9 +1273,10 @@ function getCurrentChatFeed() {
 }
 
 function isAssistantGenerating() {
-  const candidates = Array.from(document.querySelectorAll("button, [role='button']"));
+  const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
+    .filter(isVisibleElement);
   return candidates.some((button) => {
-    const label = `${button.getAttribute("aria-label") || ""} ${button.textContent || ""}`.toLowerCase();
+    const label = `${button.getAttribute("aria-label") || ""} ${button.textContent || ""}`.trim().toLowerCase();
     return label.includes("stop streaming") ||
       label.includes("stop generating") ||
       label.includes("stop response") ||
@@ -1669,15 +2166,42 @@ async function replyWithRejectedCall(call, reason) {
   chainCallCount += 1;
   const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : isAgentRosterHelperCall(call) ? "agent roster query" : isAgentTaskStatusHelperCall(call) ? "agent task status query" : "shell call";
   setStatus(`Rejected ${helperName}: ${reason}`, "error");
-  await insertReply([
+  const reply = [
     isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : isAgentRosterHelperCall(call) ? "Agent roster query rejected:" : isAgentTaskStatusHelperCall(call) ? "Agent task status query rejected:" : "Shell call rejected:",
     "",
     "```shell-output",
     formatRejectedCallSubject(call),
     `error: ${reason}`,
     "```"
-  ].join("\n"));
-  await clickSendWhenReady();
+  ].join("\n");
+  const metadata = {
+    kind: "rejected-helper-output",
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration
+  };
+  return withComposerDeliveryLease(metadata, async (deliveryToken) => {
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    let composer;
+    try {
+      composer = await insertReply(reply, { preserveExisting: true });
+    } catch (_unused) {
+      return false;
+    }
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    const expectedComposerText = getValidatedComposerOwnershipText(composer, reply);
+    if (!expectedComposerText) {
+      return false;
+    }
+    return clickSendWhenReady(
+      composer,
+      () => isComposerDeliveryTokenCurrent(deliveryToken),
+      expectedComposerText
+    );
+  });
 }
 
 function formatRejectedCallSubject(call) {
@@ -1706,6 +2230,19 @@ async function runAndReply(callId, call, options = {}) {
 
   const force = options.force === true;
   const settings = await chrome.storage.sync.get(["requireApproval", "autoSend"]);
+  if (!force && isPersistentResultHelperCall(call)) {
+    await loadPendingHelperDeliveriesForCurrentPage();
+    const pending = pendingHelperDeliveries.get(callId);
+    if (pending) {
+      const delivered = await attemptPendingHelperDelivery(pending, settings);
+      return {
+        retryable: false,
+        pendingDelivery: !delivered,
+        deliveryFailed: !delivered,
+        response: pending.response
+      };
+    }
+  }
   if (!force && settings.requireApproval === true) {
     const prompt = isFileHelperCall(call) ?
       [
@@ -1767,11 +2304,19 @@ async function runAndReply(callId, call, options = {}) {
     );
 
     if (!approved) {
-      return;
+      return { retryable: false, cancelled: true };
     }
   }
 
+  refreshPageLifecycle();
+  const callToken = {
+    callId,
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    phase: "created"
+  };
   activeCallId = callId;
+  activeCallToken = callToken;
   chainCallCount += 1;
   setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
@@ -1791,32 +2336,100 @@ async function runAndReply(callId, call, options = {}) {
       isAgentTaskStatusHelperCall(call) ?
       await sendAgentTaskStatusQuery(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
+    callToken.phase = "response-received";
+
+    if (!isCurrentCallToken(callToken)) {
+      return { retryable: false, abandoned: true };
+    }
+
+    let effectiveResponse = response;
+    let recoveredUnpresentedResult = false;
+    // Duplicate metadata is backend execution-control state, never model
+    // input. An already-presented result stays local-only. If presentation
+    // never happened and bounded replay still exists, recover the original
+    // result only after removing every duplicate-control field.
+    if (isAuthoritativeDuplicateResponse(response)) {
+      if (response.previousResultPresented === true ||
+          hasLocallyPresentedHelperExecution(response.executionId) ||
+          response.replayedOutput !== true) {
+        setHelperCompletionStatus(call, response);
+        releaseActiveCall(callToken);
+        return {
+          retryable: false,
+          response,
+          deliveryFailed: false,
+          suppressedDuplicate: true,
+          replayUnavailable: response.replayedOutput !== true
+        };
+      }
+      effectiveResponse = cleanRecoveredDuplicateResponse(response);
+      recoveredUnpresentedResult = true;
+      setStatus("Recovering an original shell result that was never presented; duplicate diagnostics stay local", "running");
+    }
 
     const reply = isFileHelperCall(call) ?
-      formatFileOutput(call, response, startedAt) :
+      formatFileOutput(call, effectiveResponse, startedAt) :
       isBoardHelperCall(call) ?
-      formatBoardOutput(call, response, startedAt) :
+      formatBoardOutput(call, effectiveResponse, startedAt) :
       isAgentMessageHelperCall(call) ?
-      formatAgentMessageOutput(call, response, startedAt) :
+      formatAgentMessageOutput(call, effectiveResponse, startedAt) :
       isAgentRosterHelperCall(call) ?
-      formatAgentRosterOutput(call, response, startedAt) :
+      formatAgentRosterOutput(call, effectiveResponse, startedAt) :
       isAgentTaskStatusHelperCall(call) ?
-      formatAgentTaskStatusOutput(call, response, startedAt) :
-      formatShellOutput(call, response, startedAt);
-    await insertReply(reply);
-    setHelperCompletionStatus(call, response);
-    activeCallId = "";
-
-    if (settings.autoSend !== false) {
-      await clickSendWhenReady();
+      formatAgentTaskStatusOutput(call, effectiveResponse, startedAt) :
+      formatShellOutput(call, effectiveResponse, startedAt);
+    const retryable = isRetryableHelperResponse(call, effectiveResponse);
+    if (isPersistentResultHelperCall(call)) {
+      const pending = await rememberPendingHelperDelivery(callId, call, effectiveResponse, reply, settings);
+      releaseActiveCall(callToken);
+      if (!isCallLifecycleCurrent(callToken)) {
+        return { retryable: false, abandoned: true, pendingDelivery: true, response };
+      }
+      const delivered = await attemptPendingHelperDelivery(pending, settings);
+      return {
+        retryable: false,
+        response: effectiveResponse,
+        recoveredUnpresentedResult,
+        pendingDelivery: !delivered,
+        deliveryFailed: !delivered
+      };
     }
+    releaseActiveCall(callToken);
+    const delivered = await deliverHelperReply(callToken, reply, settings, () => {
+      setHelperCompletionStatus(call, response);
+    });
+    return {
+      retryable: retryable || !delivered,
+      response,
+      deliveryFailed: !delivered
+    };
   } catch (error) {
+    const retryable = error?.helperRetryable !== false && !isBoardHelperCall(call);
+    if (!isCallLifecycleCurrent(callToken)) {
+      return { retryable: false, abandoned: true };
+    }
+    if (!isCurrentCallToken(callToken)) {
+      return {
+        retryable,
+        error: error.message || String(error),
+        deliveryFailed: true
+      };
+    }
     setStatus(`${isFileHelperCall(call) ? "File helper" : isBoardHelperCall(call) ? "Board helper" : isAgentMessageHelperCall(call) ? "Agent message" : isAgentRosterHelperCall(call) ? "Agent roster" : isAgentTaskStatusHelperCall(call) ? "Agent task status" : "Shell call"} failed: ${error.message || String(error)}`, "error");
+    if (error?.helperSuppressReply === true) {
+      releaseActiveCall(callToken);
+      return {
+        retryable: false,
+        error: error.message || String(error),
+        deliveryFailed: false,
+        suppressedLocalFailure: true
+      };
+    }
     const failedResponse = {
       ok: false,
       error: error.message || String(error)
     };
-    await insertReply(isFileHelperCall(call) ?
+    const failedReply = isFileHelperCall(call) ?
       formatFileOutput(call, failedResponse, startedAt) :
       isBoardHelperCall(call) ?
       formatBoardOutput(call, failedResponse, startedAt) :
@@ -1826,14 +2439,140 @@ async function runAndReply(callId, call, options = {}) {
       formatAgentRosterOutput(call, failedResponse, startedAt) :
       isAgentTaskStatusHelperCall(call) ?
       formatAgentTaskStatusOutput(call, failedResponse, startedAt) :
-      formatShellOutput(call, failedResponse, startedAt));
-    activeCallId = "";
-    if (settings.autoSend !== false) {
-      await clickSendWhenReady();
-    }
+      formatShellOutput(call, failedResponse, startedAt);
+    releaseActiveCall(callToken);
+    const delivered = await deliverHelperReply(callToken, failedReply, settings);
+    return {
+      retryable,
+      error: error.message || String(error),
+      deliveryFailed: !delivered
+    };
   } finally {
-    activeCallId = "";
+    releaseActiveCall(callToken);
   }
+}
+
+function isAuthoritativeDuplicateResponse(response) {
+  return response?.duplicate === true && response?.skipped === true;
+}
+
+function cleanRecoveredDuplicateResponse(response) {
+  const clean = { ...(response || {}) };
+  for (const field of [
+    "duplicate",
+    "skipped",
+    "replayedOutput",
+    "reason",
+    "previousCallKey",
+    "previousCompletedAt",
+    "previousInterrupted",
+    "previousInterruptSignal",
+    "previousResultPresented",
+    "resultPresented"
+  ]) {
+    delete clean[field];
+  }
+  clean.recovered = true;
+  return clean;
+}
+
+function isPersistentResultHelperCall(call) {
+  return isBoardHelperCall(call) || (
+    !isFileHelperCall(call) &&
+    !isAgentMessageHelperCall(call) &&
+    !isAgentRosterHelperCall(call) &&
+    !isAgentTaskStatusHelperCall(call)
+  );
+}
+
+function isRetryableHelperResponse(call, response) {
+  if (!response || typeof response !== "object") {
+    return true;
+  }
+  if (response.executed === true && response.executionCompleted === true) {
+    return false;
+  }
+  if (isBoardHelperCall(call)) {
+    // Board prompt evidence is intentionally never duplicate authority, so
+    // automatic retry after any dispatched board attempt is unsafe.
+    return false;
+  }
+  if (response.ok === false) {
+    return true;
+  }
+  if (!isFileHelperCall(call) &&
+      !isBoardHelperCall(call) &&
+      !isAgentMessageHelperCall(call) &&
+      !isAgentRosterHelperCall(call) &&
+      !isAgentTaskStatusHelperCall(call)) {
+    return response.executed === false ||
+      response.retryable === true ||
+      response.executionCompleted === false;
+  }
+  return false;
+}
+
+async function deliverHelperReply(callToken, reply, settings, onInserted = () => {}) {
+  return withComposerDeliveryLease({
+    kind: "helper-output",
+    pageIdentity: callToken.pageIdentity,
+    generation: callToken.generation
+  }, async (deliveryToken) => {
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    let composer;
+    try {
+      composer = await insertReply(reply, { preserveExisting: true });
+    } catch (_unused) {
+      return false;
+    }
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    const expectedComposerText = getValidatedComposerOwnershipText(composer, reply);
+    if (!expectedComposerText) {
+      return false;
+    }
+    callToken.phase = "reply-inserted";
+    await onInserted();
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    if (settings.autoSend !== false) {
+      callToken.phase = "auto-send";
+      const sent = await clickSendWhenReady(
+        composer,
+        () => isComposerDeliveryTokenCurrent(deliveryToken),
+        expectedComposerText
+      );
+      callToken.phase = "auto-send-finished";
+      if (!sent) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+function isCurrentCallToken(callToken) {
+  return activeCallToken === callToken &&
+    activeCallId === callToken?.callId &&
+    isCallLifecycleCurrent(callToken);
+}
+
+function isCallLifecycleCurrent(callToken) {
+  return Boolean(callToken) &&
+    pageLifecycleGeneration === callToken?.generation &&
+    getCurrentPageIdentity() === callToken?.pageIdentity;
+}
+
+function releaseActiveCall(callToken) {
+  if (activeCallToken !== callToken) {
+    return;
+  }
+  activeCallId = "";
+  activeCallToken = null;
 }
 
 function formatBoardApprovalTarget(call) {
@@ -1863,7 +2602,11 @@ function buildRunningStatus(call, force) {
 async function sendRunShellMessage(callId, call, force) {
   const profile = await getCurrentAgentProfile();
   const agentId = profile.agentId && profile.role !== "none" ? profile.agentId : "";
-  return chrome.runtime.sendMessage({
+  const recoveryLifecycle = {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration
+  };
+  const payload = {
     type: "run-shell",
     id: callId,
     callKey: callId,
@@ -1876,7 +2619,116 @@ async function sendRunShellMessage(callId, call, force) {
       promptHash: stableHash(getLastUserMessageText()),
       force
     }
-  });
+  };
+  try {
+    const response = await chrome.runtime.sendMessage(payload);
+    if (response?.ok === false && isRecoverableRuntimeChannelError(response.error)) {
+      return recoverRunShellResult(callId, new Error(response.error || "Shell transport failed."), recoveryLifecycle);
+    }
+    return response;
+  } catch (error) {
+    if (!isRecoverableRuntimeChannelError(error)) {
+      throw error;
+    }
+    return recoverRunShellResult(callId, error, recoveryLifecycle);
+  }
+}
+
+function isRecoverableRuntimeChannelError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  const websocketTransportFailure = message.includes("websocket") && (
+    message.includes("connect") ||
+    message.includes("closed") ||
+    message.includes("closing") ||
+    message.includes("not open") ||
+    message.includes("network") ||
+    message.includes("failed to execute 'send'")
+  );
+  return message.includes("message port closed") ||
+    message.includes("message channel closed") ||
+    message.includes("extension context invalidated") ||
+    message.includes("receiving end does not exist") ||
+    message.includes("service worker") ||
+    message.includes("shell server timed out") ||
+    message.includes("cannot connect to shell server") ||
+    message.includes("shell server closed the connection") ||
+    websocketTransportFailure;
+}
+
+async function recoverRunShellResult(callKey, originalError, lifecycle = {}) {
+  let notFoundCount = 0;
+  let transportFailureCount = 0;
+
+  while (true) {
+    if (
+      (lifecycle.pageIdentity && getCurrentPageIdentity() !== lifecycle.pageIdentity) ||
+      (Number.isInteger(lifecycle.generation) && pageLifecycleGeneration !== lifecycle.generation)
+    ) {
+      throw createNonRetryableShellRecoveryError(
+        "Shell result recovery stopped because the page lifecycle changed; the command was not resubmitted."
+      );
+    }
+    let status;
+    try {
+      status = await chrome.runtime.sendMessage({
+        type: "run-shell-status",
+        id: `${callKey}:status`,
+        callKey
+      });
+      transportFailureCount = 0;
+    } catch (error) {
+      transportFailureCount += 1;
+      if (transportFailureCount >= RUN_STATUS_MAX_TRANSPORT_FAILURES) {
+        throw createNonRetryableShellRecoveryError(
+          `Shell result recovery failed after the runtime channel closed: ${error.message || String(error)}`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (!status?.ok) {
+      transportFailureCount += 1;
+      if (transportFailureCount >= RUN_STATUS_MAX_TRANSPORT_FAILURES) {
+        throw createNonRetryableShellRecoveryError(
+          `Shell result recovery failed after the runtime channel closed: ${status?.error || originalError?.message || "status unavailable"}`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (status.found !== true) {
+      notFoundCount += 1;
+      if (notFoundCount >= RUN_STATUS_MAX_NOT_FOUND) {
+        throw createNonRetryableShellRecoveryError(
+          `Shell result recovery could not find the original server attempt for ${callKey}; the command was not resubmitted.`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    notFoundCount = 0;
+    if (status.state === "running") {
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+    if (status.state === "completed" && status.result && typeof status.result === "object") {
+      return status.result;
+    }
+
+    throw createNonRetryableShellRecoveryError(
+      status.error || `Shell server reported ${status.state || "unconfirmed"} for the original attempt; the command was not resubmitted.`
+    );
+  }
+}
+
+function createNonRetryableShellRecoveryError(message) {
+  const error = new Error(message);
+  error.helperRetryable = false;
+  error.helperSuppressReply = true;
+  return error;
 }
 
 function sendWriteFileMessage(callId, call, force) {
@@ -1895,8 +2747,12 @@ function sendWriteFileMessage(callId, call, force) {
   });
 }
 
-function sendRunBoardMessage(callId, call, force) {
-  return chrome.runtime.sendMessage({
+async function sendRunBoardMessage(callId, call, force) {
+  const recoveryLifecycle = {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration
+  };
+  const payload = {
     type: "run-board",
     id: callId,
     callKey: callId,
@@ -1910,7 +2766,95 @@ function sendRunBoardMessage(callId, call, force) {
       promptHash: stableHash(getLastUserMessageText()),
       force
     }
-  });
+  };
+  try {
+    const response = await chrome.runtime.sendMessage(payload);
+    if (response?.ok === false && isRecoverableRuntimeChannelError(response.error)) {
+      return recoverRunBoardResult(callId, new Error(response.error || "Board transport failed."), recoveryLifecycle);
+    }
+    return response;
+  } catch (error) {
+    if (!isRecoverableRuntimeChannelError(error)) {
+      throw error;
+    }
+    return recoverRunBoardResult(callId, error, recoveryLifecycle);
+  }
+}
+
+async function recoverRunBoardResult(callKey, originalError, lifecycle = {}) {
+  let notFoundCount = 0;
+  let transportFailureCount = 0;
+
+  while (true) {
+    if (
+      (lifecycle.pageIdentity && getCurrentPageIdentity() !== lifecycle.pageIdentity) ||
+      (Number.isInteger(lifecycle.generation) && pageLifecycleGeneration !== lifecycle.generation)
+    ) {
+      throw createNonRetryableBoardRecoveryError(
+        "Board result recovery stopped because the page lifecycle changed; the board command was not resubmitted."
+      );
+    }
+    let status;
+    try {
+      status = await chrome.runtime.sendMessage({
+        type: "run-board-status",
+        id: `${callKey}:status`,
+        callKey
+      });
+      transportFailureCount = 0;
+    } catch (error) {
+      transportFailureCount += 1;
+      if (transportFailureCount >= RUN_STATUS_MAX_TRANSPORT_FAILURES) {
+        throw createNonRetryableBoardRecoveryError(
+          `Board result recovery failed after the runtime channel closed: ${error.message || String(error)}`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (!status?.ok) {
+      transportFailureCount += 1;
+      if (transportFailureCount >= RUN_STATUS_MAX_TRANSPORT_FAILURES) {
+        throw createNonRetryableBoardRecoveryError(
+          `Board result recovery failed after the runtime channel closed: ${status?.error || originalError?.message || "status unavailable"}`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (status.found !== true) {
+      notFoundCount += 1;
+      if (notFoundCount >= RUN_STATUS_MAX_NOT_FOUND) {
+        throw createNonRetryableBoardRecoveryError(
+          `Board result recovery could not find the original server attempt for ${callKey}; the board command was not resubmitted.`
+        );
+      }
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    notFoundCount = 0;
+    if (status.state === "running") {
+      await sleep(RUN_STATUS_POLL_INTERVAL_MS);
+      continue;
+    }
+    if (status.state === "completed" && status.result && typeof status.result === "object") {
+      return status.result;
+    }
+
+    throw createNonRetryableBoardRecoveryError(
+      status.error || `Board server reported ${status.state || "unconfirmed"} for the original attempt; the board command was not resubmitted.`
+    );
+  }
+}
+
+function createNonRetryableBoardRecoveryError(message) {
+  const error = new Error(message);
+  error.helperRetryable = false;
+  error.helperSuppressReply = true;
+  return error;
 }
 
 async function sendAgentMessage(callId, call, force) {
@@ -1990,10 +2934,16 @@ async function getSavedAgentProfileDefaults() {
 }
 
 async function setCurrentAgentProfile(role, agentId) {
+  const previous = readSessionAgentProfile();
   const profile = {
     role: normalizeCommand(role || "none"),
     agentId: normalizeCommand(agentId || "")
   };
+  if (previous.role !== profile.role || previous.agentId !== profile.agentId) {
+    cancelAgentDeliveryLifecycle();
+    clearPendingAgentDelivery();
+    pendingAgentDeliveryLoaded = false;
+  }
   try {
     window.sessionStorage.setItem(AGENT_SESSION_PROFILE_KEY, JSON.stringify(profile));
   } catch (_unused) {
@@ -2069,7 +3019,7 @@ function stopAgentPolling() {
     window.clearTimeout(agentPollTimer);
     agentPollTimer = 0;
   }
-  agentDeliveryInFlight = false;
+  cancelAgentDeliveryLifecycle();
 }
 
 async function runAgentPollLoop() {
@@ -2135,63 +3085,173 @@ async function pollAndDeliverAgentMessage() {
 }
 
 async function deliverAgentMessageToPage(profile, message) {
+  agentDeliveryGeneration += 1;
+  const deliveryToken = {
+    generation: agentDeliveryGeneration,
+    messageId: message.messageId,
+    profileAgentId: profile.agentId,
+    pageIdentity: getCurrentPageIdentity(),
+    pageGeneration: pageLifecycleGeneration
+  };
+  activeAgentDeliveryToken = deliveryToken;
   agentDeliveryInFlight = true;
   try {
     const pending = ensurePendingAgentDelivery(profile, message);
     if (pending.sent) {
-      await ackSentPendingAgentMessage(profile, message, pending);
+      await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
       return;
     }
-    if (pending.inserted && !agentDeliveryPromptStillPresent(pending)) {
-      pending.inserted = false;
-      pending.lastError = "inserted prompt no longer present";
+    if (countSubmittedMessagesMatching(pending.promptText || "") > 0) {
+      if (!isAgentDeliveryTokenCurrent(deliveryToken)) {
+        return;
+      }
+      pending.sent = true;
+      pending.lastError = "";
       pending.updatedAt = Date.now();
       updatePendingAgentDeliveryPanel();
+      persistPendingAgentDelivery();
+      await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
+      return;
     }
-    if (!pending.inserted) {
+    const sentDuringComposerDelivery = await withComposerDeliveryLease({
+      kind: "agent-message",
+      pageIdentity: deliveryToken.pageIdentity,
+      generation: deliveryToken.pageGeneration,
+      agentToken: deliveryToken
+    }, async (composerToken) => {
+      if (!isComposerDeliveryTokenCurrent(composerToken)) {
+        return;
+      }
       const text = pending.promptText || formatInboundAgentPrompt(profile, message);
-      setStatus(`Delivering agent message from ${message.from || "(unknown)"}`, "running");
-      try {
-        await insertReply(text);
-        pending.inserted = true;
-        pending.lastError = "";
+      const currentComposer = lastComposerElement || closestEditable(document.activeElement);
+      if (pending.composerConflict === true) {
+        if (getComposerText(currentComposer)) {
+          pending.lastError = "composer text changed; waiting for it to become empty";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+          return;
+        }
+        pending.composerConflict = false;
+      }
+      if (pending.inserted && !agentDeliveryPromptStillPresent(pending)) {
+        pending.inserted = false;
+        pending.composerConflict = Boolean(getComposerText(currentComposer));
+        pending.lastError = pending.composerConflict
+          ? "composer text changed; delivery paused without overwriting it"
+          : "inserted prompt no longer present";
         pending.updatedAt = Date.now();
         updatePendingAgentDeliveryPanel();
         persistPendingAgentDelivery();
-      } catch (error) {
-        pending.lastError = error.message || String(error);
+        if (pending.composerConflict) {
+          return;
+        }
+      }
+      if (!pending.inserted) {
+        setStatus(`Delivering agent message from ${message.from || "(unknown)"}`, "running");
+        try {
+          const insertedComposer = await insertReply(text, { preserveExisting: true });
+          if (!isComposerDeliveryTokenCurrent(composerToken)) {
+            return;
+          }
+          const expectedComposerText = getValidatedComposerOwnershipText(insertedComposer, text);
+          if (!expectedComposerText) {
+            pending.inserted = false;
+            pending.composerText = "";
+            pending.composerConflict = Boolean(getComposerText(insertedComposer));
+            pending.lastError = "composer did not retain the intended agent prompt; delivery paused without sending it";
+            pending.updatedAt = Date.now();
+            updatePendingAgentDeliveryPanel();
+            persistPendingAgentDelivery();
+            return;
+          }
+          pending.inserted = true;
+          pending.composerText = expectedComposerText;
+          pending.composerConflict = false;
+          pending.lastError = "";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+        } catch (error) {
+          if (!isComposerDeliveryTokenCurrent(composerToken)) {
+            return;
+          }
+          if (error?.code === "composer-occupied") {
+            pending.inserted = false;
+            pending.composerText = "";
+            pending.composerConflict = true;
+          }
+          pending.lastError = error.message || String(error);
+          pending.updatedAt = Date.now();
+          setStatus(`Agent message ${message.messageId} cached; waiting for chat composer`, "running");
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+          return;
+        }
+      } else {
+        setStatus(`Agent message ${message.messageId} is waiting for send button`, "running");
+      }
+      const composer = lastComposerElement || closestEditable(document.activeElement);
+      const expectedComposerText = pending.composerText || normalizeCommand(text);
+      const sent = await clickSendWhenReady(
+        composer,
+        () => isComposerDeliveryTokenCurrent(composerToken),
+        expectedComposerText
+      );
+      if (!isComposerDeliveryTokenCurrent(composerToken)) {
+        return;
+      }
+      if (!sent) {
+        const currentText = getComposerText(composer);
+        if (currentText && currentText !== expectedComposerText) {
+          pending.inserted = false;
+          pending.composerConflict = true;
+          pending.lastError = "composer text changed; delivery paused without sending it";
+        } else {
+          pending.lastError = "send button not ready";
+        }
         pending.updatedAt = Date.now();
-        setStatus(`Agent message ${message.messageId} cached; waiting for chat composer`, "running");
+        setStatus("Agent message cached in panel; waiting for AI page to be ready", "running");
         updatePendingAgentDeliveryPanel();
         persistPendingAgentDelivery();
         return;
       }
-    } else {
-      setStatus(`Agent message ${message.messageId} is waiting for send button`, "running");
-    }
-    const sent = await clickSendWhenReady();
-    if (!sent) {
-      pending.lastError = "send button not ready";
+      pending.sent = true;
+      pending.lastError = "";
       pending.updatedAt = Date.now();
-      setStatus("Agent message cached in panel; waiting for AI page to be ready", "running");
       updatePendingAgentDeliveryPanel();
       persistPendingAgentDelivery();
-      return;
+      return true;
+    });
+    if (sentDuringComposerDelivery === true && isAgentDeliveryTokenCurrent(deliveryToken)) {
+      await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
     }
-    pending.sent = true;
-    pending.lastError = "";
-    pending.updatedAt = Date.now();
-    updatePendingAgentDeliveryPanel();
-    persistPendingAgentDelivery();
-    await ackSentPendingAgentMessage(profile, message, pending);
   } finally {
-    agentDeliveryInFlight = false;
+    if (activeAgentDeliveryToken === deliveryToken) {
+      activeAgentDeliveryToken = null;
+      agentDeliveryInFlight = false;
+    }
   }
 }
 
-async function ackSentPendingAgentMessage(profile, message, pending) {
+function isAgentDeliveryTokenCurrent(token) {
+  return activeAgentDeliveryToken === token &&
+    agentDeliveryGeneration === token?.generation &&
+    pageLifecycleGeneration === token?.pageGeneration &&
+    getCurrentPageIdentity() === token?.pageIdentity;
+}
+
+async function ackSentPendingAgentMessage(profile, message, pending, deliveryToken) {
   const ack = await ackDeliveredAgentMessage(profile, message);
+  if (!isAgentDeliveryTokenCurrent(deliveryToken) || pendingAgentDelivery !== pending) {
+    return;
+  }
   if (!ack?.ok) {
+    if (pending.sent === true && ack?.errorCode === "message-not-found") {
+      clearPendingAgentDelivery(pending);
+      setStatus(`Delivered agent message ${message.messageId}; local hub no longer retained its ack record`, "ok");
+      return;
+    }
     pending.lastError = ack?.error || "ack failed";
     pending.updatedAt = Date.now();
     updatePendingAgentDeliveryPanel();
@@ -2199,7 +3259,7 @@ async function ackSentPendingAgentMessage(profile, message, pending) {
     setStatus(`Agent message sent; waiting to ack local hub: ${summarizeCommand(ack?.error || "unknown")}`, "running");
     return;
   }
-  clearPendingAgentDelivery();
+  clearPendingAgentDelivery(pending);
   setStatus(`Delivered agent message ${message.messageId}`, "ok");
 }
 
@@ -2217,8 +3277,13 @@ function ensurePendingAgentDelivery(profile, message) {
     profileAgentId: profile.agentId,
     message,
     promptText: formatInboundAgentPrompt(profile, message),
+    composerText: "",
     inserted: false,
     sent: false,
+    composerConflict: false,
+    storageKey: agentPendingDeliveryKey(),
+    pageIdentity: getCurrentPageIdentity(),
+    pageGeneration: pageLifecycleGeneration,
     lastError: "",
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -2234,14 +3299,18 @@ function agentDeliveryPromptStillPresent(pending) {
   if (!composer || !composer.isConnected || !isEditableElement(composer)) {
     return false;
   }
-  return contentEditableHasText(composer, pending.promptText || "");
+  return getComposerText(composer) === (pending.composerText || normalizeCommand(pending.promptText || ""));
 }
 
-function clearPendingAgentDelivery() {
+function clearPendingAgentDelivery(expectedPending = null) {
+  if (expectedPending && pendingAgentDelivery !== expectedPending) {
+    return;
+  }
+  const storageKey = pendingAgentDelivery?.storageKey || agentPendingDeliveryKey();
   pendingAgentDelivery = null;
   pendingAgentDeliveryMessageId = "";
   updatePendingAgentDeliveryPanel();
-  chrome.storage.local.remove([agentPendingDeliveryKey()]).catch(() => {});
+  chrome.storage.local.remove([storageKey]).catch(() => {});
 }
 
 async function loadPendingAgentDelivery(profile) {
@@ -2261,8 +3330,13 @@ async function loadPendingAgentDelivery(profile) {
       profileAgentId: pending.profileAgentId,
       message: pending.message,
       promptText: pending.promptText || formatInboundAgentPrompt(profile, pending.message),
+      composerText: pending.composerText || "",
       inserted: Boolean(pending.inserted),
       sent: Boolean(pending.sent),
+      composerConflict: Boolean(pending.composerConflict),
+      storageKey: agentPendingDeliveryKey(),
+      pageIdentity: getCurrentPageIdentity(),
+      pageGeneration: pageLifecycleGeneration,
       lastError: pending.lastError || "restored after page reload",
       createdAt: Number(pending.createdAt) || Date.now(),
       updatedAt: Date.now()
@@ -2283,13 +3357,16 @@ function persistPendingAgentDelivery() {
     profileAgentId: pendingAgentDelivery.profileAgentId,
     message: pendingAgentDelivery.message,
     promptText: pendingAgentDelivery.promptText,
+    composerText: pendingAgentDelivery.composerText || "",
     inserted: Boolean(pendingAgentDelivery.inserted),
     sent: Boolean(pendingAgentDelivery.sent),
+    composerConflict: Boolean(pendingAgentDelivery.composerConflict),
     lastError: pendingAgentDelivery.lastError || "",
     createdAt: pendingAgentDelivery.createdAt || Date.now(),
     updatedAt: pendingAgentDelivery.updatedAt || Date.now()
   };
-  chrome.storage.local.set({ [agentPendingDeliveryKey()]: snapshot }).catch(() => {});
+  const storageKey = pendingAgentDelivery.storageKey || agentPendingDeliveryKey();
+  chrome.storage.local.set({ [storageKey]: snapshot }).catch(() => {});
 }
 
 function isStoredPendingAgentDelivery(value) {
@@ -2378,12 +3455,24 @@ function formatInboundAgentPrompt(profile, message) {
 
   return [
     `Message from ${from}${task}:`,
+    `Message id: ${message.messageId}`,
     "",
     body
   ].join("\n");
 }
 
 function setHelperCompletionStatus(call, response) {
+  if (isAuthoritativeDuplicateResponse(response)) {
+    rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
+    setStatus(
+      isBoardHelperCall(call)
+        ? `Server confirmed duplicate board command on ${response.targetName || response.target || "the resolved tmux pane"}`
+        : `Server confirmed duplicate shell command on ${response.targetName || response.target || "the resolved tmux pane"}`,
+      "ok"
+    );
+    return;
+  }
+
   if (pendingSelfTest && isExpectedSelfTestCall(call)) {
     const token = pendingSelfTest.token;
     pendingSelfTest = null;
@@ -2402,11 +3491,6 @@ function setHelperCompletionStatus(call, response) {
   }
 
   if (isBoardHelperCall(call)) {
-    if (response?.duplicate === true && response?.skipped === true) {
-      rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
-      setStatus(`Server confirmed duplicate board command on ${response.targetName || response.target || "the resolved tmux pane"}`, "ok");
-      return;
-    }
     setStatus(response?.ok === false ? "Board helper failed" : "Board helper completed", response?.ok === false ? "error" : "ok");
     return;
   }
@@ -2423,12 +3507,6 @@ function setHelperCompletionStatus(call, response) {
 
   if (isAgentTaskStatusHelperCall(call)) {
     setStatus(response?.ok === false ? "Agent task status query failed" : "Agent task status query completed", response?.ok === false ? "error" : "ok");
-    return;
-  }
-
-  if (response?.duplicate === true && response?.skipped === true) {
-    rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
-    setStatus(`Server confirmed duplicate shell command on ${response.targetName || response.target || "the resolved tmux pane"}`, "ok");
     return;
   }
 
@@ -2461,6 +3539,9 @@ function expirePendingSelfTest() {
 }
 
 function formatShellOutput(call, response, startedAt) {
+  if (isAuthoritativeDuplicateResponse(response)) {
+    return "";
+  }
   const commandDisplay = formatShellOutputCommand(call.cmd);
   if (!response || response.ok === false) {
     return [
@@ -2484,17 +3565,22 @@ function formatShellOutput(call, response, startedAt) {
     commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
     `target: ${response.target || ""}`,
     response.targetName ? `targetName: ${response.targetName}` : "",
+    response.executionId ? `executionId: ${response.executionId}` : "",
     `cwd: ${response.cwd || call.cwd || ""}`,
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
     response.duplicate === true ? "duplicate: true" : "",
     response.skipped === true ? "skipped: true" : "",
+    response.replayedOutput === true ? "replayedOutput: true" : "",
+    response.recovered === true ? "recovered: true" : "",
     response.reason ? `reason: ${response.reason}` : "",
     response.previousCallKey ? `previousCallKey: ${response.previousCallKey}` : "",
     response.previousInterrupted === true ? "previousInterrupted: true" : "",
     response.previousInterruptSignal ? `previousInterruptSignal: ${response.previousInterruptSignal}` : "",
     response.interrupted === true ? "interrupted: true" : "",
     response.interruptSignal ? `interruptSignal: ${response.interruptSignal}` : "",
+    response.cancelledBeforeExecution === true ? "cancelledBeforeExecution: true" : "",
+    response.retryable === true ? "retryable: true" : "",
     response.queued === true ? "queued: true" : "",
     Number.isFinite(response.queuedMs) ? `queuedMs: ${response.queuedMs}` : "",
     response.timedOut ? "timedOut: true" : "",
@@ -2520,6 +3606,9 @@ function formatShellOutput(call, response, startedAt) {
 }
 
 function formatBoardOutput(call, response, startedAt) {
+  if (isAuthoritativeDuplicateResponse(response)) {
+    return "";
+  }
   const commandDisplay = formatShellOutputCommand(call.cmd);
   const boardName = call.boardName || response?.boardName || "";
   if (!response || response.ok === false) {
@@ -2549,6 +3638,7 @@ function formatBoardOutput(call, response, startedAt) {
     commandDisplay.truncated ? `cmdHash: ${commandDisplay.hash}` : "",
     `target: ${response.target || ""}`,
     response.targetName ? `targetName: ${response.targetName}` : "",
+    response.executionId ? `executionId: ${response.executionId}` : "",
     `exitCode: ${response.exitCode}`,
     `durationMs: ${response.durationMs}`,
     response.duplicate === true ? "duplicate: true" : "",
@@ -2819,10 +3909,23 @@ function formatTmuxPanesForShellOutput(panes, error = "") {
   ].filter(Boolean).join(" ")).join("\n");
 }
 
-async function insertReply(text) {
+async function insertReply(text, options = {}) {
   const input = await findReplyInput();
   if (!input) {
     throw new Error("Could not find a chat composer. Click the chat input once, then ask the AI for a helper block again.");
+  }
+
+  if (options.preserveExisting === true) {
+    const currentText = getComposerText(input);
+    if (currentText) {
+      const reusableText = getValidatedComposerOwnershipText(input, text);
+      if (reusableText) {
+        return input;
+      }
+      const error = new Error("Chat composer already contains unsent text; automatic delivery paused without overwriting it.");
+      error.code = "composer-occupied";
+      throw error;
+    }
   }
 
   rememberComposer(input);
@@ -2984,26 +4087,62 @@ function editableScore(node) {
   return score;
 }
 
-async function clickSendWhenReady(composer = lastComposerElement || closestEditable(document.activeElement)) {
-  const originalText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
+async function clickSendWhenReady(
+  composer = lastComposerElement || closestEditable(document.activeElement),
+  shouldContinue = () => true,
+  expectedText = null
+) {
+  const originalText = normalizeCommand(expectedText === null ? getComposerText(composer) : expectedText);
+  if (!originalText || !composerOwnershipTextsMatch(getComposerText(composer), originalText)) {
+    return false;
+  }
+  const submittedMessageCountBefore = countSubmittedMessagesMatching(originalText);
+  const stillOwnsComposer = () =>
+    shouldContinue() &&
+    composer?.isConnected !== false;
+  let sendButtonClickCount = 0;
+  const maxSendButtonClicks = 2;
 
   for (let attempt = 0; attempt < 80; attempt += 1) {
-    const sendButton = findSendButton(composer, attempt < 20);
-    if (sendButton && !sendButton.disabled && sendButton.getAttribute("aria-disabled") !== "true") {
+    const ownership = getComposerSendOwnership(
+      composer,
+      originalText,
+      submittedMessageCountBefore,
+      stillOwnsComposer
+    );
+    if (ownership === "done") {
+      return true;
+    }
+    if (ownership !== "owned") {
+      return false;
+    }
+    const sendButton = findSendButton(composer, false);
+    if (sendButton &&
+        sendButtonClickCount < maxSendButtonClicks &&
+        !sendButton.disabled &&
+        sendButton.getAttribute("aria-disabled") !== "true") {
+      if (getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) !== "owned") {
+        continue;
+      }
+      sendButtonClickCount += 1;
       sendButton.click();
-      if (await waitForSubmitted(composer, originalText)) {
+      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
         return true;
       }
     }
 
-    if (attempt === 20 && trySubmitForm(composer)) {
-      if (await waitForSubmitted(composer, originalText)) {
+    if (attempt === 20 && trySubmitForm(composer, () =>
+      getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
+    )) {
+      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
         return true;
       }
     }
 
-    if (attempt === 21 && tryKeyboardSubmit(composer)) {
-      if (await waitForSubmitted(composer, originalText)) {
+    if (attempt === 21 && tryKeyboardSubmit(composer, () =>
+      getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
+    )) {
+      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
         return true;
       }
     }
@@ -3014,16 +4153,68 @@ async function clickSendWhenReady(composer = lastComposerElement || closestEdita
   return false;
 }
 
-function trySubmitForm(composer) {
+function getComposerText(composer) {
+  return normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
+}
+
+function getValidatedComposerOwnershipText(composer, intendedText) {
+  const actual = getComposerText(composer);
+  const intended = normalizeCommand(intendedText);
+  if (!actual || !intended) {
+    return "";
+  }
+  // Some contenteditable hosts vary only CRLFs, non-breaking spaces, and the
+  // number of empty paragraph lines. Preserve every non-empty line boundary
+  // and its internal whitespace: shell output formatting is semantic.
+  return normalizeComposerOwnershipText(actual) === normalizeComposerOwnershipText(intended)
+    ? actual
+    : "";
+}
+
+function normalizeComposerOwnershipText(text) {
+  return normalizeCommand(text)
+    .replace(/\u00a0/g, " ")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .join("\n");
+}
+
+function composerOwnershipTextsMatch(actual, expected) {
+  const normalizedActual = normalizeComposerOwnershipText(actual);
+  const normalizedExpected = normalizeComposerOwnershipText(expected);
+  return Boolean(normalizedActual) && normalizedActual === normalizedExpected;
+}
+
+function getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) {
+  if (countSubmittedMessagesMatching(originalText) > submittedMessageCountBefore) {
+    return "done";
+  }
+  const currentText = getComposerText(composer);
+  if (!currentText) {
+    return "aborted";
+  }
+  if (!stillOwnsComposer()) {
+    return "aborted";
+  }
+  return composerOwnershipTextsMatch(currentText, originalText) ? "owned" : "aborted";
+}
+
+function trySubmitForm(composer, stillOwnsComposer = () => true) {
   const form = composer?.closest?.("form");
-  if (!form) {
+  if (!form || !stillOwnsComposer()) {
     return false;
   }
 
   try {
+    if (!stillOwnsComposer()) {
+      return false;
+    }
     if (typeof form.requestSubmit === "function") {
       form.requestSubmit();
     } else {
+      if (!stillOwnsComposer()) {
+        return false;
+      }
       form.dispatchEvent(new SubmitEvent("submit", {
         bubbles: true,
         cancelable: true
@@ -3035,11 +4226,14 @@ function trySubmitForm(composer) {
   }
 }
 
-function tryKeyboardSubmit(composer) {
-  if (!composer) {
+function tryKeyboardSubmit(composer, stillOwnsComposer = () => true) {
+  if (!composer || !stillOwnsComposer()) {
     return false;
   }
 
+  if (!stillOwnsComposer()) {
+    return false;
+  }
   composer.focus();
   const events = [
     new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true }),
@@ -3050,40 +4244,90 @@ function tryKeyboardSubmit(composer) {
     new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, ctrlKey: true })
   ];
   for (const event of events) {
+    if (!stillOwnsComposer()) {
+      return false;
+    }
     composer.dispatchEvent(event);
   }
   return true;
 }
 
-async function waitForSubmitted(composer, originalText) {
+async function waitForSubmitted(composer, originalText, submittedMessageCountBefore = 0) {
   if (!originalText) {
     return false;
   }
 
   for (let i = 0; i < 8; i += 1) {
     await sleep(125);
-    const currentText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
-    if (!currentText || (currentText !== originalText && !currentText.includes("Shell call"))) {
+    if (countSubmittedMessagesMatching(originalText) > submittedMessageCountBefore) {
       return true;
+    }
+    const currentText = getComposerText(composer);
+    if (!composerOwnershipTextsMatch(currentText, originalText)) {
+      if (currentText) {
+        return false;
+      }
+      continue;
     }
   }
   return false;
 }
 
+function countSubmittedMessagesMatching(text) {
+  const expected = normalizeCommand(text);
+  if (!expected || typeof document.querySelectorAll !== "function") {
+    return 0;
+  }
+  const comparableExpected = normalizeComposerOwnershipText(expected);
+  return Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-author-role="user"]'))
+    .filter((node) => {
+      const candidates = [node.innerText, node.textContent]
+        .map((value) => normalizeCommand(value || ""))
+        .filter(Boolean);
+      const roleNode = node.querySelector?.('.role, [data-message-role-label], [class*="role"]');
+      const roleText = normalizeCommand(roleNode?.textContent || roleNode?.innerText || "");
+      if (roleText) {
+        for (const candidate of [...candidates]) {
+          if (candidate.startsWith(roleText)) {
+            candidates.push(normalizeCommand(candidate.slice(roleText.length)));
+          }
+        }
+      }
+      return candidates.some((messageText) => {
+        if (messageText === expected) {
+          return true;
+        }
+        // Host renderers commonly collapse blank paragraphs after submission.
+        // Compare the complete message after removing only an explicit role
+        // label and normalizing CRLF, NBSP, and empty-paragraph count. Preserve
+        // every non-empty line boundary and its internal whitespace: stdout is
+        // semantic, so `a b` must never prove submission of `a\nb`.
+        const lines = messageText.split("\n");
+        if (/^(user|you)$/i.test(lines[0]?.trim() || "")) {
+          lines.shift();
+        }
+        return normalizeComposerOwnershipText(lines.join("\n")) === comparableExpected;
+      });
+    })
+    .length;
+}
+
 function findSendButton(composer = lastComposerElement || closestEditable(document.activeElement), preferBoundOnly = false) {
   const bound = findBoundSendButton();
-  if (bound) {
+  if (bound && isBoundSendButtonAssociatedWithComposer(bound, composer)) {
     return bound;
   }
   if (preferBoundOnly) {
     return null;
   }
 
-  const nearbyRoot = composer?.closest("form, footer, main, body") || document;
+  const composerRegion = findComposerSendRegion(composer);
+  const nearbyRoot = composerRegion || document;
   const composerRect = composer?.getBoundingClientRect();
   const buttons = Array.from(nearbyRoot.querySelectorAll("button, [role='button']"))
     .filter((button) => !isInsideShellToolPanel(button))
     .filter(isVisibleElement)
+    .filter((button) => isSendButtonAssociatedWithComposer(button, composer, composerRegion))
     .map((button) => {
       const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.textContent || ""}`.toLowerCase();
       if (label.includes("stop") || label.includes("voice") || label.includes("model:")) {
@@ -3115,6 +4359,71 @@ function findSendButton(composer = lastComposerElement || closestEditable(docume
     .sort((a, b) => b.score - a.score);
 
   return buttons[0]?.button || null;
+}
+
+function isBoundSendButtonAssociatedWithComposer(button, composer) {
+  return isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer));
+}
+
+function findComposerSendRegion(composer) {
+  if (!composer) {
+    return null;
+  }
+  const form = composer.closest?.("form");
+  if (form) {
+    return form;
+  }
+  const semanticRegion = composer.closest?.('footer, [role="form"], [data-testid*="composer"], [class*="composer"]');
+  if (semanticRegion) {
+    return semanticRegion;
+  }
+  const parent = composer.parentElement;
+  const parentTag = String(parent?.tagName || "").toUpperCase();
+  return parent && !["BODY", "MAIN", "HTML"].includes(parentTag) ? parent : null;
+}
+
+function isSendButtonAssociatedWithComposer(button, composer, composerRegion = findComposerSendRegion(composer)) {
+  if (!button || !composer) {
+    return false;
+  }
+  const buttonLabels = [
+    button.getAttribute("aria-label") || "",
+    button.getAttribute("title") || "",
+    button.textContent || ""
+  ].map((value) => String(value).replace(/\s+/g, " ").trim().toLowerCase()).filter(Boolean);
+  const knownSendButton = button.matches?.('[data-testid="send-button"], [data-testid="composer-send-button"]') === true;
+  const strictSendLabel = buttonLabels.some((label) => /^(send|send message|send prompt|submit)$/.test(label));
+  const composerForm = composer.closest?.("form");
+  if (composerForm) {
+    return button.closest?.("form") === composerForm &&
+      (knownSendButton || strictSendLabel || button.getAttribute("type") === "submit");
+  }
+  const composerId = String(composer.id || "").trim();
+  const controlledIds = String(button.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean);
+  if (composerId && controlledIds.includes(composerId) && (knownSendButton || strictSendLabel)) {
+    return true;
+  }
+  const insideRegion = Boolean(composerRegion?.contains?.(button));
+  if (insideRegion && (knownSendButton || strictSendLabel)) {
+    return true;
+  }
+  return (knownSendButton || strictSendLabel) && areElementsNearEachOther(composer, button, 240);
+}
+
+function areElementsNearEachOther(left, right, maxDistance) {
+  const leftRect = left?.getBoundingClientRect?.();
+  const rightRect = right?.getBoundingClientRect?.();
+  if (!leftRect || !rightRect) {
+    return false;
+  }
+  const leftX = (Number(leftRect.left) + Number(leftRect.right)) / 2;
+  const leftY = (Number(leftRect.top) + Number(leftRect.bottom)) / 2;
+  const rightX = (Number(rightRect.left) + Number(rightRect.right)) / 2;
+  const rightY = (Number(rightRect.top) + Number(rightRect.bottom)) / 2;
+  if (![leftX, leftY, rightX, rightY].every(Number.isFinite)) {
+    return false;
+  }
+  return Math.hypot(leftX - rightX, leftY - rightY) <= maxDistance;
 }
 
 function findBoundSendButton() {
@@ -3600,9 +4909,10 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
   const summary = total === 0
     ? "candidates: 0/0"
     : `candidates: ${selectedIdx >= 0 ? selectedIdx + 1 : "?"}/${total}`;
+  const activeSummary = `activeCall: ${activeCallId || "(none)"}${activeCallToken?.phase ? ` (${activeCallToken.phase})` : ""}`;
 
   if (!candidate && total === 0) {
-    const lines = [summary, "(no helper block detected)"];
+    const lines = [summary, activeSummary, "(no helper block detected)"];
     if (lastSuppressedCallStatus) {
       lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
     }
@@ -3613,7 +4923,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
     return;
   }
 
-  const lines = [summary];
+  const lines = [summary, activeSummary];
 
   if (total > 0) {
     const MAX_LISTED = 8;

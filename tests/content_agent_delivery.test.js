@@ -80,6 +80,14 @@ function loadContentContext(options = {}) {
   return context;
 }
 
+function mockComposerWithText(text) {
+  return {
+    innerText: String(text || ""),
+    textContent: String(text || ""),
+    isConnected: true
+  };
+}
+
 async function testSavedOriginProfileDoesNotAutoPollNewTab() {
   const context = loadContentContext({
     localStore: {
@@ -138,6 +146,7 @@ async function testUnsentAgentMessageIsNotInsertedTwice() {
   context.insertReply = async (text) => {
     insertCount += 1;
     assert.match(text, /Message from master for task task-001:/);
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -197,6 +206,7 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
     if (insertCount === 1) {
       throw new Error("composer unavailable");
     }
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -261,6 +271,7 @@ async function testAgentMessageReinsertsWhenComposerLosesPrompt() {
     insertCount += 1;
     promptPresent = true;
     assert.match(text, /Message from slave-a for task task-redraw:/);
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -301,6 +312,55 @@ async function testAgentMessageReinsertsWhenComposerLosesPrompt() {
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
 }
 
+async function testExternallySubmittedAgentPromptAcksWithoutReinsertion() {
+  const context = loadContentContext();
+  const sentMessages = [];
+  let insertCount = 0;
+  let clickCount = 0;
+  let submitted = false;
+  context.getCurrentAgentProfile = async () => ({ role: "slave", agentId: "slave-a" });
+  context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submitted ? 1 : 0;
+  context.agentDeliveryPromptStillPresent = () => !submitted;
+  context.insertReply = async (text) => {
+    insertCount += 1;
+    return mockComposerWithText(text);
+  };
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    submitted = true;
+    return false;
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-external-submit",
+          from: "master",
+          to: "slave-a",
+          taskId: "task-external-submit",
+          body: "The page submitted this prompt outside the extension callback."
+        }]
+      };
+    }
+    if (payload.type === "agent-ack") {
+      return { ok: true, type: "agent-ack" };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+  assert.equal(insertCount, 1);
+  assert.equal(clickCount, 1);
+  await context.pollAndDeliverAgentMessage();
+  assert.equal(insertCount, 1, "A prompt already present in submitted user messages must not be inserted again.");
+  assert.equal(clickCount, 1, "Recovery should ack the externally submitted prompt without another send attempt.");
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
+}
+
 async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   const context = loadContentContext();
   const sentMessages = [];
@@ -318,6 +378,7 @@ async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   context.insertReply = async (text) => {
     insertCount += 1;
     assert.match(text, /Message from slave-a for task task-ack:/);
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -365,6 +426,341 @@ async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack", "agent-ack"]);
 }
 
+async function testMissingAckRecordIsIdempotentAfterMessageWasSent() {
+  const localStore = {};
+  const context = loadContentContext({ localStore });
+  const sentMessages = [];
+  const pendingPanel = { hidden: true, textContent: "" };
+  let insertCount = 0;
+  let clickCount = 0;
+  context.document.getElementById = (id) => id === "ai-chat-shell-exec-agent-pending" ? pendingPanel : null;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => {
+    insertCount += 1;
+    return mockComposerWithText(text);
+  };
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    return true;
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-lost-after-restart",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-restart",
+          body: "This was submitted before the hub restarted."
+        }]
+      };
+    }
+    if (payload.type === "agent-ack") {
+      return { ok: false, errorCode: "message-not-found", error: "mailbox restarted" };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(insertCount, 1);
+  assert.equal(clickCount, 1);
+  assert.equal(pendingPanel.hidden, true, "A sent message whose hub record vanished must leave no permanent local blocker.");
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
+}
+
+async function testModifiedAgentPromptIsNeverClickedOrOverwritten() {
+  const context = loadContentContext();
+  let insertCount = 0;
+  let clickCount = 0;
+  let composerText = "";
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.getComposerText = () => composerText;
+  context.insertReply = async (text) => {
+    insertCount += 1;
+    composerText = text;
+    return mockComposerWithText(text);
+  };
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    composerText = `${composerText.slice(0, 100)} USER MODIFIED THIS PROMPT`;
+    return false;
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-user-edit",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-user-edit",
+          body: "Do not send this if the user edits it."
+        }]
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(insertCount, 1, "A modified pending agent prompt must not be reinserted over user text.");
+  assert.equal(clickCount, 1, "A modified pending agent prompt must not trigger another click.");
+  assert.match(composerText, /USER MODIFIED THIS PROMPT/);
+}
+
+async function testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt() {
+  const context = loadContentContext();
+  let insertCount = 0;
+  let clickCount = 0;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async () => {
+    insertCount += 1;
+    return mockComposerWithText("The user's unrelated draft survived the attempted insertion.");
+  };
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    return true;
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-rejected-insertion",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-rejected-insertion",
+          body: "The intended inbound prompt."
+        }]
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(insertCount, 1);
+  assert.equal(clickCount, 0, "A post-insertion value unrelated to the intended prompt must never reach auto-send.");
+  const pending = vm.runInContext("pendingAgentDelivery", context);
+  assert.equal(pending.sent, false);
+  assert.equal(pending.inserted, false);
+  assert.equal(pending.composerConflict, true);
+}
+
+async function testPreexistingUserDraftBlocksAgentInsertionAtomically() {
+  const context = loadContentContext();
+  const composer = {
+    value: "User is actively writing this draft",
+    innerText: "",
+    textContent: "",
+    focus() {
+      throw new Error("occupied composer must not be focused");
+    }
+  };
+  let clickCount = 0;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    clickCount += 1;
+    return true;
+  };
+  context.setStatus = () => {};
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-user-draft-guard",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-user-draft-guard",
+          body: "Do not overwrite the user's composer."
+        }]
+      };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(composer.value, "User is actively writing this draft");
+  assert.equal(clickCount, 0);
+  const pending = vm.runInContext("pendingAgentDelivery", context);
+  assert.equal(pending.sent, false);
+  assert.equal(pending.inserted, false);
+  assert.equal(pending.composerConflict, true);
+  assert.match(pending.lastError, /already contains unsent text/);
+}
+
+async function testAgentAckDoesNotHoldComposerLease() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  let resolveAck;
+  let ackStarted = false;
+  let laterWriterStarted = false;
+  context.setStatus = () => {};
+  context.insertReply = async (text) => mockComposerWithText(text);
+  context.clickSendWhenReady = async () => true;
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-ack") {
+      ackStarted = true;
+      return new Promise((resolve) => {
+        resolveAck = resolve;
+      });
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const profile = { role: "master", agentId: "master" };
+  const message = {
+    messageId: "msg-ack-outside-lease",
+    from: "slave-a",
+    to: "master",
+    taskId: "task-ack-outside-lease",
+    body: "Release the composer before waiting for ack."
+  };
+
+  const delivery = context.deliverAgentMessageToPage(profile, message);
+  await waitFor(() => ackStarted && resolveAck, "agent ack to start after composer submission");
+  const laterWriter = context.withComposerDeliveryLease({
+    kind: "helper-output",
+    pageIdentity: context.getCurrentPageIdentity(),
+    generation: vm.runInContext("pageLifecycleGeneration", context)
+  }, async () => {
+    laterWriterStarted = true;
+  });
+  await waitFor(() => laterWriterStarted, "later composer writer while ack is pending");
+
+  resolveAck({ ok: true, type: "agent-ack" });
+  await Promise.all([delivery, laterWriter]);
+  assert.equal(laterWriterStarted, true);
+}
+
+async function testMasterPromptIdentityPreventsHistoricalFalseAck() {
+  const context = loadContentContext();
+  const profile = { role: "master", agentId: "master" };
+  const base = {
+    from: "slave-a",
+    to: "master",
+    taskId: "same-task",
+    body: "Same visible payload."
+  };
+  const first = context.formatInboundAgentPrompt(profile, { ...base, messageId: "msg-first" });
+  const second = context.formatInboundAgentPrompt(profile, { ...base, messageId: "msg-second" });
+
+  assert.notEqual(first, second);
+  assert.match(first, /Message id: msg-first/);
+  assert.match(second, /Message id: msg-second/);
+}
+
+async function testSpaNavigationCancelsOldAgentDeliveryTokenAndMigratesStorage() {
+  const localStore = {};
+  const context = loadContentContext({ localStore });
+  let releaseClick;
+  let ackCount = 0;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => mockComposerWithText(text);
+  context.clickSendWhenReady = async () => new Promise((resolve) => {
+    releaseClick = resolve;
+  });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-spa-cancel",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-spa",
+          body: "Do not let the old page click after navigation."
+        }]
+      };
+    }
+    if (payload.type === "agent-ack") {
+      ackCount += 1;
+      return { ok: true };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const delivery = context.pollAndDeliverAgentMessage();
+  await waitFor(() => releaseClick, "agent click attempt before SPA navigation");
+  assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"]);
+
+  context.location.pathname = "/c/agent-new";
+  context.location.href = "https://chatgpt.com/c/agent-new";
+  context.beginPageLifecycle();
+  releaseClick(true);
+  await delivery;
+  await Promise.resolve();
+
+  assert.equal(ackCount, 0, "A stale agent delivery must not ack or continue side effects after SPA navigation.");
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
+  assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"], "The pending envelope must migrate under the new page storage key.");
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"].inserted, false);
+}
+
+async function testProfileSwitchCancelsOldAgentDeliveryToken() {
+  const sessionStore = {
+    aiChatShellExecAgentProfile: JSON.stringify({ role: "master", agentId: "master" })
+  };
+  const localStore = {};
+  const context = loadContentContext({ localStore, sessionStore });
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  let releaseClick;
+  let ackCount = 0;
+  context.setStatus = () => {};
+  context.insertReply = async (text) => mockComposerWithText(text);
+  context.clickSendWhenReady = async () => new Promise((resolve) => {
+    releaseClick = resolve;
+  });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-ack") {
+      ackCount += 1;
+      return { ok: true };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+  const message = {
+    messageId: "msg-profile-cancel",
+    from: "slave-a",
+    to: "master",
+    taskId: "task-profile",
+    body: "Old profile must not finish this delivery."
+  };
+
+  const delivery = context.deliverAgentMessageToPage({ role: "master", agentId: "master" }, message);
+  await waitFor(() => releaseClick, "agent click attempt before profile switch");
+  await context.setCurrentAgentProfile("slave", "slave-new");
+  releaseClick(true);
+  await delivery;
+  await Promise.resolve();
+
+  assert.equal(ackCount, 0);
+  assert.equal(vm.runInContext("pendingAgentDelivery", context), null);
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
+  assert.deepEqual(JSON.parse(sessionStore.aiChatShellExecAgentProfile), { role: "slave", agentId: "slave-new" });
+}
+
 async function testSentPendingAgentDeliverySurvivesReloadWithoutResend() {
   const localStore = {};
   const firstContext = loadContentContext({ localStore });
@@ -374,8 +770,9 @@ async function testSentPendingAgentDeliverySurvivesReloadWithoutResend() {
   firstContext.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   firstContext.setStatus = () => {};
   firstContext.agentDeliveryPromptStillPresent = () => true;
-  firstContext.insertReply = async () => {
+  firstContext.insertReply = async (text) => {
     firstInsertCount += 1;
+    return mockComposerWithText(text);
   };
   firstContext.clickSendWhenReady = async () => {
     firstClickCount += 1;
@@ -417,8 +814,9 @@ async function testSentPendingAgentDeliverySurvivesReloadWithoutResend() {
   let secondClickCount = 0;
   secondContext.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   secondContext.setStatus = () => {};
-  secondContext.insertReply = async () => {
+  secondContext.insertReply = async (text) => {
     secondInsertCount += 1;
+    return mockComposerWithText(text);
   };
   secondContext.clickSendWhenReady = async () => {
     secondClickCount += 1;
@@ -449,8 +847,9 @@ async function testProfileChangeClearsLocalPendingDelivery() {
   const statuses = [];
   context.getCurrentAgentProfile = async () => currentProfile;
   context.setStatus = (text, state) => statuses.push({ text, state });
-  context.insertReply = async () => {
+  context.insertReply = async (text) => {
     insertCount += 1;
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -651,6 +1050,7 @@ async function testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities() {
   context.setStatus = () => {};
   context.insertReply = async (text) => {
     replyText = text;
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
@@ -697,6 +1097,7 @@ async function testAgentRosterHelperRequiresRegisteredPage() {
   context.setStatus = () => {};
   context.insertReply = async (text) => {
     replyText = text;
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => true;
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
@@ -719,6 +1120,7 @@ async function testAgentTaskStatusHelperDispatchesAndFormatsNextAction() {
   context.setStatus = () => {};
   context.insertReply = async (text) => {
     replyText = text;
+    return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => true;
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
@@ -971,7 +1373,16 @@ async function waitFor(predicate, label) {
   await testUnsentAgentMessageIsNotInsertedTwice();
   await testAgentMessageStaysPendingUntilPageIsReady();
   await testAgentMessageReinsertsWhenComposerLosesPrompt();
+  await testExternallySubmittedAgentPromptAcksWithoutReinsertion();
   await testAckFailureDoesNotResendAlreadySubmittedMessage();
+  await testMissingAckRecordIsIdempotentAfterMessageWasSent();
+  await testModifiedAgentPromptIsNeverClickedOrOverwritten();
+  await testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt();
+  await testPreexistingUserDraftBlocksAgentInsertionAtomically();
+  await testAgentAckDoesNotHoldComposerLease();
+  await testMasterPromptIdentityPreventsHistoricalFalseAck();
+  await testSpaNavigationCancelsOldAgentDeliveryTokenAndMigratesStorage();
+  await testProfileSwitchCancelsOldAgentDeliveryToken();
   await testSentPendingAgentDeliverySurvivesReloadWithoutResend();
   await testProfileChangeClearsLocalPendingDelivery();
   await testMasterPanelRegistersTmuxAiSlave();

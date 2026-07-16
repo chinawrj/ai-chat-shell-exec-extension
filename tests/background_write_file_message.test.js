@@ -27,6 +27,29 @@ class FakeWebSocket {
     const payload = JSON.parse(text);
     sentPayloads.push(payload);
     setTimeout(() => {
+      if (payload.type === "run-status") {
+        const board = payload.kind === "board";
+        this.listeners.message?.forEach((callback) => callback({
+          data: JSON.stringify({
+            ok: true,
+            found: true,
+            state: "completed",
+            completedAt: Date.now(),
+            kind: board ? "board" : "shell",
+            result: board ? {
+              ok: true,
+              exitCode: 0,
+              stdout: "board-recovered\nBOARD> ",
+              durationMs: 60000,
+              executed: true,
+              executionCompleted: false,
+              completionObserved: true,
+              target: "%40"
+            } : { ok: true, exitCode: 0, stdout: "recovered\n", durationMs: 60000 }
+          })
+        }));
+        return;
+      }
       if (payload.type === "run-board") {
         this.listeners.message?.forEach((callback) => callback({
           data: JSON.stringify({
@@ -43,6 +66,18 @@ class FakeWebSocket {
             timedOut: false,
             truncated: false,
             durationMs: 4
+          })
+        }));
+        return;
+      }
+      if (payload.type === "run-result-presented") {
+        this.listeners.message?.forEach((callback) => callback({
+          data: JSON.stringify({
+            ok: true,
+            type: "run-result-presented",
+            executionId: payload.executionId,
+            found: true,
+            matched: 1
           })
         }));
         return;
@@ -103,6 +138,7 @@ const context = {
     }
   },
   clearTimeout,
+  clearInterval,
   console,
   fetch: async () => ({
     ok: true,
@@ -112,12 +148,13 @@ const context = {
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       releaseVersion: "0.6.0",
       serverReleaseVersion: "0.6.0",
-      protocolVersion: 4,
-      serverProtocolVersion: 4,
+      protocolVersion: 6,
+      serverProtocolVersion: 6,
       helperProtocolVersion: 2
     })
   }),
   setTimeout,
+  setInterval,
   WebSocket: FakeWebSocket
 };
 
@@ -126,8 +163,13 @@ const script = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "b
 vm.runInContext(script, context, { filename: "background.js" });
 
 async function main() {
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "run" }), true);
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "run-board" }), true);
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "vision-visual-run-line" }), true);
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "vision-tmux-ocr-run-line" }), true);
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "write-file" }), false);
   assert.equal(context.getWebSocketWatchdogMs({ type: "run", timeoutMs: 1000 }), 0);
-  assert.equal(context.getWebSocketWatchdogMs({ type: "run-board", timeoutMs: 1000 }), 6000);
+  assert.equal(context.getWebSocketWatchdogMs({ type: "run-board", timeoutMs: 1000 }), 0, "Board delivery keeps its pane lease until the prompt returns, even after crossing the response timeout.");
   assert.equal(context.getWebSocketWatchdogMs({ type: "write-file", timeoutMs: 30000 }), 35000);
 
   const response = await context.handleWriteFileMessage({
@@ -328,7 +370,136 @@ async function main() {
   assert.equal(localStore["shellCallLedger:v1"].calls["board-protocol-mismatch"].state, "failed");
   context.fetch = originalFetch;
 
+  const recoveredStatus = await context.handleRunShellStatusMessage({
+    type: "run-shell-status",
+    id: "recover-status",
+    callKey: "recover-status-key"
+  });
+  assert.equal(recoveredStatus.state, "completed");
+  assert.equal(recoveredStatus.result.stdout, "recovered\n");
+  assert.equal(sentPayloads[8].type, "run-status");
+  assert.equal(sentPayloads[8].callKey, "recover-status-key");
+  assert.equal(localStore["shellCallLedger:v1"].calls["recover-status-key"].state, "completed");
+  assert.equal(localStore["shellCallLedger:v1"].calls["recover-status-key"].recovered, true);
+
+  const recoveredBoardStatus = await context.handleRunBoardStatusMessage({
+    type: "run-board-status",
+    id: "recover-board-status",
+    callKey: "recover-board-status-key"
+  });
+  assert.equal(recoveredBoardStatus.state, "completed");
+  assert.equal(recoveredBoardStatus.result.stdout, "board-recovered\nBOARD> ");
+  assert.equal(sentPayloads[9].type, "run-status");
+  assert.equal(sentPayloads[9].kind, "board");
+  assert.equal(sentPayloads[9].callKey, "recover-board-status-key");
+  assert.equal(localStore["shellCallLedger:v1"].calls["recover-board-status-key"].state, "completed");
+  assert.equal(localStore["shellCallLedger:v1"].calls["recover-board-status-key"].recovered, true);
+  assert.equal(localStore["shellCallLedger:v1"].calls["recover-board-status-key"].target, "%40");
+
+  const presented = await context.handleRunResultPresentedMessage({
+    type: "run-result-presented",
+    executionId: "0123456789abcdef"
+  });
+  assert.equal(presented.ok, true);
+  assert.equal(presented.found, true);
+  assert.equal(sentPayloads[10].type, "run-result-presented");
+  assert.equal(sentPayloads[10].executionId, "0123456789abcdef");
+  await assert.rejects(
+    () => context.handleRunResultPresentedMessage({ type: "run-result-presented", executionId: "not-valid" }),
+    /invalid executionId/
+  );
+
+  await verifyLongCommandWebSocketHeartbeat();
+
   console.log("background write-file and board message tests passed");
+}
+
+async function verifyLongCommandWebSocketHeartbeat() {
+  const OriginalWebSocket = context.WebSocket;
+  const originalSetInterval = context.setInterval;
+  const originalClearInterval = context.clearInterval;
+  let intervalCallback = null;
+  let intervalMs = 0;
+  let clearedTimer = 0;
+  let pendingSocket = null;
+  let throwOnHeartbeat = false;
+  const frames = [];
+
+  class PendingWebSocket {
+    constructor() {
+      this.listeners = {};
+      this.readyState = 1;
+      pendingSocket = this;
+      setTimeout(() => this.emit("open"), 0);
+    }
+
+    addEventListener(event, callback) {
+      this.listeners[event] ||= [];
+      this.listeners[event].push(callback);
+    }
+
+    send(text) {
+      const frame = JSON.parse(text);
+      if (throwOnHeartbeat && frame.type === "keepalive") {
+        throw new Error("socket closed during heartbeat");
+      }
+      frames.push(frame);
+    }
+
+    close() {}
+
+    emit(event, value = {}) {
+      this.listeners[event]?.forEach((callback) => callback(value));
+    }
+  }
+
+  context.WebSocket = PendingWebSocket;
+  context.setInterval = (callback, ms) => {
+    intervalCallback = callback;
+    intervalMs = ms;
+    return 91;
+  };
+  context.clearInterval = (timer) => {
+    clearedTimer = timer;
+  };
+
+  try {
+    const responsePromise = context.runShellViaWebSocket({
+      type: "run",
+      id: "heartbeat-run",
+      cmd: "sleep 60"
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0].type, "run");
+    assert.equal(intervalMs, 20_000);
+    assert.equal(typeof intervalCallback, "function");
+
+    intervalCallback();
+    assert.deepEqual(frames[1], { type: "keepalive" });
+
+    pendingSocket.emit("message", { data: JSON.stringify({ ok: true, exitCode: 0 }) });
+    const response = await responsePromise;
+    assert.equal(response.ok, true);
+    assert.equal(clearedTimer, 91);
+
+    intervalCallback();
+    assert.equal(frames.length, 2, "A settled socket must stop emitting heartbeat frames.");
+
+    throwOnHeartbeat = true;
+    const closeRacePromise = context.runShellViaWebSocket({
+      type: "run-board",
+      id: "heartbeat-close-race",
+      cmd: "monitor"
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    intervalCallback();
+    await assert.rejects(closeRacePromise, /socket closed during heartbeat/);
+  } finally {
+    context.WebSocket = OriginalWebSocket;
+    context.setInterval = originalSetInterval;
+    context.clearInterval = originalClearInterval;
+  }
 }
 
 main().catch((error) => {

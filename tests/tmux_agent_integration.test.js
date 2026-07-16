@@ -107,6 +107,41 @@ async function main() {
   assert.match(paneText, /Do not reconstruct or memorize the long agent_reply_cli\.js command/);
   assert.match(paneText, /msg-tmux-001-slave-tmux-reply\.sh/);
   assert.match(paneText, new RegExp(escapeRegExp(path.join(stateDir, "agent-replies", "msg-tmux-001-slave-tmux.md"))));
+  const initialTaskTextCount = countMatches(paneText, /Inspect the repository state/g);
+
+  const firstTmuxEnvelope = response.message;
+  response = await handleAgentHubMessageAsync({
+    type: "agent-send",
+    from: "master",
+    to: "slave-tmux",
+    taskId: "task-tmux-001",
+    messageId: "msg-tmux-001",
+    body: taskBody
+  }, 1210);
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.idempotent, true);
+  assert.equal(response.message, firstTmuxEnvelope, "An exact tmux-ai retry must return the original envelope.");
+  assert.equal(
+    countMatches(capturePane("AgentAITest:0.0"), /Inspect the repository state/g),
+    initialTaskTextCount,
+    "An idempotent retry must not type the task into the tmux pane again."
+  );
+
+  response = await handleAgentHubMessageAsync({
+    type: "agent-send",
+    from: "master",
+    to: "slave-tmux",
+    taskId: "task-tmux-001",
+    messageId: "msg-tmux-001",
+    body: "Changed tmux task payload."
+  }, 1220);
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(response.errorCode, "duplicate-message-id");
+  assert.equal(
+    countMatches(capturePane("AgentAITest:0.0"), /Inspect the repository state/g),
+    initialTaskTextCount,
+    "A conflicting retry must not type anything into the tmux pane."
+  );
 
   response = handleAgentHubMessage({
     type: "agent-task-status",
@@ -246,4 +281,8 @@ function restoreEnv(key, value) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function countMatches(value, pattern) {
+  return Array.from(String(value || "").matchAll(pattern)).length;
 }
