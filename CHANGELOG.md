@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-07-17
+
+- Makes the helper retry timer and agent poll loop detect same-tab route-only `pushState`/`replaceState` changes before loading route-scoped pending state, so an exact plugin-owned composer value cannot be stranded merely because the host changed the URL without a DOM mutation.
+- Revalidates the fresh current visible composer before every send actuator side effect. A connected but hidden/stale old editor and a localized saved button outside the current composer structure have zero send authority.
+- Persists one cumulative five-actuation envelope across helper and agent retries: at most three button clicks, one form submit, and one keyboard submit. Page interruption/reload recovery cannot reset it, and a visible-but-no-op button cannot starve the form/keyboard fallbacks.
+- Adds route-only helper/agent migration, hidden connected composer, stale localized binding, and cross-call actuation-budget regressions.
+
 ## [0.9.5] - 2026-07-17
 
 - Tightens the v0.9.4 send actuator after team review: an enabled button receives at most one delayed-readiness fallback beyond the first two clicks, and a stale saved selector is never used merely because no heuristic button exists. Strict localized send labels remain supported.

@@ -100,6 +100,7 @@ function loadContentContext() {
     "utf8"
   );
   vm.runInContext(source, context, { filename: "content.js" });
+  context.__localStore = localStore;
   return context;
 }
 
@@ -115,6 +116,11 @@ function navigate(context, pathname) {
   context.location.pathname = pathname;
   context.location.href = `${context.location.origin}${pathname}`;
   context.refreshPageLifecycle();
+}
+
+function navigateWithoutLifecycleRefresh(context, pathname) {
+  context.location.pathname = pathname;
+  context.location.href = `${context.location.origin}${pathname}`;
 }
 
 async function settleBootstrap() {
@@ -193,24 +199,18 @@ async function testExactPluginTextMigratesAcrossRouteChange() {
   const oldGeneration = vm.runInContext("pageLifecycleGeneration", context);
   const oldIdentity = context.getCurrentPageIdentity();
 
-  // A SPA route change invalidates the old lifecycle token and may replace the
-  // editor node. Exact plugin-owned text in the current visible composer is
-  // continuity proof for send-only ownership; it never authorizes a rewrite.
-  currentComposer.isConnected = false;
-  currentComposer = {
-    innerText: insertedText,
-    textContent: insertedText,
-    isConnected: true
-  };
-  navigate(context, "/c/route-owned");
+  // A route-only pushState/replaceState can happen without any DOM mutation.
+  // The retry timer itself must refresh/migrate lifecycle state before it
+  // chooses the new route-scoped storage key.
+  navigateWithoutLifecycleRefresh(context, "/c/route-owned");
   assert.notEqual(context.getCurrentPageIdentity(), oldIdentity);
-  assert.ok(
-    vm.runInContext("pageLifecycleGeneration", context) > oldGeneration,
-    "The route change must invalidate the old lifecycle generation."
-  );
 
   await context.retryPendingHelperDeliveries();
 
+  assert.ok(
+    vm.runInContext("pageLifecycleGeneration", context) > oldGeneration,
+    "The retry path itself must observe and migrate a route-only navigation."
+  );
   assert.equal(backendRuns, 1, "Route migration must never execute the helper again.");
   assert.equal(composerWrites, 1, "Route migration must never write the helper result again.");
   assert.equal(sendAttempts, 2, "The migrated delivery should retry only submission.");
@@ -272,13 +272,9 @@ async function testDifferentUserDraftDoesNotMigrateOrSend() {
   assert.equal(first.pendingDelivery, true);
   assert.equal(sendAttempts, 1);
 
-  currentComposer.isConnected = false;
-  currentComposer = {
-    innerText: "This is the user's unrelated draft",
-    textContent: "This is the user's unrelated draft",
-    isConnected: true
-  };
-  navigate(context, "/c/user-draft");
+  currentComposer.innerText = "This is the user's unrelated draft";
+  currentComposer.textContent = currentComposer.innerText;
+  navigateWithoutLifecycleRefresh(context, "/c/user-draft");
   await context.retryPendingHelperDeliveries();
 
   assert.equal(backendRuns, 1);
@@ -341,10 +337,10 @@ async function testSubmittedReceiptAndTombstoneSurviveRouteChange() {
   assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "submitted");
   assert.equal(vm.runInContext("hasLocallyPresentedHelperExecution('0011223344556677')", context), true);
 
-  navigate(context, "/c/receipt-route");
-  assert.equal(vm.runInContext("hasLocallyPresentedHelperExecution('0011223344556677')", context), true);
+  navigateWithoutLifecycleRefresh(context, "/c/receipt-route");
   await context.retryPendingHelperDeliveries();
 
+  assert.equal(vm.runInContext("hasLocallyPresentedHelperExecution('0011223344556677')", context), true);
   assert.equal(backendRuns, 1);
   assert.equal(composerWrites, 1);
   assert.equal(sendAttempts, 1, "Receipt recovery must not submit the message again.");
@@ -435,11 +431,94 @@ async function testRejectedFeedbackUsesOneWriteSendOnlyRetry() {
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
 }
 
+async function testExhaustedBudgetStillObservesUserDeletion() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "run-result-presented") {
+      return { ok: true, found: true };
+    }
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "8899aabbccddeeff",
+      exitCode: 0,
+      stdout: "budget-owned-output"
+    };
+  };
+  context.insertReply = async (text) => {
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async (_composer, _continue, _text, reserve) => {
+    assert.equal(typeof reserve, "function");
+    assert.equal(await reserve("button"), true);
+    assert.equal(await reserve("button"), true);
+    assert.equal(await reserve("button"), true);
+    assert.equal(await reserve("form"), true);
+    assert.equal(await reserve("keyboard"), true);
+    return false;
+  };
+
+  const call = createShellCall(context, "printf budget-owned-output");
+  await context.runAndReply("budget-owned-call", call);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(
+    vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].sendActuationCount", context),
+    5,
+    "The real helper reserve callback must persist its cumulative budget."
+  );
+  assert.equal(
+    vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].sendActuationCounts.button", context),
+    3
+  );
+  assert.equal(
+    vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].sendActuationCounts.form", context),
+    1
+  );
+  assert.equal(
+    vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].sendActuationCounts.keyboard", context),
+    1
+  );
+  const storedSnapshot = Object.values(context.__localStore)
+    .find((value) => Array.isArray(value?.entries) &&
+      value.entries.some((entry) => entry.callId === "budget-owned-call"));
+  assert.equal(storedSnapshot.entries[0].sendActuationCount, 5);
+  assert.deepEqual(storedSnapshot.entries[0].sendActuationCounts, {
+    button: 3,
+    form: 1,
+    keyboard: 1
+  });
+
+  composer.innerText = "";
+  composer.textContent = "";
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.size", context),
+    0,
+    "Budget exhaustion must not bypass user-deletion cancellation or block later helpers."
+  );
+}
+
 testExactPluginTextMigratesAcrossRouteChange()
   .then(() => testDifferentUserDraftDoesNotMigrateOrSend())
   .then(() => testSubmittedReceiptAndTombstoneSurviveRouteChange())
   .then(() => testBackendFailureUsesOneWriteSendOnlyRetry())
   .then(() => testRejectedFeedbackUsesOneWriteSendOnlyRetry())
+  .then(() => testExhaustedBudgetStillObservesUserDeletion())
   .then(() => {
     console.log("content route delivery tests passed");
   })

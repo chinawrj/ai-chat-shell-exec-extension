@@ -192,6 +192,7 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
+  let secondActuationCounts = null;
   let composerText = "";
   const message = {
     messageId: "reply-001",
@@ -749,15 +750,22 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
     return composer;
   };
   context.findReplyInput = async () => composer;
-  context.clickSendWhenReady = async (currentComposer, _shouldContinue, expectedText) => {
+  context.clickSendWhenReady = async (currentComposer, _shouldContinue, expectedText, reserve) => {
     clickCount += 1;
     assert.equal(currentComposer, composer);
     assert.equal(context.getValidatedComposerOwnershipText(currentComposer, expectedText), expectedText);
+    assert.equal(typeof reserve, "function");
     if (clickCount === 1) {
+      assert.equal(await reserve("button"), true);
       return new Promise((resolve) => {
         releaseClick = resolve;
       });
     }
+    assert.equal(await reserve("form"), true);
+    secondActuationCounts = JSON.parse(vm.runInContext(
+      "JSON.stringify(pendingAgentDelivery.sendActuationCounts)",
+      context
+    ));
     return true;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
@@ -785,28 +793,35 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
   const delivery = context.pollAndDeliverAgentMessage();
   await waitFor(() => releaseClick, "agent click attempt before SPA navigation");
   assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"]);
+  assert.equal(
+    localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"].sendActuationCounts.button,
+    1,
+    "Agent send authority must be persisted by actuator kind before the side effect."
+  );
 
-  const insertedText = composer.innerText;
-  composer.isConnected = false;
-  composer = mockComposerWithText(insertedText);
+  const oldGeneration = vm.runInContext("pageLifecycleGeneration", context);
+  // Route-only navigation: no composer replacement and no DOM mutation to
+  // wake the scanner. The next agent poll must detect/migrate it itself.
   context.location.pathname = "/c/agent-new";
   context.location.href = "https://chatgpt.com/c/agent-new";
-  context.refreshPageLifecycle();
   releaseClick(false);
   await delivery;
   await Promise.resolve();
 
   assert.equal(ackCount, 0, "The stale pre-route token must not ack.");
-  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
-  assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"], "The pending envelope must migrate under the new page storage key.");
-  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"].inserted, true);
 
   await context.pollAndDeliverAgentMessage();
 
+  assert.ok(
+    vm.runInContext("pageLifecycleGeneration", context) > oldGeneration,
+    "Agent polling must observe a route-only navigation before loading pending state."
+  );
   assert.equal(insertCount, 1, "SPA route continuity must never rewrite the prompt.");
-  assert.equal(clickCount, 2, "The replacement composer should receive send-only retry.");
+  assert.equal(clickCount, 2, "The same exact composer should receive only a send retry.");
+  assert.deepEqual(secondActuationCounts, { button: 1, form: 1, keyboard: 0 });
   assert.equal(ackCount, 1, "Only the successfully submitted prompt may be acknowledged.");
   assert.equal(vm.runInContext("pendingAgentDelivery", context), null);
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
 }
 
 async function testProfileSwitchCancelsOldAgentDeliveryToken() {

@@ -2331,20 +2331,21 @@ async function verifyUnboundSendButtonIsTriedImmediately() {
   const submitted = [];
   const preferBoundOnlyValues = [];
   let clicks = 0;
+  const sendButton = {
+    disabled: false,
+    getAttribute: () => "false",
+    click() {
+      clicks += 1;
+      submitted.push({ innerText: text, textContent: text });
+      composer.innerText = "";
+      composer.textContent = "";
+    }
+  };
   context.document.querySelectorAll = (selector) =>
     selector.includes("data-message-author-role") ? submitted : [];
   context.findSendButton = (_composer, preferBoundOnly) => {
     preferBoundOnlyValues.push(preferBoundOnly);
-    return {
-      disabled: false,
-      getAttribute: () => "false",
-      click() {
-        clicks += 1;
-        submitted.push({ innerText: text, textContent: text });
-        composer.innerText = "";
-        composer.textContent = "";
-      }
-    };
+    return sendButton;
   };
   context.sleep = async () => {};
 
@@ -2627,13 +2628,14 @@ async function verifyNoOpSendButtonHasBoundedRetries() {
   };
   let clicks = 0;
   context.document.querySelectorAll = () => [];
-  context.findSendButton = () => ({
+  const sendButton = {
     disabled: false,
     getAttribute: () => "false",
     click() {
       clicks += 1;
     }
-  });
+  };
+  context.findSendButton = () => sendButton;
   context.trySubmitForm = () => false;
   context.tryKeyboardSubmit = () => false;
   context.sleep = async () => {};

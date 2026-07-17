@@ -264,8 +264,11 @@ async function testThirdButtonAttemptCanRecoverFromTwoNoOps() {
   const context = loadContentContext();
   const intended = "Shell call result:\n\nstdout:\nthird click succeeds";
   const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
   composer.innerText = intended;
   composer.textContent = intended;
+  context.findReplyInput = async () => composer;
   let clicks = 0;
   const button = new context.HTMLButtonElement();
   button.getAttribute = (name) => name === "aria-disabled" ? "false" : null;
@@ -290,6 +293,8 @@ async function testExplicitChineseDistantBindingIsUsable() {
   const context = loadContentContext();
   const intended = "Shell call result:\n\nstdout:\n显式绑定发送";
   const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
   composer.id = "chat-composer";
   composer.innerText = intended;
   composer.textContent = intended;
@@ -303,7 +308,10 @@ async function testExplicitChineseDistantBindingIsUsable() {
   });
 
   let clicks = 0;
+  const form = new context.Element();
+  composer.form = form;
   const button = new context.HTMLButtonElement();
+  button.form = form;
   button.id = "manual-chinese-send";
   button.setAttribute("aria-label", "发送");
   button.getBoundingClientRect = () => ({
@@ -322,6 +330,7 @@ async function testExplicitChineseDistantBindingIsUsable() {
   };
   context.__selectorResults.set("#manual-chinese-send", [button]);
   vm.runInContext('savedSendSelector = "#manual-chinese-send";', context);
+  context.findReplyInput = async () => composer;
   context.sleep = async () => {};
 
   assert.equal(
@@ -337,8 +346,11 @@ async function testUserDraftChangeStopsEverySendSideEffect() {
   const context = loadContentContext();
   const intended = "Shell call result:\n\nstdout:\nowned output";
   const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
   composer.innerText = intended;
   composer.textContent = intended;
+  context.findReplyInput = async () => composer;
   let buttonClicks = 0;
   let formSubmits = 0;
   let focuses = 0;
@@ -375,11 +387,264 @@ async function testUserDraftChangeStopsEverySendSideEffect() {
   );
 }
 
+async function testHiddenConnectedComposerCannotSend() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nstale hidden composer";
+  const staleComposer = new context.Element();
+  staleComposer.setAttribute("contenteditable", "true");
+  staleComposer.isContentEditable = true;
+  staleComposer.innerText = intended;
+  staleComposer.textContent = intended;
+  staleComposer.visible = false;
+  const currentComposer = new context.HTMLTextAreaElement();
+  currentComposer.value = "用户当前草稿";
+  context.findReplyInput = async () => currentComposer;
+
+  let clicks = 0;
+  const staleButton = new context.HTMLButtonElement();
+  staleButton.click = () => {
+    clicks += 1;
+  };
+  context.findSendButton = () => staleButton;
+  context.sleep = async () => {};
+
+  assert.equal(await context.clickSendWhenReady(staleComposer, () => true, intended), false);
+  assert.equal(clicks, 0, "A hidden but connected stale composer must have zero send side effects.");
+  assert.equal(currentComposer.value, "用户当前草稿");
+}
+
+async function testStaleLocalizedBindingOutsideComposerIsRejected() {
+  const context = loadContentContext();
+  const composer = new context.HTMLTextAreaElement();
+  composer.value = "Shell call result:\n\nstdout:\ncurrent composer";
+  const composerForm = new context.Element();
+  composer.form = composerForm;
+  const unrelatedForm = new context.Element();
+  const staleButton = new context.HTMLButtonElement();
+  staleButton.form = unrelatedForm;
+  staleButton.setAttribute("aria-label", "发送");
+  staleButton.id = "stale-send";
+  context.__selectorResults.set("#stale-send", [staleButton]);
+  vm.runInContext('savedSendSelector = "#stale-send";', context);
+
+  assert.equal(
+    context.findSendButton(composer, true),
+    null,
+    "A localized selector remains only a candidate and cannot bypass current-composer association."
+  );
+}
+
+async function testBoundComposerWinsOverUnrelatedVisibleEditor() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nbound composer";
+  const boundComposer = new context.Element();
+  boundComposer.id = "bound-composer";
+  boundComposer.setAttribute("contenteditable", "true");
+  boundComposer.isContentEditable = true;
+  boundComposer.innerText = intended;
+  boundComposer.textContent = intended;
+  const unrelatedEditor = new context.HTMLTextAreaElement();
+  unrelatedEditor.value = "用户在另一个可见编辑器中的草稿";
+  await context.chrome.storage.local.set({
+    [context.composerProfileKey()]: {
+      selector: "#bound-composer"
+    }
+  });
+  context.document.querySelector = (selector) =>
+    selector === "#bound-composer" ? boundComposer : null;
+  context.findReplyInput = async () => unrelatedEditor;
+  let clicks = 0;
+  const button = new context.HTMLButtonElement();
+  button.click = () => {
+    clicks += 1;
+    context.__submittedMessages.push({ innerText: intended, textContent: intended });
+    boundComposer.innerText = "";
+    boundComposer.textContent = "";
+  };
+  context.findSendButton = () => button;
+  context.sleep = async () => {};
+
+  assert.equal(await context.clickSendWhenReady(boundComposer, () => true, intended), true);
+  assert.equal(clicks, 1, "An exact still-valid explicit composer binding remains current authority.");
+  assert.equal(unrelatedEditor.value, "用户在另一个可见编辑器中的草稿");
+}
+
+async function testPersistentActuationBudgetStopsAcrossCalls() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nbounded retries";
+  const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
+  composer.innerText = intended;
+  composer.textContent = intended;
+  context.findReplyInput = async () => composer;
+  let clicks = 0;
+  const persistedCounts = {
+    button: 0,
+    form: 0,
+    keyboard: 0
+  };
+  const kindLimits = {
+    button: 3,
+    form: 1,
+    keyboard: 1
+  };
+  const button = new context.HTMLButtonElement();
+  button.click = () => {
+    clicks += 1;
+  };
+  context.findSendButton = () => button;
+  context.trySubmitForm = () => false;
+  context.sleep = async () => {};
+  const reserve = async (kind) => {
+    if (!kindLimits[kind] || persistedCounts[kind] >= kindLimits[kind]) {
+      return false;
+    }
+    persistedCounts[kind] += 1;
+    return true;
+  };
+
+  assert.equal(await context.clickSendWhenReady(composer, () => true, intended, reserve), false);
+  assert.equal(clicks, 3);
+
+  let now = 0;
+  context.__testNow = 0;
+  vm.runInContext("Date.now = () => __testNow;", context);
+  context.sleep = async () => {
+    now += 150;
+    context.__testNow = now;
+  };
+  composer.dispatchEvent = (event) => {
+    if (event.type === "keydown" && event.key === "Enter") {
+      context.__submittedMessages.push({ innerText: intended, textContent: intended });
+      composer.innerText = "";
+      composer.textContent = "";
+    }
+    return true;
+  };
+
+  assert.equal(await context.clickSendWhenReady(composer, () => true, intended, reserve), true);
+  assert.equal(clicks, 3, "Button authority must remain capped across retry calls.");
+  assert.deepEqual(persistedCounts, { button: 3, form: 0, keyboard: 1 });
+  assert.equal(context.__submittedMessages.length, 1);
+}
+
+async function testNoOpButtonWithoutFormStillReachesKeyboard() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nkeyboard fallback";
+  const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
+  composer.innerText = intended;
+  composer.textContent = intended;
+  context.findReplyInput = async () => composer;
+  let clicks = 0;
+  const noOpButton = new context.HTMLButtonElement();
+  noOpButton.click = () => {
+    clicks += 1;
+  };
+  context.findSendButton = () => noOpButton;
+  const reservedKinds = [];
+  let now = 0;
+  context.__testNow = 0;
+  vm.runInContext("Date.now = () => __testNow;", context);
+  context.sleep = async () => {
+    now += 150;
+    context.__testNow = now;
+  };
+  composer.dispatchEvent = (event) => {
+    if (event.type === "keydown" && event.key === "Enter") {
+      context.__submittedMessages.push({ innerText: intended, textContent: intended });
+      composer.innerText = "";
+      composer.textContent = "";
+    }
+    return true;
+  };
+
+  const sent = await context.clickSendWhenReady(
+    composer,
+    () => true,
+    intended,
+    async (kind) => {
+      reservedKinds.push(kind);
+      return true;
+    }
+  );
+
+  assert.equal(sent, true);
+  assert.equal(clicks, 3);
+  assert.deepEqual(
+    reservedKinds,
+    ["button", "button", "button", "keyboard"],
+    "A no-op button and missing form must leave reserved capacity for keyboard fallback."
+  );
+  assert.equal(context.__submittedMessages.length, 1);
+}
+
+async function testNoOpButtonStillReachesFormFallback() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nform fallback";
+  const composer = new context.Element();
+  composer.setAttribute("contenteditable", "true");
+  composer.isContentEditable = true;
+  composer.innerText = intended;
+  composer.textContent = intended;
+  const form = {
+    requestSubmit() {
+      context.__submittedMessages.push({ innerText: intended, textContent: intended });
+      composer.innerText = "";
+      composer.textContent = "";
+    }
+  };
+  composer.form = form;
+  context.findReplyInput = async () => composer;
+  let clicks = 0;
+  const noOpButton = new context.HTMLButtonElement();
+  noOpButton.form = form;
+  noOpButton.click = () => {
+    clicks += 1;
+  };
+  context.findSendButton = () => noOpButton;
+  const reservedKinds = [];
+  let now = 0;
+  context.__testNow = 0;
+  vm.runInContext("Date.now = () => __testNow;", context);
+  context.sleep = async () => {
+    now += 150;
+    context.__testNow = now;
+  };
+
+  const sent = await context.clickSendWhenReady(
+    composer,
+    () => true,
+    intended,
+    async (kind) => {
+      reservedKinds.push(kind);
+      return true;
+    }
+  );
+
+  assert.equal(sent, true);
+  assert.equal(clicks, 3);
+  assert.deepEqual(
+    reservedKinds,
+    ["button", "button", "button", "form"],
+    "Three bounded no-op button attempts must not starve the form fallback."
+  );
+  assert.equal(context.__submittedMessages.length, 1);
+}
+
 async function main() {
   await testTrackedTextareaUpdatesHostState();
   await testThirdButtonAttemptCanRecoverFromTwoNoOps();
   await testExplicitChineseDistantBindingIsUsable();
   await testUserDraftChangeStopsEverySendSideEffect();
+  await testHiddenConnectedComposerCannotSend();
+  await testStaleLocalizedBindingOutsideComposerIsRejected();
+  await testBoundComposerWinsOverUnrelatedVisibleEditor();
+  await testPersistentActuationBudgetStopsAcrossCalls();
+  await testNoOpButtonWithoutFormStillReachesKeyboard();
+  await testNoOpButtonStillReachesFormFallback();
   console.log("content_send_actuator.test.js: all tests passed");
 }
 

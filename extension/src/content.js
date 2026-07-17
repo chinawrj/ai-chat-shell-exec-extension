@@ -22,7 +22,9 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.5";
+const CONTENT_SCRIPT_VERSION = "0.9.6";
+const MAX_PERSISTED_SEND_ACTUATIONS = 5;
+const MAX_SEND_BUTTON_CLICKS = 3;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -1029,6 +1031,12 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     createdAt: now,
     updatedAt: now,
     attempts: 0,
+    sendActuationCount: 0,
+    sendActuationCounts: {
+      button: 0,
+      form: 0,
+      keyboard: 0
+    },
     lastError: "",
     restored: false
   };
@@ -1037,6 +1045,67 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
   pendingHelperDeliveries = new Map(pruned.map((pending) => [pending.callId, pending]));
   await persistPendingHelperDeliveries();
   return pendingHelperDeliveries.get(callId) || entry;
+}
+
+function normalizedSendActuationCounts(state) {
+  const source = state?.sendActuationCounts && typeof state.sendActuationCounts === "object"
+    ? state.sendActuationCounts
+    : {};
+  const counts = {
+    button: Math.max(0, Number(source.button || 0)),
+    form: Math.max(0, Number(source.form || 0)),
+    keyboard: Math.max(0, Number(source.keyboard || 0))
+  };
+  const recordedTotal = Math.max(0, Number(state?.sendActuationCount || 0));
+  const countedTotal = counts.button + counts.form + counts.keyboard;
+  if (recordedTotal > countedTotal) {
+    const lastKind = ["button", "form", "keyboard"].includes(state?.lastSendActuationKind)
+      ? state.lastSendActuationKind
+      : "button";
+    // Conservatively attribute legacy/unclassified attempts to one kind so an
+    // upgrade cannot reset previously consumed persistent authority.
+    counts[lastKind] += recordedTotal - countedTotal;
+  }
+  return counts;
+}
+
+function sendActuationKindLimit(kind) {
+  return {
+    button: MAX_SEND_BUTTON_CLICKS,
+    form: 1,
+    keyboard: 1
+  }[kind] || 0;
+}
+
+async function reservePendingHelperSendActuation(entry, kind) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return false;
+  }
+  const normalizedKind = String(kind || "");
+  const kindLimit = sendActuationKindLimit(normalizedKind);
+  const counts = normalizedSendActuationCounts(entry);
+  const count = Math.max(
+    Number(entry.sendActuationCount || 0),
+    counts.button + counts.form + counts.keyboard
+  );
+  if (!kindLimit || counts[normalizedKind] >= kindLimit) {
+    return false;
+  }
+  if (count >= MAX_PERSISTED_SEND_ACTUATIONS) {
+    entry.lastError = "automatic send actuation budget exhausted; exact result remains for manual send";
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    return false;
+  }
+  entry.sendActuationCount = count + 1;
+  counts[normalizedKind] += 1;
+  entry.sendActuationCounts = counts;
+  entry.lastSendActuationKind = normalizedKind;
+  entry.updatedAt = Date.now();
+  // Persist before the side effect so a service/page interruption cannot
+  // reset the cumulative click/form/keyboard budget.
+  await persistPendingHelperDeliveries(undefined, { propagateErrors: true });
+  return true;
 }
 
 function persistPendingHelperDeliveries(
@@ -1147,6 +1216,16 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   if (deliverySettings.autoSend === false) {
     return finalizePendingHelperDelivery(entry, "presented");
   }
+  if (Number(entry.sendActuationCount || 0) >= MAX_PERSISTED_SEND_ACTUATIONS) {
+    entry.lastError = "automatic send actuation budget exhausted; exact result remains for manual send";
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    setPendingHelperDeliveryStatus(entry);
+    // Continue to notice a later manual submit or deletion, but avoid a hot
+    // two-second storage/status loop after automatic side effects are paused.
+    schedulePendingHelperDeliveryRetry(30_000);
+    return false;
+  }
 
   const callToken = {
     callId: entry.callId,
@@ -1166,7 +1245,8 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     return clickSendWhenReady(
       composer,
       () => isComposerDeliveryTokenCurrent(deliveryToken),
-      expectedComposerText
+      expectedComposerText,
+      (kind) => reservePendingHelperSendActuation(entry, kind)
     );
   });
   if (sent) {
@@ -1223,7 +1303,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       entry.updatedAt = Date.now();
       entry.lastError = "";
       await persistPendingHelperDeliveries();
-    });
+    }, entry);
     if (delivered) {
       return finalizePendingHelperDelivery(
         entry,
@@ -1245,6 +1325,11 @@ async function retryPendingHelperDeliveries() {
   if (pendingHelperDeliveryRetryInFlight || !extensionActive) {
     return;
   }
+  // The retry timer does not depend on DOM mutations. Detect a route-only SPA
+  // navigation before selecting a per-page storage key, otherwise the old
+  // in-memory delivery can be discarded while its exact text remains in the
+  // composer.
+  refreshPageLifecycle();
   await loadPendingHelperDeliveriesForCurrentPage();
   const entries = Array.from(pendingHelperDeliveries.values())
     .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
@@ -2705,7 +2790,8 @@ async function deliverHelperReply(
   reply,
   settings,
   onInserted = () => {},
-  onWriteAttempted = () => {}
+  onWriteAttempted = () => {},
+  pendingEntry = null
 ) {
   return withComposerDeliveryLease({
     kind: "helper-output",
@@ -2743,7 +2829,10 @@ async function deliverHelperReply(
       const sent = await clickSendWhenReady(
         composer,
         () => isComposerDeliveryTokenCurrent(deliveryToken),
-        expectedComposerText
+        expectedComposerText,
+        pendingEntry
+          ? (kind) => reservePendingHelperSendActuation(pendingEntry, kind)
+          : null
       );
       callToken.phase = "auto-send-finished";
       if (!sent) {
@@ -3239,6 +3328,10 @@ async function runAgentPollLoop() {
 }
 
 async function pollAndDeliverAgentMessage() {
+  // Agent polling can be the only active timer on a quiet SPA page. Refresh
+  // the lifecycle before loading its route-scoped pending delivery so a
+  // pushState/replaceState navigation cannot strand the one-write send retry.
+  refreshPageLifecycle();
   const profile = await getCurrentAgentProfile();
   if (!profile.agentId || profile.role === "none") {
     return;
@@ -3444,10 +3537,18 @@ async function deliverAgentMessageToPage(profile, message) {
       const composer = ownership.composer;
       pending.composerElement = composer;
       pending.composerText = ownership.text;
+      if (Number(pending.sendActuationCount || 0) >= MAX_PERSISTED_SEND_ACTUATIONS) {
+        pending.lastError = "automatic send actuation budget exhausted; exact agent prompt remains for manual send";
+        pending.updatedAt = Date.now();
+        updatePendingAgentDeliveryPanel();
+        persistPendingAgentDelivery();
+        return;
+      }
       const sent = await clickSendWhenReady(
         composer,
         () => isComposerDeliveryTokenCurrent(composerToken),
-        expectedComposerText
+        expectedComposerText,
+        (kind) => reservePendingAgentSendActuation(pending, kind)
       );
       if (!isComposerDeliveryTokenCurrent(composerToken)) {
         return;
@@ -3567,6 +3668,12 @@ function ensurePendingAgentDelivery(profile, message) {
     storageKey: agentPendingDeliveryKey(),
     pageIdentity: getCurrentPageIdentity(),
     pageGeneration: pageLifecycleGeneration,
+    sendActuationCount: 0,
+    sendActuationCounts: {
+      button: 0,
+      form: 0,
+      keyboard: 0
+    },
     lastError: "",
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -3575,6 +3682,35 @@ function ensurePendingAgentDelivery(profile, message) {
   updatePendingAgentDeliveryPanel();
   persistPendingAgentDelivery();
   return pendingAgentDelivery;
+}
+
+async function reservePendingAgentSendActuation(pending, kind) {
+  if (!pending || pendingAgentDelivery !== pending) {
+    return false;
+  }
+  const normalizedKind = String(kind || "");
+  const kindLimit = sendActuationKindLimit(normalizedKind);
+  const counts = normalizedSendActuationCounts(pending);
+  const count = Math.max(
+    Number(pending.sendActuationCount || 0),
+    counts.button + counts.form + counts.keyboard
+  );
+  if (!kindLimit || counts[normalizedKind] >= kindLimit) {
+    return false;
+  }
+  if (count >= MAX_PERSISTED_SEND_ACTUATIONS) {
+    pending.lastError = "automatic send actuation budget exhausted; exact agent prompt remains for manual send";
+    pending.updatedAt = Date.now();
+    await persistPendingAgentDelivery({ propagateErrors: true });
+    return false;
+  }
+  pending.sendActuationCount = count + 1;
+  counts[normalizedKind] += 1;
+  pending.sendActuationCounts = counts;
+  pending.lastSendActuationKind = normalizedKind;
+  pending.updatedAt = Date.now();
+  await persistPendingAgentDelivery({ propagateErrors: true });
+  return true;
 }
 
 function agentDeliveryPromptStillPresent(pending) {
@@ -3622,6 +3758,9 @@ async function loadPendingAgentDelivery(profile) {
       storageKey: agentPendingDeliveryKey(),
       pageIdentity: getCurrentPageIdentity(),
       pageGeneration: pageLifecycleGeneration,
+      sendActuationCount: Math.max(0, Number(pending.sendActuationCount || 0)),
+      sendActuationCounts: normalizedSendActuationCounts(pending),
+      lastSendActuationKind: String(pending.lastSendActuationKind || ""),
       lastError: pending.lastError || "restored after page reload",
       createdAt: Number(pending.createdAt) || Date.now(),
       updatedAt: Date.now()
@@ -3648,6 +3787,9 @@ function persistPendingAgentDelivery(options = {}) {
     sent: Boolean(pendingAgentDelivery.sent),
     cancelled: Boolean(pendingAgentDelivery.cancelled),
     composerConflict: Boolean(pendingAgentDelivery.composerConflict),
+    sendActuationCount: Math.max(0, Number(pendingAgentDelivery.sendActuationCount || 0)),
+    sendActuationCounts: normalizedSendActuationCounts(pendingAgentDelivery),
+    lastSendActuationKind: String(pendingAgentDelivery.lastSendActuationKind || ""),
     lastError: pendingAgentDelivery.lastError || "",
     createdAt: pendingAgentDelivery.createdAt || Date.now(),
     updatedAt: pendingAgentDelivery.updatedAt || Date.now()
@@ -4354,21 +4496,24 @@ function contentEditableHasText(input, expected) {
     (compactExpected.length > 0 && compactActual.includes(compactExpected.slice(0, Math.min(120, compactExpected.length))));
 }
 
-async function findReplyInput() {
-  if (lastComposerElement &&
+async function findReplyInput(options = {}) {
+  if (options.fresh !== true &&
+      lastComposerElement &&
       lastComposerElement.isConnected &&
       isEditableElement(lastComposerElement) &&
       isVisibleElement(lastComposerElement)) {
     return lastComposerElement;
   }
 
-  const profile = await chrome.storage.local.get(composerProfileKey());
-  const selector = profile[composerProfileKey()]?.selector;
-  if (selector) {
-    const saved = document.querySelector(selector);
-    if (saved && isEditableElement(saved) && isVisibleElement(saved)) {
-      lastComposerElement = saved;
-      return saved;
+  if (options.fresh !== true) {
+    const profile = await chrome.storage.local.get(composerProfileKey());
+    const selector = profile[composerProfileKey()]?.selector;
+    if (selector) {
+      const saved = document.querySelector(selector);
+      if (saved && isEditableElement(saved) && isVisibleElement(saved)) {
+        lastComposerElement = saved;
+        return saved;
+      }
     }
   }
 
@@ -4418,7 +4563,8 @@ function editableScore(node) {
 async function clickSendWhenReady(
   composer = lastComposerElement || closestEditable(document.activeElement),
   shouldContinue = () => true,
-  expectedText = null
+  expectedText = null,
+  reservePersistentActuation = null
 ) {
   const originalText = normalizeCommand(expectedText === null ? getComposerText(composer) : expectedText);
   if (!originalText || !composerOwnershipTextsMatch(getComposerText(composer), originalText)) {
@@ -4427,21 +4573,52 @@ async function clickSendWhenReady(
   const submittedMessageCountBefore = countSubmittedMessagesMatching(originalText);
   const stillOwnsComposer = () =>
     shouldContinue() &&
-    composer?.isConnected !== false;
+    composer?.isConnected !== false &&
+    (!(composer instanceof Element) ||
+      (isEditableElement(composer) && isVisibleElement(composer)));
   const startedAt = Date.now();
   const deadlineAt = startedAt + 15_000;
+  let sendActuationCount = 0;
   let sendButtonClickCount = 0;
-  const maxSendButtonClicks = 3;
+  const maxSendActuations = MAX_PERSISTED_SEND_ACTUATIONS;
   let formSubmitAttempted = false;
   let keyboardSubmitAttempted = false;
+  const currentOwnership = async () => {
+    if (countSubmittedMessagesMatching(originalText) > submittedMessageCountBefore) {
+      return "done";
+    }
+    if (!stillOwnsComposer()) {
+      return "aborted";
+    }
+    const ownership = await inspectCurrentComposerOwnership(composer, originalText);
+    if (!stillOwnsComposer()) {
+      return "aborted";
+    }
+    return ownership.state === "owned" && ownership.composer === composer
+      ? "owned"
+      : "aborted";
+  };
+  const reserveActuation = async (kind) => {
+    if (sendActuationCount >= maxSendActuations) {
+      return false;
+    }
+    if (typeof reservePersistentActuation === "function") {
+      try {
+        if (await reservePersistentActuation(kind) !== true) {
+          return false;
+        }
+      } catch (_unused) {
+        // Fail closed: a side effect whose cumulative budget could not be
+        // persisted must not occur.
+        return false;
+      }
+    }
+    sendActuationCount += 1;
+    return true;
+  };
 
   for (let attempt = 0; attempt < 80 && Date.now() < deadlineAt; attempt += 1) {
-    const ownership = getComposerSendOwnership(
-      composer,
-      originalText,
-      submittedMessageCountBefore,
-      stillOwnsComposer
-    );
+    const ownership = await currentOwnership();
     if (ownership === "done") {
       return true;
     }
@@ -4450,36 +4627,61 @@ async function clickSendWhenReady(
     }
     const sendButton = findSendButton(composer, false);
     if (sendButton &&
-        sendButtonClickCount < maxSendButtonClicks &&
+        sendButtonClickCount < MAX_SEND_BUTTON_CLICKS &&
+        sendActuationCount < maxSendActuations &&
         !sendButton.disabled &&
         sendButton.getAttribute("aria-disabled") !== "true") {
-      if (getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) !== "owned") {
+      if (await currentOwnership() !== "owned") {
         continue;
       }
-      sendButtonClickCount += 1;
-      sendButton.click();
-      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-        return true;
+      const buttonReserved = await reserveActuation("button");
+      if (buttonReserved) {
+        if (await currentOwnership() !== "owned" ||
+            findSendButton(composer, false) !== sendButton ||
+            sendButton.disabled ||
+            sendButton.getAttribute("aria-disabled") === "true") {
+          continue;
+        }
+        sendButtonClickCount += 1;
+        sendButton.click();
+        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
+          return true;
+        }
       }
     }
 
     const elapsedMs = Date.now() - startedAt;
-    if (!formSubmitAttempted && elapsedMs >= 3_000 && trySubmitForm(composer, () =>
-      getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
-    )) {
+    if (!formSubmitAttempted && elapsedMs >= 3_000) {
       formSubmitAttempted = true;
-      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-        return true;
+      const submitForm = composer?.closest?.("form");
+      if (submitForm &&
+          await currentOwnership() === "owned" &&
+          await reserveActuation("form") &&
+          await currentOwnership() === "owned" &&
+          trySubmitForm(composer, () =>
+            getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
+          )) {
+        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
+          return true;
+        }
       }
     }
 
-    if (!keyboardSubmitAttempted && elapsedMs >= 4_500 && tryKeyboardSubmit(composer, () =>
-      getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
-    )) {
+    if (!keyboardSubmitAttempted && elapsedMs >= 4_500) {
       keyboardSubmitAttempted = true;
-      if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-        return true;
+      if (await currentOwnership() === "owned" &&
+          await reserveActuation("keyboard") &&
+          await currentOwnership() === "owned" &&
+          tryKeyboardSubmit(composer, () =>
+            getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
+          )) {
+        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
+          return true;
+        }
       }
+    }
+    if (sendActuationCount >= maxSendActuations) {
+      return false;
     }
     await sleep(150);
   }
@@ -4510,22 +4712,45 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
   const preferredUsable = preferredComposer?.isConnected !== false &&
     (!(preferredComposer instanceof Element) ||
       (isEditableElement(preferredComposer) && isVisibleElement(preferredComposer)));
-  const preferredText = preferredUsable
-    ? getValidatedComposerOwnershipText(preferredComposer, intendedText)
-    : "";
-  if (preferredText) {
-    return {
-      state: "owned",
-      composer: preferredComposer,
-      text: preferredText
-    };
+  // Unit/integration harnesses may provide a non-DOM composer adapter. Real
+  // page composers are Elements and always take the fresh-current proof below.
+  if (preferredUsable && !(preferredComposer instanceof Element)) {
+    const adapterText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    if (adapterText) {
+      return {
+        state: "owned",
+        composer: preferredComposer,
+        text: adapterText
+      };
+    }
   }
-
+  if (preferredUsable && preferredComposer instanceof Element) {
+    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    if (preferredText && await isSavedComposerBindingFor(preferredComposer)) {
+      return {
+        state: "owned",
+        composer: preferredComposer,
+        text: preferredText
+      };
+    }
+  }
   let currentComposer = null;
   try {
-    currentComposer = await findReplyInput();
+    // Ignore the cached node so a connected-but-hidden/stale composer cannot
+    // remain send authority after a SPA swaps in its current editor.
+    currentComposer = await findReplyInput({ fresh: true });
   } catch (_unused) {
     currentComposer = null;
+  }
+  if (preferredUsable && currentComposer === preferredComposer) {
+    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    if (preferredText) {
+      return {
+        state: "owned",
+        composer: preferredComposer,
+        text: preferredText
+      };
+    }
   }
   if (!currentComposer) {
     return {
@@ -4547,6 +4772,26 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
     composer: currentComposer,
     text: ""
   };
+}
+
+async function isSavedComposerBindingFor(composer) {
+  if (!composer || !(composer instanceof Element)) {
+    return false;
+  }
+  try {
+    const profile = await chrome.storage.local.get(composerProfileKey());
+    const selector = profile[composerProfileKey()]?.selector;
+    if (!selector) {
+      return false;
+    }
+    const saved = document.querySelector(selector);
+    return saved === composer &&
+      saved.isConnected !== false &&
+      isEditableElement(saved) &&
+      isVisibleElement(saved);
+  } catch (_unused) {
+    return false;
+  }
 }
 
 function normalizeComposerOwnershipText(text) {
@@ -4740,20 +4985,9 @@ function findSendButton(composer = lastComposerElement || closestEditable(docume
 }
 
 function isBoundSendButtonAssociatedWithComposer(button, composer) {
-  if (isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer))) {
-    return true;
-  }
-  // Explicit bindings may use localized labels and layouts that cannot satisfy
-  // the generic English/geometry heuristic. Accept only a strict localized
-  // send meaning here; never fall back to an arbitrary stale selector.
-  const labels = [
-    button?.getAttribute?.("aria-label") || "",
-    button?.getAttribute?.("title") || "",
-    button?.textContent || ""
-  ].map((value) => String(value).replace(/\s+/g, " ").trim()).filter(Boolean);
-  return labels.some((value) =>
-    /^(发送|发送消息|提交|提交消息|送信|送信する|メッセージを送信|전송|메시지 보내기)$/.test(value)
-  );
+  // An explicit selector identifies a candidate, not send authority. It must
+  // still prove a structural/geometry relationship to the current composer.
+  return isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer));
 }
 
 function findComposerSendRegion(composer) {
@@ -4783,7 +5017,9 @@ function isSendButtonAssociatedWithComposer(button, composer, composerRegion = f
     button.textContent || ""
   ].map((value) => String(value).replace(/\s+/g, " ").trim().toLowerCase()).filter(Boolean);
   const knownSendButton = button.matches?.('[data-testid="send-button"], [data-testid="composer-send-button"]') === true;
-  const strictSendLabel = buttonLabels.some((label) => /^(send|send message|send prompt|submit)$/.test(label));
+  const strictSendLabel = buttonLabels.some((label) =>
+    /^(send|send message|send prompt|submit|发送|发送消息|提交|提交消息|送信|送信する|メッセージを送信|전송|메시지 보내기)$/.test(label)
+  );
   const composerForm = composer.closest?.("form");
   if (composerForm) {
     return button.closest?.("form") === composerForm &&
