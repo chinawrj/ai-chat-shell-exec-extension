@@ -2639,7 +2639,7 @@ async function verifyNoOpSendButtonHasBoundedRetries() {
   context.sleep = async () => {};
 
   assert.equal(await context.clickSendWhenReady(composer), false);
-  assert.equal(clicks, 2, "A no-op heuristic candidate must not be clicked on every calibration attempt.");
+  assert.equal(clicks, 12, "A no-op heuristic candidate may be retried after delayed readiness, but retries must remain bounded.");
 }
 
 verifyForceRunUsesLatestHelper()

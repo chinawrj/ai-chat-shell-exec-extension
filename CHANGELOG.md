@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-07-17
+
+- Preserves exact plugin-owned send-only delivery across same-tab SPA URL changes, fixing results or agent prompts that remained visibly stuck in the composer after ChatGPT moved a new conversation to its canonical route. Backend execution and composer insertion remain single-shot; different user text cancels without a send.
+- Routes backend failures and rejected-helper feedback through the same durable local delivery queue so every extension-owned composer write has a send-only fallback.
+- Uses the native input/textarea value setter so controlled React editors receive the inserted value, retries an enabled send button beyond the first two no-op clicks within a bounded deadline, and retains explicit localized/custom Send bindings when no current-page heuristic control exists.
+- Adds route-transfer, React tracked-input, delayed-button, localized-binding, and exact-text redraw regressions. The Chromium test now models composer replacement with a live submit handler and requires exactly one full submitted user message with an empty current composer.
+
 ## [0.9.3] - 2026-07-17
 
 - Extends the durable one-write, send-only retry queue to every successful helper response, fixing file and agent-query results that could remain in the composer forever after the first send calibration failed.

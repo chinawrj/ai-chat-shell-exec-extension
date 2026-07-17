@@ -378,7 +378,6 @@
 
     <script>
       const thread = document.getElementById("thread");
-      const composer = document.getElementById("composer");
       const form = document.getElementById("composerForm");
       const command = document.getElementById("command");
       const status = document.getElementById("status");
@@ -406,17 +405,18 @@
 
       form.addEventListener("submit", (event) => {
         event.preventDefault();
-        const text = composer.innerText.trim();
+        const currentComposer = document.getElementById("composer");
+        const text = currentComposer?.innerText.trim() || "";
         if (!text) {
           return;
         }
         appendMessage("user", text);
-        composer.textContent = "";
+        currentComposer.textContent = "";
         setStatus("Composer message appended to thread.");
       });
 
-      composer.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" && !event.shiftKey) {
+      form.addEventListener("keydown", (event) => {
+        if (event.target?.closest?.("#composer") && event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
           form.requestSubmit();
         }

@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.3";
+const CONTENT_SCRIPT_VERSION = "0.9.4";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -726,7 +726,11 @@ function getCurrentPageIdentity() {
   return location.href || `${location.origin}${location.pathname || ""}`;
 }
 
-function beginPageLifecycle() {
+function beginPageLifecycle(options = {}) {
+  const routeHandoffEntries = Array.isArray(options.routeHandoffEntries)
+    ? options.routeHandoffEntries
+    : [];
+  const previousStorageKey = String(options.previousStorageKey || "");
   cancelPendingHelperDeliveryRetry();
   pendingHelperDeliveries = new Map();
   locallyPresentedHelperExecutions = new Map();
@@ -742,8 +746,29 @@ function beginPageLifecycle() {
   lastUserMessageText = "";
   pendingSelfTest = null;
   cancelAgentDeliveryLifecycle();
-  migratePendingAgentDeliveryToCurrentPage();
+  migratePendingAgentDeliveryToCurrentPage({
+    preserveInsertedOwnership: options.routeTransition === true
+  });
   clearPendingForceRun();
+
+  if (routeHandoffEntries.length > 0) {
+    const nextPageIdentity = getCurrentPageIdentity();
+    for (const entry of routeHandoffEntries) {
+      entry.pageIdentity = nextPageIdentity;
+      entry.restored = false;
+      entry.deliveryInFlight = false;
+      entry.updatedAt = Date.now();
+      pendingHelperDeliveries.set(entry.callId, entry);
+    }
+    pendingHelperDeliveriesLoadedKey = pendingHelperDeliveryStorageKey(nextPageIdentity);
+    const nextStorageKey = pendingHelperDeliveriesLoadedKey;
+    persistPendingHelperDeliveries(nextStorageKey)
+      .then(() => previousStorageKey && previousStorageKey !== nextStorageKey
+        ? chrome.storage.local.remove([previousStorageKey])
+        : undefined)
+      .catch(() => {});
+    schedulePendingHelperDeliveryRetry(0);
+  }
 }
 
 function refreshPageLifecycle() {
@@ -753,7 +778,18 @@ function refreshPageLifecycle() {
     return;
   }
   if (pageIdentity !== observedPageIdentity) {
-    beginPageLifecycle();
+    const previousPageIdentity = observedPageIdentity;
+    const previousStorageKey = pendingHelperDeliveriesLoadedKey ||
+      pendingHelperDeliveryStorageKey(previousPageIdentity);
+    const routeHandoffEntries = Array.from(pendingHelperDeliveries.values());
+    const preserveInsertedHelperOwnership = routeHandoffEntries.some((entry) =>
+      entry?.phase === "inserted" && entry?.pageIdentity === previousPageIdentity
+    );
+    beginPageLifecycle({
+      routeTransition: true,
+      previousStorageKey,
+      routeHandoffEntries: preserveInsertedHelperOwnership ? routeHandoffEntries : []
+    });
   }
 }
 
@@ -1264,7 +1300,7 @@ function cancelAgentDeliveryLifecycle() {
   activeAgentDeliveryToken = null;
 }
 
-function migratePendingAgentDeliveryToCurrentPage() {
+function migratePendingAgentDeliveryToCurrentPage(options = {}) {
   pendingAgentDeliveryLoaded = false;
   if (!pendingAgentDelivery) {
     return;
@@ -1275,7 +1311,14 @@ function migratePendingAgentDeliveryToCurrentPage() {
   pendingAgentDelivery.pageIdentity = getCurrentPageIdentity();
   pendingAgentDelivery.pageGeneration = pageLifecycleGeneration;
   if (pendingAgentDelivery.sent !== true) {
-    if (pendingAgentDelivery.composerWriteAttempted === true) {
+    if (pendingAgentDelivery.composerWriteAttempted === true &&
+        options.preserveInsertedOwnership === true) {
+      // A same-tab SPA route change is not proof of user cancellation. Keep
+      // the one-write invariant and let the next attempt validate the entire
+      // current composer before it performs any send side effect.
+      pendingAgentDelivery.cancelled = false;
+      pendingAgentDelivery.lastError = "page route changed; verifying exact composer ownership before resuming send-only delivery";
+    } else if (pendingAgentDelivery.composerWriteAttempted === true) {
       pendingAgentDelivery.cancelled = true;
       pendingAgentDelivery.inserted = false;
       pendingAgentDelivery.composerElement = null;
@@ -2303,34 +2346,14 @@ async function replyWithRejectedCall(call, reason) {
     `error: ${reason}`,
     "```"
   ].join("\n");
-  const metadata = {
-    kind: "rejected-helper-output",
-    pageIdentity: getCurrentPageIdentity(),
-    generation: pageLifecycleGeneration
+  const settings = await chrome.storage.sync.get(["autoSend"]);
+  const response = {
+    ok: false,
+    error: String(reason || "Helper rejected")
   };
-  return withComposerDeliveryLease(metadata, async (deliveryToken) => {
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
-      return false;
-    }
-    let composer;
-    try {
-      composer = await insertReply(reply, { preserveExisting: true });
-    } catch (_unused) {
-      return false;
-    }
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
-      return false;
-    }
-    const expectedComposerText = getValidatedComposerOwnershipText(composer, reply);
-    if (!expectedComposerText) {
-      return false;
-    }
-    return clickSendWhenReady(
-      composer,
-      () => isComposerDeliveryTokenCurrent(deliveryToken),
-      expectedComposerText
-    );
-  });
+  const callId = `rejected:${stableHash(`${getCurrentPageIdentity()}\n${reply}`)}`;
+  const pending = await rememberPendingHelperDelivery(callId, call, response, reply, settings);
+  return attemptPendingHelperDelivery(pending, settings);
 }
 
 function formatRejectedCallSubject(call) {
@@ -2535,13 +2558,12 @@ async function runAndReply(callId, call, options = {}) {
       deliveryFailed: !delivered
     };
   } catch (error) {
-    const retryable = error?.helperRetryable !== false && !isBoardHelperCall(call);
     if (!isCallLifecycleCurrent(callToken)) {
       return { retryable: false, abandoned: true };
     }
     if (!isCurrentCallToken(callToken)) {
       return {
-        retryable,
+        retryable: false,
         error: error.message || String(error),
         deliveryFailed: true
       };
@@ -2571,13 +2593,21 @@ async function runAndReply(callId, call, options = {}) {
       isAgentTaskStatusHelperCall(call) ?
       formatAgentTaskStatusOutput(call, failedResponse, startedAt) :
       formatShellOutput(call, failedResponse, startedAt);
+    const pending = await rememberPendingHelperDelivery(
+      callId,
+      call,
+      failedResponse,
+      failedReply,
+      settings
+    );
     releaseActiveCall(callToken);
-    const delivered = await deliverHelperReply(callToken, failedReply, settings);
+    const delivered = await attemptPendingHelperDelivery(pending, settings);
     return {
-      // Once error text was written, keep the rendered helper consumed. If no
-      // composer mutation happened at all, the original pre-execution failure
-      // remains eligible for the scanner's normal retry.
-      retryable: retryable && callToken.composerWriteAttempted !== true,
+      // Backend errors are also plugin-owned output. Persist their local
+      // delivery rather than rerunning the backend because a UI send attempt
+      // was lost; a newly rendered helper remains eligible for fresh backend
+      // adjudication.
+      retryable: false,
       error: error.message || String(error),
       deliveryFailed: !delivered
     };
@@ -4164,9 +4194,10 @@ async function insertReply(text, options = {}) {
   input.focus();
 
   if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
-    input.value = text;
+    setNativeInputValue(input, text);
     input.dispatchEvent(new InputEvent("input", {
       bubbles: true,
+      composed: true,
       inputType: "insertText",
       data: text
     }));
@@ -4178,6 +4209,18 @@ async function insertReply(text, options = {}) {
   return input;
 }
 
+function setNativeInputValue(input, text) {
+  const prototype = input instanceof HTMLTextAreaElement
+    ? HTMLTextAreaElement.prototype
+    : HTMLInputElement.prototype;
+  const nativeSetter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  if (typeof nativeSetter === "function") {
+    nativeSetter.call(input, text);
+  } else {
+    input.value = text;
+  }
+}
+
 function setContentEditableText(input, text) {
   input.focus();
   if (insertContentEditableWithEditingCommand(input, text)) {
@@ -4186,6 +4229,28 @@ function setContentEditableText(input, text) {
 
   const selection = document.getSelection();
   selection?.removeAllRanges();
+
+  // Controlled editors need to observe the intended replacement while the
+  // current selection still describes it. A synthetic beforeinput has no
+  // browser default insertion, but editor frameworks may consume it into
+  // their own state before the DOM fallback below is needed.
+  input.dispatchEvent(new InputEvent("beforeinput", {
+    bubbles: true,
+    composed: true,
+    cancelable: true,
+    inputType: "insertText",
+    data: text
+  }));
+  if (contentEditableHasText(input, text)) {
+    input.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      composed: true,
+      inputType: "insertText",
+      data: text
+    }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return;
+  }
 
   input.replaceChildren(...text.split("\n").map((line) => {
     const paragraph = document.createElement("p");
@@ -4198,13 +4263,6 @@ function setContentEditableText(input, text) {
   range.collapse(false);
   selection?.addRange(range);
 
-  input.dispatchEvent(new InputEvent("beforeinput", {
-    bubbles: true,
-    composed: true,
-    cancelable: true,
-    inputType: "insertText",
-    data: text
-  }));
   input.dispatchEvent(new InputEvent("input", {
     bubbles: true,
     composed: true,
@@ -4335,10 +4393,14 @@ async function clickSendWhenReady(
   const stillOwnsComposer = () =>
     shouldContinue() &&
     composer?.isConnected !== false;
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + 15_000;
   let sendButtonClickCount = 0;
-  const maxSendButtonClicks = 2;
+  const maxSendButtonClicks = 12;
+  let formSubmitAttempted = false;
+  let keyboardSubmitAttempted = false;
 
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  for (let attempt = 0; attempt < 80 && Date.now() < deadlineAt; attempt += 1) {
     const ownership = getComposerSendOwnership(
       composer,
       originalText,
@@ -4366,17 +4428,20 @@ async function clickSendWhenReady(
       }
     }
 
-    if (attempt === 20 && trySubmitForm(composer, () =>
+    const elapsedMs = Date.now() - startedAt;
+    if (!formSubmitAttempted && elapsedMs >= 3_000 && trySubmitForm(composer, () =>
       getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
     )) {
+      formSubmitAttempted = true;
       if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
         return true;
       }
     }
 
-    if (attempt === 21 && tryKeyboardSubmit(composer, () =>
+    if (!keyboardSubmitAttempted && elapsedMs >= 4_500 && tryKeyboardSubmit(composer, () =>
       getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
     )) {
+      keyboardSubmitAttempted = true;
       if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
         return true;
       }
@@ -4636,7 +4701,11 @@ function findSendButton(composer = lastComposerElement || closestEditable(docume
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
 
-  return buttons[0]?.button || null;
+  // If no current-page heuristic can identify a send control, retain the
+  // user's explicit calibration even for localized/custom layouts. A stale
+  // SPA binding never wins over a recognized control near the current
+  // composer, and exact composer ownership still gates every side effect.
+  return buttons[0]?.button || bound || null;
 }
 
 function isBoundSendButtonAssociatedWithComposer(button, composer) {

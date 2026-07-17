@@ -733,17 +733,33 @@ async function testMasterPromptIdentityPreventsHistoricalFalseAck() {
   assert.match(second, /Message id: msg-second/);
 }
 
-async function testSpaNavigationCancelsOldAgentDeliveryTokenAndMigratesStorage() {
+async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
   const localStore = {};
   const context = loadContentContext({ localStore });
   let releaseClick;
+  let composer = null;
+  let insertCount = 0;
+  let clickCount = 0;
   let ackCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
-  context.insertReply = async (text) => mockComposerWithText(text);
-  context.clickSendWhenReady = async () => new Promise((resolve) => {
-    releaseClick = resolve;
-  });
+  context.insertReply = async (text) => {
+    insertCount += 1;
+    composer = mockComposerWithText(text);
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async (currentComposer, _shouldContinue, expectedText) => {
+    clickCount += 1;
+    assert.equal(currentComposer, composer);
+    assert.equal(context.getValidatedComposerOwnershipText(currentComposer, expectedText), expectedText);
+    if (clickCount === 1) {
+      return new Promise((resolve) => {
+        releaseClick = resolve;
+      });
+    }
+    return true;
+  };
   context.chrome.runtime.sendMessage = async (payload) => {
     if (payload.type === "agent-poll") {
       return {
@@ -770,17 +786,27 @@ async function testSpaNavigationCancelsOldAgentDeliveryTokenAndMigratesStorage()
   await waitFor(() => releaseClick, "agent click attempt before SPA navigation");
   assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"]);
 
+  const insertedText = composer.innerText;
+  composer.isConnected = false;
+  composer = mockComposerWithText(insertedText);
   context.location.pathname = "/c/agent-new";
   context.location.href = "https://chatgpt.com/c/agent-new";
-  context.beginPageLifecycle();
-  releaseClick(true);
+  context.refreshPageLifecycle();
+  releaseClick(false);
   await delivery;
   await Promise.resolve();
 
-  assert.equal(ackCount, 0, "A stale agent delivery must not ack or continue side effects after SPA navigation.");
+  assert.equal(ackCount, 0, "The stale pre-route token must not ack.");
   assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
   assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"], "The pending envelope must migrate under the new page storage key.");
-  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"].inserted, false);
+  assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-new"].inserted, true);
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(insertCount, 1, "SPA route continuity must never rewrite the prompt.");
+  assert.equal(clickCount, 2, "The replacement composer should receive send-only retry.");
+  assert.equal(ackCount, 1, "Only the successfully submitted prompt may be acknowledged.");
+  assert.equal(vm.runInContext("pendingAgentDelivery", context), null);
 }
 
 async function testProfileSwitchCancelsOldAgentDeliveryToken() {
@@ -1451,7 +1477,7 @@ async function waitFor(predicate, label) {
   await testPreexistingUserDraftBlocksAgentInsertionAtomically();
   await testAgentAckDoesNotHoldComposerLease();
   await testMasterPromptIdentityPreventsHistoricalFalseAck();
-  await testSpaNavigationCancelsOldAgentDeliveryTokenAndMigratesStorage();
+  await testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry();
   await testProfileSwitchCancelsOldAgentDeliveryToken();
   await testSentPendingAgentDeliverySurvivesReloadWithoutResend();
   await testProfileChangeClearsLocalPendingDelivery();

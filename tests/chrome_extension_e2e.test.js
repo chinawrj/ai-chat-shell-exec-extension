@@ -543,18 +543,6 @@ async function main() {
   ].join("; ");
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
-    window.__aiShellComposerRedrawnForFileResult = false;
-    const redrawAfterPluginWrite = () => {
-      const text = composer.innerText || composer.textContent || "";
-      if (!text.includes("File write result:")) {
-        return;
-      }
-      composer.removeEventListener("input", redrawAfterPluginWrite);
-      const replacement = composer.cloneNode(true);
-      composer.replaceWith(replacement);
-      window.__aiShellComposerRedrawnForFileResult = true;
-    };
-    composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
@@ -762,6 +750,21 @@ async function main() {
 
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
+    window.__aiShellComposerRedrawnForFileResult = false;
+    window.__aiShellFileComposerWriteSnapshot = "";
+    window.__aiShellFileUserCountBefore = document.querySelectorAll('[data-message-author-role="user"]').length;
+    const redrawAfterPluginWrite = () => {
+      const text = (composer.innerText || composer.textContent || "").trim();
+      if (!text.includes("File write result:")) {
+        return;
+      }
+      composer.removeEventListener("input", redrawAfterPluginWrite);
+      window.__aiShellFileComposerWriteSnapshot = text;
+      const replacement = composer.cloneNode(true);
+      composer.replaceWith(replacement);
+      window.__aiShellComposerRedrawnForFileResult = true;
+    };
+    composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
@@ -796,14 +799,27 @@ async function main() {
   assert.match(fileText, /File write result:/);
   assert.match(fileText, new RegExp(escapeRegExp(`file: ${filename}`)));
   assert.equal(fs.readFileSync(path.join(os.homedir(), "Downloads", filename), "utf8"), fileContent);
-  await waitForEvaluate(page, `(() => {
+  const fileDeliveryState = await waitForEvaluateValue(page, `(() => {
     const composer = document.getElementById("composer");
-    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
-      .some((node) => (node.innerText || "").includes(${JSON.stringify(`file: ${filename}`)}));
-    return window.__aiShellComposerRedrawnForFileResult === true &&
-      submitted &&
-      !(composer?.innerText || "").trim();
+    const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
+    if (window.__aiShellComposerRedrawnForFileResult !== true ||
+        !window.__aiShellFileComposerWriteSnapshot ||
+        newMessages.length !== 1 ||
+        (composer?.innerText || "").trim()) {
+      return null;
+    }
+    const submittedText = newMessages[0].querySelector("pre code")?.textContent || "";
+    return {
+      writtenText: window.__aiShellFileComposerWriteSnapshot,
+      submittedText,
+      newMessageCount: newMessages.length,
+      composerText: composer?.innerText || ""
+    };
   })()`, "file result to follow exact text across a composer redraw and submit");
+  assert.equal(fileDeliveryState.newMessageCount, 1, "File delivery must append exactly one new user message.");
+  assert.equal(fileDeliveryState.submittedText, fileDeliveryState.writtenText, "Submitted file output must exactly match the plugin-owned composer snapshot.");
+  assert.equal(fileDeliveryState.composerText, "", "The current visible composer must be empty after file output submission.");
 
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
