@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.4";
+const CONTENT_SCRIPT_VERSION = "0.9.5";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -730,6 +730,9 @@ function beginPageLifecycle(options = {}) {
   const routeHandoffEntries = Array.isArray(options.routeHandoffEntries)
     ? options.routeHandoffEntries
     : [];
+  const routeHandoffPresentedExecutions = Array.isArray(options.routeHandoffPresentedExecutions)
+    ? options.routeHandoffPresentedExecutions
+    : [];
   const previousStorageKey = String(options.previousStorageKey || "");
   cancelPendingHelperDeliveryRetry();
   pendingHelperDeliveries = new Map();
@@ -760,14 +763,27 @@ function beginPageLifecycle(options = {}) {
       entry.updatedAt = Date.now();
       pendingHelperDeliveries.set(entry.callId, entry);
     }
+  }
+  for (const presented of routeHandoffPresentedExecutions) {
+    if (isCanonicalExecutionId(presented?.executionId)) {
+      locallyPresentedHelperExecutions.set(
+        presented.executionId,
+        Number(presented.presentedAt || Date.now())
+      );
+    }
+  }
+  if (routeHandoffEntries.length > 0 || routeHandoffPresentedExecutions.length > 0) {
+    const nextPageIdentity = getCurrentPageIdentity();
     pendingHelperDeliveriesLoadedKey = pendingHelperDeliveryStorageKey(nextPageIdentity);
     const nextStorageKey = pendingHelperDeliveriesLoadedKey;
-    persistPendingHelperDeliveries(nextStorageKey)
+    persistPendingHelperDeliveries(nextStorageKey, { propagateErrors: true })
       .then(() => previousStorageKey && previousStorageKey !== nextStorageKey
         ? chrome.storage.local.remove([previousStorageKey])
         : undefined)
       .catch(() => {});
-    schedulePendingHelperDeliveryRetry(0);
+    if (routeHandoffEntries.length > 0) {
+      schedulePendingHelperDeliveryRetry(0);
+    }
   }
 }
 
@@ -782,13 +798,19 @@ function refreshPageLifecycle() {
     const previousStorageKey = pendingHelperDeliveriesLoadedKey ||
       pendingHelperDeliveryStorageKey(previousPageIdentity);
     const routeHandoffEntries = Array.from(pendingHelperDeliveries.values());
-    const preserveInsertedHelperOwnership = routeHandoffEntries.some((entry) =>
-      entry?.phase === "inserted" && entry?.pageIdentity === previousPageIdentity
+    const preservePendingHelperOwnership = routeHandoffEntries.some((entry) =>
+      ["inserted", "submitted", "presented"].includes(entry?.phase) &&
+      entry?.pageIdentity === previousPageIdentity
+    );
+    const routeHandoffPresentedExecutions = Array.from(
+      locallyPresentedHelperExecutions,
+      ([executionId, presentedAt]) => ({ executionId, presentedAt })
     );
     beginPageLifecycle({
       routeTransition: true,
       previousStorageKey,
-      routeHandoffEntries: preserveInsertedHelperOwnership ? routeHandoffEntries : []
+      routeHandoffEntries: preservePendingHelperOwnership ? routeHandoffEntries : [],
+      routeHandoffPresentedExecutions
     });
   }
 }
@@ -1017,7 +1039,10 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
   return pendingHelperDeliveries.get(callId) || entry;
 }
 
-function persistPendingHelperDeliveries(storageKey = pendingHelperDeliveriesLoadedKey || pendingHelperDeliveryStorageKey()) {
+function persistPendingHelperDeliveries(
+  storageKey = pendingHelperDeliveriesLoadedKey || pendingHelperDeliveryStorageKey(),
+  options = {}
+) {
   const entries = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()))
     .map(({ restored: _restored, deliveryInFlight: _deliveryInFlight, ...entry }) => entry);
   const presentedExecutions = pruneLocallyPresentedHelperExecutions(
@@ -1030,12 +1055,13 @@ function persistPendingHelperDeliveries(storageKey = pendingHelperDeliveriesLoad
     entries,
     presentedExecutions
   };
-  pendingHelperDeliveryStorageTail = pendingHelperDeliveryStorageTail
+  const operation = pendingHelperDeliveryStorageTail
     .catch(() => {})
     .then(() => entries.length > 0 || presentedExecutions.length > 0
       ? chrome.storage.local.set({ [storageKey]: snapshot })
       : chrome.storage.local.remove([storageKey]));
-  return pendingHelperDeliveryStorageTail.catch(() => {});
+  pendingHelperDeliveryStorageTail = operation.catch(() => {});
+  return options.propagateErrors === true ? operation : pendingHelperDeliveryStorageTail;
 }
 
 async function clearPendingHelperDelivery(entry) {
@@ -1329,7 +1355,10 @@ function migratePendingAgentDeliveryToCurrentPage(options = {}) {
     }
   }
   if (previousStorageKey !== nextStorageKey) {
-    chrome.storage.local.remove([previousStorageKey]).catch(() => {});
+    persistPendingAgentDelivery({ propagateErrors: true })
+      .then(() => chrome.storage.local.remove([previousStorageKey]))
+      .catch(() => {});
+    return;
   }
   persistPendingAgentDelivery();
 }
@@ -3604,9 +3633,9 @@ async function loadPendingAgentDelivery(profile) {
   }
 }
 
-function persistPendingAgentDelivery() {
+function persistPendingAgentDelivery(options = {}) {
   if (!pendingAgentDelivery) {
-    return;
+    return Promise.resolve();
   }
   const snapshot = {
     messageId: pendingAgentDelivery.messageId,
@@ -3624,7 +3653,8 @@ function persistPendingAgentDelivery() {
     updatedAt: pendingAgentDelivery.updatedAt || Date.now()
   };
   const storageKey = pendingAgentDelivery.storageKey || agentPendingDeliveryKey();
-  chrome.storage.local.set({ [storageKey]: snapshot }).catch(() => {});
+  const operation = chrome.storage.local.set({ [storageKey]: snapshot });
+  return options.propagateErrors === true ? operation : operation.catch(() => {});
 }
 
 function isStoredPendingAgentDelivery(value) {
@@ -4229,6 +4259,11 @@ function setContentEditableText(input, text) {
 
   const selection = document.getSelection();
   selection?.removeAllRanges();
+  if (selection) {
+    const replacementRange = document.createRange();
+    replacementRange.selectNodeContents(input);
+    selection.addRange(replacementRange);
+  }
 
   // Controlled editors need to observe the intended replacement while the
   // current selection still describes it. A synthetic beforeinput has no
@@ -4396,7 +4431,7 @@ async function clickSendWhenReady(
   const startedAt = Date.now();
   const deadlineAt = startedAt + 15_000;
   let sendButtonClickCount = 0;
-  const maxSendButtonClicks = 12;
+  const maxSendButtonClicks = 3;
   let formSubmitAttempted = false;
   let keyboardSubmitAttempted = false;
 
@@ -4701,15 +4736,24 @@ function findSendButton(composer = lastComposerElement || closestEditable(docume
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
 
-  // If no current-page heuristic can identify a send control, retain the
-  // user's explicit calibration even for localized/custom layouts. A stale
-  // SPA binding never wins over a recognized control near the current
-  // composer, and exact composer ownership still gates every side effect.
-  return buttons[0]?.button || bound || null;
+  return buttons[0]?.button || null;
 }
 
 function isBoundSendButtonAssociatedWithComposer(button, composer) {
-  return isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer));
+  if (isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer))) {
+    return true;
+  }
+  // Explicit bindings may use localized labels and layouts that cannot satisfy
+  // the generic English/geometry heuristic. Accept only a strict localized
+  // send meaning here; never fall back to an arbitrary stale selector.
+  const labels = [
+    button?.getAttribute?.("aria-label") || "",
+    button?.getAttribute?.("title") || "",
+    button?.textContent || ""
+  ].map((value) => String(value).replace(/\s+/g, " ").trim()).filter(Boolean);
+  return labels.some((value) =>
+    /^(发送|发送消息|提交|提交消息|送信|送信する|メッセージを送信|전송|메시지 보내기)$/.test(value)
+  );
 }
 
 function findComposerSendRegion(composer) {

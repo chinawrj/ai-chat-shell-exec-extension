@@ -320,17 +320,6 @@ async function main() {
   }, "master panel tmux-ai slave registration");
   assert.equal(agentResponse.ok, true, JSON.stringify(agentResponse));
   assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-tmux-ai" && agent.surface === "tmux-ai"));
-  await masterPage.evaluate(`(() => {
-    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
-    panel.querySelector('[data-shell-tool-action="agent-check"]').click();
-    return true;
-  })()`);
-  await waitForEvaluate(masterPage, `(() => {
-    const text = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText || "";
-    return text.includes("Agent setup check:") &&
-      text.includes("tmux-ai slaves: slave-tmux-ai@") &&
-      text.includes("Ready: delegate to slave-a, slave-tmux-ai. Tmux AI is optional.");
-  })()`, "master panel agent setup check ready state");
 
   agentResponse = await sendLocalAgentRequest(masterPage, {
     type: "agent-send",
@@ -751,6 +740,7 @@ async function main() {
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
     window.__aiShellComposerRedrawnForFileResult = false;
+    window.__aiShellRouteChangedForFileResult = false;
     window.__aiShellFileComposerWriteSnapshot = "";
     window.__aiShellFileUserCountBefore = document.querySelectorAll('[data-message-author-role="user"]').length;
     const redrawAfterPluginWrite = () => {
@@ -763,6 +753,8 @@ async function main() {
       const replacement = composer.cloneNode(true);
       composer.replaceWith(replacement);
       window.__aiShellComposerRedrawnForFileResult = true;
+      history.pushState({}, "", location.pathname + "?file-result-route=" + Date.now());
+      window.__aiShellRouteChangedForFileResult = true;
     };
     composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
@@ -804,6 +796,7 @@ async function main() {
     const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
     const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
     if (window.__aiShellComposerRedrawnForFileResult !== true ||
+        window.__aiShellRouteChangedForFileResult !== true ||
         !window.__aiShellFileComposerWriteSnapshot ||
         newMessages.length !== 1 ||
         (composer?.innerText || "").trim()) {

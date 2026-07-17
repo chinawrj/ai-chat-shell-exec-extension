@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-07-17
+
+- Tightens the v0.9.4 send actuator after team review: an enabled button receives at most one delayed-readiness fallback beyond the first two clicks, and a stale saved selector is never used merely because no heuristic button exists. Strict localized send labels remain supported.
+- Restores a real replacement selection before the controlled-contenteditable `beforeinput` fallback so editor frameworks can observe the intended full replacement rather than only a later DOM mutation.
+- Carries submitted/presented-but-unacknowledged delivery entries and local presentation tombstones across same-tab SPA route changes, and removes the old storage key only after the new snapshot is confirmed written.
+- Adds direct backend-failure, rejected-output, and presentation-receipt send-only regressions. The real Chromium redraw test now changes the SPA URL during the plugin input event and proves the full result still submits exactly once through the production actuator.
+
 ## [0.9.4] - 2026-07-17
 
 - Preserves exact plugin-owned send-only delivery across same-tab SPA URL changes, fixing results or agent prompts that remained visibly stuck in the composer after ChatGPT moved a new conversation to its canonical route. Backend execution and composer insertion remain single-shot; different user text cancels without a send.

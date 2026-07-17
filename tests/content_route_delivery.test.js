@@ -289,8 +289,157 @@ async function testDifferentUserDraftDoesNotMigrateOrSend() {
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
 }
 
+async function testSubmittedReceiptAndTombstoneSurviveRouteChange() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  let backendRuns = 0;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  let receiptAttempts = 0;
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "run-result-presented") {
+      receiptAttempts += 1;
+      return receiptAttempts === 1
+        ? { ok: false, found: true }
+        : { ok: true, found: true };
+    }
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "0011223344556677",
+      exitCode: 0,
+      stdout: "receipt-route-output"
+    };
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+
+  const call = createShellCall(context, "printf receipt-route-output");
+  await context.runAndReply("route-receipt-call", call);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "submitted");
+  assert.equal(vm.runInContext("hasLocallyPresentedHelperExecution('0011223344556677')", context), true);
+
+  navigate(context, "/c/receipt-route");
+  assert.equal(vm.runInContext("hasLocallyPresentedHelperExecution('0011223344556677')", context), true);
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1);
+  assert.equal(composerWrites, 1);
+  assert.equal(sendAttempts, 1, "Receipt recovery must not submit the message again.");
+  assert.equal(receiptAttempts, 2, "Only the failed presentation receipt should retry.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function testBackendFailureUsesOneWriteSendOnlyRetry() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  let backendRuns = 0;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.chrome.runtime.sendMessage = async () => {
+    backendRuns += 1;
+    throw new Error("simulated transport failure");
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    if (sendAttempts === 1) {
+      return false;
+    }
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+
+  const call = createShellCall(context, "printf transport-failure");
+  const first = await context.runAndReply("transport-failure-call", call);
+  assert.equal(first.deliveryFailed, true);
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1, "Local delivery recovery must never retry the failed backend request.");
+  assert.equal(composerWrites, 1, "Failure output must be written only once.");
+  assert.equal(sendAttempts, 2);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function testRejectedFeedbackUsesOneWriteSendOnlyRetry() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.chrome.storage.sync.get = async () => ({ enabled: true, autoSend: true });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    if (sendAttempts === 1) {
+      return false;
+    }
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+
+  const call = createShellCall(context, "printf rejected");
+  assert.equal(await context.replyWithRejectedCall(call, "simulated rejection"), false);
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(composerWrites, 1, "Rejected feedback must never be inserted twice.");
+  assert.equal(sendAttempts, 2);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
 testExactPluginTextMigratesAcrossRouteChange()
   .then(() => testDifferentUserDraftDoesNotMigrateOrSend())
+  .then(() => testSubmittedReceiptAndTombstoneSurviveRouteChange())
+  .then(() => testBackendFailureUsesOneWriteSendOnlyRetry())
+  .then(() => testRejectedFeedbackUsesOneWriteSendOnlyRetry())
   .then(() => {
     console.log("content route delivery tests passed");
   })
