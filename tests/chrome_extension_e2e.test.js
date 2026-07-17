@@ -148,6 +148,17 @@ async function main() {
   await waitForExtensionTarget(debugPort);
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
+  // A developer may rerun this E2E against an already-running foreground
+  // server after a prior browser process crashed before unregistering. Clear
+  // the fixed test identities so stale mailbox/roster state cannot make the
+  // current clean-profile assertions timing-dependent.
+  for (const agentId of ["slave-a", "master", "slave-tmux-ai"]) {
+    await sendLocalAgentRequest(page, {
+      type: "agent-unregister",
+      agentId
+    });
+  }
+
   await page.evaluate(`(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     panel.querySelector("[data-shell-agent-role]").value = "slave";
