@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.1";
+const CONTENT_SCRIPT_VERSION = "0.9.2";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -1234,6 +1234,7 @@ function migratePendingAgentDeliveryToCurrentPage() {
     if (pendingAgentDelivery.composerWriteAttempted === true) {
       pendingAgentDelivery.cancelled = true;
       pendingAgentDelivery.inserted = false;
+      pendingAgentDelivery.composerElement = null;
       pendingAgentDelivery.lastError = "page changed after composer delivery began; automatic reinsertion was cancelled";
     } else {
       pendingAgentDelivery.inserted = false;
@@ -2628,10 +2629,12 @@ async function deliverHelperReply(
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
       return false;
     }
-    const expectedComposerText = getValidatedComposerOwnershipText(composer, reply);
-    if (!expectedComposerText) {
+    const ownership = await inspectCurrentComposerOwnership(composer, reply);
+    if (ownership.state !== "owned") {
       return false;
     }
+    composer = ownership.composer;
+    const expectedComposerText = ownership.text;
     callToken.phase = "reply-inserted";
     await onInserted();
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
@@ -3226,15 +3229,31 @@ async function deliverAgentMessageToPage(profile, message) {
       }
       const text = pending.promptText || formatInboundAgentPrompt(profile, message);
       const currentComposer = lastComposerElement || closestEditable(document.activeElement);
-      if (pending.composerWriteAttempted === true && !agentDeliveryPromptStillPresent(pending)) {
-        pending.cancelled = true;
-        pending.inserted = false;
-        pending.composerConflict = false;
-        pending.lastError = "composer content was removed or changed by the user; automatic reinsertion cancelled";
-        pending.updatedAt = Date.now();
-        updatePendingAgentDeliveryPanel();
-        persistPendingAgentDelivery();
-        return;
+      if (pending.composerWriteAttempted === true) {
+        const ownership = await inspectCurrentComposerOwnership(
+          pending.composerElement || currentComposer,
+          pending.composerText || text
+        );
+        if (ownership.state === "owned") {
+          pending.composerElement = ownership.composer;
+          pending.composerText = ownership.text;
+        } else if (ownership.state === "unavailable") {
+          pending.lastError = "composer temporarily unavailable after insertion; waiting without reinserting";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+          return;
+        } else {
+          pending.cancelled = true;
+          pending.inserted = false;
+          pending.composerElement = null;
+          pending.composerConflict = false;
+          pending.lastError = "composer content was removed or changed by the user; automatic reinsertion cancelled";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+          return;
+        }
       }
       if (pending.composerConflict === true) {
         if (getComposerText(currentComposer)) {
@@ -3262,12 +3281,14 @@ async function deliverAgentMessageToPage(profile, message) {
             return;
           }
           pending.composerWriteAttempted = true;
+          pending.composerElement = insertedComposer;
           pending.updatedAt = Date.now();
           persistPendingAgentDelivery();
           const expectedComposerText = getValidatedComposerOwnershipText(insertedComposer, text);
           if (!expectedComposerText) {
             pending.inserted = false;
             pending.composerText = "";
+            pending.composerElement = null;
             pending.composerConflict = false;
             pending.cancelled = true;
             pending.lastError = "composer did not retain the intended agent prompt; automatic delivery cancelled without reinserting or sending";
@@ -3302,8 +3323,29 @@ async function deliverAgentMessageToPage(profile, message) {
       } else {
         setStatus(`Agent message ${message.messageId} is waiting for send button`, "running");
       }
-      const composer = lastComposerElement || closestEditable(document.activeElement);
       const expectedComposerText = pending.composerText || normalizeCommand(text);
+      const ownership = await inspectCurrentComposerOwnership(
+        pending.composerElement || lastComposerElement || closestEditable(document.activeElement),
+        expectedComposerText
+      );
+      if (ownership.state !== "owned") {
+        if (ownership.state === "changed") {
+          pending.inserted = false;
+          pending.composerElement = null;
+          pending.composerConflict = false;
+          pending.cancelled = true;
+          pending.lastError = "composer content was removed or changed by the user; automatic delivery cancelled";
+        } else {
+          pending.lastError = "composer temporarily unavailable; waiting without reinserting";
+        }
+        pending.updatedAt = Date.now();
+        updatePendingAgentDeliveryPanel();
+        persistPendingAgentDelivery();
+        return;
+      }
+      const composer = ownership.composer;
+      pending.composerElement = composer;
+      pending.composerText = ownership.text;
       const sent = await clickSendWhenReady(
         composer,
         () => isComposerDeliveryTokenCurrent(composerToken),
@@ -3324,6 +3366,7 @@ async function deliverAgentMessageToPage(profile, message) {
         const currentText = getComposerText(composer);
         if (currentText !== expectedComposerText) {
           pending.inserted = false;
+          pending.composerElement = null;
           pending.composerConflict = false;
           pending.cancelled = true;
           pending.lastError = "composer content was removed or changed by the user; automatic delivery cancelled";
@@ -3417,6 +3460,7 @@ function ensurePendingAgentDelivery(profile, message) {
     message,
     promptText: formatInboundAgentPrompt(profile, message),
     composerText: "",
+    composerElement: null,
     composerWriteAttempted: false,
     inserted: false,
     sent: false,
@@ -4179,7 +4223,10 @@ function contentEditableHasText(input, expected) {
 }
 
 async function findReplyInput() {
-  if (lastComposerElement && lastComposerElement.isConnected && isEditableElement(lastComposerElement)) {
+  if (lastComposerElement &&
+      lastComposerElement.isConnected &&
+      isEditableElement(lastComposerElement) &&
+      isVisibleElement(lastComposerElement)) {
     return lastComposerElement;
   }
 
@@ -4318,6 +4365,49 @@ function getValidatedComposerOwnershipText(composer, intendedText) {
   return normalizeComposerOwnershipText(actual) === normalizeComposerOwnershipText(intended)
     ? actual
     : "";
+}
+
+async function inspectCurrentComposerOwnership(preferredComposer, intendedText) {
+  const preferredUsable = preferredComposer?.isConnected !== false &&
+    (!(preferredComposer instanceof Element) ||
+      (isEditableElement(preferredComposer) && isVisibleElement(preferredComposer)));
+  const preferredText = preferredUsable
+    ? getValidatedComposerOwnershipText(preferredComposer, intendedText)
+    : "";
+  if (preferredText) {
+    return {
+      state: "owned",
+      composer: preferredComposer,
+      text: preferredText
+    };
+  }
+
+  let currentComposer = null;
+  try {
+    currentComposer = await findReplyInput();
+  } catch (_unused) {
+    currentComposer = null;
+  }
+  if (!currentComposer) {
+    return {
+      state: "unavailable",
+      composer: null,
+      text: ""
+    };
+  }
+  const currentText = getValidatedComposerOwnershipText(currentComposer, intendedText);
+  if (currentText) {
+    return {
+      state: "owned",
+      composer: currentComposer,
+      text: currentText
+    };
+  }
+  return {
+    state: "changed",
+    composer: currentComposer,
+    text: ""
+  };
 }
 
 function normalizeComposerOwnershipText(text) {

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-17
+
+- Fixes a v0.9.1 regression where a page framework replacing the composer DOM node after insertion could leave exact plugin-owned content unsent or incorrectly treat the redraw as user cancellation.
+- Reacquires only the current visible composer containing the exact inserted text before helper-output or agent-prompt auto-send. Different user text remains untouched and is never adopted as plugin-owned.
+- Adds focused regression coverage for helper and agent composer redraws while retaining the v0.9.1 intentional-deletion cancellation behavior.
+
 ## [0.9.1] - 2026-07-17
 
 - Treats removal or replacement of automatically inserted helper output as an explicit user cancellation: the extension never writes that content again, cancels the already-queued composer batch, and leaves the server result unpresented so a genuinely new helper may recover it later.

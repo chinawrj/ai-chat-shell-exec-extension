@@ -270,20 +270,21 @@ async function testDeletedAgentPromptIsCancelledInsteadOfReinserted() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
-  let promptPresent = false;
+  let composer = null;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
-  context.agentDeliveryPromptStillPresent = () => promptPresent;
   context.insertReply = async (text) => {
     insertCount += 1;
-    promptPresent = true;
     assert.match(text, /Message from slave-a for task task-redraw:/);
-    return mockComposerWithText(text);
+    composer = mockComposerWithText(text);
+    return composer;
   };
+  context.findReplyInput = async () => composer;
   context.clickSendWhenReady = async () => {
     clickCount += 1;
     if (clickCount === 1) {
-      promptPresent = false;
+      composer.innerText = "";
+      composer.textContent = "";
       return false;
     }
     return true;
@@ -321,6 +322,52 @@ async function testDeletedAgentPromptIsCancelledInsteadOfReinserted() {
   assert.equal(clickCount, 1, "A removed agent prompt must not receive another send attempt.");
   assert.equal(ackCount, 2, "Cancellation may retry only the local hub acknowledgement.");
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack", "agent-ack"]);
+}
+
+async function testRedrawnOwnedAgentComposerStillSends() {
+  const context = loadContentContext();
+  const sentMessages = [];
+  let replacementComposer = null;
+  let sendComposer = null;
+  context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
+  context.setStatus = () => {};
+  context.insertReply = async (text) => {
+    replacementComposer = mockComposerWithText(text);
+    return {
+      ...mockComposerWithText(text),
+      isConnected: false
+    };
+  };
+  context.findReplyInput = async () => replacementComposer;
+  context.clickSendWhenReady = async (composer) => {
+    sendComposer = composer;
+    return composer === replacementComposer;
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    if (payload.type === "agent-poll") {
+      return {
+        ok: true,
+        registered: true,
+        messages: [{
+          messageId: "msg-redrawn-owned-composer",
+          from: "slave-a",
+          to: "master",
+          taskId: "task-redrawn-owned-composer",
+          body: "Send this after the page redraws its composer."
+        }]
+      };
+    }
+    if (payload.type === "agent-ack") {
+      return { ok: true, type: "agent-ack" };
+    }
+    throw new Error(`Unexpected message type: ${payload.type}`);
+  };
+
+  await context.pollAndDeliverAgentMessage();
+
+  assert.equal(sendComposer, replacementComposer, "Agent auto-send must follow exact owned text to the replacement composer node.");
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
 }
 
 async function testExternallySubmittedAgentPromptAcksWithoutReinsertion() {
@@ -1395,6 +1442,7 @@ async function waitFor(predicate, label) {
   await testUnsentAgentMessageIsNotInsertedTwice();
   await testAgentMessageStaysPendingUntilPageIsReady();
   await testDeletedAgentPromptIsCancelledInsteadOfReinserted();
+  await testRedrawnOwnedAgentComposerStillSends();
   await testExternallySubmittedAgentPromptAcksWithoutReinsertion();
   await testAckFailureDoesNotResendAlreadySubmittedMessage();
   await testMissingAckRecordIsIdempotentAfterMessageWasSent();

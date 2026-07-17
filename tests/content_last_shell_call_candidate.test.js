@@ -2346,6 +2346,38 @@ async function verifyUnrelatedPostInsertionDraftIsNeverAdopted() {
   );
 }
 
+async function verifyHelperSendReacquiresRedrawnOwnedComposer() {
+  const context = loadContentContext();
+  const intended = "Shell call result:\n\nstdout:\nredrawn composer output";
+  const oldComposer = {
+    innerText: intended,
+    textContent: intended,
+    isConnected: false
+  };
+  const replacementComposer = {
+    innerText: intended,
+    textContent: intended,
+    isConnected: true
+  };
+  let sendComposer = null;
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  context.insertReply = async () => oldComposer;
+  context.findReplyInput = async () => replacementComposer;
+  context.clickSendWhenReady = async (composer, _shouldContinue, expectedText) => {
+    sendComposer = composer;
+    return composer === replacementComposer && expectedText === intended;
+  };
+
+  const delivered = await context.deliverHelperReply({
+    pageIdentity: context.getCurrentPageIdentity(),
+    generation: vm.runInContext("pageLifecycleGeneration", context),
+    phase: "response-received"
+  }, intended, { autoSend: true });
+
+  assert.equal(delivered, true, "A page redraw that preserves exact plugin-owned text must still auto-send.");
+  assert.equal(sendComposer, replacementComposer, "Auto-send must reacquire the connected composer instead of using the detached writer node.");
+}
+
 async function verifyInsertReplyPreservesExistingComposerAtomically() {
   const context = loadContentContext();
   const composer = new context.HTMLTextAreaElement();
@@ -2595,6 +2627,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyAutoSendAbortsWhenComposerOwnershipChanges())
   .then(() => verifyUnboundSendButtonIsTriedImmediately())
   .then(() => verifyUnrelatedPostInsertionDraftIsNeverAdopted())
+  .then(() => verifyHelperSendReacquiresRedrawnOwnedComposer())
   .then(() => verifyInsertReplyPreservesExistingComposerAtomically())
   .then(() => verifyLaterHelperCannotOverwriteUnsentEarlierOutput())
   .then(() => verifyUnboundSendAssociationRejectsFeedbackAndArbitrarySubmit())
