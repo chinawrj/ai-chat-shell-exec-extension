@@ -1544,6 +1544,60 @@ async function verifyNonShellComposerWritesNeverReexecuteRenderedHelpers() {
   assert.equal(composerWrites, 2);
 }
 
+async function verifyNonPersistentResultRetriesSendOnly() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const call = context.parseCallPayload([
+    "ai-helper-file-start",
+    "send-only-retry.txt",
+    "write once and retry only sending",
+    "ai-helper-file-end"
+  ].join("\n"));
+  let backendAttempts = 0;
+  let insertAttempts = 0;
+  let sendAttempts = 0;
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.chrome.runtime.sendMessage = async () => {
+    backendAttempts += 1;
+    return {
+      ok: true,
+      filename: "send-only-retry.txt",
+      path: "/tmp/send-only-retry.txt",
+      bytes: 33
+    };
+  };
+  context.insertReply = async (text) => {
+    insertAttempts += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    return sendAttempts >= 2;
+  };
+
+  const first = await context.runAndReply("file-send-only-retry", call);
+  assert.equal(first.pendingDelivery, true, "A file result whose first send attempt fails must remain in local delivery.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "inserted");
+  vm.runInContext("extensionActive = true;", context);
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendAttempts, 1, "Send retry must never execute the file helper again.");
+  assert.equal(insertAttempts, 1, "Send retry must never write the file result again.");
+  assert.equal(sendAttempts, 2);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
 async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   const context = loadContentContext();
   await Promise.resolve();
@@ -2613,6 +2667,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyAutoSendDoesNotHoldExecutionLock())
   .then(() => verifyBackendResponsesRetryOnlyLocalDelivery())
   .then(() => verifyNonShellComposerWritesNeverReexecuteRenderedHelpers())
+  .then(() => verifyNonPersistentResultRetriesSendOnly())
   .then(() => verifySameRenderedPendingResultRetriesLocallyOnly())
   .then(() => verifyDeletedPendingResultCancelsAutomaticComposerDelivery())
   .then(() => verifyPendingResultRestoresAcrossSamePageReload())

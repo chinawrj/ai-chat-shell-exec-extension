@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.2";
+const CONTENT_SCRIPT_VERSION = "0.9.3";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -852,12 +852,20 @@ function prunePendingHelperDeliveryEntries(entries, now = Date.now()) {
 }
 
 function isStoredPendingHelperDelivery(entry, now = Date.now()) {
+  const supportedKinds = new Set([
+    "shell",
+    "board",
+    "file",
+    "agent-message",
+    "agent-roster",
+    "agent-task-status"
+  ]);
   return Boolean(
     entry &&
     typeof entry === "object" &&
     typeof entry.callId === "string" &&
     entry.callId &&
-    (entry.kind === "shell" || entry.kind === "board") &&
+    supportedKinds.has(entry.kind) &&
     entry.call &&
     typeof entry.call === "object" &&
     typeof entry.reply === "string" &&
@@ -879,12 +887,48 @@ function boundPendingHelperReply(reply) {
 
 function snapshotPendingHelperCall(call) {
   return {
-    kind: isBoardHelperCall(call) ? "board" : "shell",
+    kind: pendingHelperDeliveryKind(call),
     cmd: String(call?.cmd || ""),
     cwd: String(call?.cwd || ""),
     boardName: String(call?.boardName || ""),
-    helperId: String(call?.helperId || "")
+    helperId: String(call?.helperId || ""),
+    filename: String(call?.filename || ""),
+    to: String(call?.to || ""),
+    taskId: String(call?.taskId || ""),
+    messageId: String(call?.messageId || ""),
+    role: String(call?.role || ""),
+    surface: String(call?.surface || "")
   };
+}
+
+function pendingHelperDeliveryKind(call) {
+  if (isFileHelperCall(call)) {
+    return "file";
+  }
+  if (isBoardHelperCall(call)) {
+    return "board";
+  }
+  if (isAgentMessageHelperCall(call)) {
+    return "agent-message";
+  }
+  if (isAgentRosterHelperCall(call)) {
+    return "agent-roster";
+  }
+  if (isAgentTaskStatusHelperCall(call)) {
+    return "agent-task-status";
+  }
+  return "shell";
+}
+
+function pendingHelperDeliveryLabel(entry) {
+  return {
+    board: "Board helper",
+    file: "File helper",
+    "agent-message": "Agent message",
+    "agent-roster": "Agent roster",
+    "agent-task-status": "Agent task status",
+    shell: "Shell helper"
+  }[entry?.kind] || "Helper";
 }
 
 function snapshotPendingHelperResponse(response) {
@@ -916,7 +960,7 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
   const entry = {
     callId,
     executionId,
-    kind: isBoardHelperCall(call) ? "board" : "shell",
+    kind: pendingHelperDeliveryKind(call),
     call: snapshotPendingHelperCall(call),
     response: snapshotPendingHelperResponse(response),
     reply: boundPendingHelperReply(reply),
@@ -975,7 +1019,7 @@ async function cancelPendingHelperDeliveryAfterComposerRemoval(entry) {
   // queued behind it. A later new helper may still create a fresh delivery.
   pendingHelperDeliveries.clear();
   await persistPendingHelperDeliveries();
-  const label = entry.kind === "board" ? "Board helper" : "Shell helper";
+  const label = pendingHelperDeliveryLabel(entry);
   setStatus(`${label} result delivery and the current queued batch were cancelled because composer content was removed or changed; they will not be inserted again.`, "ok");
   return true;
 }
@@ -1014,8 +1058,8 @@ async function finalizePendingHelperDelivery(entry, phase) {
 }
 
 function setPendingHelperDeliveryStatus(entry) {
-  const label = entry?.kind === "board" ? "Board helper" : "Shell helper";
-  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The command will not be sent again.`, "running");
+  const label = pendingHelperDeliveryLabel(entry);
+  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The backend operation and composer write will not be repeated.`, "running");
 }
 
 async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
@@ -2567,12 +2611,7 @@ function cleanRecoveredDuplicateResponse(response) {
 }
 
 function isPersistentResultHelperCall(call) {
-  return isBoardHelperCall(call) || (
-    !isFileHelperCall(call) &&
-    !isAgentMessageHelperCall(call) &&
-    !isAgentRosterHelperCall(call) &&
-    !isAgentTaskStatusHelperCall(call)
-  );
+  return isRunnableHelperCall(call);
 }
 
 function isRetryableHelperResponse(call, response) {

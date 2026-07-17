@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-17
+
+- Extends the durable one-write, send-only retry queue to every successful helper response, fixing file and agent-query results that could remain in the composer forever after the first send calibration failed.
+- Keeps the backend operation and composer write single-shot while retrying only exact-text send ownership through button, form, and keyboard fallbacks; empty or different user text still cancels immediately.
+- Strengthens real Chromium coverage so the file-result test synchronously replaces the composer during the input event and must observe the result as a submitted user message, not merely text somewhere in the page body.
+
 ## [0.9.2] - 2026-07-17
 
 - Fixes a v0.9.1 regression where a page framework replacing the composer DOM node after insertion could leave exact plugin-owned content unsent or incorrectly treat the redraw as user cancellation.

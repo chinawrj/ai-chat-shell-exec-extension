@@ -543,6 +543,18 @@ async function main() {
   ].join("; ");
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
+    window.__aiShellComposerRedrawnForFileResult = false;
+    const redrawAfterPluginWrite = () => {
+      const text = composer.innerText || composer.textContent || "";
+      if (!text.includes("File write result:")) {
+        return;
+      }
+      composer.removeEventListener("input", redrawAfterPluginWrite);
+      const replacement = composer.cloneNode(true);
+      composer.replaceWith(replacement);
+      window.__aiShellComposerRedrawnForFileResult = true;
+    };
+    composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
@@ -784,6 +796,14 @@ async function main() {
   assert.match(fileText, /File write result:/);
   assert.match(fileText, new RegExp(escapeRegExp(`file: ${filename}`)));
   assert.equal(fs.readFileSync(path.join(os.homedir(), "Downloads", filename), "utf8"), fileContent);
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(`file: ${filename}`)}));
+    return window.__aiShellComposerRedrawnForFileResult === true &&
+      submitted &&
+      !(composer?.innerText || "").trim();
+  })()`, "file result to follow exact text across a composer redraw and submit");
 
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
