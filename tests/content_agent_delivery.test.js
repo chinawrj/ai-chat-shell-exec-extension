@@ -140,11 +140,14 @@ async function testUnsentAgentMessageIsNotInsertedTwice() {
   const sentMessages = [];
   let insertCount = 0;
   let clickCount = 0;
+  let composerText = "";
   context.getCurrentAgentProfile = async () => ({ role: "slave", agentId: "slave-a" });
   context.setStatus = () => {};
   context.agentDeliveryPromptStillPresent = () => true;
+  context.getComposerText = () => composerText;
   context.insertReply = async (text) => {
     insertCount += 1;
+    composerText = text;
     assert.match(text, /Message from master for task task-001:/);
     return mockComposerWithText(text);
   };
@@ -189,6 +192,7 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
+  let composerText = "";
   const message = {
     messageId: "reply-001",
     from: "slave-tmux",
@@ -200,12 +204,14 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
   context.agentDeliveryPromptStillPresent = () => insertCount > 1;
+  context.getComposerText = () => composerText;
   context.insertReply = async (text) => {
     insertCount += 1;
     assert.match(text, /Message from slave-tmux for task task-cli-001:/);
     if (insertCount === 1) {
       throw new Error("composer unavailable");
     }
+    composerText = text;
     return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
@@ -258,11 +264,12 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
 }
 
-async function testAgentMessageReinsertsWhenComposerLosesPrompt() {
+async function testDeletedAgentPromptIsCancelledInsteadOfReinserted() {
   const context = loadContentContext();
   const sentMessages = [];
   let insertCount = 0;
   let clickCount = 0;
+  let ackCount = 0;
   let promptPresent = false;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
@@ -293,13 +300,16 @@ async function testAgentMessageReinsertsWhenComposerLosesPrompt() {
           from: "slave-a",
           to: "master",
           taskId: "task-redraw",
-          body: "The composer was redrawn."
+          body: "The user intentionally deleted this prompt."
         }]
       };
     }
     if (payload.type === "agent-ack") {
+      ackCount += 1;
       assert.equal(payload.messageId, "msg-redraw");
-      return { ok: true, type: "agent-ack" };
+      return ackCount === 1
+        ? { ok: false, error: "local hub temporarily unavailable" }
+        : { ok: true, type: "agent-ack" };
     }
     throw new Error(`Unexpected message type: ${payload.type}`);
   };
@@ -307,9 +317,10 @@ async function testAgentMessageReinsertsWhenComposerLosesPrompt() {
   await context.pollAndDeliverAgentMessage();
   await context.pollAndDeliverAgentMessage();
 
-  assert.equal(insertCount, 2);
-  assert.equal(clickCount, 2);
-  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
+  assert.equal(insertCount, 1, "A removed agent prompt must never be written into the composer again.");
+  assert.equal(clickCount, 1, "A removed agent prompt must not receive another send attempt.");
+  assert.equal(ackCount, 2, "Cancellation may retry only the local hub acknowledgement.");
+  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack", "agent-ack"]);
 }
 
 async function testExternallySubmittedAgentPromptAcksWithoutReinsertion() {
@@ -355,7 +366,6 @@ async function testExternallySubmittedAgentPromptAcksWithoutReinsertion() {
   await context.pollAndDeliverAgentMessage();
   assert.equal(insertCount, 1);
   assert.equal(clickCount, 1);
-  await context.pollAndDeliverAgentMessage();
   assert.equal(insertCount, 1, "A prompt already present in submitted user messages must not be inserted again.");
   assert.equal(clickCount, 1, "Recovery should ack the externally submitted prompt without another send attempt.");
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
@@ -478,6 +488,7 @@ async function testModifiedAgentPromptIsNeverClickedOrOverwritten() {
   const context = loadContentContext();
   let insertCount = 0;
   let clickCount = 0;
+  let ackCount = 0;
   let composerText = "";
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
@@ -506,21 +517,27 @@ async function testModifiedAgentPromptIsNeverClickedOrOverwritten() {
         }]
       };
     }
+    if (payload.type === "agent-ack") {
+      ackCount += 1;
+      return { ok: true, type: "agent-ack" };
+    }
     throw new Error(`Unexpected message type: ${payload.type}`);
   };
 
   await context.pollAndDeliverAgentMessage();
-  await context.pollAndDeliverAgentMessage();
 
   assert.equal(insertCount, 1, "A modified pending agent prompt must not be reinserted over user text.");
   assert.equal(clickCount, 1, "A modified pending agent prompt must not trigger another click.");
+  assert.equal(ackCount, 1, "Replacing an inserted agent prompt must immediately cancel and acknowledge its delivery.");
+  assert.equal(vm.runInContext("pendingAgentDelivery", context), null, "A replaced prompt must not remain pending and block new helpers.");
   assert.match(composerText, /USER MODIFIED THIS PROMPT/);
 }
 
-async function testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt() {
+async function testUnrelatedPostInsertionDraftCancelsAgentPrompt() {
   const context = loadContentContext();
   let insertCount = 0;
   let clickCount = 0;
+  let ackCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
   context.insertReply = async () => {
@@ -545,6 +562,10 @@ async function testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt() {
         }]
       };
     }
+    if (payload.type === "agent-ack") {
+      ackCount += 1;
+      return { ok: true, type: "agent-ack" };
+    }
     throw new Error(`Unexpected message type: ${payload.type}`);
   };
 
@@ -552,10 +573,8 @@ async function testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt() {
 
   assert.equal(insertCount, 1);
   assert.equal(clickCount, 0, "A post-insertion value unrelated to the intended prompt must never reach auto-send.");
-  const pending = vm.runInContext("pendingAgentDelivery", context);
-  assert.equal(pending.sent, false);
-  assert.equal(pending.inserted, false);
-  assert.equal(pending.composerConflict, true);
+  assert.equal(ackCount, 1);
+  assert.equal(vm.runInContext("pendingAgentDelivery", context), null, "A failed post-write ownership check must cancel instead of blocking future helpers.");
 }
 
 async function testPreexistingUserDraftBlocksAgentInsertionAtomically() {
@@ -844,11 +863,14 @@ async function testProfileChangeClearsLocalPendingDelivery() {
   let currentProfile = { role: "master", agentId: "master" };
   let insertCount = 0;
   let clickCount = 0;
+  let composerText = "";
   const statuses = [];
   context.getCurrentAgentProfile = async () => currentProfile;
   context.setStatus = (text, state) => statuses.push({ text, state });
+  context.getComposerText = () => composerText;
   context.insertReply = async (text) => {
     insertCount += 1;
+    composerText = text;
     return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
@@ -1372,12 +1394,12 @@ async function waitFor(predicate, label) {
   await testAutoReregisterWhenRosterIsLost();
   await testUnsentAgentMessageIsNotInsertedTwice();
   await testAgentMessageStaysPendingUntilPageIsReady();
-  await testAgentMessageReinsertsWhenComposerLosesPrompt();
+  await testDeletedAgentPromptIsCancelledInsteadOfReinserted();
   await testExternallySubmittedAgentPromptAcksWithoutReinsertion();
   await testAckFailureDoesNotResendAlreadySubmittedMessage();
   await testMissingAckRecordIsIdempotentAfterMessageWasSent();
   await testModifiedAgentPromptIsNeverClickedOrOverwritten();
-  await testUnrelatedPostInsertionDraftIsNeverSentAsAgentPrompt();
+  await testUnrelatedPostInsertionDraftCancelsAgentPrompt();
   await testPreexistingUserDraftBlocksAgentInsertionAtomically();
   await testAgentAckDoesNotHoldComposerLease();
   await testMasterPromptIdentityPreventsHistoricalFalseAck();

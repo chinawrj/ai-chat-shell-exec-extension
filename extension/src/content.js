@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.0";
+const CONTENT_SCRIPT_VERSION = "0.9.1";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -554,7 +554,9 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
-  if (!force && pendingAgentDelivery && pendingAgentDelivery.sent !== true) {
+  if (!force && pendingAgentDelivery &&
+      pendingAgentDelivery.sent !== true &&
+      pendingAgentDelivery.cancelled !== true) {
     setStatus("Helper detected; waiting for the pending agent message to leave the composer", "running");
     scheduleScan();
     return;
@@ -964,6 +966,20 @@ async function clearPendingHelperDelivery(entry) {
   await persistPendingHelperDeliveries();
 }
 
+async function cancelPendingHelperDeliveryAfterComposerRemoval(entry) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return true;
+  }
+  // Emptying or replacing the current text is an explicit user cancellation.
+  // Do not immediately fill the composer with another result that was already
+  // queued behind it. A later new helper may still create a fresh delivery.
+  pendingHelperDeliveries.clear();
+  await persistPendingHelperDeliveries();
+  const label = entry.kind === "board" ? "Board helper" : "Shell helper";
+  setStatus(`${label} result delivery and the current queued batch were cancelled because composer content was removed or changed; they will not be inserted again.`, "ok");
+  return true;
+}
+
 async function acknowledgePendingHelperResultPresented(entry) {
   const executionId = String(entry?.executionId || "");
   if (!isCanonicalExecutionId(executionId)) {
@@ -980,9 +996,85 @@ async function acknowledgePendingHelperResultPresented(entry) {
   }
 }
 
+async function finalizePendingHelperDelivery(entry, phase) {
+  entry.phase = phase;
+  entry.updatedAt = Date.now();
+  await persistPendingHelperDeliveries();
+  await rememberLocallyPresentedHelperExecution(entry);
+  const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
+  if (receiptAcknowledged) {
+    await clearPendingHelperDelivery(entry);
+  } else {
+    entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
+    await persistPendingHelperDeliveries();
+    schedulePendingHelperDeliveryRetry();
+  }
+  setHelperCompletionStatus(entry.call, entry.response);
+  return true;
+}
+
 function setPendingHelperDeliveryStatus(entry) {
   const label = entry?.kind === "board" ? "Board helper" : "Shell helper";
   setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The command will not be sent again.`, "running");
+}
+
+async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
+  let composer;
+  try {
+    composer = await findReplyInput();
+  } catch (_unused) {
+    composer = null;
+  }
+  if (!composer) {
+    entry.lastError = "composer unavailable after the result was inserted; waiting without reinserting";
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    setPendingHelperDeliveryStatus(entry);
+    schedulePendingHelperDeliveryRetry();
+    return false;
+  }
+
+  const expectedComposerText = getValidatedComposerOwnershipText(composer, entry.reply);
+  if (!expectedComposerText) {
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  if (deliverySettings.autoSend === false) {
+    return finalizePendingHelperDelivery(entry, "presented");
+  }
+
+  const callToken = {
+    callId: entry.callId,
+    pageIdentity: entry.pageIdentity,
+    generation: pageLifecycleGeneration,
+    phase: "pending-send-only",
+    composerWriteAttempted: true
+  };
+  const sent = await withComposerDeliveryLease({
+    kind: "helper-output-send-retry",
+    pageIdentity: callToken.pageIdentity,
+    generation: callToken.generation
+  }, async (deliveryToken) => {
+    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+      return false;
+    }
+    return clickSendWhenReady(
+      composer,
+      () => isComposerDeliveryTokenCurrent(deliveryToken),
+      expectedComposerText
+    );
+  });
+  if (sent) {
+    return finalizePendingHelperDelivery(entry, "submitted");
+  }
+  if (!getValidatedComposerOwnershipText(composer, entry.reply)) {
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  entry.lastError = "send button not ready; waiting without reinserting";
+  entry.updatedAt = Date.now();
+  await persistPendingHelperDeliveries();
+  setPendingHelperDeliveryStatus(entry);
+  schedulePendingHelperDeliveryRetry();
+  return false;
 }
 
 async function attemptPendingHelperDelivery(entry, settings = null) {
@@ -996,19 +1088,10 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
   try {
     if (entry.phase === "submitted" || entry.phase === "presented" ||
         countSubmittedMessagesMatching(entry.reply) > Number(entry.submittedMessageCountBefore || 0)) {
-      entry.phase = entry.phase === "presented" ? "presented" : "submitted";
-      entry.updatedAt = Date.now();
-      await rememberLocallyPresentedHelperExecution(entry);
-      const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
-      if (receiptAcknowledged) {
-        await clearPendingHelperDelivery(entry);
-      } else {
-        entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
-        await persistPendingHelperDeliveries();
-        schedulePendingHelperDeliveryRetry();
-      }
-      setHelperCompletionStatus(entry.call, entry.response);
-      return true;
+      return finalizePendingHelperDelivery(
+        entry,
+        entry.phase === "presented" ? "presented" : "submitted"
+      );
     }
     if (entry.restored === true && entry.phase === "inserted" && !initialThreadSettled) {
       setPendingHelperDeliveryStatus(entry);
@@ -1016,6 +1099,9 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       return false;
     }
     const deliverySettings = settings || await chrome.storage.sync.get(["autoSend"]);
+    if (entry.phase === "inserted") {
+      return retryInsertedPendingHelperDelivery(entry, deliverySettings);
+    }
     const callToken = {
       callId: entry.callId,
       pageIdentity: entry.pageIdentity,
@@ -1025,26 +1111,18 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
     entry.attempts = Number(entry.attempts || 0) + 1;
     entry.updatedAt = Date.now();
     const delivered = await deliverHelperReply(callToken, entry.reply, deliverySettings, async () => {
+      setHelperCompletionStatus(entry.call, entry.response);
+    }, async () => {
       entry.phase = "inserted";
       entry.updatedAt = Date.now();
       entry.lastError = "";
       await persistPendingHelperDeliveries();
-      setHelperCompletionStatus(entry.call, entry.response);
     });
     if (delivered) {
-      entry.phase = deliverySettings.autoSend === false ? "presented" : "submitted";
-      entry.updatedAt = Date.now();
-      await persistPendingHelperDeliveries();
-      await rememberLocallyPresentedHelperExecution(entry);
-      const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
-      if (receiptAcknowledged) {
-        await clearPendingHelperDelivery(entry);
-      } else {
-        entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
-        await persistPendingHelperDeliveries();
-        schedulePendingHelperDeliveryRetry();
-      }
-      return true;
+      return finalizePendingHelperDelivery(
+        entry,
+        deliverySettings.autoSend === false ? "presented" : "submitted"
+      );
     }
     entry.lastError = "chat composer insertion or send is not complete";
     entry.updatedAt = Date.now();
@@ -1153,8 +1231,14 @@ function migratePendingAgentDeliveryToCurrentPage() {
   pendingAgentDelivery.pageIdentity = getCurrentPageIdentity();
   pendingAgentDelivery.pageGeneration = pageLifecycleGeneration;
   if (pendingAgentDelivery.sent !== true) {
-    pendingAgentDelivery.inserted = false;
-    pendingAgentDelivery.lastError = "page changed before delivery completed";
+    if (pendingAgentDelivery.composerWriteAttempted === true) {
+      pendingAgentDelivery.cancelled = true;
+      pendingAgentDelivery.inserted = false;
+      pendingAgentDelivery.lastError = "page changed after composer delivery began; automatic reinsertion was cancelled";
+    } else {
+      pendingAgentDelivery.inserted = false;
+      pendingAgentDelivery.lastError = "page changed before delivery completed";
+    }
   }
   if (previousStorageKey !== nextStorageKey) {
     chrome.storage.local.remove([previousStorageKey]).catch(() => {});
@@ -2378,7 +2462,6 @@ async function runAndReply(callId, call, options = {}) {
       isAgentTaskStatusHelperCall(call) ?
       formatAgentTaskStatusOutput(call, effectiveResponse, startedAt) :
       formatShellOutput(call, effectiveResponse, startedAt);
-    const retryable = isRetryableHelperResponse(call, effectiveResponse);
     if (isPersistentResultHelperCall(call)) {
       const pending = await rememberPendingHelperDelivery(callId, call, effectiveResponse, reply, settings);
       releaseActiveCall(callToken);
@@ -2399,7 +2482,10 @@ async function runAndReply(callId, call, options = {}) {
       setHelperCompletionStatus(call, response);
     });
     return {
-      retryable: retryable || !delivered,
+      // A backend response must never be replayed merely because the page did
+      // not confirm composer delivery. Side-effecting file/agent helpers would
+      // otherwise execute repeatedly and keep rewriting the input.
+      retryable: false,
       response,
       deliveryFailed: !delivered
     };
@@ -2443,7 +2529,10 @@ async function runAndReply(callId, call, options = {}) {
     releaseActiveCall(callToken);
     const delivered = await deliverHelperReply(callToken, failedReply, settings);
     return {
-      retryable,
+      // Once error text was written, keep the rendered helper consumed. If no
+      // composer mutation happened at all, the original pre-execution failure
+      // remains eligible for the scanner's normal retry.
+      retryable: retryable && callToken.composerWriteAttempted !== true,
       error: error.message || String(error),
       deliveryFailed: !delivered
     };
@@ -2512,7 +2601,13 @@ function isRetryableHelperResponse(call, response) {
   return false;
 }
 
-async function deliverHelperReply(callToken, reply, settings, onInserted = () => {}) {
+async function deliverHelperReply(
+  callToken,
+  reply,
+  settings,
+  onInserted = () => {},
+  onWriteAttempted = () => {}
+) {
   return withComposerDeliveryLease({
     kind: "helper-output",
     pageIdentity: callToken.pageIdentity,
@@ -2527,6 +2622,9 @@ async function deliverHelperReply(callToken, reply, settings, onInserted = () =>
     } catch (_unused) {
       return false;
     }
+    callToken.composerWriteAttempted = true;
+    callToken.phase = "reply-write-attempted";
+    await onWriteAttempted(composer);
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
       return false;
     }
@@ -3113,6 +3211,10 @@ async function deliverAgentMessageToPage(profile, message) {
       await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
       return;
     }
+    if (pending.cancelled === true) {
+      await ackCancelledPendingAgentMessage(profile, message, pending, deliveryToken);
+      return;
+    }
     const sentDuringComposerDelivery = await withComposerDeliveryLease({
       kind: "agent-message",
       pageIdentity: deliveryToken.pageIdentity,
@@ -3124,6 +3226,16 @@ async function deliverAgentMessageToPage(profile, message) {
       }
       const text = pending.promptText || formatInboundAgentPrompt(profile, message);
       const currentComposer = lastComposerElement || closestEditable(document.activeElement);
+      if (pending.composerWriteAttempted === true && !agentDeliveryPromptStillPresent(pending)) {
+        pending.cancelled = true;
+        pending.inserted = false;
+        pending.composerConflict = false;
+        pending.lastError = "composer content was removed or changed by the user; automatic reinsertion cancelled";
+        pending.updatedAt = Date.now();
+        updatePendingAgentDeliveryPanel();
+        persistPendingAgentDelivery();
+        return;
+      }
       if (pending.composerConflict === true) {
         if (getComposerText(currentComposer)) {
           pending.lastError = "composer text changed; waiting for it to become empty";
@@ -3134,32 +3246,31 @@ async function deliverAgentMessageToPage(profile, message) {
         }
         pending.composerConflict = false;
       }
-      if (pending.inserted && !agentDeliveryPromptStillPresent(pending)) {
-        pending.inserted = false;
-        pending.composerConflict = Boolean(getComposerText(currentComposer));
-        pending.lastError = pending.composerConflict
-          ? "composer text changed; delivery paused without overwriting it"
-          : "inserted prompt no longer present";
-        pending.updatedAt = Date.now();
-        updatePendingAgentDeliveryPanel();
-        persistPendingAgentDelivery();
-        if (pending.composerConflict) {
+      if (!pending.inserted) {
+        if (pending.composerWriteAttempted === true) {
+          pending.cancelled = true;
+          pending.lastError = "composer delivery was already attempted; automatic reinsertion cancelled";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
           return;
         }
-      }
-      if (!pending.inserted) {
         setStatus(`Delivering agent message from ${message.from || "(unknown)"}`, "running");
         try {
           const insertedComposer = await insertReply(text, { preserveExisting: true });
           if (!isComposerDeliveryTokenCurrent(composerToken)) {
             return;
           }
+          pending.composerWriteAttempted = true;
+          pending.updatedAt = Date.now();
+          persistPendingAgentDelivery();
           const expectedComposerText = getValidatedComposerOwnershipText(insertedComposer, text);
           if (!expectedComposerText) {
             pending.inserted = false;
             pending.composerText = "";
-            pending.composerConflict = Boolean(getComposerText(insertedComposer));
-            pending.lastError = "composer did not retain the intended agent prompt; delivery paused without sending it";
+            pending.composerConflict = false;
+            pending.cancelled = true;
+            pending.lastError = "composer did not retain the intended agent prompt; automatic delivery cancelled without reinserting or sending";
             pending.updatedAt = Date.now();
             updatePendingAgentDeliveryPanel();
             persistPendingAgentDelivery();
@@ -3202,11 +3313,20 @@ async function deliverAgentMessageToPage(profile, message) {
         return;
       }
       if (!sent) {
+        if (countSubmittedMessagesMatching(pending.promptText || "") > 0) {
+          pending.sent = true;
+          pending.lastError = "";
+          pending.updatedAt = Date.now();
+          updatePendingAgentDeliveryPanel();
+          persistPendingAgentDelivery();
+          return true;
+        }
         const currentText = getComposerText(composer);
-        if (currentText && currentText !== expectedComposerText) {
+        if (currentText !== expectedComposerText) {
           pending.inserted = false;
-          pending.composerConflict = true;
-          pending.lastError = "composer text changed; delivery paused without sending it";
+          pending.composerConflict = false;
+          pending.cancelled = true;
+          pending.lastError = "composer content was removed or changed by the user; automatic delivery cancelled";
         } else {
           pending.lastError = "send button not ready";
         }
@@ -3225,6 +3345,8 @@ async function deliverAgentMessageToPage(profile, message) {
     });
     if (sentDuringComposerDelivery === true && isAgentDeliveryTokenCurrent(deliveryToken)) {
       await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
+    } else if (pending.cancelled === true && isAgentDeliveryTokenCurrent(deliveryToken)) {
+      await ackCancelledPendingAgentMessage(profile, message, pending, deliveryToken);
     }
   } finally {
     if (activeAgentDeliveryToken === deliveryToken) {
@@ -3263,6 +3385,23 @@ async function ackSentPendingAgentMessage(profile, message, pending, deliveryTok
   setStatus(`Delivered agent message ${message.messageId}`, "ok");
 }
 
+async function ackCancelledPendingAgentMessage(profile, message, pending, deliveryToken) {
+  const ack = await ackDeliveredAgentMessage(profile, message);
+  if (!isAgentDeliveryTokenCurrent(deliveryToken) || pendingAgentDelivery !== pending) {
+    return;
+  }
+  if (!ack?.ok && ack?.errorCode !== "message-not-found") {
+    pending.lastError = `automatic composer delivery cancelled; waiting to ack local hub: ${ack?.error || "unknown"}`;
+    pending.updatedAt = Date.now();
+    updatePendingAgentDeliveryPanel();
+    persistPendingAgentDelivery();
+    setStatus(`Agent message ${message.messageId} composer delivery cancelled; retrying only local hub ack`, "running");
+    return;
+  }
+  clearPendingAgentDelivery(pending);
+  setStatus(`Cancelled agent message ${message.messageId} after its composer content was removed; it will not be inserted again.`, "ok");
+}
+
 function ensurePendingAgentDelivery(profile, message) {
   if (pendingAgentDelivery?.messageId === message.messageId) {
     pendingAgentDelivery.message = message;
@@ -3278,8 +3417,10 @@ function ensurePendingAgentDelivery(profile, message) {
     message,
     promptText: formatInboundAgentPrompt(profile, message),
     composerText: "",
+    composerWriteAttempted: false,
     inserted: false,
     sent: false,
+    cancelled: false,
     composerConflict: false,
     storageKey: agentPendingDeliveryKey(),
     pageIdentity: getCurrentPageIdentity(),
@@ -3331,8 +3472,10 @@ async function loadPendingAgentDelivery(profile) {
       message: pending.message,
       promptText: pending.promptText || formatInboundAgentPrompt(profile, pending.message),
       composerText: pending.composerText || "",
+      composerWriteAttempted: Boolean(pending.composerWriteAttempted || pending.inserted || pending.sent),
       inserted: Boolean(pending.inserted),
       sent: Boolean(pending.sent),
+      cancelled: Boolean(pending.cancelled),
       composerConflict: Boolean(pending.composerConflict),
       storageKey: agentPendingDeliveryKey(),
       pageIdentity: getCurrentPageIdentity(),
@@ -3358,8 +3501,10 @@ function persistPendingAgentDelivery() {
     message: pendingAgentDelivery.message,
     promptText: pendingAgentDelivery.promptText,
     composerText: pendingAgentDelivery.composerText || "",
+    composerWriteAttempted: Boolean(pendingAgentDelivery.composerWriteAttempted),
     inserted: Boolean(pendingAgentDelivery.inserted),
     sent: Boolean(pendingAgentDelivery.sent),
+    cancelled: Boolean(pendingAgentDelivery.cancelled),
     composerConflict: Boolean(pendingAgentDelivery.composerConflict),
     lastError: pendingAgentDelivery.lastError || "",
     createdAt: pendingAgentDelivery.createdAt || Date.now(),
@@ -3399,10 +3544,14 @@ function updatePendingAgentDeliveryPanel() {
   const message = pendingAgentDelivery.message || {};
   const from = message.from || "(unknown)";
   const task = message.taskId ? ` task ${message.taskId}` : "";
-  const phase = pendingAgentDelivery.sent
+  const phase = pendingAgentDelivery.cancelled
+    ? "composer delivery cancelled; waiting to ack local hub"
+    : pendingAgentDelivery.sent
     ? "sent to AI page; waiting to ack local hub"
     : pendingAgentDelivery.inserted ? "waiting for AI page send readiness" : "waiting for chat composer";
-  const nextAction = pendingAgentDelivery.sent
+  const nextAction = pendingAgentDelivery.cancelled
+    ? "No reinsertion or send will happen; the extension will retry only the local cancellation ack."
+    : pendingAgentDelivery.sent
     ? "No resend will happen; the extension will retry only the local ack."
     : pendingAgentDelivery.inserted
       ? pendingAgentDelivery.lastError === "send button not ready"

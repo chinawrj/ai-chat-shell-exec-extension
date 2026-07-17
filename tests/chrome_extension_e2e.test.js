@@ -444,6 +444,93 @@ async function main() {
   })()`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Agent mode disabled")`, "page agent mode to disable before non-agent refresh tests");
 
+  const deletedComposerMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-deleted-composer-e2e-${process.pid}-${Date.now()}.txt`);
+  const deletedComposerToken = `ai-chat-shell-deleted-composer-${Date.now()}`;
+  const afterDeletionToken = `ai-chat-shell-after-deletion-${Date.now()}`;
+  cleanup.push(() => fs.rmSync(deletedComposerMarkerPath, { force: true }));
+  const deletedComposerCommand = [
+    `printf 'executed\\n' >> ${shellQuote(deletedComposerMarkerPath)}`,
+    `printf '${deletedComposerToken}'`
+  ].join("; ");
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    const form = document.getElementById("composerForm");
+    const send = document.getElementById("send");
+    window.__aiShellDeletionGuard?.abort();
+    window.__aiShellDeletionGuard = new AbortController();
+    const options = { capture: true, signal: window.__aiShellDeletionGuard.signal };
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, options);
+    composer.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, options);
+    send.disabled = true;
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    appendAssistantToolCall([
+      "ai-helper-shell-start:deleted-composer-e2e",
+      ${JSON.stringify(deletedComposerCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const text = document.getElementById("composer")?.innerText || "";
+    return text.includes(${JSON.stringify(deletedComposerToken)}) && text.includes("Shell call result:");
+  })()`, "pending shell output to be inserted before intentional deletion");
+  const deletionUserCountBefore = await page.evaluate("document.querySelectorAll('[data-message-author-role=\"user\"]').length");
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.replaceChildren();
+    composer.dispatchEvent(new InputEvent("beforeinput", {
+      bubbles: true,
+      composed: true,
+      inputType: "deleteContentBackward",
+      data: null
+    }));
+    composer.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      composed: true,
+      inputType: "deleteContentBackward",
+      data: null
+    }));
+    composer.dispatchEvent(new Event("change", { bubbles: true }));
+    return !(composer.innerText || "").trim();
+  })()`);
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 6500))");
+  const deletionState = await page.evaluate(`(() => ({
+    composer: document.getElementById("composer")?.innerText || "",
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    userText: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "").join("\\n")
+  }))()`);
+  assert.equal(deletionState.composer, "", "Intentionally deleted helper output must remain absent across multiple retry intervals.");
+  assert.equal(deletionState.userCount, deletionUserCountBefore, "Deleted helper output must not be submitted after cancellation.");
+  assert.ok(!deletionState.userText.includes(deletedComposerToken));
+  assert.equal(fs.readFileSync(deletedComposerMarkerPath, "utf8"), "executed\n", "Composer cancellation must not re-execute the shell command.");
+
+  await page.evaluate(`(() => {
+    window.__aiShellDeletionGuard?.abort();
+    document.getElementById("send").disabled = false;
+    appendAssistantToolCall([
+      "ai-helper-shell-start:after-deleted-composer-e2e",
+      ${JSON.stringify(`printf '${afterDeletionToken}'`)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(afterDeletionToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "new helper to deliver normally after user-cancelled composer output");
+
   const refreshMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-refresh-e2e-${process.pid}-${Date.now()}.txt`);
   const refreshOldToken = `ai-chat-shell-refresh-old-${Date.now()}`;
   const refreshNewToken = `ai-chat-shell-refresh-new-${Date.now()}`;

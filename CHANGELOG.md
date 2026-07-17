@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-17
+
+- Treats removal or replacement of automatically inserted helper output as an explicit user cancellation: the extension never writes that content again, cancels the already-queued composer batch, and leaves the server result unpresented so a genuinely new helper may recover it later.
+- Gives inbound agent prompts the same one-write limit. Removing or editing the prompt cancels automatic composer delivery; only the local hub cancellation acknowledgement may retry, and SPA navigation cannot reinsert a prompt whose composer write already began.
+- Prevents file, agent-message, roster, task-status, and other non-persistent helper responses from re-executing the same rendered helper merely because composer auto-send was not confirmed. Pre-execution failures remain retryable only when no composer mutation occurred.
+- Adds regression coverage for intentional deletion, queued-result cancellation, send-only retry without reinsertion, failed cancellation acknowledgements, and side-effecting non-shell helper responses.
+
 ## [0.9.0] - 2026-07-16
 
 - Persists per-pane runner ownership in tmux so a restarted shell server adopts or waits for the existing runner instead of injecting a second command into a busy pane; manually started child processes are held until their foreground process group exits or is interrupted.

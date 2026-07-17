@@ -1496,6 +1496,54 @@ async function verifyBackendResponsesRetryOnlyLocalDelivery() {
   assert.equal(insertionFailure.pendingDelivery, true);
 }
 
+async function verifyNonShellComposerWritesNeverReexecuteRenderedHelpers() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const call = context.parseCallPayload([
+    "ai-helper-file-start",
+    "write-once.txt",
+    "write this file once",
+    "ai-helper-file-end"
+  ].join("\n"));
+  let backendAttempts = 0;
+  let composerWrites = 0;
+  context.chrome.runtime.sendMessage = async () => {
+    backendAttempts += 1;
+    return {
+      ok: true,
+      filename: "write-once.txt",
+      path: "/tmp/write-once.txt",
+      bytes: 20
+    };
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    return { innerText: text, textContent: text, isConnected: true };
+  };
+  context.clickSendWhenReady = async () => false;
+
+  const completedResponse = await context.runAndReply("file-write-once-response", call);
+  assert.equal(completedResponse.retryable, false, "A backend response must consume that rendered helper even when auto-send is not confirmed.");
+  assert.equal(backendAttempts, 1);
+  assert.equal(composerWrites, 1);
+
+  context.chrome.runtime.sendMessage = async () => {
+    backendAttempts += 1;
+    throw new Error("file helper transport unavailable");
+  };
+  const failedResponse = await context.runAndReply("file-write-once-error", call);
+  assert.equal(
+    failedResponse.retryable,
+    false,
+    "Once an error reply was written into the composer, the same rendered side-effecting helper must not execute again."
+  );
+  assert.equal(backendAttempts, 2);
+  assert.equal(composerWrites, 2);
+}
+
 async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   const context = loadContentContext();
   await Promise.resolve();
@@ -1521,11 +1569,14 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
     };
   };
   const composer = { innerText: "", textContent: "", isConnected: true };
+  let insertAttempts = 0;
   context.insertReply = async (text) => {
+    insertAttempts += 1;
     composer.innerText = text;
     composer.textContent = text;
     return composer;
   };
+  context.findReplyInput = async () => composer;
   let sendAttempts = 0;
   context.clickSendWhenReady = async () => {
     sendAttempts += 1;
@@ -1545,9 +1596,99 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   const second = await context.runAndReply("same-rendered-pending", call);
   assert.equal(second.pendingDelivery, false);
   assert.equal(messages.filter((payload) => payload.type === "run-shell").length, 1, "Retrying the same rendered helper must retry only composer delivery.");
+  assert.equal(insertAttempts, 1, "Once helper output is in the composer, send retries must not write it again.");
   assert.equal(sendAttempts, 2);
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
   assert.ok(messages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "aabbccddeeff0011"));
+}
+
+async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  const messages = [];
+  context.chrome.runtime.sendMessage = async (payload) => {
+    messages.push(payload);
+    if (payload.type === "run-result-presented") {
+      throw new Error("A user-cancelled composer delivery must not be marked presented.");
+    }
+    assert.equal(payload.type, "run-shell");
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "decafbaddecafbad",
+      exitCode: 0,
+      stdout: "delete this pending output"
+    };
+  };
+  const composer = {
+    innerText: "",
+    textContent: "",
+    isConnected: true
+  };
+  let insertAttempts = 0;
+  let sendAttempts = 0;
+  context.insertReply = async (text) => {
+    insertAttempts += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    return false;
+  };
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf delete-pending" }));
+
+  const first = await context.runAndReply("deleted-pending-result", call);
+  assert.equal(first.pendingDelivery, true);
+  assert.equal(insertAttempts, 1);
+  assert.equal(sendAttempts, 1);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+
+  const secondCall = context.parseCallPayload(createHelperBlock({ cmd: "printf queued-after-delete" }));
+  await context.rememberPendingHelperDelivery(
+    "queued-after-deleted-result",
+    secondCall,
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "feedfacefeedface",
+      exitCode: 0,
+      stdout: "this queued result must not replace the deleted one"
+    },
+    "SECOND QUEUED REPLY",
+    { autoSend: true }
+  );
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 2);
+
+  // This is an explicit user action, not a page-readiness failure. The
+  // extension must yield ownership permanently instead of putting the output
+  // back on its next local-delivery retry.
+  composer.innerText = "";
+  composer.textContent = "";
+  const pendingEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  await context.attemptPendingHelperDelivery(pendingEntry, { autoSend: true });
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(insertAttempts, 1, "Deleting pending helper output must cancel every future automatic composer write.");
+  assert.equal(sendAttempts, 1, "Deleted helper output must not trigger another send attempt.");
+  assert.equal(messages.filter((payload) => payload.type === "run-shell").length, 1);
+  assert.equal(messages.filter((payload) => payload.type === "run-result-presented").length, 0);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.size", context),
+    0,
+    "User cancellation should release the whole existing pending-delivery batch."
+  );
 }
 
 async function verifyPendingResultRestoresAcrossSamePageReload() {
@@ -2439,7 +2580,9 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifySubmittedMessageReleasesStaleComposerWait())
   .then(() => verifyAutoSendDoesNotHoldExecutionLock())
   .then(() => verifyBackendResponsesRetryOnlyLocalDelivery())
+  .then(() => verifyNonShellComposerWritesNeverReexecuteRenderedHelpers())
   .then(() => verifySameRenderedPendingResultRetriesLocallyOnly())
+  .then(() => verifyDeletedPendingResultCancelsAutomaticComposerDelivery())
   .then(() => verifyPendingResultRestoresAcrossSamePageReload())
   .then(() => verifyPresentationReceiptRetriesWithoutDuplicateInsertion())
   .then(() => verifyCanonicalExecutionCoalescesPendingDeliveries())
