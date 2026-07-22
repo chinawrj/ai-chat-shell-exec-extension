@@ -163,6 +163,18 @@ const script = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "b
 vm.runInContext(script, context, { filename: "background.js" });
 
 async function main() {
+  const uiDelayStartedAt = Date.now();
+  const uiDelay = await context.handleContentUiDelayMessage({
+    type: "content-ui-delay",
+    delayMs: 5
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(uiDelay)), {
+    ok: true,
+    type: "content-ui-delay",
+    delayMs: 5
+  });
+  assert.ok(Date.now() - uiDelayStartedAt >= 4, "The background delay must not resolve synchronously.");
+
   assert.equal(context.shouldKeepWebSocketAlive({ type: "run" }), true);
   assert.equal(context.shouldKeepWebSocketAlive({ type: "run-board" }), true);
   assert.equal(context.shouldKeepWebSocketAlive({ type: "vision-visual-run-line" }), true);

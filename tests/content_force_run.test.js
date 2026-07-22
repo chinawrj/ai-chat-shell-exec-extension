@@ -24,7 +24,8 @@ assert.match(source, /setHelperCompletionStatus\(call,\s*response\);[\s\S]*relea
 assert.match(source, /function isCurrentCallToken\(callToken\)/);
 assert.match(source, /function releaseActiveCall\(callToken\)/);
 assert.match(source, /const processedRenderedHelpers = new WeakMap\(\);/);
-assert.match(source, /function buildRenderedHelperKey\(candidate, semanticCallKey\)/);
+assert.match(source, /function buildRenderedHelperKey\(candidate, semanticCallKey, pageIdentity = getCurrentPageIdentity\(\)\)/);
+assert.match(source, /routeHandoffPreviousPageIdentity/);
 assert.match(source, /candidate\?\.blockIndex \?\? candidate\?\.index/);
 assert.doesNotMatch(source, /processedSemanticCalls/);
 assert.doesNotMatch(source, /processedCalls/);

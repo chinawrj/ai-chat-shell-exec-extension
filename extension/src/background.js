@@ -11,6 +11,7 @@ const SETTINGS_MIGRATION_VERSION = 2;
 const REQUIRED_SERVER_PROTOCOL_VERSION = 6;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 2;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
+const CONTENT_UI_DELAY_MAX_MS = 2_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
   "vision-health",
   "vision-list-tmux-windows",
@@ -62,6 +63,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "extension-version") {
     sendResponse(getExtensionVersionInfo());
     return false;
+  }
+
+  if (message.type === "content-ui-delay") {
+    handleContentUiDelayMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
   }
 
   if (message.type === "shell-health") {
@@ -190,6 +201,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+
+function handleContentUiDelayMessage(message) {
+  const delayMs = Math.max(0, Math.min(
+    CONTENT_UI_DELAY_MAX_MS,
+    Number.isFinite(Number(message?.delayMs)) ? Number(message.delayMs) : 0
+  ));
+  return new Promise((resolve) => {
+    setTimeout(() => resolve({
+      ok: true,
+      type: "content-ui-delay",
+      delayMs
+    }), delayMs);
+  });
+}
 
 async function handleAgentMessage(message) {
   if (!BACKGROUND_AGENT_MESSAGE_TYPES.has(message.type)) {

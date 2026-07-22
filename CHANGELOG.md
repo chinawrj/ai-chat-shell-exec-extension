@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-07-22
+
+- Restores the five composer send-actuator functions byte-for-byte from v0.8.9, including its button lookup order, delayed heuristic fallback, form/keyboard fallback timing, and submission detection.
+- Removes the later persistent click/form/keyboard budget and send-button association filters without reverting durable pending delivery, SPA route recovery, one-write composer ownership, backend deduplication, tmux serialization, refresh recovery, or Ctrl+C completion fixes.
+- Keeps the v0.8.9 actuator behind the existing ownership/lifecycle boundary: each invocation retains its original bounded 80-round button/form/keyboard attempts, stale events are blocked if the page or composer changes mid-run, and the persistent delivery queue cannot restart another 80-round loop every two seconds within one page lifecycle.
+- Keeps the original 125/150ms timing usable in hidden tabs through a bounded MV3 background delay message, and carries rendered-helper handling only across a route transition with an actual pending delivery so SPA redraw recovery cannot re-execute a file or other non-shell helper.
+- Extends the outer ownership guard to detached composer subtrees, continuously proves the guarded node is still the current composer, rejects trusted user mutations during the v0.8.9 confirmation window, aborts the old 80-round loop at its next await boundary after ownership loss, permits one bounded exact-text composer-redraw handoff, and preserves even not-yet-inserted queued results across their route handoff without repeating the backend operation.
+- Replaces regressions for the superseded actuator behavior with a full-SHA-256, single-declaration v0.8.9 compatibility lock while retaining route, agent, draft-preservation, backend, intentional-deletion, and real-browser coverage.
+
 ## [0.9.6] - 2026-07-17
 
 - Makes the helper retry timer and agent poll loop detect same-tab route-only `pushState`/`replaceState` changes before loading route-scoped pending state, so an exact plugin-owned composer value cannot be stranded merely because the host changed the URL without a DOM mutation.

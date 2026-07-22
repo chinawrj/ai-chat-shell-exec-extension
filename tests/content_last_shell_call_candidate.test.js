@@ -379,6 +379,18 @@ async function verifyFrontendDoesNotDedupCommands() {
     "processed rendered helper",
     "The exact same rendered helper request remains scan-debounced."
   );
+  const previousPageIdentity = context.getCurrentPageIdentity();
+  context.location.pathname = "/c/same-rendered-helper-new-route";
+  context.location.href = `${context.location.origin}${context.location.pathname}`;
+  vm.runInContext(
+    `routeHandoffPreviousPageIdentity = ${JSON.stringify(previousPageIdentity)};`,
+    context
+  );
+  assert.equal(
+    context.getHandledHelperReason(firstShellCandidate, "route-changed-shell-call", shellSemanticKey, shell),
+    "processed rendered helper carried across pending route delivery",
+    "A pending-delivery route handoff must not turn the exact same rendered helper into a new backend request."
+  );
 }
 
 async function verifyHiddenStopButtonDoesNotBlockHelperScan() {
@@ -1369,24 +1381,18 @@ async function verifyDebugPanelListsAllCandidates() {
   );
 }
 
-async function verifySubmittedMessageReleasesStaleComposerWait() {
+async function verifySubmittedMessageMatchingPreservesLineBoundaries() {
   const context = loadContentContext();
   const originalText = "Shell call result:\r\n\r\nstdout:\u00a0a b";
-  const composer = { innerText: originalText, textContent: originalText };
   const submitted = [];
   context.document.querySelectorAll = (selector) =>
     selector.includes('data-message-author-role="user"') ? submitted : [];
 
-  submitted.push(new MockNode({ text: `User\n${originalText}`, role: "user", order: 1 }));
-
-  const result = await context.waitForSubmitted(composer, originalText, 0);
-  assert.equal(result, true, "A newly rendered user message must release auto-send even when the old composer node still reports stale text.");
-
-  submitted[0] = new MockNode({
+  submitted.push(new MockNode({
     text: "User\nShell call result:\n\n\nstdout: a b",
     role: "user",
     order: 2
-  });
+  }));
   assert.equal(
     context.countSubmittedMessagesMatching(originalText),
     1,
@@ -1594,8 +1600,8 @@ async function verifyNonPersistentResultRetriesSendOnly() {
 
   assert.equal(backendAttempts, 1, "Send retry must never execute the file helper again.");
   assert.equal(insertAttempts, 1, "Send retry must never write the file result again.");
-  assert.equal(sendAttempts, 2);
-  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.equal(sendAttempts, 1, "The persistent queue must not restart the v0.8.9 actuator.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
 }
 
 async function verifySameRenderedPendingResultRetriesLocallyOnly() {
@@ -1648,12 +1654,12 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   assert.ok(Object.keys(backing).some((key) => key.startsWith("helperPendingDelivery:v1:")));
 
   const second = await context.runAndReply("same-rendered-pending", call);
-  assert.equal(second.pendingDelivery, false);
-  assert.equal(messages.filter((payload) => payload.type === "run-shell").length, 1, "Retrying the same rendered helper must retry only composer delivery.");
+  assert.equal(second.pendingDelivery, true);
+  assert.equal(messages.filter((payload) => payload.type === "run-shell").length, 1, "Retrying the same rendered helper must remain local.");
   assert.equal(insertAttempts, 1, "Once helper output is in the composer, send retries must not write it again.");
-  assert.equal(sendAttempts, 2);
-  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
-  assert.ok(messages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "aabbccddeeff0011"));
+  assert.equal(sendAttempts, 1, "The same page lifecycle must not restart the v0.8.9 actuator.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.ok(!messages.some((payload) => payload.type === "run-result-presented"));
 }
 
 async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
@@ -2258,106 +2264,6 @@ async function verifyComposerDeliveryLeaseSerializesWriters() {
   assert.deepEqual(events, ["helper-start", "helper-end", "agent-start"]);
 }
 
-async function verifyAutoSendAbortsWhenComposerOwnershipChanges() {
-  const context = loadContentContext();
-  let clicks = 0;
-  let formSubmits = 0;
-  let focuses = 0;
-  let keyboardEvents = 0;
-  const form = {
-    requestSubmit() {
-      formSubmits += 1;
-    }
-  };
-  const makeComposer = (text) => ({
-    innerText: text,
-    textContent: text,
-    isConnected: true,
-    closest: () => form,
-    focus() {
-      focuses += 1;
-    },
-    dispatchEvent() {
-      keyboardEvents += 1;
-    }
-  });
-  const button = {
-    disabled: false,
-    getAttribute: () => "false",
-    click() {
-      clicks += 1;
-    }
-  };
-  context.sleep = async () => {};
-
-  const overwritten = makeComposer("Shell call result: original");
-  context.findSendButton = () => {
-    overwritten.innerText = "A newly typed user or agent prompt";
-    overwritten.textContent = overwritten.innerText;
-    return button;
-  };
-  assert.equal(await context.clickSendWhenReady(overwritten), false);
-  assert.deepEqual(
-    { clicks, formSubmits, focuses, keyboardEvents },
-    { clicks: 0, formSubmits: 0, focuses: 0, keyboardEvents: 0 },
-    "Auto-send must recheck exact composer ownership after button lookup and before every send side effect."
-  );
-
-  const disconnected = makeComposer("Shell call result: disconnected");
-  disconnected.isConnected = false;
-  context.findSendButton = () => button;
-  assert.equal(await context.clickSendWhenReady(disconnected), false);
-
-  const emptied = makeComposer("");
-  assert.equal(await context.clickSendWhenReady(emptied), false, "An empty composer without a newly rendered submitted message is not proof of submission.");
-  assert.deepEqual(
-    { clicks, formSubmits, focuses, keyboardEvents },
-    { clicks: 0, formSubmits: 0, focuses: 0, keyboardEvents: 0 },
-    "Disconnected, overwritten, and empty composers must never trigger click, form, focus, or keyboard side effects."
-  );
-}
-
-async function verifyUnboundSendButtonIsTriedImmediately() {
-  const context = loadContentContext();
-  const text = "Shell call result: heartbeat completed";
-  const composer = {
-    innerText: text,
-    textContent: text,
-    isConnected: true,
-    closest: () => null,
-    focus() {},
-    dispatchEvent() {}
-  };
-  const submitted = [];
-  const preferBoundOnlyValues = [];
-  let clicks = 0;
-  const sendButton = {
-    disabled: false,
-    getAttribute: () => "false",
-    click() {
-      clicks += 1;
-      submitted.push({ innerText: text, textContent: text });
-      composer.innerText = "";
-      composer.textContent = "";
-    }
-  };
-  context.document.querySelectorAll = (selector) =>
-    selector.includes("data-message-author-role") ? submitted : [];
-  context.findSendButton = (_composer, preferBoundOnly) => {
-    preferBoundOnlyValues.push(preferBoundOnly);
-    return sendButton;
-  };
-  context.sleep = async () => {};
-
-  assert.equal(await context.clickSendWhenReady(composer), true);
-  assert.equal(clicks, 1);
-  assert.equal(
-    preferBoundOnlyValues[0],
-    false,
-    "A visible unbound page send button must be eligible on the first attempt so one queued composer delivery cannot delay every later helper."
-  );
-}
-
 async function verifyUnrelatedPostInsertionDraftIsNeverAdopted() {
   const context = loadContentContext();
   let sendLookupCount = 0;
@@ -2418,9 +2324,10 @@ async function verifyHelperSendReacquiresRedrawnOwnedComposer() {
   vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
   context.insertReply = async () => oldComposer;
   context.findReplyInput = async () => replacementComposer;
-  context.clickSendWhenReady = async (composer, _shouldContinue, expectedText) => {
+  context.clickSendWhenReady = async (composer) => {
     sendComposer = composer;
-    return composer === replacementComposer && expectedText === intended;
+    return composer === replacementComposer &&
+      context.getValidatedComposerOwnershipText(composer, intended) === intended;
   };
 
   const delivered = await context.deliverHelperReply({
@@ -2431,6 +2338,58 @@ async function verifyHelperSendReacquiresRedrawnOwnedComposer() {
 
   assert.equal(delivered, true, "A page redraw that preserves exact plugin-owned text must still auto-send.");
   assert.equal(sendComposer, replacementComposer, "Auto-send must reacquire the connected composer instead of using the detached writer node.");
+}
+
+async function verifyTrackedTextareaUpdatesHostState() {
+  const context = loadContentContext();
+  context.Event = class Event {};
+  context.chrome.storage.local.set = async () => {};
+  Object.defineProperty(context.HTMLTextAreaElement.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._value || "";
+    },
+    set(value) {
+      this._value = String(value);
+    }
+  });
+
+  const composer = new context.HTMLTextAreaElement();
+  composer.id = "tracked-composer";
+  composer.isConnected = true;
+  composer.getBoundingClientRect = () => ({ width: 600, height: 48 });
+  let trackedValue = "";
+  let hostEditorState = "";
+  Object.defineProperty(composer, "value", {
+    configurable: true,
+    get() {
+      return this._value || "";
+    },
+    set(value) {
+      this._value = String(value);
+      trackedValue = this._value;
+    }
+  });
+  composer.focus = () => {};
+  composer.dispatchEvent = () => {
+    if (trackedValue !== composer._value) {
+      hostEditorState = composer._value;
+      trackedValue = composer._value;
+    }
+    return true;
+  };
+  context.findReplyInput = async () => composer;
+
+  const intended = "Shell call result:\n\nstdout:\ntracked textarea";
+  const returned = await context.insertReply(intended, { preserveExisting: true });
+
+  assert.equal(returned, composer);
+  assert.equal(composer.value, intended);
+  assert.equal(
+    hostEditorState,
+    intended,
+    "The native textarea setter must bypass a framework value tracker so the input event updates host editor state."
+  );
 }
 
 async function verifyInsertReplyPreservesExistingComposerAtomically() {
@@ -2513,137 +2472,6 @@ async function verifyLaterHelperCannotOverwriteUnsentEarlierOutput() {
   assert.equal(clickCount, 2, "A replay of the exact first output may reuse the composer and retry sending.");
 }
 
-async function verifyUnboundSendAssociationRejectsFeedbackAndArbitrarySubmit() {
-  const context = loadContentContext();
-  const region = { contains: () => true };
-  const composer = {
-    id: "composer-id",
-    closest: (selector) => selector === "form" ? null : region,
-    parentElement: region,
-    getBoundingClientRect: () => ({ left: 0, right: 400, top: 0, bottom: 100 })
-  };
-  const button = ({ ariaLabel = "", text = "", type = "button", testId = "", controls = "" }) => ({
-    textContent: text,
-    getAttribute(name) {
-      if (name === "aria-label") return ariaLabel;
-      if (name === "type") return type;
-      if (name === "data-testid") return testId;
-      if (name === "aria-controls") return controls;
-      return "";
-    },
-    matches(selector) {
-      return Boolean(testId && selector.includes(`[data-testid="${testId}"]`));
-    },
-    closest: () => null,
-    getBoundingClientRect: () => ({ left: 360, right: 400, top: 30, bottom: 70 })
-  });
-
-  assert.equal(
-    context.isSendButtonAssociatedWithComposer(button({ ariaLabel: "Send feedback", text: "Send feedback" }), composer, region),
-    false
-  );
-  assert.equal(
-    context.isSendButtonAssociatedWithComposer(button({ ariaLabel: "Continue", type: "submit" }), composer, region),
-    false,
-    "A submit type outside an actual composer form is not sufficient association."
-  );
-  assert.equal(
-    context.isSendButtonAssociatedWithComposer(button({ ariaLabel: "Send message", text: "Send" }), composer, region),
-    true
-  );
-  assert.equal(
-    context.isSendButtonAssociatedWithComposer(button({ testId: "send-button", ariaLabel: "Send message" }), composer, region),
-    true
-  );
-}
-
-async function verifyBoundSendButtonMustBelongToCurrentComposer() {
-  const context = loadContentContext();
-  const currentForm = {
-    contains: (node) => node?.form === currentForm,
-    querySelectorAll: () => [heuristicButton]
-  };
-  const staleForm = { contains: () => false };
-  const composer = {
-    id: "current-composer",
-    closest: (selector) => selector === "form" ? currentForm : null,
-    parentElement: currentForm,
-    getBoundingClientRect: () => ({ left: 0, right: 400, top: 0, bottom: 100 })
-  };
-  const makeButton = ({ form, label = "Send message", type = "button", testId = "" }) => {
-    const node = new context.HTMLButtonElement();
-    node.form = form;
-    node.textContent = label;
-    node.getAttribute = (name) => {
-      if (name === "aria-label") return label;
-      if (name === "type") return type;
-      if (name === "data-testid") return testId;
-      if (name === "aria-controls") return "";
-      if (name === "title") return "";
-      return "";
-    };
-    node.matches = (selector) => Boolean(testId && selector.includes(`[data-testid="${testId}"]`));
-    node.closest = (selector) => selector === "form" ? form : null;
-    node.getBoundingClientRect = () => ({ width: 40, height: 40, left: 350, right: 390, top: 30, bottom: 70 });
-    return node;
-  };
-  const validBound = makeButton({ form: currentForm, type: "submit" });
-  const staleBound = makeButton({ form: staleForm, type: "submit" });
-  const unrelatedBound = makeButton({ form: currentForm, label: "Attach file" });
-  const heuristicButton = makeButton({ form: currentForm, testId: "send-button" });
-
-  assert.equal(context.isBoundSendButtonAssociatedWithComposer(validBound, composer), true);
-  assert.equal(
-    context.isBoundSendButtonAssociatedWithComposer(staleBound, composer),
-    false,
-    "A saved selector that now resolves inside a stale SPA form must not be clicked."
-  );
-  assert.equal(
-    context.isBoundSendButtonAssociatedWithComposer(unrelatedBound, composer),
-    false,
-    "A saved node still in the form must retain send semantics; structural proximity alone is insufficient."
-  );
-
-  context.findBoundSendButton = () => validBound;
-  assert.equal(context.findSendButton(composer, false), validBound, "A valid saved send control remains preferred.");
-
-  context.findBoundSendButton = () => staleBound;
-  assert.equal(
-    context.findSendButton(composer, false),
-    heuristicButton,
-    "A stale saved binding falls back to current-page heuristics without deleting the saved selector."
-  );
-}
-
-async function verifyNoOpSendButtonHasBoundedRetries() {
-  const context = loadContentContext();
-  const text = "Shell call result: bounded calibration";
-  const composer = {
-    innerText: text,
-    textContent: text,
-    isConnected: true,
-    closest: () => null,
-    focus() {},
-    dispatchEvent() {}
-  };
-  let clicks = 0;
-  context.document.querySelectorAll = () => [];
-  const sendButton = {
-    disabled: false,
-    getAttribute: () => "false",
-    click() {
-      clicks += 1;
-    }
-  };
-  context.findSendButton = () => sendButton;
-  context.trySubmitForm = () => false;
-  context.tryKeyboardSubmit = () => false;
-  context.sleep = async () => {};
-
-  assert.equal(await context.clickSendWhenReady(composer), false);
-  assert.equal(clicks, 3, "A no-op heuristic candidate gets one delayed-readiness fallback beyond the first two clicks, but retries remain tightly bounded.");
-}
-
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
   .then(() => verifyFrontendDoesNotDedupCommands())
@@ -2665,7 +2493,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdatesWhileActiveCallRunning())
   .then(() => verifyForceRunPersistsWhileActiveCallRunning())
   .then(() => verifyDebugPanelListsAllCandidates())
-  .then(() => verifySubmittedMessageReleasesStaleComposerWait())
+  .then(() => verifySubmittedMessageMatchingPreservesLineBoundaries())
   .then(() => verifyAutoSendDoesNotHoldExecutionLock())
   .then(() => verifyBackendResponsesRetryOnlyLocalDelivery())
   .then(() => verifyNonShellComposerWritesNeverReexecuteRenderedHelpers())
@@ -2681,15 +2509,11 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyUnpresentedDuplicateRecoversCleanResult())
   .then(() => verifyRejectedHelperUsesComposerLeaseAndPreservesDraft())
   .then(() => verifyComposerDeliveryLeaseSerializesWriters())
-  .then(() => verifyAutoSendAbortsWhenComposerOwnershipChanges())
-  .then(() => verifyUnboundSendButtonIsTriedImmediately())
   .then(() => verifyUnrelatedPostInsertionDraftIsNeverAdopted())
   .then(() => verifyHelperSendReacquiresRedrawnOwnedComposer())
+  .then(() => verifyTrackedTextareaUpdatesHostState())
   .then(() => verifyInsertReplyPreservesExistingComposerAtomically())
   .then(() => verifyLaterHelperCannotOverwriteUnsentEarlierOutput())
-  .then(() => verifyUnboundSendAssociationRejectsFeedbackAndArbitrarySubmit())
-  .then(() => verifyBoundSendButtonMustBelongToCurrentComposer())
-  .then(() => verifyNoOpSendButtonHasBoundedRetries())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })

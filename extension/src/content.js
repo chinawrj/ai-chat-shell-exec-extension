@@ -22,12 +22,11 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.6";
-const MAX_PERSISTED_SEND_ACTUATIONS = 5;
-const MAX_SEND_BUTTON_CLICKS = 3;
+const CONTENT_SCRIPT_VERSION = "0.9.7";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
+const ORIGINAL_SEND_ACTUATOR_CANCELLED = Symbol("original-send-actuator-cancelled");
 const SHELL_PROFILE_PREFIX = "shellProfile:";
 const PANEL_PROFILE_PREFIX = "panelProfile:";
 const AGENT_PENDING_DELIVERY_PREFIX = "agentPendingDelivery:";
@@ -66,9 +65,11 @@ let activeCallId = "";
 let activeCallToken = null;
 let pageLifecycleGeneration = 0;
 let observedPageIdentity = "";
+let routeHandoffPreviousPageIdentity = "";
 let composerDeliverySequence = 0;
 let composerDeliveryTail = Promise.resolve();
 let activeComposerDeliveryToken = null;
+let activeOriginalSendActuatorGuard = null;
 let chainCallCount = 0;
 let lastUserMessageText = "";
 let lastDisabledStatusAt = 0;
@@ -694,6 +695,12 @@ function getHandledHelperReason(candidate, _callKey, semanticCallKey, call) {
   if (processedRenderedHelpers.get(renderRoot)?.has(renderedHelperKey)) {
     return "processed rendered helper";
   }
+  if (routeHandoffPreviousPageIdentity &&
+      processedRenderedHelpers.get(renderRoot)?.has(
+        buildRenderedHelperKey(candidate, semanticCallKey, routeHandoffPreviousPageIdentity)
+      )) {
+    return "processed rendered helper carried across pending route delivery";
+  }
   return "";
 }
 
@@ -736,6 +743,9 @@ function beginPageLifecycle(options = {}) {
     ? options.routeHandoffPresentedExecutions
     : [];
   const previousStorageKey = String(options.previousStorageKey || "");
+  routeHandoffPreviousPageIdentity = options.routeTransition === true && routeHandoffEntries.length > 0
+    ? String(options.previousPageIdentity || "")
+    : "";
   cancelPendingHelperDeliveryRetry();
   pendingHelperDeliveries = new Map();
   locallyPresentedHelperExecutions = new Map();
@@ -799,19 +809,20 @@ function refreshPageLifecycle() {
     const previousPageIdentity = observedPageIdentity;
     const previousStorageKey = pendingHelperDeliveriesLoadedKey ||
       pendingHelperDeliveryStorageKey(previousPageIdentity);
-    const routeHandoffEntries = Array.from(pendingHelperDeliveries.values());
-    const preservePendingHelperOwnership = routeHandoffEntries.some((entry) =>
-      ["inserted", "submitted", "presented"].includes(entry?.phase) &&
-      entry?.pageIdentity === previousPageIdentity
-    );
+    const routeHandoffEntries = Array.from(pendingHelperDeliveries.values())
+      .filter((entry) =>
+        ["queued", "inserted", "submitted", "presented"].includes(entry?.phase) &&
+        entry?.pageIdentity === previousPageIdentity
+      );
     const routeHandoffPresentedExecutions = Array.from(
       locallyPresentedHelperExecutions,
       ([executionId, presentedAt]) => ({ executionId, presentedAt })
     );
     beginPageLifecycle({
       routeTransition: true,
+      previousPageIdentity,
       previousStorageKey,
-      routeHandoffEntries: preservePendingHelperOwnership ? routeHandoffEntries : [],
+      routeHandoffEntries,
       routeHandoffPresentedExecutions
     });
   }
@@ -1031,12 +1042,6 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     createdAt: now,
     updatedAt: now,
     attempts: 0,
-    sendActuationCount: 0,
-    sendActuationCounts: {
-      button: 0,
-      form: 0,
-      keyboard: 0
-    },
     lastError: "",
     restored: false
   };
@@ -1047,73 +1052,17 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
   return pendingHelperDeliveries.get(callId) || entry;
 }
 
-function normalizedSendActuationCounts(state) {
-  const source = state?.sendActuationCounts && typeof state.sendActuationCounts === "object"
-    ? state.sendActuationCounts
-    : {};
-  const counts = {
-    button: Math.max(0, Number(source.button || 0)),
-    form: Math.max(0, Number(source.form || 0)),
-    keyboard: Math.max(0, Number(source.keyboard || 0))
-  };
-  const recordedTotal = Math.max(0, Number(state?.sendActuationCount || 0));
-  const countedTotal = counts.button + counts.form + counts.keyboard;
-  if (recordedTotal > countedTotal) {
-    const lastKind = ["button", "form", "keyboard"].includes(state?.lastSendActuationKind)
-      ? state.lastSendActuationKind
-      : "button";
-    // Conservatively attribute legacy/unclassified attempts to one kind so an
-    // upgrade cannot reset previously consumed persistent authority.
-    counts[lastKind] += recordedTotal - countedTotal;
-  }
-  return counts;
-}
-
-function sendActuationKindLimit(kind) {
-  return {
-    button: MAX_SEND_BUTTON_CLICKS,
-    form: 1,
-    keyboard: 1
-  }[kind] || 0;
-}
-
-async function reservePendingHelperSendActuation(entry, kind) {
-  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
-    return false;
-  }
-  const normalizedKind = String(kind || "");
-  const kindLimit = sendActuationKindLimit(normalizedKind);
-  const counts = normalizedSendActuationCounts(entry);
-  const count = Math.max(
-    Number(entry.sendActuationCount || 0),
-    counts.button + counts.form + counts.keyboard
-  );
-  if (!kindLimit || counts[normalizedKind] >= kindLimit) {
-    return false;
-  }
-  if (count >= MAX_PERSISTED_SEND_ACTUATIONS) {
-    entry.lastError = "automatic send actuation budget exhausted; exact result remains for manual send";
-    entry.updatedAt = Date.now();
-    await persistPendingHelperDeliveries();
-    return false;
-  }
-  entry.sendActuationCount = count + 1;
-  counts[normalizedKind] += 1;
-  entry.sendActuationCounts = counts;
-  entry.lastSendActuationKind = normalizedKind;
-  entry.updatedAt = Date.now();
-  // Persist before the side effect so a service/page interruption cannot
-  // reset the cumulative click/form/keyboard budget.
-  await persistPendingHelperDeliveries(undefined, { propagateErrors: true });
-  return true;
-}
-
 function persistPendingHelperDeliveries(
   storageKey = pendingHelperDeliveriesLoadedKey || pendingHelperDeliveryStorageKey(),
   options = {}
 ) {
   const entries = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()))
-    .map(({ restored: _restored, deliveryInFlight: _deliveryInFlight, ...entry }) => entry);
+    .map(({
+      restored: _restored,
+      deliveryInFlight: _deliveryInFlight,
+      sendActuatorGeneration: _sendActuatorGeneration,
+      ...entry
+    }) => entry);
   const presentedExecutions = pruneLocallyPresentedHelperExecutions(
     Array.from(locallyPresentedHelperExecutions, ([executionId, presentedAt]) => ({ executionId, presentedAt }))
   );
@@ -1216,14 +1165,12 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   if (deliverySettings.autoSend === false) {
     return finalizePendingHelperDelivery(entry, "presented");
   }
-  if (Number(entry.sendActuationCount || 0) >= MAX_PERSISTED_SEND_ACTUATIONS) {
-    entry.lastError = "automatic send actuation budget exhausted; exact result remains for manual send";
+  if (entry.sendActuatorGeneration === pageLifecycleGeneration) {
+    entry.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
     entry.updatedAt = Date.now();
     await persistPendingHelperDeliveries();
     setPendingHelperDeliveryStatus(entry);
-    // Continue to notice a later manual submit or deletion, but avoid a hot
-    // two-second storage/status loop after automatic side effects are paused.
-    schedulePendingHelperDeliveryRetry(30_000);
+    schedulePendingHelperDeliveryRetry();
     return false;
   }
 
@@ -1242,11 +1189,13 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
       return false;
     }
-    return clickSendWhenReady(
+    entry.sendActuatorGeneration = pageLifecycleGeneration;
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    return runOriginalSendActuatorForOwnedComposer(
       composer,
       () => isComposerDeliveryTokenCurrent(deliveryToken),
-      expectedComposerText,
-      (kind) => reservePendingHelperSendActuation(entry, kind)
+      expectedComposerText
     );
   });
   if (sent) {
@@ -1255,7 +1204,7 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   if (!getValidatedComposerOwnershipText(composer, entry.reply)) {
     return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
   }
-  entry.lastError = "send button not ready; waiting without reinserting";
+  entry.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
   entry.updatedAt = Date.now();
   await persistPendingHelperDeliveries();
   setPendingHelperDeliveryStatus(entry);
@@ -1297,13 +1246,16 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
     entry.attempts = Number(entry.attempts || 0) + 1;
     entry.updatedAt = Date.now();
     const delivered = await deliverHelperReply(callToken, entry.reply, deliverySettings, async () => {
+      if (deliverySettings.autoSend !== false) {
+        entry.sendActuatorGeneration = pageLifecycleGeneration;
+      }
       setHelperCompletionStatus(entry.call, entry.response);
     }, async () => {
       entry.phase = "inserted";
       entry.updatedAt = Date.now();
       entry.lastError = "";
       await persistPendingHelperDeliveries();
-    }, entry);
+    });
     if (delivered) {
       return finalizePendingHelperDelivery(
         entry,
@@ -1448,9 +1400,9 @@ function migratePendingAgentDeliveryToCurrentPage(options = {}) {
   persistPendingAgentDelivery();
 }
 
-function buildRenderedHelperKey(candidate, semanticCallKey) {
+function buildRenderedHelperKey(candidate, semanticCallKey, pageIdentity = getCurrentPageIdentity()) {
   return [
-    getCurrentPageIdentity(),
+    pageIdentity,
     getHelperRenderRootGeneration(getCandidateRenderRoot(candidate)),
     candidate?.source || "",
     candidate?.blockIndex ?? candidate?.index ?? "",
@@ -2790,8 +2742,7 @@ async function deliverHelperReply(
   reply,
   settings,
   onInserted = () => {},
-  onWriteAttempted = () => {},
-  pendingEntry = null
+  onWriteAttempted = () => {}
 ) {
   return withComposerDeliveryLease({
     kind: "helper-output",
@@ -2826,13 +2777,10 @@ async function deliverHelperReply(
     }
     if (settings.autoSend !== false) {
       callToken.phase = "auto-send";
-      const sent = await clickSendWhenReady(
+      const sent = await runOriginalSendActuatorForOwnedComposer(
         composer,
         () => isComposerDeliveryTokenCurrent(deliveryToken),
-        expectedComposerText,
-        pendingEntry
-          ? (kind) => reservePendingHelperSendActuation(pendingEntry, kind)
-          : null
+        expectedComposerText
       );
       callToken.phase = "auto-send-finished";
       if (!sent) {
@@ -3537,18 +3485,20 @@ async function deliverAgentMessageToPage(profile, message) {
       const composer = ownership.composer;
       pending.composerElement = composer;
       pending.composerText = ownership.text;
-      if (Number(pending.sendActuationCount || 0) >= MAX_PERSISTED_SEND_ACTUATIONS) {
-        pending.lastError = "automatic send actuation budget exhausted; exact agent prompt remains for manual send";
+      if (pending.sendActuatorGeneration === pageLifecycleGeneration) {
+        pending.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
         pending.updatedAt = Date.now();
         updatePendingAgentDeliveryPanel();
         persistPendingAgentDelivery();
         return;
       }
-      const sent = await clickSendWhenReady(
+      pending.sendActuatorGeneration = pageLifecycleGeneration;
+      pending.updatedAt = Date.now();
+      persistPendingAgentDelivery();
+      const sent = await runOriginalSendActuatorForOwnedComposer(
         composer,
         () => isComposerDeliveryTokenCurrent(composerToken),
-        expectedComposerText,
-        (kind) => reservePendingAgentSendActuation(pending, kind)
+        expectedComposerText
       );
       if (!isComposerDeliveryTokenCurrent(composerToken)) {
         return;
@@ -3668,12 +3618,6 @@ function ensurePendingAgentDelivery(profile, message) {
     storageKey: agentPendingDeliveryKey(),
     pageIdentity: getCurrentPageIdentity(),
     pageGeneration: pageLifecycleGeneration,
-    sendActuationCount: 0,
-    sendActuationCounts: {
-      button: 0,
-      form: 0,
-      keyboard: 0
-    },
     lastError: "",
     createdAt: Date.now(),
     updatedAt: Date.now()
@@ -3682,35 +3626,6 @@ function ensurePendingAgentDelivery(profile, message) {
   updatePendingAgentDeliveryPanel();
   persistPendingAgentDelivery();
   return pendingAgentDelivery;
-}
-
-async function reservePendingAgentSendActuation(pending, kind) {
-  if (!pending || pendingAgentDelivery !== pending) {
-    return false;
-  }
-  const normalizedKind = String(kind || "");
-  const kindLimit = sendActuationKindLimit(normalizedKind);
-  const counts = normalizedSendActuationCounts(pending);
-  const count = Math.max(
-    Number(pending.sendActuationCount || 0),
-    counts.button + counts.form + counts.keyboard
-  );
-  if (!kindLimit || counts[normalizedKind] >= kindLimit) {
-    return false;
-  }
-  if (count >= MAX_PERSISTED_SEND_ACTUATIONS) {
-    pending.lastError = "automatic send actuation budget exhausted; exact agent prompt remains for manual send";
-    pending.updatedAt = Date.now();
-    await persistPendingAgentDelivery({ propagateErrors: true });
-    return false;
-  }
-  pending.sendActuationCount = count + 1;
-  counts[normalizedKind] += 1;
-  pending.sendActuationCounts = counts;
-  pending.lastSendActuationKind = normalizedKind;
-  pending.updatedAt = Date.now();
-  await persistPendingAgentDelivery({ propagateErrors: true });
-  return true;
 }
 
 function agentDeliveryPromptStillPresent(pending) {
@@ -3758,9 +3673,6 @@ async function loadPendingAgentDelivery(profile) {
       storageKey: agentPendingDeliveryKey(),
       pageIdentity: getCurrentPageIdentity(),
       pageGeneration: pageLifecycleGeneration,
-      sendActuationCount: Math.max(0, Number(pending.sendActuationCount || 0)),
-      sendActuationCounts: normalizedSendActuationCounts(pending),
-      lastSendActuationKind: String(pending.lastSendActuationKind || ""),
       lastError: pending.lastError || "restored after page reload",
       createdAt: Number(pending.createdAt) || Date.now(),
       updatedAt: Date.now()
@@ -3787,9 +3699,6 @@ function persistPendingAgentDelivery(options = {}) {
     sent: Boolean(pendingAgentDelivery.sent),
     cancelled: Boolean(pendingAgentDelivery.cancelled),
     composerConflict: Boolean(pendingAgentDelivery.composerConflict),
-    sendActuationCount: Math.max(0, Number(pendingAgentDelivery.sendActuationCount || 0)),
-    sendActuationCounts: normalizedSendActuationCounts(pendingAgentDelivery),
-    lastSendActuationKind: String(pendingAgentDelivery.lastSendActuationKind || ""),
     lastError: pendingAgentDelivery.lastError || "",
     createdAt: pendingAgentDelivery.createdAt || Date.now(),
     updatedAt: pendingAgentDelivery.updatedAt || Date.now()
@@ -4517,12 +4426,14 @@ async function findReplyInput(options = {}) {
     }
   }
 
-  const active = closestEditable(document.activeElement);
-  if (active && isVisibleElement(active)) {
-    lastComposerElement = active;
-    return active;
+  const candidate = findCurrentReplyInputSynchronously();
+  if (candidate) {
+    lastComposerElement = candidate;
   }
+  return candidate;
+}
 
+function getVisibleReplyInputCandidates() {
   const preferredSelectors = [
     '[contenteditable="true"][role="textbox"]',
     '[role="textbox"][contenteditable="true"]',
@@ -4532,18 +4443,20 @@ async function findReplyInput(options = {}) {
     '[contenteditable="true"]'
   ];
 
-  const candidates = preferredSelectors
+  return preferredSelectors
     .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
     .filter((node, index, all) => all.indexOf(node) === index)
     .filter(isEditableElement)
     .filter(isVisibleElement)
     .sort((a, b) => editableScore(b) - editableScore(a));
+}
 
-  const candidate = candidates[0] || null;
-  if (candidate) {
-    lastComposerElement = candidate;
+function findCurrentReplyInputSynchronously() {
+  const active = closestEditable(document.activeElement);
+  if (active && isVisibleElement(active)) {
+    return active;
   }
-  return candidate;
+  return getVisibleReplyInputCandidates()[0] || null;
 }
 
 function editableScore(node) {
@@ -4560,134 +4473,252 @@ function editableScore(node) {
   return score;
 }
 
-async function clickSendWhenReady(
-  composer = lastComposerElement || closestEditable(document.activeElement),
-  shouldContinue = () => true,
-  expectedText = null,
-  reservePersistentActuation = null
-) {
-  const originalText = normalizeCommand(expectedText === null ? getComposerText(composer) : expectedText);
-  if (!originalText || !composerOwnershipTextsMatch(getComposerText(composer), originalText)) {
-    return false;
-  }
-  const submittedMessageCountBefore = countSubmittedMessagesMatching(originalText);
-  const stillOwnsComposer = () =>
-    shouldContinue() &&
-    composer?.isConnected !== false &&
-    (!(composer instanceof Element) ||
-      (isEditableElement(composer) && isVisibleElement(composer)));
-  const startedAt = Date.now();
-  const deadlineAt = startedAt + 15_000;
-  let sendActuationCount = 0;
-  let sendButtonClickCount = 0;
-  const maxSendActuations = MAX_PERSISTED_SEND_ACTUATIONS;
-  let formSubmitAttempted = false;
-  let keyboardSubmitAttempted = false;
-  const currentOwnership = async () => {
-    if (countSubmittedMessagesMatching(originalText) > submittedMessageCountBefore) {
-      return "done";
-    }
-    if (!stillOwnsComposer()) {
-      return "aborted";
-    }
-    const ownership = await inspectCurrentComposerOwnership(composer, originalText);
-    if (!stillOwnsComposer()) {
-      return "aborted";
-    }
-    return ownership.state === "owned" && ownership.composer === composer
-      ? "owned"
-      : "aborted";
-  };
-  const reserveActuation = async (kind) => {
-    if (sendActuationCount >= maxSendActuations) {
-      return false;
-    }
-    if (typeof reservePersistentActuation === "function") {
-      try {
-        if (await reservePersistentActuation(kind) !== true) {
-          return false;
-        }
-      } catch (_unused) {
-        // Fail closed: a side effect whose cumulative budget could not be
-        // persisted must not occur.
-        return false;
-      }
-    }
-    sendActuationCount += 1;
-    return true;
-  };
+async function clickSendWhenReady(composer = lastComposerElement || closestEditable(document.activeElement)) {
+  const originalText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
 
-  for (let attempt = 0; attempt < 80 && Date.now() < deadlineAt; attempt += 1) {
-    const ownership = await currentOwnership();
-    if (ownership === "done") {
-      return true;
-    }
-    if (ownership !== "owned") {
-      return false;
-    }
-    const sendButton = findSendButton(composer, false);
-    if (sendButton &&
-        sendButtonClickCount < MAX_SEND_BUTTON_CLICKS &&
-        sendActuationCount < maxSendActuations &&
-        !sendButton.disabled &&
-        sendButton.getAttribute("aria-disabled") !== "true") {
-      if (await currentOwnership() !== "owned") {
-        continue;
-      }
-      const buttonReserved = await reserveActuation("button");
-      if (buttonReserved) {
-        if (await currentOwnership() !== "owned" ||
-            findSendButton(composer, false) !== sendButton ||
-            sendButton.disabled ||
-            sendButton.getAttribute("aria-disabled") === "true") {
-          continue;
-        }
-        sendButtonClickCount += 1;
-        sendButton.click();
-        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-          return true;
-        }
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const sendButton = findSendButton(composer, attempt < 20);
+    if (sendButton && !sendButton.disabled && sendButton.getAttribute("aria-disabled") !== "true") {
+      sendButton.click();
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
       }
     }
 
-    const elapsedMs = Date.now() - startedAt;
-    if (!formSubmitAttempted && elapsedMs >= 3_000) {
-      formSubmitAttempted = true;
-      const submitForm = composer?.closest?.("form");
-      if (submitForm &&
-          await currentOwnership() === "owned" &&
-          await reserveActuation("form") &&
-          await currentOwnership() === "owned" &&
-          trySubmitForm(composer, () =>
-            getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
-          )) {
-        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-          return true;
-        }
+    if (attempt === 20 && trySubmitForm(composer)) {
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
       }
     }
 
-    if (!keyboardSubmitAttempted && elapsedMs >= 4_500) {
-      keyboardSubmitAttempted = true;
-      if (await currentOwnership() === "owned" &&
-          await reserveActuation("keyboard") &&
-          await currentOwnership() === "owned" &&
-          tryKeyboardSubmit(composer, () =>
-            getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) === "owned"
-          )) {
-        if (await waitForSubmitted(composer, originalText, submittedMessageCountBefore)) {
-          return true;
-        }
+    if (attempt === 21 && tryKeyboardSubmit(composer)) {
+      if (await waitForSubmitted(composer, originalText)) {
+        return true;
       }
-    }
-    if (sendActuationCount >= maxSendActuations) {
-      return false;
     }
     await sleep(150);
   }
 
   setStatus("Shell output inserted; send button was not ready", "error");
   return false;
+}
+
+function isOriginalSendActuatorGuardCurrent(guard) {
+  if (!guard || activeOriginalSendActuatorGuard !== guard) {
+    return false;
+  }
+  if (guard.sawTrustedComposerMutation) {
+    return false;
+  }
+  if (typeof guard.shouldContinue === "function" && guard.shouldContinue() !== true) {
+    return false;
+  }
+  if (guard.composer instanceof Element && (
+    guard.composer.isConnected === false ||
+    !isEditableElement(guard.composer) ||
+    !isVisibleElement(guard.composer)
+  )) {
+    return false;
+  }
+  if (guard.composer instanceof Element) {
+    if (lastComposerElement instanceof Element &&
+        lastComposerElement !== guard.composer &&
+        lastComposerElement.isConnected !== false &&
+        isEditableElement(lastComposerElement) &&
+        isVisibleElement(lastComposerElement)) {
+      return false;
+    }
+    const currentComposer = findCurrentReplyInputSynchronously();
+    if (currentComposer && currentComposer !== guard.composer) {
+      return false;
+    }
+    const guardScore = editableScore(guard.composer);
+    if (getVisibleReplyInputCandidates().some((candidate) =>
+      candidate !== guard.composer &&
+      isLikelyReplyComposerCandidate(candidate) &&
+      getComposerText(candidate) &&
+      (isStrongReplyComposerCandidate(candidate) || editableScore(candidate) >= guardScore)
+    )) {
+      return false;
+    }
+  }
+  return Boolean(getValidatedComposerOwnershipText(guard.composer, guard.expectedText));
+}
+
+function isOriginalSendActuatorEventForComposer(event, composer) {
+  const type = String(event?.type || "");
+  const target = event?.target;
+  if ((type === "keydown" || type === "keyup") && target === composer) {
+    return true;
+  }
+  const form = composer?.closest?.("form") || composer?.form || null;
+  if (type === "submit") {
+    return target === form;
+  }
+  if (type !== "click") {
+    return false;
+  }
+  if (event?.isTrusted === false) {
+    return true;
+  }
+  const button = target?.closest?.("button, [role='button']") || target;
+  if (!button) {
+    return false;
+  }
+  if (button === findBoundSendButton()) {
+    return true;
+  }
+  return Boolean(form && (button.form === form || form.contains?.(button)));
+}
+
+function isLikelyReplyComposerCandidate(node) {
+  if (!(node instanceof Element) || isInsideShellToolPanel(node)) {
+    return false;
+  }
+  if (isStrongReplyComposerCandidate(node)) {
+    return true;
+  }
+  const tagName = String(node.tagName || "").toLowerCase();
+  if (tagName !== "input" && tagName !== "textarea") {
+    return false;
+  }
+  const hint = [
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("placeholder"),
+    node.getAttribute?.("name")
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (tagName === "textarea") {
+    return !["shell", "command", "search", "filter", "query", "code"].some((word) => hint.includes(word));
+  }
+  return false;
+}
+
+function isStrongReplyComposerCandidate(node) {
+  if (!(node instanceof Element) || isInsideShellToolPanel(node)) {
+    return false;
+  }
+  const role = String(node.getAttribute?.("role") || "").toLowerCase();
+  const contentEditable = String(node.getAttribute?.("contenteditable") || "").toLowerCase();
+  if (role === "textbox" || contentEditable === "true") {
+    return true;
+  }
+  const hint = [
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("placeholder"),
+    node.getAttribute?.("name")
+  ].filter(Boolean).join(" ").toLowerCase();
+  return ["message", "ask", "reply", "chat", "prompt"].some((word) => hint.includes(word));
+}
+
+async function runOriginalSendActuatorForOwnedComposer(
+  composer,
+  shouldContinue,
+  expectedText
+) {
+  const guard = {
+    composer,
+    expectedText: getValidatedComposerOwnershipText(composer, expectedText),
+    shouldContinue,
+    sawTrustedComposerMutation: false,
+    submittedMessageCountBefore: countSubmittedMessagesMatching(expectedText)
+  };
+  if (!guard.expectedText) {
+    return false;
+  }
+  if (typeof shouldContinue === "function" && shouldContinue() !== true) {
+    return false;
+  }
+  if (activeOriginalSendActuatorGuard) {
+    return false;
+  }
+
+  activeOriginalSendActuatorGuard = guard;
+  const stopStaleSideEffect = (event) => {
+    if (!isOriginalSendActuatorEventForComposer(event, guard.composer)) {
+      return;
+    }
+    if (isOriginalSendActuatorGuardCurrent(guard)) {
+      return;
+    }
+    event.preventDefault?.();
+    event.stopImmediatePropagation?.();
+  };
+  const noticeTrustedComposerMutation = (event) => {
+    const mutatedComposer = closestEditable(event?.target);
+    if (event?.isTrusted === true && (
+      event.target === guard.composer ||
+      (mutatedComposer && mutatedComposer !== guard.composer && isVisibleElement(mutatedComposer))
+    )) {
+      guard.sawTrustedComposerMutation = true;
+    }
+  };
+  const captureTargets = new Set();
+  const captureTypes = ["click", "submit", "keydown", "keyup"];
+  const mutationTypes = ["beforeinput", "input", "change", "cut", "paste"];
+  const attachCaptureTargets = (targetComposer) => {
+    for (const target of [
+      document,
+      targetComposer,
+      targetComposer?.closest?.("form, footer, main, body")
+    ]) {
+      if (!target || captureTargets.has(target) || typeof target.addEventListener !== "function") {
+        continue;
+      }
+      captureTargets.add(target);
+      for (const type of captureTypes) {
+        target.addEventListener(type, stopStaleSideEffect, true);
+      }
+      for (const type of mutationTypes) {
+        target.addEventListener(type, noticeTrustedComposerMutation, true);
+      }
+    }
+  };
+  attachCaptureTargets(composer);
+  try {
+    for (let handoff = 0; handoff < 2; handoff += 1) {
+      let sent = false;
+      try {
+        sent = await clickSendWhenReady(guard.composer);
+      } catch (error) {
+        if (error !== ORIGINAL_SEND_ACTUATOR_CANCELLED) {
+          throw error;
+        }
+      }
+      if (countSubmittedMessagesMatching(guard.expectedText) > guard.submittedMessageCountBefore) {
+        return true;
+      }
+      if (guard.sawTrustedComposerMutation) {
+        return false;
+      }
+      const ownership = await inspectCurrentComposerOwnership(guard.composer, guard.expectedText);
+      if (ownership.state === "owned" && ownership.composer !== guard.composer && handoff === 0) {
+        guard.composer = ownership.composer;
+        guard.expectedText = ownership.text;
+        attachCaptureTargets(guard.composer);
+        if (!isOriginalSendActuatorGuardCurrent(guard)) {
+          return false;
+        }
+        continue;
+      }
+      if (ownership.state === "changed" && getComposerText(ownership.composer)) {
+        return false;
+      }
+      return sent;
+    }
+    return false;
+  } finally {
+    for (const target of captureTargets) {
+      for (const type of captureTypes) {
+        target.removeEventListener(type, stopStaleSideEffect, true);
+      }
+      for (const type of mutationTypes) {
+        target.removeEventListener(type, noticeTrustedComposerMutation, true);
+      }
+    }
+    if (activeOriginalSendActuatorGuard === guard) {
+      activeOriginalSendActuatorGuard = null;
+    }
+  }
 }
 
 function getComposerText(composer) {
@@ -4822,22 +4853,16 @@ function getComposerSendOwnership(composer, originalText, submittedMessageCountB
   return composerOwnershipTextsMatch(currentText, originalText) ? "owned" : "aborted";
 }
 
-function trySubmitForm(composer, stillOwnsComposer = () => true) {
+function trySubmitForm(composer) {
   const form = composer?.closest?.("form");
-  if (!form || !stillOwnsComposer()) {
+  if (!form) {
     return false;
   }
 
   try {
-    if (!stillOwnsComposer()) {
-      return false;
-    }
     if (typeof form.requestSubmit === "function") {
       form.requestSubmit();
     } else {
-      if (!stillOwnsComposer()) {
-        return false;
-      }
       form.dispatchEvent(new SubmitEvent("submit", {
         bubbles: true,
         cancelable: true
@@ -4849,14 +4874,11 @@ function trySubmitForm(composer, stillOwnsComposer = () => true) {
   }
 }
 
-function tryKeyboardSubmit(composer, stillOwnsComposer = () => true) {
-  if (!composer || !stillOwnsComposer()) {
+function tryKeyboardSubmit(composer) {
+  if (!composer) {
     return false;
   }
 
-  if (!stillOwnsComposer()) {
-    return false;
-  }
   composer.focus();
   const events = [
     new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true }),
@@ -4867,30 +4889,21 @@ function tryKeyboardSubmit(composer, stillOwnsComposer = () => true) {
     new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, ctrlKey: true })
   ];
   for (const event of events) {
-    if (!stillOwnsComposer()) {
-      return false;
-    }
     composer.dispatchEvent(event);
   }
   return true;
 }
 
-async function waitForSubmitted(composer, originalText, submittedMessageCountBefore = 0) {
+async function waitForSubmitted(composer, originalText) {
   if (!originalText) {
     return false;
   }
 
   for (let i = 0; i < 8; i += 1) {
     await sleep(125);
-    if (countSubmittedMessagesMatching(originalText) > submittedMessageCountBefore) {
+    const currentText = normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
+    if (!currentText || (currentText !== originalText && !currentText.includes("Shell call"))) {
       return true;
-    }
-    const currentText = getComposerText(composer);
-    if (!composerOwnershipTextsMatch(currentText, originalText)) {
-      if (currentText) {
-        return false;
-      }
-      continue;
     }
   }
   return false;
@@ -4937,20 +4950,18 @@ function countSubmittedMessagesMatching(text) {
 
 function findSendButton(composer = lastComposerElement || closestEditable(document.activeElement), preferBoundOnly = false) {
   const bound = findBoundSendButton();
-  if (bound && isBoundSendButtonAssociatedWithComposer(bound, composer)) {
+  if (bound) {
     return bound;
   }
   if (preferBoundOnly) {
     return null;
   }
 
-  const composerRegion = findComposerSendRegion(composer);
-  const nearbyRoot = composerRegion || document;
+  const nearbyRoot = composer?.closest("form, footer, main, body") || document;
   const composerRect = composer?.getBoundingClientRect();
   const buttons = Array.from(nearbyRoot.querySelectorAll("button, [role='button']"))
     .filter((button) => !isInsideShellToolPanel(button))
     .filter(isVisibleElement)
-    .filter((button) => isSendButtonAssociatedWithComposer(button, composer, composerRegion))
     .map((button) => {
       const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.textContent || ""}`.toLowerCase();
       if (label.includes("stop") || label.includes("voice") || label.includes("model:")) {
@@ -4982,75 +4993,6 @@ function findSendButton(composer = lastComposerElement || closestEditable(docume
     .sort((a, b) => b.score - a.score);
 
   return buttons[0]?.button || null;
-}
-
-function isBoundSendButtonAssociatedWithComposer(button, composer) {
-  // An explicit selector identifies a candidate, not send authority. It must
-  // still prove a structural/geometry relationship to the current composer.
-  return isSendButtonAssociatedWithComposer(button, composer, findComposerSendRegion(composer));
-}
-
-function findComposerSendRegion(composer) {
-  if (!composer) {
-    return null;
-  }
-  const form = composer.closest?.("form");
-  if (form) {
-    return form;
-  }
-  const semanticRegion = composer.closest?.('footer, [role="form"], [data-testid*="composer"], [class*="composer"]');
-  if (semanticRegion) {
-    return semanticRegion;
-  }
-  const parent = composer.parentElement;
-  const parentTag = String(parent?.tagName || "").toUpperCase();
-  return parent && !["BODY", "MAIN", "HTML"].includes(parentTag) ? parent : null;
-}
-
-function isSendButtonAssociatedWithComposer(button, composer, composerRegion = findComposerSendRegion(composer)) {
-  if (!button || !composer) {
-    return false;
-  }
-  const buttonLabels = [
-    button.getAttribute("aria-label") || "",
-    button.getAttribute("title") || "",
-    button.textContent || ""
-  ].map((value) => String(value).replace(/\s+/g, " ").trim().toLowerCase()).filter(Boolean);
-  const knownSendButton = button.matches?.('[data-testid="send-button"], [data-testid="composer-send-button"]') === true;
-  const strictSendLabel = buttonLabels.some((label) =>
-    /^(send|send message|send prompt|submit|发送|发送消息|提交|提交消息|送信|送信する|メッセージを送信|전송|메시지 보내기)$/.test(label)
-  );
-  const composerForm = composer.closest?.("form");
-  if (composerForm) {
-    return button.closest?.("form") === composerForm &&
-      (knownSendButton || strictSendLabel || button.getAttribute("type") === "submit");
-  }
-  const composerId = String(composer.id || "").trim();
-  const controlledIds = String(button.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean);
-  if (composerId && controlledIds.includes(composerId) && (knownSendButton || strictSendLabel)) {
-    return true;
-  }
-  const insideRegion = Boolean(composerRegion?.contains?.(button));
-  if (insideRegion && (knownSendButton || strictSendLabel)) {
-    return true;
-  }
-  return (knownSendButton || strictSendLabel) && areElementsNearEachOther(composer, button, 240);
-}
-
-function areElementsNearEachOther(left, right, maxDistance) {
-  const leftRect = left?.getBoundingClientRect?.();
-  const rightRect = right?.getBoundingClientRect?.();
-  if (!leftRect || !rightRect) {
-    return false;
-  }
-  const leftX = (Number(leftRect.left) + Number(leftRect.right)) / 2;
-  const leftY = (Number(leftRect.top) + Number(leftRect.bottom)) / 2;
-  const rightX = (Number(rightRect.left) + Number(rightRect.right)) / 2;
-  const rightY = (Number(rightRect.top) + Number(rightRect.bottom)) / 2;
-  if (![leftX, leftY, rightX, rightY].every(Number.isFinite)) {
-    return false;
-  }
-  return Math.hypot(leftX - rightX, leftY - rightY) <= maxDistance;
 }
 
 function findBoundSendButton() {
@@ -6099,7 +6041,11 @@ async function runFullChainTest() {
 
   setStatus(`Starting full test on default ForAI:host ${tmux.defaultTarget}: ${token}`, "running");
   const composer = await insertReply(prompt);
-  const sent = await clickSendWhenReady(composer);
+  const sent = await runOriginalSendActuatorForOwnedComposer(
+    composer,
+    () => extensionActive && getCurrentPageIdentity() === observedPageIdentity,
+    getComposerText(composer)
+  );
   if (sent) {
     pendingSelfTest = {
       token,
@@ -6228,6 +6174,26 @@ function escapeRegExp(value) {
 }
 
 function sleep(ms) {
+  if (activeOriginalSendActuatorGuard &&
+      !isOriginalSendActuatorGuardCurrent(activeOriginalSendActuatorGuard)) {
+    return Promise.reject(ORIGINAL_SEND_ACTUATOR_CANCELLED);
+  }
+  if (activeOriginalSendActuatorGuard) {
+    const guard = activeOriginalSendActuatorGuard;
+    return chrome.runtime.sendMessage({
+      type: "content-ui-delay",
+      delayMs: Math.max(0, Number(ms) || 0)
+    }).then((response) => {
+      if (response?.ok !== true) {
+        throw new Error(response?.error || "background UI delay unavailable");
+      }
+    }).catch(() => new Promise((resolve) => setTimeout(resolve, ms)))
+      .then(() => {
+        if (!isOriginalSendActuatorGuardCurrent(guard)) {
+          throw ORIGINAL_SEND_ACTUATOR_CANCELLED;
+        }
+      });
+  }
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 

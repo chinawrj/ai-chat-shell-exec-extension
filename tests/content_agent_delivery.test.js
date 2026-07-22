@@ -48,6 +48,7 @@ function loadContentContext(options = {}) {
     document: {
       activeElement: null,
       getElementById: () => null,
+      addEventListener() {},
       removeEventListener() {}
     },
     location: {
@@ -178,7 +179,7 @@ async function testUnsentAgentMessageIsNotInsertedTwice() {
   await context.pollAndDeliverAgentMessage();
 
   assert.equal(insertCount, 1);
-  assert.equal(clickCount, 2);
+  assert.equal(clickCount, 1, "The v0.8.9 actuator must not be restarted by the persistent poll loop.");
   assert.deepEqual(sentMessages.map((message) => message.type), ["agent-poll"]);
 }
 
@@ -192,7 +193,6 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
-  let secondActuationCounts = null;
   let composerText = "";
   const message = {
     messageId: "reply-001",
@@ -257,9 +257,14 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   assert.match(pendingPanel.textContent, /Keep this tab open/);
   assert.match(pendingPanel.textContent, /Bind send/);
 
+  const submittedPrompt = vm.runInContext("pendingAgentDelivery.promptText", context);
+  context.document.querySelectorAll = (selector) =>
+    selector.includes("data-message-author-role")
+      ? [{ innerText: submittedPrompt, textContent: submittedPrompt }]
+      : [];
   await context.pollAndDeliverAgentMessage();
   assert.equal(insertCount, 2);
-  assert.equal(clickCount, 2);
+  assert.equal(clickCount, 1, "A later poll may observe manual submission but must not restart the actuator.");
   assert.equal(ackCount, 1);
   assert.equal(pendingPanel.hidden, true);
   assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack"]);
@@ -750,22 +755,15 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
     return composer;
   };
   context.findReplyInput = async () => composer;
-  context.clickSendWhenReady = async (currentComposer, _shouldContinue, expectedText, reserve) => {
+  context.clickSendWhenReady = async (currentComposer) => {
     clickCount += 1;
     assert.equal(currentComposer, composer);
-    assert.equal(context.getValidatedComposerOwnershipText(currentComposer, expectedText), expectedText);
-    assert.equal(typeof reserve, "function");
+    assert.ok(context.getComposerText(currentComposer));
     if (clickCount === 1) {
-      assert.equal(await reserve("button"), true);
       return new Promise((resolve) => {
         releaseClick = resolve;
       });
     }
-    assert.equal(await reserve("form"), true);
-    secondActuationCounts = JSON.parse(vm.runInContext(
-      "JSON.stringify(pendingAgentDelivery.sendActuationCounts)",
-      context
-    ));
     return true;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
@@ -793,11 +791,6 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
   const delivery = context.pollAndDeliverAgentMessage();
   await waitFor(() => releaseClick, "agent click attempt before SPA navigation");
   assert.ok(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"]);
-  assert.equal(
-    localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"].sendActuationCounts.button,
-    1,
-    "Agent send authority must be persisted by actuator kind before the side effect."
-  );
 
   const oldGeneration = vm.runInContext("pageLifecycleGeneration", context);
   // Route-only navigation: no composer replacement and no DOM mutation to
@@ -818,7 +811,6 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
   );
   assert.equal(insertCount, 1, "SPA route continuity must never rewrite the prompt.");
   assert.equal(clickCount, 2, "The same exact composer should receive only a send retry.");
-  assert.deepEqual(secondActuationCounts, { button: 1, form: 1, keyboard: 0 });
   assert.equal(ackCount, 1, "Only the successfully submitted prompt may be acknowledged.");
   assert.equal(vm.runInContext("pendingAgentDelivery", context), null);
   assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);

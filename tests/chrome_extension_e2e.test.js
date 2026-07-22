@@ -204,6 +204,40 @@ async function main() {
       panel: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
       users: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((node) => node.innerText || "")
     }))()`);
+    const isolatedWorlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof activeOriginalSendActuatorGuard === "undefined") {
+        return null;
+      }
+      const candidates = typeof getVisibleReplyInputCandidates === "function"
+        ? getVisibleReplyInputCandidates()
+        : [];
+      return {
+        guardCurrent: typeof isOriginalSendActuatorGuardCurrent === "function"
+          ? isOriginalSendActuatorGuardCurrent(activeOriginalSendActuatorGuard)
+          : null,
+        guardExpected: activeOriginalSendActuatorGuard?.expectedText || "",
+        guardActual: typeof getComposerText === "function"
+          ? getComposerText(activeOriginalSendActuatorGuard?.composer)
+          : "",
+        guardComposerId: activeOriginalSendActuatorGuard?.composer?.id || "",
+        guardConnected: activeOriginalSendActuatorGuard?.composer?.isConnected,
+        lastComposerId: lastComposerElement?.id || "",
+        currentComposerId: typeof findCurrentReplyInputSynchronously === "function"
+          ? findCurrentReplyInputSynchronously()?.id || ""
+          : "",
+        activeElementId: document.activeElement?.id || "",
+        candidates: candidates.map((candidate) => ({
+          id: candidate.id || "",
+          tagName: candidate.tagName || "",
+          text: typeof getComposerText === "function" ? getComposerText(candidate) : "",
+          likely: typeof isLikelyReplyComposerCandidate === "function"
+            ? isLikelyReplyComposerCandidate(candidate)
+            : null,
+          score: typeof editableScore === "function" ? editableScore(candidate) : null
+        }))
+      };
+    })()`);
+    deliveryState.isolatedWorlds = isolatedWorlds;
     throw new Error(`${error.message}; deliveryState=${JSON.stringify(deliveryState)}`);
   }
 
@@ -423,6 +457,9 @@ async function main() {
       "",
       "Remove the leading > quote markers when you send the final helper reply."
     ].join("\\n"));
+    const composer = document.getElementById("composer");
+    composer.replaceChildren();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
     return true;
   })()`);
   await page.evaluate("new Promise((resolve) => setTimeout(resolve, 4000))");
@@ -516,7 +553,8 @@ async function main() {
 
   await page.evaluate(`(() => {
     window.__aiShellDeletionGuard?.abort();
-    document.getElementById("send").disabled = false;
+    const send = document.getElementById("send");
+    send.disabled = false;
     appendAssistantToolCall([
       "ai-helper-shell-start:after-deleted-composer-e2e",
       ${JSON.stringify(`printf '${afterDeletionToken}'`)},
@@ -524,12 +562,61 @@ async function main() {
     ].join("\\n"), "text");
     return true;
   })()`);
-  await waitForEvaluate(page, `(() => {
-    const composer = document.getElementById("composer");
-    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
-      .some((node) => (node.innerText || "").includes(${JSON.stringify(afterDeletionToken)}));
-    return submitted && !(composer?.innerText || "").trim();
-  })()`, "new helper to deliver normally after user-cancelled composer output");
+  try {
+    await waitForEvaluate(page, `(() => {
+      const composer = document.getElementById("composer");
+      const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .some((node) => (node.innerText || "").includes(${JSON.stringify(afterDeletionToken)}));
+      return submitted && !(composer?.innerText || "").trim();
+    })()`, "new helper to deliver normally after user-cancelled composer output");
+  } catch (error) {
+    const isolatedWorlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") {
+        return null;
+      }
+      const composer = document.getElementById("composer");
+      const candidate = typeof findSendButton === "function" ? findSendButton(composer, false) : null;
+      return {
+        savedSendSelector,
+        pageLifecycleGeneration,
+        observedPageIdentity,
+        activeComposerDeliveryToken,
+        guardCurrent: typeof isOriginalSendActuatorGuardCurrent === "function"
+          ? isOriginalSendActuatorGuardCurrent(activeOriginalSendActuatorGuard)
+          : null,
+        guardExpectedText: activeOriginalSendActuatorGuard?.expectedText || "",
+        guardActualText: typeof getComposerText === "function"
+          ? getComposerText(activeOriginalSendActuatorGuard?.composer)
+          : "",
+        currentComposerText: typeof getComposerText === "function" ? getComposerText(composer) : "",
+        candidateId: candidate?.id || "",
+        candidateText: candidate?.innerText || candidate?.textContent || "",
+        candidateDisabled: candidate?.disabled,
+        formId: composer?.closest?.("form")?.id || "",
+        pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+          callId: entry.callId,
+          phase: entry.phase,
+          sendActuatorGeneration: entry.sendActuatorGeneration,
+          deliveryInFlight: entry.deliveryInFlight,
+          lastError: entry.lastError
+        }))
+      };
+    })()`);
+    const deletionDiagnostics = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      status: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
+      helperDebug: document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || "",
+      sendButton: {
+        disabled: document.getElementById("send")?.disabled,
+        ariaDisabled: document.getElementById("send")?.getAttribute("aria-disabled")
+      },
+      body: document.body.innerText || "",
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .map((node) => node.innerText || "")
+    }))()`);
+    deletionDiagnostics.isolatedWorlds = isolatedWorlds;
+    throw new Error(`${error.message}; deletionDiagnostics=${JSON.stringify(deletionDiagnostics)}`);
+  }
 
   const refreshMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-refresh-e2e-${process.pid}-${Date.now()}.txt`);
   const refreshOldToken = `ai-chat-shell-refresh-old-${Date.now()}`;
@@ -655,12 +742,20 @@ async function main() {
       text.includes(${JSON.stringify(`stdout:\n${heartbeatToken}`)}) ? text : "";
   })()`, "shell helper result after crossing the MV3 30-second idle threshold");
   assert.ok(heartbeatText.includes(`stdout:\n${heartbeatToken}`));
+  await page.evaluate(`(() => {
+    document.getElementById("send")?.click();
+    return true;
+  })()`);
   await waitForEvaluate(page, `(() => {
     const composer = document.getElementById("composer");
     const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
       .some((node) => (node.innerText || "").includes(${JSON.stringify(heartbeatToken)}));
     return submitted && !(composer?.innerText || "").trim();
   })()`, "heartbeat shell result to be submitted before the next helper");
+  await page.send("Page.reload", { ignoreCache: true });
+  await waitForEvaluate(page, "document.readyState === 'complete'", "test page reload after heartbeat");
+  await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status after heartbeat reload");
+  await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;
@@ -744,6 +839,12 @@ async function main() {
   const fileToken = `ai-chat-shell-file-e2e-${Date.now()}`;
   const filename = `${fileToken}.txt`;
   const fileContent = `file helper wrote ${fileToken}`;
+  await masterPage.send("Page.bringToFront");
+  await waitForEvaluate(
+    page,
+    "document.visibilityState === 'hidden'",
+    "primary helper page to become a hidden tab before send-actuator timing coverage"
+  );
   cleanup.push(() => {
     fs.rmSync(path.join(os.homedir(), "Downloads", filename), { force: true });
   });
@@ -802,28 +903,73 @@ async function main() {
   assert.match(fileText, /File write result:/);
   assert.match(fileText, new RegExp(escapeRegExp(`file: ${filename}`)));
   assert.equal(fs.readFileSync(path.join(os.homedir(), "Downloads", filename), "utf8"), fileContent);
-  const fileDeliveryState = await waitForEvaluateValue(page, `(() => {
-    const composer = document.getElementById("composer");
-    const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
-    const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
-    if (window.__aiShellComposerRedrawnForFileResult !== true ||
-        window.__aiShellRouteChangedForFileResult !== true ||
-        !window.__aiShellFileComposerWriteSnapshot ||
-        newMessages.length !== 1 ||
-        (composer?.innerText || "").trim()) {
-      return null;
-    }
-    const submittedText = newMessages[0].querySelector("pre code")?.textContent || "";
-    return {
-      writtenText: window.__aiShellFileComposerWriteSnapshot,
-      submittedText,
-      newMessageCount: newMessages.length,
-      composerText: composer?.innerText || ""
-    };
-  })()`, "file result to follow exact text across a composer redraw and submit");
+  let fileDeliveryState;
+  try {
+    fileDeliveryState = await waitForEvaluateValue(page, `(() => {
+      const composer = document.getElementById("composer");
+      const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+      const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
+      if (window.__aiShellComposerRedrawnForFileResult !== true ||
+          window.__aiShellRouteChangedForFileResult !== true ||
+          !window.__aiShellFileComposerWriteSnapshot ||
+          newMessages.length !== 1 ||
+          (composer?.innerText || "").trim()) {
+        return null;
+      }
+      const submittedText = newMessages[0].querySelector("pre code")?.textContent || "";
+      return {
+        writtenText: window.__aiShellFileComposerWriteSnapshot,
+        submittedText,
+        newMessageCount: newMessages.length,
+        composerText: composer?.innerText || "",
+        visibilityState: document.visibilityState
+      };
+    })()`, "file result to follow exact text across a composer redraw and submit");
+  } catch (error) {
+    const pageState = await page.evaluate(`(() => ({
+      href: location.href,
+      composer: document.getElementById("composer")?.innerText || "",
+      redraw: window.__aiShellComposerRedrawnForFileResult,
+      routeChanged: window.__aiShellRouteChangedForFileResult,
+      snapshot: window.__aiShellFileComposerWriteSnapshot || "",
+      userCountBefore: window.__aiShellFileUserCountBefore,
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .map((node) => node.innerText || ""),
+      status: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || ""
+    }))()`);
+    const isolatedWorlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") {
+        return null;
+      }
+      const composer = document.getElementById("composer");
+      const candidate = findSendButton(composer, false);
+      return {
+        href: location.href,
+        pageLifecycleGeneration,
+        observedPageIdentity,
+        activeComposerDeliveryToken,
+        guardCurrent: isOriginalSendActuatorGuardCurrent(activeOriginalSendActuatorGuard),
+        currentComposerText: getComposerText(composer),
+        candidateId: candidate?.id || "",
+        candidateDisabled: candidate?.disabled,
+        pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+          callId: entry.callId,
+          phase: entry.phase,
+          pageIdentity: entry.pageIdentity,
+          restored: entry.restored,
+          sendActuatorGeneration: entry.sendActuatorGeneration,
+          deliveryInFlight: entry.deliveryInFlight,
+          lastError: entry.lastError
+        }))
+      };
+    })()`);
+    throw new Error(`${error.message}; filePageState=${JSON.stringify(pageState)}; fileIsolatedWorlds=${JSON.stringify(isolatedWorlds)}`);
+  }
   assert.equal(fileDeliveryState.newMessageCount, 1, "File delivery must append exactly one new user message.");
   assert.equal(fileDeliveryState.submittedText, fileDeliveryState.writtenText, "Submitted file output must exactly match the plugin-owned composer snapshot.");
   assert.equal(fileDeliveryState.composerText, "", "The current visible composer must be empty after file output submission.");
+  assert.equal(fileDeliveryState.visibilityState, "hidden", "The original v0.8.9 send loop must finish while its page is backgrounded.");
+  await page.send("Page.bringToFront");
 
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
@@ -1181,8 +1327,8 @@ async function saveScreenshot(page, filePath) {
   assert.ok(fs.statSync(filePath).size > 1000, `Screenshot was not written: ${filePath}`);
 }
 
-async function waitForEvaluate(page, expression, label) {
-  await waitFor(async () => Boolean(await page.evaluate(expression)), label);
+async function waitForEvaluate(page, expression, label, timeoutMs = E2E_TIMEOUT_MS) {
+  await waitFor(async () => Boolean(await page.evaluate(expression)), label, timeoutMs);
 }
 
 async function waitForEvaluateValue(page, expression, label) {
@@ -1257,9 +1403,17 @@ class CdpClient {
     this.ws = ws;
     this.nextId = 1;
     this.pending = new Map();
+    this.executionContexts = new Map();
     ws.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
       if (!message.id) {
+        if (message.method === "Runtime.executionContextCreated" && message.params?.context?.id) {
+          this.executionContexts.set(message.params.context.id, message.params.context);
+        } else if (message.method === "Runtime.executionContextDestroyed") {
+          this.executionContexts.delete(message.params?.executionContextId);
+        } else if (message.method === "Runtime.executionContextsCleared") {
+          this.executionContexts.clear();
+        }
         return;
       }
       const pending = this.pending.get(message.id);
@@ -1317,6 +1471,34 @@ class CdpClient {
       throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");
     }
     return result.result?.value;
+  }
+
+  async evaluateAcrossContexts(expression) {
+    const values = [];
+    for (const context of this.executionContexts.values()) {
+      try {
+        const result = await this.send("Runtime.evaluate", {
+          expression,
+          contextId: context.id,
+          awaitPromise: true,
+          returnByValue: true
+        });
+        if (!result.exceptionDetails && result.result?.value !== null && result.result?.value !== undefined) {
+          values.push({
+            context: {
+              id: context.id,
+              name: context.name || "",
+              origin: context.origin || "",
+              auxData: context.auxData || null
+            },
+            value: result.result.value
+          });
+        }
+      } catch (_unused) {
+        // A navigation may destroy a context while diagnostics are collected.
+      }
+    }
+    return values;
   }
 
   close() {
