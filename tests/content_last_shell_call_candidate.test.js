@@ -1402,6 +1402,7 @@ async function verifySubmittedMessageMatchingPreservesLineBoundaries() {
   submitted[0] = {
     innerText: "User\nShell call result: stdout: a b",
     textContent: `User${originalText}`,
+    getAttribute: (name) => name === "data-message-author-role" ? "user" : "",
     querySelector: () => ({ textContent: "User" })
   };
   assert.equal(
@@ -1430,6 +1431,130 @@ async function verifySubmittedMessageMatchingPreservesLineBoundaries() {
     context.countSubmittedMessagesMatching(originalText),
     0,
     "Whitespace inside a non-empty line remains semantic and must match exactly."
+  );
+
+  const fencedText = [
+    "Shell call result:",
+    "",
+    "```shell-output",
+    "$ printf rendered-proof",
+    "executionId: 0011223344556677",
+    "",
+    "stdout:",
+    "rendered proof",
+    "```"
+  ].join("\n");
+  const renderedCode = [
+    "$ printf rendered-proof",
+    "executionId: 0011223344556677",
+    "",
+    "stdout:",
+    "rendered proof"
+  ].join("\n");
+  submitted[0] = {
+    innerText: `You\nShell call result:\nshell-output\n${renderedCode}\nShow more`,
+    textContent: `You\nShell call result:\nshell-output\n${renderedCode}\nShow more`,
+    getAttribute: (name) => name === "data-message-author-role" ? "user" : "",
+    querySelector: () => ({ textContent: "You" }),
+    querySelectorAll: (selector) => selector.includes("code") ? [{ textContent: renderedCode }] : []
+  };
+  assert.equal(
+    context.countSubmittedMessagesMatching(fencedText),
+    1,
+    "A chat-rendered fenced shell-output block must prove exact submission even when the host exposes its language label and Show more UI text."
+  );
+  submitted[0].querySelectorAll = () => [{ textContent: renderedCode.replace("rendered proof", "different output") }];
+  assert.equal(
+    context.countSubmittedMessagesMatching(fencedText),
+    0,
+    "Rendered code-block submission proof still requires the complete exact fenced payload."
+  );
+
+  context.location.hostname = "m365.cloud.microsoft";
+  const m365Flattened = fencedText.replace(/\n/g, "");
+  const m365UserMessage = {
+    className: "fai-UserMessage",
+    innerText: `You said:\n${m365Flattened}\n`,
+    textContent: `You said:\n${m365Flattened}\n`,
+    getAttribute: () => "",
+    matches: (selector) => selector === '.fai-UserMessage[role="article"]',
+    querySelector: () => ({ textContent: "You said:" }),
+    querySelectorAll: () => []
+  };
+  context.document.querySelectorAll = () => [m365UserMessage];
+  assert.equal(
+    context.countSubmittedMessagesMatching(fencedText),
+    1,
+    "M365 may flatten a structured plugin delivery after submission; the exact fresh root and complete flattened payload still prove presentation."
+  );
+  const m365EquivalentStructuredLayout = fencedText.replace(
+    "stdout:\nrendered proof",
+    "stdout:rendered\n proof"
+  );
+  assert.equal(m365EquivalentStructuredLayout.replace(/\n/g, ""), m365Flattened);
+  assert.equal(
+    context.countSubmittedMessagesMatching(m365EquivalentStructuredLayout),
+    1,
+    "M365 irreversibly erases structured line boundaries, so this host equivalence is safe only as a fresh before/after count inside the plugin-owned delivery lifecycle."
+  );
+  m365UserMessage.innerText = `You said:\n${m365Flattened.replace("rendered proof", "changed proof")}\n`;
+  m365UserMessage.textContent = m365UserMessage.innerText;
+  assert.equal(
+    context.countSubmittedMessagesMatching(fencedText),
+    0,
+    "M365 submission proof must still reject any non-formatting payload change."
+  );
+  for (const changed of [
+    `prefix${m365Flattened}`,
+    `${m365Flattened}suffix`,
+    m365Flattened.replace("stdout:", "stdout: "),
+    ` ${m365Flattened}`,
+    `${m365Flattened} `,
+    `\t${m365Flattened}`,
+    `${m365Flattened}\t`
+  ]) {
+    m365UserMessage.innerText = `You said:\n${changed}`;
+    m365UserMessage.textContent = m365UserMessage.innerText;
+    assert.equal(
+      context.countSubmittedMessagesMatching(fencedText),
+      0,
+      "M365 submission proof requires complete whole-message equality without extra prefix, suffix, or whitespace."
+    );
+  }
+  const m365CopilotMessage = {
+    ...m365UserMessage,
+    className: "fai-CopilotMessage",
+    innerText: `Copilot said:\n${m365Flattened}\n`,
+    textContent: `Copilot said:\n${m365Flattened}\n`,
+    matches: () => false,
+    querySelector: () => ({ textContent: "Copilot said:" })
+  };
+  context.document.querySelectorAll = () => [m365CopilotMessage];
+  assert.equal(
+    context.countSubmittedMessagesMatching(fencedText),
+    0,
+    "An M365 Copilot response must never be accepted as a submitted user message."
+  );
+  for (const ordinaryNode of [
+    { ...m365UserMessage, matches: () => false },
+    { ...m365UserMessage, matches: (selector) => selector === ".fai-UserMessage" }
+  ]) {
+    ordinaryNode.innerText = `You said:\n${m365Flattened}\n`;
+    ordinaryNode.textContent = ordinaryNode.innerText;
+    context.document.querySelectorAll = () => [ordinaryNode];
+    assert.equal(
+      context.countSubmittedMessagesMatching(fencedText),
+      0,
+      "A generic article or M365-looking node without both the exact class and article role is not submission proof."
+    );
+  }
+  m365UserMessage.innerText = "You said:\na\nbc\n";
+  m365UserMessage.textContent = m365UserMessage.innerText;
+  context.document.querySelectorAll = () => [m365UserMessage];
+  assert.equal(
+    context.countSubmittedMessagesMatching("ab\nc"),
+    0,
+    "M365 submission proof must not collapse distinct newline layouts into the same flattened string."
   );
 }
 
@@ -1673,6 +1798,9 @@ async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
   const messages = [];
   context.chrome.runtime.sendMessage = async (payload) => {
     messages.push(payload);
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
     if (payload.type === "run-result-presented") {
       throw new Error("A user-cancelled composer delivery must not be marked presented.");
     }
@@ -1751,6 +1879,251 @@ async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
   );
 }
 
+async function verifyHostClearedComposerFinalizesDelayedSubmissionBeforeCancellation() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  let submittedCount = 0;
+  let receiptCount = 0;
+  let delayCount = 0;
+  context.countSubmittedMessagesMatching = () => submittedCount;
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay") {
+      delayCount += 1;
+      submittedCount = 1;
+      return { ok: true };
+    }
+    if (payload.type === "run-result-presented") {
+      receiptCount += 1;
+      return { ok: true, found: true, matched: 1 };
+    }
+    assert.equal(payload.type, "run-shell");
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "c001d00dc001d00d",
+      exitCode: 0,
+      stdout: "host-cleared submitted output"
+    };
+  };
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.insertReply = async (text) => {
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => false;
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf host-cleared-submitted" }));
+
+  const first = await context.runAndReply("host-cleared-submitted", call);
+  assert.equal(first.pendingDelivery, true);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+
+  // Chat hosts may clear the owned composer before their submitted-message
+  // DOM is visible. The exact new user message is proof of submission, not a
+  // user cancellation, so the pending entry must finalize and send a receipt.
+  composer.innerText = "";
+  composer.textContent = "";
+  const pendingEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  const finalized = await context.attemptPendingHelperDelivery(pendingEntry, { autoSend: true });
+
+  assert.equal(finalized, true);
+  assert.ok(delayCount >= 1);
+  assert.equal(receiptCount, 1, "A delayed exact submission must produce the canonical presentation receipt.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function verifyM365SubmittedResultProducesOnePresentationReceipt() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  context.location.href = "https://m365.cloud.microsoft/chat/conversation/receipt-test";
+  context.location.hostname = "m365.cloud.microsoft";
+  context.location.origin = "https://m365.cloud.microsoft";
+  context.location.pathname = "/chat/conversation/receipt-test";
+
+  const reply = [
+    "Shell call result:",
+    "",
+    "```shell-output",
+    "$ printf m365-receipt",
+    "executionId: abcdefabcdefabcd",
+    "stdout:",
+    "m365-receipt",
+    "```"
+  ].join("\n");
+  const makeUserMessage = () => ({
+    innerText: `You said:\n${reply.replace(/\n/g, "")}\n`,
+    textContent: `You said:\n${reply.replace(/\n/g, "")}\n`,
+    getAttribute: () => "",
+    matches: (selector) => selector === '.fai-UserMessage[role="article"]',
+    querySelector: () => ({ textContent: "You said:" }),
+    querySelectorAll: () => []
+  });
+  const submittedRoots = [makeUserMessage()];
+  context.document.querySelectorAll = (selector) =>
+    selector.includes(".fai-UserMessage") ? submittedRoots : [];
+
+  const composer = new context.Element();
+  composer.innerText = "";
+  composer.textContent = "";
+  composer.isConnected = true;
+  composer.isContentEditable = true;
+  composer.getAttribute = (name) => ({
+    role: "textbox",
+    contenteditable: "true",
+    "aria-label": "Message Copilot"
+  })[name] || "";
+  composer.querySelector = (selector) => selector === '[aria-hidden="true"][data-lexical-text="true"]'
+    ? { textContent: "\u200b\u200c" }
+    : null;
+  composer.getBoundingClientRect = () => ({ width: 700, height: 100 });
+  composer.closest = () => null;
+  context.insertReply = async (text) => {
+    assert.equal(text, reply);
+    composer.innerText = `${text.replace(/\n/g, "")}\u200b\u200c`;
+    composer.textContent = composer.innerText;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    submittedRoots.push(makeUserMessage());
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+  let receiptCount = 0;
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "run-result-presented") {
+      receiptCount += 1;
+      assert.equal(payload.executionId, "abcdefabcdefabcd");
+      return { ok: true, found: true, matched: 1 };
+    }
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
+    throw new Error(`Unexpected runtime message: ${payload.type}`);
+  };
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  assert.equal(context.countSubmittedMessagesMatching(reply), 1);
+
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf m365-receipt" }));
+  const entry = await context.rememberPendingHelperDelivery(
+    "m365-receipt-call",
+    call,
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "abcdefabcdefabcd",
+      exitCode: 0,
+      stdout: "m365-receipt"
+    },
+    reply,
+    { autoSend: true }
+  );
+  assert.equal(entry.submittedMessageCountBefore, 1, "Existing identical history is only a baseline, not fresh submission proof.");
+
+  const delivered = await context.attemptPendingHelperDelivery(entry, { autoSend: true });
+  assert.equal(delivered, true);
+  assert.equal(context.countSubmittedMessagesMatching(reply), 2);
+  assert.equal(receiptCount, 1, "Only the newly added M365 user message produces one presentation receipt.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  await context.retryPendingHelperDeliveries();
+  assert.equal(receiptCount, 1, "A completed M365 delivery must not send the receipt twice.");
+}
+
+async function verifyM365ClearedComposerWithoutSubmittedRootStaysUnpresented() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.setTimeout = () => 1;
+  context.clearTimeout = () => {};
+  context.location.href = "https://m365.cloud.microsoft/chat/conversation/no-submit-proof";
+  context.location.hostname = "m365.cloud.microsoft";
+  context.location.origin = "https://m365.cloud.microsoft";
+  context.location.pathname = "/chat/conversation/no-submit-proof";
+  context.document.querySelectorAll = () => [];
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+
+  const composer = new context.Element();
+  composer.innerText = "";
+  composer.textContent = "";
+  composer.isConnected = true;
+  composer.isContentEditable = true;
+  composer.getAttribute = (name) => ({
+    role: "textbox",
+    contenteditable: "true",
+    "aria-label": "Message Copilot"
+  })[name] || "";
+  composer.querySelector = (selector) => selector === '[aria-hidden="true"][data-lexical-text="true"]'
+    ? { textContent: "\u200b\u200c" }
+    : null;
+  composer.getBoundingClientRect = () => ({ width: 700, height: 100 });
+  composer.closest = () => null;
+  let insertedReply = "";
+  context.insertReply = async (text) => {
+    insertedReply = text;
+    composer.innerText = `${text.replace(/\n/g, "")}\u200b\u200c`;
+    composer.textContent = composer.innerText;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+
+  let receiptCount = 0;
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
+    if (payload.type === "run-result-presented") {
+      receiptCount += 1;
+      return { ok: true, found: true, matched: 1 };
+    }
+    assert.equal(payload.type, "run-shell");
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "0123456789abcdef",
+      exitCode: 0,
+      stdout: "no-submit-proof"
+    };
+  };
+  context.setStatus = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf no-submit-proof" }));
+
+  const outcome = await context.runAndReply("m365-no-submit-proof", call);
+  assert.equal(outcome.pendingDelivery, true);
+  assert.match(insertedReply, /no-submit-proof/);
+  assert.equal(receiptCount, 0, "A cleared M365 composer without a new exact user-message root must never emit a presentation receipt.");
+  assert.equal(vm.runInContext("locallyPresentedHelperExecutions.size", context), 0);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(
+    vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context),
+    "inserted",
+    "The canonical result remains pending without rewriting or repeating the actuator."
+  );
+}
+
 async function verifyPendingResultRestoresAcrossSamePageReload() {
   const backing = {};
   const firstContext = loadContentContext();
@@ -1794,6 +2167,8 @@ async function verifyPendingResultRestoresAcrossSamePageReload() {
   restoredContext.clearTimeout = () => {};
   restoredContext.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: false });
   const restoredMessages = [];
+  let restoredSubmittedCount = 0;
+  restoredContext.countSubmittedMessagesMatching = () => restoredSubmittedCount;
   restoredContext.chrome.runtime.sendMessage = async (payload) => {
     restoredMessages.push(payload);
     if (payload.type === "run-shell") {
@@ -1817,6 +2192,11 @@ async function verifyPendingResultRestoresAcrossSamePageReload() {
   assert.equal(inserted.length, 1);
   assert.match(inserted[0], /restore me after reload/);
   assert.equal(restoredMessages.filter((payload) => payload.type === "run-shell").length, 0);
+  assert.ok(!restoredMessages.some((payload) => payload.type === "run-result-presented"));
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", restoredContext), 1);
+
+  restoredSubmittedCount = 1;
+  await restoredContext.retryPendingHelperDeliveries();
   assert.ok(restoredMessages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "1122334455667788"));
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", restoredContext), 0);
   const retainedKey = Object.keys(backing).find((key) => key.startsWith("helperPendingDelivery:v1:"));
@@ -1838,7 +2218,9 @@ async function verifyPresentationReceiptRetriesWithoutDuplicateInsertion() {
   let runCount = 0;
   let receiptCount = 0;
   let receiptReady = false;
+  let submittedCount = 0;
   const inserted = [];
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.chrome.runtime.sendMessage = async (payload) => {
     if (payload.type === "run-result-presented") {
       receiptCount += 1;
@@ -1881,9 +2263,15 @@ async function verifyPresentationReceiptRetriesWithoutDuplicateInsertion() {
   const call = context.parseCallPayload(createHelperBlock({ cmd: "printf present-once" }));
 
   const first = await context.runAndReply("presentation-first", call);
-  assert.equal(first.pendingDelivery, false);
+  assert.equal(first.pendingDelivery, true);
   assert.equal(inserted.length, 1);
-  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1, "A failed receipt must remain durably pending after local presentation.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(receiptCount, 0, "Insertion with auto-send disabled is not presentation proof.");
+
+  submittedCount = 1;
+  const manuallySubmittedEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  await context.attemptPendingHelperDelivery(manuallySubmittedEntry, { autoSend: false });
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1, "A failed receipt must remain durably pending after exact manual submission.");
   assert.equal(receiptCount, 1);
 
   const staleDuplicate = await context.runAndReply("presentation-stale-duplicate", call);
@@ -2127,6 +2515,8 @@ async function verifyUnpresentedDuplicateRecoversCleanResult() {
   await Promise.resolve();
   const inserted = [];
   const messages = [];
+  let submittedCount = 0;
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: false });
   context.chrome.runtime.sendMessage = async (payload) => {
     messages.push(payload);
@@ -2177,6 +2567,10 @@ async function verifyUnpresentedDuplicateRecoversCleanResult() {
   assert.doesNotMatch(inserted[0], /^skipped: true$/m);
   assert.doesNotMatch(inserted[0], /^replayedOutput: true$/m);
   assert.doesNotMatch(inserted[0], /^reason:/m);
+  assert.ok(!messages.some((payload) => payload.type === "run-result-presented"));
+  submittedCount = 1;
+  const recoveredEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  await context.attemptPendingHelperDelivery(recoveredEntry, { autoSend: false });
   assert.ok(messages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "0011223344556677"));
 }
 
@@ -2307,6 +2701,156 @@ async function verifyUnrelatedPostInsertionDraftIsNeverAdopted() {
   );
 }
 
+async function verifyM365LexicalFlatteningKeepsOriginalSendActuator() {
+  const context = loadContentContext();
+  const intended = [
+    "Shell call result:",
+    "",
+    "```shell-output",
+    "$ printf m365-owned",
+    "stdout:",
+    "m365-owned",
+    "```"
+  ].join("\n");
+  const composer = new context.Element();
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  composer.isConnected = true;
+  composer.isContentEditable = true;
+  composer.getAttribute = (name) => ({
+    role: "textbox",
+    contenteditable: "true",
+    "aria-label": "Message Copilot"
+  })[name] || "";
+  composer.querySelector = (selector) => selector === '[aria-hidden="true"][data-lexical-text="true"]'
+    ? { textContent: "\u200b\u200c" }
+    : null;
+  composer.getBoundingClientRect = () => ({ width: 700, height: 100 });
+  composer.closest = () => null;
+
+  context.location.href = "https://m365.cloud.microsoft/chat/conversation/test";
+  context.location.hostname = "m365.cloud.microsoft";
+  context.location.origin = "https://m365.cloud.microsoft";
+  context.location.pathname = "/chat/conversation/test";
+  context.findReplyInput = async () => composer;
+  composer.innerText = "\n";
+  composer.textContent = "";
+  composer.querySelector = () => null;
+  assert.equal(
+    context.hasPreexistingComposerContent(composer),
+    false,
+    "M365's real empty Lexical shape (<p><br></p>, innerText newline, empty textContent, no sentinel) remains writable."
+  );
+  composer.querySelector = (selector) => selector === '[aria-hidden="true"][data-lexical-text="true"]'
+    ? { textContent: "\u200b\u200c" }
+    : null;
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  await assert.rejects(
+    () => context.insertReply(intended, { preserveExisting: true }),
+    (error) => error?.code === "composer-occupied"
+  );
+  composer.innerText = " \t\u00a0\u200b\u200c";
+  composer.textContent = composer.innerText;
+  await assert.rejects(
+    () => context.insertReply(intended, { preserveExisting: true }),
+    (error) => error?.code === "composer-occupied"
+  );
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended),
+    "",
+    "A pre-existing flattened M365 user draft is never reusable without post-write ownership proof."
+  );
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    composer.innerText,
+    "Post-write delivery may explicitly accept M365's exact host normalization."
+  );
+
+  const originalHostname = context.location.hostname;
+  context.location.hostname = "example.com";
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    ""
+  );
+  context.location.hostname = originalHostname;
+  const originalGetAttribute = composer.getAttribute;
+  composer.getAttribute = (name) => name === "aria-label" ? "Search chats" : originalGetAttribute(name);
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    ""
+  );
+  composer.getAttribute = originalGetAttribute;
+  const originalQuerySelector = composer.querySelector;
+  composer.querySelector = () => null;
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    ""
+  );
+  composer.querySelector = originalQuerySelector;
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200d`;
+  composer.textContent = composer.innerText;
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    "",
+    "A semantic ZWJ must not be swallowed as the M365 caret sentinel."
+  );
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+
+  context.insertReply = async () => composer;
+  let submittedCount = 0;
+  context.countSubmittedMessagesMatching = () => submittedCount;
+  let sendCalls = 0;
+  context.clickSendWhenReady = async (ownedComposer) => {
+    sendCalls += 1;
+    assert.equal(ownedComposer, composer);
+    submittedCount = 1;
+    return true;
+  };
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    composer.innerText,
+    "M365's exact Lexical newline flattening remains the plugin-owned text."
+  );
+  const delivered = await context.deliverHelperReply({
+    pageIdentity: context.getCurrentPageIdentity(),
+    generation: vm.runInContext("pageLifecycleGeneration", context),
+    phase: "response-received"
+  }, intended, { autoSend: true });
+  assert.equal(delivered, true, "The unchanged v0.8.9 actuator must still run on M365's host-normalized composer text.");
+  assert.equal(sendCalls, 1);
+
+  for (const changed of [
+    ` ${intended.replace(/\n/g, "")}\u200b\u200c`,
+    `\t${intended.replace(/\n/g, "")}\u200b\u200c`,
+    `${intended.replace(/\n/g, "")} \u200b\u200c`,
+    `${intended.replace(/\n/g, "")}\t\u200b\u200c`
+  ]) {
+    composer.innerText = changed;
+    composer.textContent = changed;
+    assert.equal(
+      context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+      "",
+      "M365 composer ownership must preserve every non-newline character, including leading and trailing spaces or tabs."
+    );
+  }
+
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  composer.innerText = composer.innerText.replace("m365-owned", "user-changed");
+  composer.textContent = composer.innerText;
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    "",
+    "Any non-formatting user change must revoke M365 composer ownership."
+  );
+}
+
 async function verifyHelperSendReacquiresRedrawnOwnedComposer() {
   const context = loadContentContext();
   const intended = "Shell call result:\n\nstdout:\nredrawn composer output";
@@ -2321,13 +2865,19 @@ async function verifyHelperSendReacquiresRedrawnOwnedComposer() {
     isConnected: true
   };
   let sendComposer = null;
+  let submittedCount = 0;
   vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async () => oldComposer;
   context.findReplyInput = async () => replacementComposer;
   context.clickSendWhenReady = async (composer) => {
     sendComposer = composer;
-    return composer === replacementComposer &&
+    const sent = composer === replacementComposer &&
       context.getValidatedComposerOwnershipText(composer, intended) === intended;
+    if (sent) {
+      submittedCount = 1;
+    }
+    return sent;
   };
 
   const delivered = await context.deliverHelperReply({
@@ -2416,12 +2966,23 @@ async function verifyInsertReplyPreservesExistingComposerAtomically() {
   assert.equal(focusCount, 0, "The occupied-composer guard must run before focus.");
   assert.equal(mutationCount, 0, "The occupied-composer guard must run before input/DOM mutation.");
 
-  composer.value = "Shell call result:\r\n\r\n\r\nstdout:\r\nreplayed\u00a0output";
-  const reused = await context.insertReply(
-    "Shell call result:\n\nstdout:\nreplayed output",
-    { preserveExisting: true }
+  composer.value = " \t\u00a0";
+  await assert.rejects(
+    () => context.insertReply("Shell call result:\nstdout:\nwhitespace draft", { preserveExisting: true }),
+    (error) => error?.code === "composer-occupied"
   );
-  assert.equal(reused, composer, "An equivalent retry may reuse the existing composer without rewriting it.");
+  assert.equal(composer.value, " \t\u00a0", "Whitespace-only textarea content remains user-owned and untouched.");
+  assert.equal(focusCount, 0);
+  assert.equal(mutationCount, 0);
+
+  composer.value = "Shell call result:\r\n\r\n\r\nstdout:\r\nreplayed\u00a0output";
+  await assert.rejects(
+    () => context.insertReply(
+      "Shell call result:\n\nstdout:\nreplayed output",
+      { preserveExisting: true }
+    ),
+    (error) => error?.code === "composer-occupied"
+  );
   assert.equal(composer.value, "Shell call result:\r\n\r\n\r\nstdout:\r\nreplayed\u00a0output");
   assert.equal(focusCount, 0);
   assert.equal(mutationCount, 0);
@@ -2438,9 +2999,6 @@ async function verifyLaterHelperCannotOverwriteUnsentEarlierOutput() {
   context.insertReply = async (text, options) => {
     assert.equal(options?.preserveExisting, true);
     if (context.getComposerText(composer)) {
-      if (context.getValidatedComposerOwnershipText(composer, text)) {
-        return composer;
-      }
       const error = new Error("composer occupied");
       error.code = "composer-occupied";
       throw error;
@@ -2469,7 +3027,7 @@ async function verifyLaterHelperCannotOverwriteUnsentEarlierOutput() {
   assert.equal(clickCount, 1, "The occupied second delivery must fail before send calibration.");
 
   assert.equal(await context.deliverHelperReply(metadata(), first, { autoSend: true }), false);
-  assert.equal(clickCount, 2, "A replay of the exact first output may reuse the composer and retry sending.");
+  assert.equal(clickCount, 1, "A pre-existing exact-text draft is never adopted or sent by a new queued delivery.");
 }
 
 verifyForceRunUsesLatestHelper()
@@ -2500,6 +3058,9 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyNonPersistentResultRetriesSendOnly())
   .then(() => verifySameRenderedPendingResultRetriesLocallyOnly())
   .then(() => verifyDeletedPendingResultCancelsAutomaticComposerDelivery())
+  .then(() => verifyHostClearedComposerFinalizesDelayedSubmissionBeforeCancellation())
+  .then(() => verifyM365SubmittedResultProducesOnePresentationReceipt())
+  .then(() => verifyM365ClearedComposerWithoutSubmittedRootStaysUnpresented())
   .then(() => verifyPendingResultRestoresAcrossSamePageReload())
   .then(() => verifyPresentationReceiptRetriesWithoutDuplicateInsertion())
   .then(() => verifyCanonicalExecutionCoalescesPendingDeliveries())
@@ -2510,6 +3071,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyRejectedHelperUsesComposerLeaseAndPreservesDraft())
   .then(() => verifyComposerDeliveryLeaseSerializesWriters())
   .then(() => verifyUnrelatedPostInsertionDraftIsNeverAdopted())
+  .then(() => verifyM365LexicalFlatteningKeepsOriginalSendActuator())
   .then(() => verifyHelperSendReacquiresRedrawnOwnedComposer())
   .then(() => verifyTrackedTextareaUpdatesHostState())
   .then(() => verifyInsertReplyPreservesExistingComposerAtomically())

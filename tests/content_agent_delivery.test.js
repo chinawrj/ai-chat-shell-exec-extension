@@ -260,7 +260,11 @@ async function testAgentMessageStaysPendingUntilPageIsReady() {
   const submittedPrompt = vm.runInContext("pendingAgentDelivery.promptText", context);
   context.document.querySelectorAll = (selector) =>
     selector.includes("data-message-author-role")
-      ? [{ innerText: submittedPrompt, textContent: submittedPrompt }]
+      ? [{
+        innerText: submittedPrompt,
+        textContent: submittedPrompt,
+        getAttribute: (name) => name === "data-message-author-role" ? "user" : ""
+      }]
       : [];
   await context.pollAndDeliverAgentMessage();
   assert.equal(insertCount, 2);
@@ -323,11 +327,15 @@ async function testDeletedAgentPromptIsCancelledInsteadOfReinserted() {
 
   await context.pollAndDeliverAgentMessage();
   await context.pollAndDeliverAgentMessage();
+  await context.pollAndDeliverAgentMessage();
 
   assert.equal(insertCount, 1, "A removed agent prompt must never be written into the composer again.");
   assert.equal(clickCount, 1, "A removed agent prompt must not receive another send attempt.");
   assert.equal(ackCount, 2, "Cancellation may retry only the local hub acknowledgement.");
-  assert.deepEqual(sentMessages.map((payload) => payload.type), ["agent-poll", "agent-ack", "agent-ack"]);
+  assert.deepEqual(
+    sentMessages.map((payload) => payload.type).filter((type) => type !== "content-ui-delay"),
+    ["agent-poll", "agent-ack", "agent-ack"]
+  );
 }
 
 async function testRedrawnOwnedAgentComposerStillSends() {
@@ -335,8 +343,10 @@ async function testRedrawnOwnedAgentComposerStillSends() {
   const sentMessages = [];
   let replacementComposer = null;
   let sendComposer = null;
+  let submittedCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     replacementComposer = mockComposerWithText(text);
     return {
@@ -347,7 +357,11 @@ async function testRedrawnOwnedAgentComposerStillSends() {
   context.findReplyInput = async () => replacementComposer;
   context.clickSendWhenReady = async (composer) => {
     sendComposer = composer;
-    return composer === replacementComposer;
+    if (composer === replacementComposer) {
+      submittedCount = 1;
+      return true;
+    }
+    return false;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
     sentMessages.push(payload);
@@ -434,10 +448,12 @@ async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
+  let submittedCount = 0;
   context.document.getElementById = (id) => id === "ai-chat-shell-exec-agent-pending" ? pendingPanel : null;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
   context.agentDeliveryPromptStillPresent = () => true;
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     insertCount += 1;
     assert.match(text, /Message from slave-a for task task-ack:/);
@@ -445,6 +461,7 @@ async function testAckFailureDoesNotResendAlreadySubmittedMessage() {
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
+    submittedCount = 1;
     return true;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
@@ -496,15 +513,18 @@ async function testMissingAckRecordIsIdempotentAfterMessageWasSent() {
   const pendingPanel = { hidden: true, textContent: "" };
   let insertCount = 0;
   let clickCount = 0;
+  let submittedCount = 0;
   context.document.getElementById = (id) => id === "ai-chat-shell-exec-agent-pending" ? pendingPanel : null;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     insertCount += 1;
     return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
+    submittedCount = 1;
     return true;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
@@ -684,9 +704,15 @@ async function testAgentAckDoesNotHoldComposerLease() {
   let resolveAck;
   let ackStarted = false;
   let laterWriterStarted = false;
+  let submittedCount = 0;
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
+  context.chrome.storage.local.set = () => new Promise(() => {});
   context.insertReply = async (text) => mockComposerWithText(text);
-  context.clickSendWhenReady = async () => true;
+  context.clickSendWhenReady = async () => {
+    submittedCount = 1;
+    return true;
+  };
   context.chrome.runtime.sendMessage = async (payload) => {
     if (payload.type === "agent-ack") {
       ackStarted = true;
@@ -747,8 +773,10 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
   let insertCount = 0;
   let clickCount = 0;
   let ackCount = 0;
+  let submittedCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     insertCount += 1;
     composer = mockComposerWithText(text);
@@ -764,6 +792,7 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
         releaseClick = resolve;
       });
     }
+    submittedCount = 1;
     return true;
   };
   context.chrome.runtime.sendMessage = async (payload) => {
@@ -866,15 +895,18 @@ async function testSentPendingAgentDeliverySurvivesReloadWithoutResend() {
   let firstInsertCount = 0;
   let firstClickCount = 0;
   let firstAckCount = 0;
+  let firstSubmittedCount = 0;
   firstContext.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   firstContext.setStatus = () => {};
   firstContext.agentDeliveryPromptStillPresent = () => true;
+  firstContext.countSubmittedMessagesMatching = () => firstSubmittedCount;
   firstContext.insertReply = async (text) => {
     firstInsertCount += 1;
     return mockComposerWithText(text);
   };
   firstContext.clickSendWhenReady = async () => {
     firstClickCount += 1;
+    firstSubmittedCount = 1;
     return true;
   };
   firstContext.chrome.runtime.sendMessage = async (payload) => {
@@ -1148,14 +1180,17 @@ async function testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities() {
   const sentMessages = [];
   let replyText = "";
   let clickCount = 0;
+  let submittedCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     replyText = text;
     return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
     clickCount += 1;
+    submittedCount = 1;
     return true;
   };
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
@@ -1195,13 +1230,18 @@ async function testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities() {
 async function testAgentRosterHelperRequiresRegisteredPage() {
   const context = loadContentContext();
   let replyText = "";
+  let submittedCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     replyText = text;
     return mockComposerWithText(text);
   };
-  context.clickSendWhenReady = async () => true;
+  context.clickSendWhenReady = async () => {
+    submittedCount = 1;
+    return true;
+  };
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
   const call = context.parseCallPayload([
     "ai-helper-agent-roster-start",
@@ -1218,13 +1258,18 @@ async function testAgentTaskStatusHelperDispatchesAndFormatsNextAction() {
   const context = loadContentContext();
   const sentMessages = [];
   let replyText = "";
+  let submittedCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
   context.setStatus = () => {};
+  context.countSubmittedMessagesMatching = () => submittedCount;
   context.insertReply = async (text) => {
     replyText = text;
     return mockComposerWithText(text);
   };
-  context.clickSendWhenReady = async () => true;
+  context.clickSendWhenReady = async () => {
+    submittedCount = 1;
+    return true;
+  };
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
   context.chrome.runtime.sendMessage = async (payload) => {
     sentMessages.push(payload);

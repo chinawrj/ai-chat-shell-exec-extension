@@ -7,6 +7,7 @@ const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+const { CdpPipeClient } = require("./helpers/cdp_pipe_client");
 
 const ROOT_DIR = path.join(__dirname, "..");
 const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
@@ -43,6 +44,7 @@ main()
 async function main() {
   const chromePath = findChrome();
   assert.ok(chromePath, `Chrome e2e requires a Chromium-family browser version ${MIN_CHROMIUM_MAJOR}+.`);
+  const chromeMajor = getChromiumMajor(chromePath);
   assert.ok(commandExists("tmux"), "Chrome e2e requires tmux on PATH.");
   assert.ok(fs.existsSync(EXTENSION_DIR), `Missing extension directory: ${EXTENSION_DIR}`);
   const browserEnv = await setupBrowserEnvironment(chromePath);
@@ -107,18 +109,28 @@ async function main() {
     "--no-sandbox",
     "--test-type",
     "--enable-automation",
-    "--disable-features=DisableLoadExtensionCommandLineSwitch",
     `--user-data-dir=${profileDir}`,
-    `--disable-extensions-except=${EXTENSION_DIR}`,
-    `--load-extension=${EXTENSION_DIR}`,
     "--allow-insecure-localhost",
     "--ignore-certificate-errors",
     "--remote-debugging-port=0",
     "--no-first-run",
     "--no-default-browser-check",
-    "--window-size=1280,900",
-    "about:blank"
+    "--window-size=1280,900"
   ];
+  const useModernExtensionLoader = chromeMajor >= 137;
+  if (useModernExtensionLoader) {
+    chromeArgs.push(
+      "--remote-debugging-pipe",
+      "--enable-unsafe-extension-debugging"
+    );
+  } else {
+    chromeArgs.push(
+      "--disable-features=DisableLoadExtensionCommandLineSwitch",
+      `--disable-extensions-except=${EXTENSION_DIR}`,
+      `--load-extension=${EXTENSION_DIR}`
+    );
+  }
+  chromeArgs.push("about:blank");
   if (browserEnv.headless) {
     chromeArgs.unshift("--headless=new");
   }
@@ -126,11 +138,24 @@ async function main() {
   const chrome = spawn(chromePath, chromeArgs, {
     cwd: ROOT_DIR,
     env: browserEnv.env,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: useModernExtensionLoader
+      ? ["ignore", "pipe", "pipe", "pipe", "pipe"]
+      : ["ignore", "pipe", "pipe"]
   });
   captureProcessOutput(chrome, "chrome");
   cleanup.push(() => stopProcess(chrome));
 
+  if (useModernExtensionLoader) {
+    const pipe = CdpPipeClient.fromProcess(chrome, { timeoutMs: E2E_TIMEOUT_MS });
+    const loaded = await pipe.send("Extensions.loadUnpacked", {
+      path: path.resolve(EXTENSION_DIR)
+    });
+    assert.equal(
+      loaded.id,
+      "lkmeogidbglhedgekjgbpbfjkpapnhke",
+      `Unexpected unpacked extension id: ${loaded.id || "(missing)"}`
+    );
+  }
   const debugPort = await waitForChromeDebugPort(profileDir);
   const pageWsUrl = await waitForChromePageWebSocket(debugPort, "about:blank");
   const page = await CdpClient.connect(pageWsUrl);
@@ -852,6 +877,7 @@ async function main() {
   await page.evaluate(`(() => {
     const composer = document.getElementById("composer");
     window.__aiShellComposerRedrawnForFileResult = false;
+    window.__aiShellComposerTextRestoredForFileResult = false;
     window.__aiShellRouteChangedForFileResult = false;
     window.__aiShellFileComposerWriteSnapshot = "";
     window.__aiShellFileUserCountBefore = document.querySelectorAll('[data-message-author-role="user"]').length;
@@ -862,11 +888,28 @@ async function main() {
       }
       composer.removeEventListener("input", redrawAfterPluginWrite);
       window.__aiShellFileComposerWriteSnapshot = text;
-      const replacement = composer.cloneNode(true);
-      composer.replaceWith(replacement);
-      window.__aiShellComposerRedrawnForFileResult = true;
-      history.pushState({}, "", location.pathname + "?file-result-route=" + Date.now());
-      window.__aiShellRouteChangedForFileResult = true;
+      const sendButton = document.getElementById("send");
+      sendButton.disabled = true;
+      window.setTimeout(() => {
+        const replacement = composer.cloneNode(false);
+        composer.replaceWith(replacement);
+        window.__aiShellComposerRedrawnForFileResult = true;
+        window.setTimeout(() => {
+          replacement.innerText = text;
+          replacement.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            composed: true,
+            inputType: "insertText",
+            data: text
+          }));
+          sendButton.disabled = false;
+          window.__aiShellComposerTextRestoredForFileResult = true;
+        }, 350);
+      }, 100);
+      window.setTimeout(() => {
+        history.pushState({}, "", location.pathname + "?file-result-route=" + Date.now());
+        window.__aiShellRouteChangedForFileResult = true;
+      }, 900);
     };
     composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
@@ -910,6 +953,7 @@ async function main() {
       const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
       const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
       if (window.__aiShellComposerRedrawnForFileResult !== true ||
+          window.__aiShellComposerTextRestoredForFileResult !== true ||
           window.__aiShellRouteChangedForFileResult !== true ||
           !window.__aiShellFileComposerWriteSnapshot ||
           newMessages.length !== 1 ||
@@ -930,6 +974,7 @@ async function main() {
       href: location.href,
       composer: document.getElementById("composer")?.innerText || "",
       redraw: window.__aiShellComposerRedrawnForFileResult,
+      textRestored: window.__aiShellComposerTextRestoredForFileResult,
       routeChanged: window.__aiShellRouteChangedForFileResult,
       snapshot: window.__aiShellFileComposerWriteSnapshot || "",
       userCountBefore: window.__aiShellFileUserCountBefore,
@@ -1004,13 +1049,17 @@ function findChrome() {
   return "";
 }
 
-function isSupportedChromiumBinary(binaryPath) {
+function getChromiumMajor(binaryPath) {
   const result = spawnSync(binaryPath, ["--version"], {
     encoding: "utf8",
     timeout: 3000
   });
   const match = `${result.stdout || ""} ${result.stderr || ""}`.match(/\b(\d+)\./);
-  return result.status === 0 && Number(match?.[1] || 0) >= MIN_CHROMIUM_MAJOR;
+  return result.status === 0 ? Number(match?.[1] || 0) : 0;
+}
+
+function isSupportedChromiumBinary(binaryPath) {
+  return getChromiumMajor(binaryPath) >= MIN_CHROMIUM_MAJOR;
 }
 
 function findPlaywrightChromium() {

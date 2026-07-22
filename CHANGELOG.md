@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-22
+
+- Fixes M365 Copilot results that were written into `Message Copilot` but never sent: the post-write ownership guard now recognizes M365 Lexical's exact newline flattening and caret sentinel, then lets the unchanged v0.8.9 send actuator run.
+- Keeps user drafts fail-closed. M365 host normalization is accepted only after the extension has written the delivery, only on the exact M365 composer signature, and only when every non-newline character is unchanged; every pre-existing draft containing characters—including whitespace-only and exact pending text—remains occupied and is never auto-sent.
+- Recognizes fresh exact M365 `.fai-UserMessage[role="article"]` submissions, including M365's observed newline flattening only for known structured plugin deliveries with no trimming or other character changes. A cleared composer or auto-send-disabled insertion without a new matching user-message root remains unpresented, produces no receipt/tombstone, and cannot suppress later clean backend recovery.
+- Stops inactive generic tool/side-panel textareas from masquerading as a second reply composer and vetoing auto-send, while still failing closed for lower-scored strong reply composers and an actively edited ambiguous textarea.
+- Reports a preflight ownership veto as retryable guard readiness instead of falsely claiming that the original actuator finished; only the synchronous `onStarted` boundary consumes the lifecycle's send generation.
+- Hardens composer redraw ownership without changing the five pinned send-actuator functions (which are identical in v0.8.6 and v0.8.9): an empty-first framework replacement gets one bounded handoff, unrelated search/panel editors cannot steal composer identity, every visible non-empty competing reply draft vetoes sending, trusted removal waits briefly for delayed submission proof, and actuator generation is recorded after guard preflight without awaiting persistence before the first original actuator call.
+- Updates real-browser coverage for empty-first composer redraw plus route change, and loads unpacked extensions on Chrome 137+ through the unsafe-authorized CDP pipe while retaining the legacy Chrome 116-136 startup path.
+
 ## [0.9.7] - 2026-07-22
 
 - Restores the five composer send-actuator functions byte-for-byte from v0.8.9, including its button lookup order, delayed heuristic fallback, form/keyboard fallback timing, and submission detection.

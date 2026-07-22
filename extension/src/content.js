@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.7";
+const CONTENT_SCRIPT_VERSION = "0.9.8";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -51,6 +51,8 @@ const PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS = 500_000;
 const PENDING_HELPER_DELIVERY_MAX_TOTAL_CHARS = 4_000_000;
 const PENDING_HELPER_DELIVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PENDING_HELPER_DELIVERY_RETRY_MS = 2000;
+const COMPOSER_HANDOFF_SETTLE_ATTEMPTS = 12;
+const COMPOSER_HANDOFF_SETTLE_DELAY_MS = 125;
 let helperRenderRootSequence = 0;
 const helperRenderRootIds = new WeakMap();
 const helperRenderRootGenerations = new WeakMap();
@@ -382,9 +384,13 @@ function handleBindingDragStart(event) {
   }
 }
 
-function rememberComposer(target) {
+function rememberComposer(target, options) {
+  options = options || {};
   const editable = closestEditable(target);
-  if (!editable || !isVisibleElement(editable)) {
+  if (!editable ||
+      !isVisibleElement(editable) ||
+      isInsideShellToolPanel(editable) ||
+      (options.force !== true && !isLikelyReplyComposerCandidate(editable))) {
     return;
   }
 
@@ -416,7 +422,7 @@ function bindElement(mode, target) {
       setStatus("Binding failed: selected element is not editable", "error");
       return;
     }
-    rememberComposer(editable);
+    rememberComposer(editable, { force: true });
     setStatus("Bound chat input for this origin", "ok");
     return;
   }
@@ -579,7 +585,15 @@ async function scanForShellCall(options = {}) {
   if (!force) {
     const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, call);
     if (handledReason) {
-      setStatus(`Already handled this helper block: ${summarizeCommand(helperPreviewText(call))}`, "ok");
+      const pendingDelivery = Array.from(pendingHelperDeliveries.values()).find((entry) =>
+        entry.pageIdentity === getCurrentPageIdentity() &&
+        buildSemanticCallKey(entry.call) === semanticCallKey
+      );
+      if (pendingDelivery) {
+        setPendingHelperDeliveryStatus(pendingDelivery);
+      } else {
+        setStatus(`Already handled this helper block: ${summarizeCommand(helperPreviewText(call))}`, "ok");
+      }
       return;
     }
   }
@@ -1094,6 +1108,12 @@ async function cancelPendingHelperDeliveryAfterComposerRemoval(entry) {
   if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
     return true;
   }
+  if (await waitForOriginalSendActuatorSubmissionProof(
+    entry.reply,
+    Number(entry.submittedMessageCountBefore || 0)
+  )) {
+    return finalizePendingHelperDelivery(entry, "submitted");
+  }
   // Emptying or replacing the current text is an explicit user cancellation.
   // Do not immediately fill the composer with another result that was already
   // queued behind it. A later new helper may still create a fresh delivery.
@@ -1139,7 +1159,8 @@ async function finalizePendingHelperDelivery(entry, phase) {
 
 function setPendingHelperDeliveryStatus(entry) {
   const label = pendingHelperDeliveryLabel(entry);
-  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The backend operation and composer write will not be repeated.`, "running");
+  const lastError = entry.lastError ? ` Last send state: ${summarizeCommand(entry.lastError)}.` : "";
+  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The backend operation and composer write will not be repeated.${lastError}`, "running");
 }
 
 async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
@@ -1158,12 +1179,19 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     return false;
   }
 
-  const expectedComposerText = getValidatedComposerOwnershipText(composer, entry.reply);
+  const expectedComposerText = getValidatedComposerOwnershipText(composer, entry.reply, {
+    allowM365HostNormalization: true
+  });
   if (!expectedComposerText) {
     return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
   }
   if (deliverySettings.autoSend === false) {
-    return finalizePendingHelperDelivery(entry, "presented");
+    entry.lastError = "auto-send is disabled; waiting for exact manual submission proof";
+    entry.updatedAt = Date.now();
+    await persistPendingHelperDeliveries();
+    setPendingHelperDeliveryStatus(entry);
+    schedulePendingHelperDeliveryRetry();
+    return false;
   }
   if (entry.sendActuatorGeneration === pageLifecycleGeneration) {
     entry.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
@@ -1179,7 +1207,8 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     pageIdentity: entry.pageIdentity,
     generation: pageLifecycleGeneration,
     phase: "pending-send-only",
-    composerWriteAttempted: true
+    composerWriteAttempted: true,
+    composerCancelled: false
   };
   const sent = await withComposerDeliveryLease({
     kind: "helper-output-send-retry",
@@ -1189,22 +1218,35 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
       return false;
     }
-    entry.sendActuatorGeneration = pageLifecycleGeneration;
-    entry.updatedAt = Date.now();
-    await persistPendingHelperDeliveries();
     return runOriginalSendActuatorForOwnedComposer(
       composer,
       () => isComposerDeliveryTokenCurrent(deliveryToken),
-      expectedComposerText
+      entry.reply,
+      {
+        onStarted: async () => {
+          entry.sendActuatorGeneration = pageLifecycleGeneration;
+          entry.updatedAt = Date.now();
+          await persistPendingHelperDeliveries();
+        },
+        onUserCancellation: () => {
+          callToken.composerCancelled = true;
+        }
+      }
     );
   });
   if (sent) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
-  if (!getValidatedComposerOwnershipText(composer, entry.reply)) {
+  if (callToken.composerCancelled) {
     return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
   }
-  entry.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
+  const currentOwnership = await inspectCurrentComposerOwnership(composer, entry.reply);
+  if (currentOwnership.state === "changed" && getComposerText(currentOwnership.composer)) {
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  entry.lastError = entry.sendActuatorGeneration === pageLifecycleGeneration
+    ? "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions"
+    : "send ownership guard is not ready; will retry without rewriting the composer";
   entry.updatedAt = Date.now();
   await persistPendingHelperDeliveries();
   setPendingHelperDeliveryStatus(entry);
@@ -1241,26 +1283,38 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       callId: entry.callId,
       pageIdentity: entry.pageIdentity,
       generation: pageLifecycleGeneration,
-      phase: "pending-reply"
+      phase: "pending-reply",
+      composerCancelled: false
     };
     entry.attempts = Number(entry.attempts || 0) + 1;
     entry.updatedAt = Date.now();
     const delivered = await deliverHelperReply(callToken, entry.reply, deliverySettings, async () => {
-      if (deliverySettings.autoSend !== false) {
-        entry.sendActuatorGeneration = pageLifecycleGeneration;
-      }
       setHelperCompletionStatus(entry.call, entry.response);
     }, async () => {
       entry.phase = "inserted";
       entry.updatedAt = Date.now();
       entry.lastError = "";
       await persistPendingHelperDeliveries();
+    }, async () => {
+      entry.sendActuatorGeneration = pageLifecycleGeneration;
+      entry.updatedAt = Date.now();
+      await persistPendingHelperDeliveries();
+    }, () => {
+      callToken.composerCancelled = true;
     });
     if (delivered) {
-      return finalizePendingHelperDelivery(
-        entry,
-        deliverySettings.autoSend === false ? "presented" : "submitted"
-      );
+      if (deliverySettings.autoSend === false) {
+        entry.lastError = "auto-send is disabled; waiting for exact manual submission proof";
+        entry.updatedAt = Date.now();
+        await persistPendingHelperDeliveries();
+        setPendingHelperDeliveryStatus(entry);
+        schedulePendingHelperDeliveryRetry();
+        return false;
+      }
+      return finalizePendingHelperDelivery(entry, "submitted");
+    }
+    if (callToken.composerCancelled) {
+      return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
     }
     entry.lastError = "chat composer insertion or send is not complete";
     entry.updatedAt = Date.now();
@@ -2742,7 +2796,9 @@ async function deliverHelperReply(
   reply,
   settings,
   onInserted = () => {},
-  onWriteAttempted = () => {}
+  onWriteAttempted = () => {},
+  onSendActuatorStarted = () => {},
+  onSendActuatorCancelled = () => {}
 ) {
   return withComposerDeliveryLease({
     kind: "helper-output",
@@ -2769,7 +2825,6 @@ async function deliverHelperReply(
       return false;
     }
     composer = ownership.composer;
-    const expectedComposerText = ownership.text;
     callToken.phase = "reply-inserted";
     await onInserted();
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
@@ -2780,7 +2835,11 @@ async function deliverHelperReply(
       const sent = await runOriginalSendActuatorForOwnedComposer(
         composer,
         () => isComposerDeliveryTokenCurrent(deliveryToken),
-        expectedComposerText
+        reply,
+        {
+          onStarted: onSendActuatorStarted,
+          onUserCancellation: onSendActuatorCancelled
+        }
       );
       callToken.phase = "auto-send-finished";
       if (!sent) {
@@ -3341,7 +3400,8 @@ async function deliverAgentMessageToPage(profile, message) {
       await ackSentPendingAgentMessage(profile, message, pending, deliveryToken);
       return;
     }
-    if (countSubmittedMessagesMatching(pending.promptText || "") > 0) {
+    if (countSubmittedMessagesMatching(pending.promptText || "") >
+        Number(pending.submittedMessageCountBefore || 0)) {
       if (!isAgentDeliveryTokenCurrent(deliveryToken)) {
         return;
       }
@@ -3375,7 +3435,7 @@ async function deliverAgentMessageToPage(profile, message) {
         );
         if (ownership.state === "owned") {
           pending.composerElement = ownership.composer;
-          pending.composerText = ownership.text;
+          pending.composerText = normalizeCommand(text);
         } else if (ownership.state === "unavailable") {
           pending.lastError = "composer temporarily unavailable after insertion; waiting without reinserting";
           pending.updatedAt = Date.now();
@@ -3423,7 +3483,9 @@ async function deliverAgentMessageToPage(profile, message) {
           pending.composerElement = insertedComposer;
           pending.updatedAt = Date.now();
           persistPendingAgentDelivery();
-          const expectedComposerText = getValidatedComposerOwnershipText(insertedComposer, text);
+          const expectedComposerText = getValidatedComposerOwnershipText(insertedComposer, text, {
+            allowM365HostNormalization: true
+          });
           if (!expectedComposerText) {
             pending.inserted = false;
             pending.composerText = "";
@@ -3437,7 +3499,7 @@ async function deliverAgentMessageToPage(profile, message) {
             return;
           }
           pending.inserted = true;
-          pending.composerText = expectedComposerText;
+          pending.composerText = normalizeCommand(text);
           pending.composerConflict = false;
           pending.lastError = "";
           pending.updatedAt = Date.now();
@@ -3484,7 +3546,7 @@ async function deliverAgentMessageToPage(profile, message) {
       }
       const composer = ownership.composer;
       pending.composerElement = composer;
-      pending.composerText = ownership.text;
+      pending.composerText = normalizeCommand(text);
       if (pending.sendActuatorGeneration === pageLifecycleGeneration) {
         pending.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
         pending.updatedAt = Date.now();
@@ -3492,19 +3554,28 @@ async function deliverAgentMessageToPage(profile, message) {
         persistPendingAgentDelivery();
         return;
       }
-      pending.sendActuatorGeneration = pageLifecycleGeneration;
-      pending.updatedAt = Date.now();
-      persistPendingAgentDelivery();
+      let composerCancelled = false;
       const sent = await runOriginalSendActuatorForOwnedComposer(
         composer,
         () => isComposerDeliveryTokenCurrent(composerToken),
-        expectedComposerText
+        text,
+        {
+          onStarted: () => {
+            pending.sendActuatorGeneration = pageLifecycleGeneration;
+            pending.updatedAt = Date.now();
+            return persistPendingAgentDelivery();
+          },
+          onUserCancellation: () => {
+            composerCancelled = true;
+          }
+        }
       );
       if (!isComposerDeliveryTokenCurrent(composerToken)) {
         return;
       }
       if (!sent) {
-        if (countSubmittedMessagesMatching(pending.promptText || "") > 0) {
+        if (countSubmittedMessagesMatching(pending.promptText || "") >
+            Number(pending.submittedMessageCountBefore || 0)) {
           pending.sent = true;
           pending.lastError = "";
           pending.updatedAt = Date.now();
@@ -3512,8 +3583,9 @@ async function deliverAgentMessageToPage(profile, message) {
           persistPendingAgentDelivery();
           return true;
         }
-        const currentText = getComposerText(composer);
-        if (currentText !== expectedComposerText) {
+        const currentOwnership = await inspectCurrentComposerOwnership(composer, expectedComposerText);
+        if (composerCancelled ||
+            (currentOwnership.state === "changed" && getComposerText(currentOwnership.composer))) {
           pending.inserted = false;
           pending.composerElement = null;
           pending.composerConflict = false;
@@ -3603,11 +3675,13 @@ function ensurePendingAgentDelivery(profile, message) {
     return pendingAgentDelivery;
   }
 
+  const promptText = formatInboundAgentPrompt(profile, message);
   pendingAgentDelivery = {
     messageId: message.messageId,
     profileAgentId: profile.agentId,
     message,
-    promptText: formatInboundAgentPrompt(profile, message),
+    promptText,
+    submittedMessageCountBefore: countSubmittedMessagesMatching(promptText),
     composerText: "",
     composerElement: null,
     composerWriteAttempted: false,
@@ -3664,6 +3738,7 @@ async function loadPendingAgentDelivery(profile) {
       profileAgentId: pending.profileAgentId,
       message: pending.message,
       promptText: pending.promptText || formatInboundAgentPrompt(profile, pending.message),
+      submittedMessageCountBefore: Number(pending.submittedMessageCountBefore || 0),
       composerText: pending.composerText || "",
       composerWriteAttempted: Boolean(pending.composerWriteAttempted || pending.inserted || pending.sent),
       inserted: Boolean(pending.inserted),
@@ -3693,6 +3768,7 @@ function persistPendingAgentDelivery(options = {}) {
     profileAgentId: pendingAgentDelivery.profileAgentId,
     message: pendingAgentDelivery.message,
     promptText: pendingAgentDelivery.promptText,
+    submittedMessageCountBefore: Number(pendingAgentDelivery.submittedMessageCountBefore || 0),
     composerText: pendingAgentDelivery.composerText || "",
     composerWriteAttempted: Boolean(pendingAgentDelivery.composerWriteAttempted),
     inserted: Boolean(pendingAgentDelivery.inserted),
@@ -4259,19 +4335,14 @@ async function insertReply(text, options = {}) {
   }
 
   if (options.preserveExisting === true) {
-    const currentText = getComposerText(input);
-    if (currentText) {
-      const reusableText = getValidatedComposerOwnershipText(input, text);
-      if (reusableText) {
-        return input;
-      }
+    if (hasPreexistingComposerContent(input)) {
       const error = new Error("Chat composer already contains unsent text; automatic delivery paused without overwriting it.");
       error.code = "composer-occupied";
       throw error;
     }
   }
 
-  rememberComposer(input);
+  rememberComposer(input, { force: true });
   input.focus();
 
   if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
@@ -4410,7 +4481,8 @@ async function findReplyInput(options = {}) {
       lastComposerElement &&
       lastComposerElement.isConnected &&
       isEditableElement(lastComposerElement) &&
-      isVisibleElement(lastComposerElement)) {
+      isVisibleElement(lastComposerElement) &&
+      !isInsideShellToolPanel(lastComposerElement)) {
     return lastComposerElement;
   }
 
@@ -4419,9 +4491,17 @@ async function findReplyInput(options = {}) {
     const selector = profile[composerProfileKey()]?.selector;
     if (selector) {
       const saved = document.querySelector(selector);
-      if (saved && isEditableElement(saved) && isVisibleElement(saved)) {
+      if (saved &&
+          isEditableElement(saved) &&
+          isVisibleElement(saved) &&
+          !isInsideShellToolPanel(saved)) {
         lastComposerElement = saved;
         return saved;
+      }
+      if (saved && isInsideShellToolPanel(saved)) {
+        lastComposerElement = null;
+        lastComposerSelector = "";
+        chrome.storage.local.remove([composerProfileKey()]).catch(() => {});
       }
     }
   }
@@ -4448,12 +4528,17 @@ function getVisibleReplyInputCandidates() {
     .filter((node, index, all) => all.indexOf(node) === index)
     .filter(isEditableElement)
     .filter(isVisibleElement)
+    .filter((node) => !isInsideShellToolPanel(node))
+    .filter(isLikelyReplyComposerCandidate)
     .sort((a, b) => editableScore(b) - editableScore(a));
 }
 
 function findCurrentReplyInputSynchronously() {
   const active = closestEditable(document.activeElement);
-  if (active && isVisibleElement(active)) {
+  if (active &&
+      isVisibleElement(active) &&
+      !isInsideShellToolPanel(active) &&
+      isLikelyReplyComposerCandidate(active)) {
     return active;
   }
   return getVisibleReplyInputCandidates()[0] || null;
@@ -4520,29 +4605,49 @@ function isOriginalSendActuatorGuardCurrent(guard) {
   )) {
     return false;
   }
-  if (guard.composer instanceof Element) {
-    if (lastComposerElement instanceof Element &&
-        lastComposerElement !== guard.composer &&
-        lastComposerElement.isConnected !== false &&
-        isEditableElement(lastComposerElement) &&
-        isVisibleElement(lastComposerElement)) {
-      return false;
-    }
-    const currentComposer = findCurrentReplyInputSynchronously();
-    if (currentComposer && currentComposer !== guard.composer) {
-      return false;
-    }
-    const guardScore = editableScore(guard.composer);
-    if (getVisibleReplyInputCandidates().some((candidate) =>
-      candidate !== guard.composer &&
-      isLikelyReplyComposerCandidate(candidate) &&
-      getComposerText(candidate) &&
-      (isStrongReplyComposerCandidate(candidate) || editableScore(candidate) >= guardScore)
-    )) {
-      return false;
-    }
+  if (guard.composer instanceof Element && hasCompetingVisibleUserDraft(guard)) {
+    return false;
   }
-  return Boolean(getValidatedComposerOwnershipText(guard.composer, guard.expectedText));
+  return Boolean(getValidatedComposerOwnershipText(guard.composer, guard.expectedText, {
+    allowM365HostNormalization: true
+  }));
+}
+
+function hasCompetingVisibleUserDraft(guard, specificCandidate = null) {
+  if (!(guard?.composer instanceof Element)) {
+    return false;
+  }
+  const candidates = specificCandidate ? [specificCandidate] : getVisibleReplyInputCandidates();
+  return candidates.some((candidate) => {
+    if (!(candidate instanceof Element) ||
+        candidate === guard.composer ||
+        !candidate.isConnected ||
+        !isVisibleElement(candidate) ||
+        !isConfidentCompetingReplyComposerCandidate(candidate)) {
+      return false;
+    }
+    const candidateText = getComposerText(candidate);
+    if (!candidateText || composerOwnershipTextsMatch(candidateText, guard.expectedText, candidate, {
+      allowM365HostNormalization: true
+    })) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function isConfidentCompetingReplyComposerCandidate(node) {
+  if (!isLikelyReplyComposerCandidate(node)) {
+    return false;
+  }
+  if (isStrongReplyComposerCandidate(node)) {
+    return true;
+  }
+  // Keep an unlabeled textarea eligible as the primary composer on simple
+  // chat pages, but do not let every prefilled tool/side-panel textarea veto
+  // a proven active reply composer. If the user is actually interacting with
+  // that otherwise-ambiguous textarea, fail closed and preserve its draft.
+  return closestEditable(document.activeElement) === node;
 }
 
 function isOriginalSendActuatorEventForComposer(event, composer) {
@@ -4597,32 +4702,40 @@ function isStrongReplyComposerCandidate(node) {
   if (!(node instanceof Element) || isInsideShellToolPanel(node)) {
     return false;
   }
-  const role = String(node.getAttribute?.("role") || "").toLowerCase();
-  const contentEditable = String(node.getAttribute?.("contenteditable") || "").toLowerCase();
-  if (role === "textbox" || contentEditable === "true") {
-    return true;
-  }
   const hint = [
     node.getAttribute?.("aria-label"),
     node.getAttribute?.("placeholder"),
     node.getAttribute?.("name")
   ].filter(Boolean).join(" ").toLowerCase();
+  if (["search", "filter", "query", "shell", "command", "code"].some((word) => hint.includes(word))) {
+    return false;
+  }
+  const role = String(node.getAttribute?.("role") || "").toLowerCase();
+  const contentEditable = String(node.getAttribute?.("contenteditable") || "").toLowerCase();
+  if (role === "textbox" || contentEditable === "true") {
+    return true;
+  }
   return ["message", "ask", "reply", "chat", "prompt"].some((word) => hint.includes(word));
 }
 
 async function runOriginalSendActuatorForOwnedComposer(
   composer,
   shouldContinue,
-  expectedText
+  expectedText,
+  callbacks
 ) {
+  callbacks = callbacks || {};
+  const canonicalExpectedText = normalizeCommand(expectedText);
   const guard = {
     composer,
-    expectedText: getValidatedComposerOwnershipText(composer, expectedText),
+    expectedText: canonicalExpectedText,
     shouldContinue,
     sawTrustedComposerMutation: false,
-    submittedMessageCountBefore: countSubmittedMessagesMatching(expectedText)
+    submittedMessageCountBefore: countSubmittedMessagesMatching(canonicalExpectedText)
   };
-  if (!guard.expectedText) {
+  if (!canonicalExpectedText || !getValidatedComposerOwnershipText(composer, canonicalExpectedText, {
+    allowM365HostNormalization: true
+  })) {
     return false;
   }
   if (typeof shouldContinue === "function" && shouldContinue() !== true) {
@@ -4647,7 +4760,7 @@ async function runOriginalSendActuatorForOwnedComposer(
     const mutatedComposer = closestEditable(event?.target);
     if (event?.isTrusted === true && (
       event.target === guard.composer ||
-      (mutatedComposer && mutatedComposer !== guard.composer && isVisibleElement(mutatedComposer))
+      hasCompetingVisibleUserDraft(guard, mutatedComposer)
     )) {
       guard.sawTrustedComposerMutation = true;
     }
@@ -4675,6 +4788,17 @@ async function runOriginalSendActuatorForOwnedComposer(
   };
   attachCaptureTargets(composer);
   try {
+    if (!isOriginalSendActuatorGuardCurrent(guard)) {
+      return false;
+    }
+    if (typeof callbacks.onStarted === "function") {
+      try {
+        Promise.resolve(callbacks.onStarted()).catch(() => {});
+      } catch (_unused) {
+        // Starting the pinned actuator must not acquire an asynchronous gap or
+        // be suppressed by best-effort lifecycle persistence.
+      }
+    }
     for (let handoff = 0; handoff < 2; handoff += 1) {
       let sent = false;
       try {
@@ -4688,12 +4812,24 @@ async function runOriginalSendActuatorForOwnedComposer(
         return true;
       }
       if (guard.sawTrustedComposerMutation) {
+        if (await waitForOriginalSendActuatorSubmissionProof(
+          guard.expectedText,
+          guard.submittedMessageCountBefore
+        )) {
+          return true;
+        }
+        callbacks.onUserCancellation?.();
         return false;
       }
-      const ownership = await inspectCurrentComposerOwnership(guard.composer, guard.expectedText);
+      if (typeof guard.shouldContinue === "function" && guard.shouldContinue() !== true) {
+        return false;
+      }
+      const ownership = await waitForOriginalSendActuatorComposerOwnership(
+        guard.composer,
+        guard.expectedText
+      );
       if (ownership.state === "owned" && ownership.composer !== guard.composer && handoff === 0) {
         guard.composer = ownership.composer;
-        guard.expectedText = ownership.text;
         attachCaptureTargets(guard.composer);
         if (!isOriginalSendActuatorGuardCurrent(guard)) {
           return false;
@@ -4703,7 +4839,13 @@ async function runOriginalSendActuatorForOwnedComposer(
       if (ownership.state === "changed" && getComposerText(ownership.composer)) {
         return false;
       }
-      return sent;
+      if (sent && await waitForOriginalSendActuatorSubmissionProof(
+        guard.expectedText,
+        guard.submittedMessageCountBefore
+      )) {
+        return true;
+      }
+      return false;
     }
     return false;
   } finally {
@@ -4725,8 +4867,19 @@ function getComposerText(composer) {
   return normalizeCommand(composer?.innerText || composer?.value || composer?.textContent || "");
 }
 
-function getValidatedComposerOwnershipText(composer, intendedText) {
-  const actual = getComposerText(composer);
+function getRawComposerText(composer) {
+  return String(composer?.innerText || composer?.value || composer?.textContent || "")
+    .replace(/\r\n?/g, "\n");
+}
+
+function hasPreexistingComposerContent(composer) {
+  return [composer?.value, composer?.textContent, composer?.innerText]
+    .some((value) => String(value || "").replace(/\r\n?/g, "\n").replace(/\n/g, "").length > 0);
+}
+
+function getValidatedComposerOwnershipText(composer, intendedText, options = {}) {
+  const rawActual = composer instanceof Element ? getRawComposerText(composer) : getComposerText(composer);
+  const actual = normalizeCommand(rawActual);
   const intended = normalizeCommand(intendedText);
   if (!actual || !intended) {
     return "";
@@ -4734,9 +4887,36 @@ function getValidatedComposerOwnershipText(composer, intendedText) {
   // Some contenteditable hosts vary only CRLFs, non-breaking spaces, and the
   // number of empty paragraph lines. Preserve every non-empty line boundary
   // and its internal whitespace: shell output formatting is semantic.
-  return normalizeComposerOwnershipText(actual) === normalizeComposerOwnershipText(intended)
+  return normalizeComposerOwnershipText(actual) === normalizeComposerOwnershipText(intended) ||
+    (options.allowM365HostNormalization === true &&
+      isM365FlattenedLexicalComposerOwnership(composer, rawActual, intended))
     ? actual
     : "";
+}
+
+function isM365FlattenedLexicalComposerOwnership(composer, actualText, intendedText) {
+  if (location.hostname !== "m365.cloud.microsoft" || !(composer instanceof Element)) {
+    return false;
+  }
+  if (String(composer.getAttribute?.("role") || "").toLowerCase() !== "textbox" ||
+      String(composer.getAttribute?.("contenteditable") || "").toLowerCase() !== "true" ||
+      String(composer.getAttribute?.("aria-label") || "") !== "Message Copilot") {
+    return false;
+  }
+  const sentinel = composer.querySelector?.('[aria-hidden="true"][data-lexical-text="true"]');
+  if (String(sentinel?.textContent || "") !== "\u200b\u200c") {
+    return false;
+  }
+  return m365FlattenedComposerTextMatches(actualText, intendedText);
+}
+
+function m365FlattenedComposerTextMatches(actualText, intendedText) {
+  const actual = String(actualText || "").replace(/\r\n?/g, "\n");
+  if (!actual.endsWith("\u200b\u200c")) {
+    return false;
+  }
+  const intended = normalizeCommand(intendedText).replace(/\n/g, "");
+  return Boolean(intended) && actual.slice(0, -2) === intended;
 }
 
 async function inspectCurrentComposerOwnership(preferredComposer, intendedText) {
@@ -4746,7 +4926,9 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
   // Unit/integration harnesses may provide a non-DOM composer adapter. Real
   // page composers are Elements and always take the fresh-current proof below.
   if (preferredUsable && !(preferredComposer instanceof Element)) {
-    const adapterText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    const adapterText = getValidatedComposerOwnershipText(preferredComposer, intendedText, {
+      allowM365HostNormalization: true
+    });
     if (adapterText) {
       return {
         state: "owned",
@@ -4754,9 +4936,18 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
         text: adapterText
       };
     }
+    if (getComposerText(preferredComposer)) {
+      return {
+        state: "changed",
+        composer: preferredComposer,
+        text: ""
+      };
+    }
   }
   if (preferredUsable && preferredComposer instanceof Element) {
-    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText, {
+      allowM365HostNormalization: true
+    });
     if (preferredText && await isSavedComposerBindingFor(preferredComposer)) {
       return {
         state: "owned",
@@ -4774,7 +4965,9 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
     currentComposer = null;
   }
   if (preferredUsable && currentComposer === preferredComposer) {
-    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText);
+    const preferredText = getValidatedComposerOwnershipText(preferredComposer, intendedText, {
+      allowM365HostNormalization: true
+    });
     if (preferredText) {
       return {
         state: "owned",
@@ -4790,7 +4983,9 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
       text: ""
     };
   }
-  const currentText = getValidatedComposerOwnershipText(currentComposer, intendedText);
+  const currentText = getValidatedComposerOwnershipText(currentComposer, intendedText, {
+    allowM365HostNormalization: true
+  });
   if (currentText) {
     return {
       state: "owned",
@@ -4803,6 +4998,37 @@ async function inspectCurrentComposerOwnership(preferredComposer, intendedText) 
     composer: currentComposer,
     text: ""
   };
+}
+
+async function waitForOriginalSendActuatorComposerOwnership(preferredComposer, intendedText) {
+  let ownership = await inspectCurrentComposerOwnership(preferredComposer, intendedText);
+  for (let attempt = 1; attempt < COMPOSER_HANDOFF_SETTLE_ATTEMPTS; attempt += 1) {
+    if (ownership.state === "owned") {
+      return ownership;
+    }
+    if (ownership.state === "changed" && getComposerText(ownership.composer)) {
+      return ownership;
+    }
+    await contentUiDelay(COMPOSER_HANDOFF_SETTLE_DELAY_MS);
+    ownership = await inspectCurrentComposerOwnership(preferredComposer, intendedText);
+  }
+  return ownership;
+}
+
+async function waitForOriginalSendActuatorSubmissionProof(
+  expectedText,
+  submittedMessageCountBefore,
+  attempts = COMPOSER_HANDOFF_SETTLE_ATTEMPTS
+) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (countSubmittedMessagesMatching(expectedText) > submittedMessageCountBefore) {
+      return true;
+    }
+    if (attempt + 1 < attempts) {
+      await contentUiDelay(COMPOSER_HANDOFF_SETTLE_DELAY_MS);
+    }
+  }
+  return false;
 }
 
 async function isSavedComposerBindingFor(composer) {
@@ -4819,7 +5045,8 @@ async function isSavedComposerBindingFor(composer) {
     return saved === composer &&
       saved.isConnected !== false &&
       isEditableElement(saved) &&
-      isVisibleElement(saved);
+      isVisibleElement(saved) &&
+      !isInsideShellToolPanel(saved);
   } catch (_unused) {
     return false;
   }
@@ -4833,10 +5060,14 @@ function normalizeComposerOwnershipText(text) {
     .join("\n");
 }
 
-function composerOwnershipTextsMatch(actual, expected) {
+function composerOwnershipTextsMatch(actual, expected, composer = null, options = {}) {
   const normalizedActual = normalizeComposerOwnershipText(actual);
   const normalizedExpected = normalizeComposerOwnershipText(expected);
-  return Boolean(normalizedActual) && normalizedActual === normalizedExpected;
+  return Boolean(normalizedActual) && (
+    normalizedActual === normalizedExpected ||
+    (options.allowM365HostNormalization === true &&
+      isM365FlattenedLexicalComposerOwnership(composer, getRawComposerText(composer), expected))
+  );
 }
 
 function getComposerSendOwnership(composer, originalText, submittedMessageCountBefore, stillOwnsComposer) {
@@ -4850,7 +5081,9 @@ function getComposerSendOwnership(composer, originalText, submittedMessageCountB
   if (!stillOwnsComposer()) {
     return "aborted";
   }
-  return composerOwnershipTextsMatch(currentText, originalText) ? "owned" : "aborted";
+  return composerOwnershipTextsMatch(currentText, originalText, composer, {
+    allowM365HostNormalization: true
+  }) ? "owned" : "aborted";
 }
 
 function trySubmitForm(composer) {
@@ -4915,9 +5148,19 @@ function countSubmittedMessagesMatching(text) {
     return 0;
   }
   const comparableExpected = normalizeComposerOwnershipText(expected);
-  return Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-author-role="user"]'))
+  const expectedRenderedCodeBlock = extractExpectedRenderedCodeBlock(expected);
+  return Array.from(document.querySelectorAll(
+    '[data-message-author-role="user"], [data-author-role="user"], .fai-UserMessage[role="article"]'
+  ))
+    .filter(isSubmittedUserMessageNode)
     .filter((node) => {
-      const candidates = [node.innerText, node.textContent]
+      const rawCandidates = [node.innerText, node.textContent]
+        .map((value) => String(value || "").replace(/\r\n?/g, "\n"))
+        .filter(Boolean);
+      if (isM365SubmittedUserMessageNode(node)) {
+        return rawCandidates.some((candidate) => m365SubmittedMessageTextMatches(candidate, expected));
+      }
+      const candidates = rawCandidates
         .map((value) => normalizeCommand(value || ""))
         .filter(Boolean);
       const roleNode = node.querySelector?.('.role, [data-message-role-label], [class*="role"]');
@@ -4928,6 +5171,9 @@ function countSubmittedMessagesMatching(text) {
             candidates.push(normalizeCommand(candidate.slice(roleText.length)));
           }
         }
+      }
+      if (expectedRenderedCodeBlock && renderedCodeBlockMatchesExpected(node, expectedRenderedCodeBlock, candidates)) {
+        return true;
       }
       return candidates.some((messageText) => {
         if (messageText === expected) {
@@ -4946,6 +5192,85 @@ function countSubmittedMessagesMatching(text) {
       });
     })
     .length;
+}
+
+function isSubmittedUserMessageNode(node) {
+  const dataRole = String(
+    node?.getAttribute?.("data-message-author-role") ||
+    node?.getAttribute?.("data-author-role") ||
+    ""
+  ).toLowerCase();
+  if (dataRole === "user") {
+    return true;
+  }
+  return isM365SubmittedUserMessageNode(node);
+}
+
+function isM365SubmittedUserMessageNode(node) {
+  return location.hostname === "m365.cloud.microsoft" &&
+    node?.matches?.('.fai-UserMessage[role="article"]') === true;
+}
+
+function m365SubmittedMessageTextMatches(messageText, expectedText) {
+  const prefix = "You said:\n";
+  const submittedText = String(messageText || "").replace(/\r\n?/g, "\n");
+  if (!submittedText.startsWith(prefix)) {
+    return false;
+  }
+  const submittedPayload = submittedText.slice(prefix.length);
+  const expectedPayload = normalizeCommand(expectedText);
+  const submittedVariants = [submittedPayload];
+  if (submittedPayload.endsWith("\n")) {
+    submittedVariants.push(submittedPayload.slice(0, -1));
+  }
+  if (submittedVariants.includes(expectedPayload)) {
+    return true;
+  }
+  // M365 serializes extension-inserted structured text as one text node and
+  // irreversibly removes its line boundaries. Callers therefore use this host
+  // equivalence only as a before/after count inside the plugin-owned delivery
+  // lifecycle; it is never standalone evidence that an arbitrary historical
+  // payload was presented.
+  return isM365FlattenableStructuredDelivery(expectedPayload) &&
+    submittedVariants.includes(expectedPayload.replace(/\n/g, ""));
+}
+
+function isM365FlattenableStructuredDelivery(expectedText) {
+  const expected = normalizeCommand(expectedText);
+  if (extractExpectedRenderedCodeBlock(expected)) {
+    return true;
+  }
+  return /^Message from [^\n]+:\n/.test(expected) && (
+    /\nMessage id: [^\n]+(?:\n|$)/.test(expected) ||
+    /\n> reply-to: [^\n]+(?:\n|$)/.test(expected)
+  );
+}
+
+function extractExpectedRenderedCodeBlock(expectedText) {
+  const expected = normalizeCommand(expectedText);
+  const match = /(?:^|\n)```shell-output[^\n]*\n([\s\S]*?)\n```(?:\n|$)/.exec(expected);
+  if (!match) {
+    return null;
+  }
+  return {
+    prefix: normalizeComposerOwnershipText(expected.slice(0, match.index)),
+    code: normalizeComposerOwnershipText(match[1])
+  };
+}
+
+function renderedCodeBlockMatchesExpected(node, expectedBlock, messageCandidates) {
+  if (!expectedBlock?.code || typeof node?.querySelectorAll !== "function") {
+    return false;
+  }
+  const prefixMatches = !expectedBlock.prefix || Array.from(messageCandidates || []).some((candidate) =>
+    normalizeComposerOwnershipText(candidate).includes(expectedBlock.prefix)
+  );
+  if (!prefixMatches) {
+    return false;
+  }
+  return Array.from(node.querySelectorAll("pre code, code")).some((codeNode) =>
+    normalizeComposerOwnershipText(codeNode?.textContent || codeNode?.innerText || "") === expectedBlock.code
+  );
 }
 
 function findSendButton(composer = lastComposerElement || closestEditable(document.activeElement), preferBoundOnly = false) {
@@ -6153,7 +6478,7 @@ function installPanelDrag(panel, handle) {
 }
 
 function isInsideShellToolPanel(target) {
-  return target instanceof Element && Boolean(target.closest(`#${STATUS_ID}`));
+  return target instanceof Element && Boolean(target.closest?.(`#${STATUS_ID}`));
 }
 
 function summarizeCommand(command) {
@@ -6180,14 +6505,7 @@ function sleep(ms) {
   }
   if (activeOriginalSendActuatorGuard) {
     const guard = activeOriginalSendActuatorGuard;
-    return chrome.runtime.sendMessage({
-      type: "content-ui-delay",
-      delayMs: Math.max(0, Number(ms) || 0)
-    }).then((response) => {
-      if (response?.ok !== true) {
-        throw new Error(response?.error || "background UI delay unavailable");
-      }
-    }).catch(() => new Promise((resolve) => setTimeout(resolve, ms)))
+    return contentUiDelay(ms)
       .then(() => {
         if (!isOriginalSendActuatorGuardCurrent(guard)) {
           throw ORIGINAL_SEND_ACTUATOR_CANCELLED;
@@ -6195,6 +6513,17 @@ function sleep(ms) {
       });
   }
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function contentUiDelay(ms) {
+  return chrome.runtime.sendMessage({
+    type: "content-ui-delay",
+    delayMs: Math.max(0, Number(ms) || 0)
+  }).then((response) => {
+    if (response?.ok !== true) {
+      throw new Error(response?.error || "background UI delay unavailable");
+    }
+  }).catch(() => new Promise((resolve) => setTimeout(resolve, ms)));
 }
 
 function stableHash(input) {
