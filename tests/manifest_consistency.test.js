@@ -56,7 +56,7 @@ assert.match(contentSource, /Extension v\$\{getDisplayVersion\(\)\}; \$\{formatS
 assert.match(backgroundSource, /message\.type === "extension-version"/);
 assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /message\.type === "tmux-reset-forai"/);
-assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 6/);
+assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 7/);
 assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 2/);
 assert.match(backgroundSource, /startsWith\("vision-"\)/);
 assert.match(backgroundSource, /function handleVisionMessage\(/);

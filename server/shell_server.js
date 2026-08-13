@@ -13,9 +13,13 @@ const EXTENSION_ID = "lkmeogidbglhedgekjgbpbfjkpapnhke";
 const ALLOWED_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
-const MAX_COMMAND_CHARS = 8000;
+const MAX_SHELL_SCRIPT_BYTES = 1024 * 1024;
+const MAX_INTERACTIVE_COMMAND_CHARS = 8000;
+const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
+const COMMAND_ECHO_MAX_CHARS = 8000;
+const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 6;
+const SERVER_PROTOCOL_VERSION = 7;
 const HELPER_PROTOCOL_VERSION = 2;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -391,6 +395,9 @@ function buildHealthResponse() {
     visionAvailable: visionAvailability.available,
     visionErrorCode: visionAvailability.errorCode || "",
     visionError: visionAvailability.error || "",
+    maxShellScriptBytes: MAX_SHELL_SCRIPT_BYTES,
+    maxInteractiveCommandChars: MAX_INTERACTIVE_COMMAND_CHARS,
+    maxWebSocketMessageBytes: MAX_WEBSOCKET_MESSAGE_BYTES,
     ledgerEntries: Object.keys(serverLedger.calls || {}).length
   };
 }
@@ -457,9 +464,7 @@ async function handleMessageText(text) {
   if (!cmd) {
     throw new Error("Missing command.");
   }
-  if (cmd.length > MAX_COMMAND_CHARS) {
-    throw new Error(`Command is too long (${cmd.length} chars, max ${MAX_COMMAND_CHARS}).`);
-  }
+  validateShellScriptSize(cmd);
 
   validateCommand(cmd);
 
@@ -517,7 +522,7 @@ async function handleMessageText(text) {
       });
 
       if (claim.action === "skip") {
-        console.log(`[duplicate] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${currentPane.id} cmd=${JSON.stringify(cmd)}`);
+        console.log(`[duplicate] reason=${claim.reason} callKey=${callKey} previousCallKey=${claim.previousCallKey || ""} target=${currentPane.id} ${formatCommandForLog(cmd)}`);
         const response = buildExecutedDuplicateResponse({
           message,
           callKey,
@@ -535,7 +540,7 @@ async function handleMessageText(text) {
         return response;
       }
 
-      console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${currentPane.id} cwd=${cwd} cmd=${JSON.stringify(cmd)}`);
+      console.log(`[run] callKey=${callKey} seq=${message.seq || ""} target=${currentPane.id} cwd=${cwd} ${formatCommandForLog(cmd)}`);
       const result = await runTmuxShell({
         cmd,
         cwd,
@@ -553,7 +558,7 @@ async function handleMessageText(text) {
         callKey,
         executionId: claim.attemptId,
         agentId: config.agentId || "",
-        cmd,
+        ...buildCommandEchoFields(cmd),
         cwd,
         target: currentPane.id,
         targetName: currentPane.label,
@@ -602,7 +607,7 @@ async function withTmuxShellPaneQueue(options, task) {
 
   try {
     if (previousSlot) {
-      console.log(`[queued] target=${options?.pane?.id || ""} cmd=${JSON.stringify(options?.cmd || "")}`);
+      console.log(`[queued] target=${options?.pane?.id || ""} ${formatCommandForLog(options?.cmd || "")}`);
       await previousSlot;
     }
     const currentPane = await verifyTmuxShellPaneBeforeDispatch(options?.pane, { socketPath, queued: Boolean(previousSlot) });
@@ -1184,9 +1189,6 @@ async function handleRunBoardMessage(message) {
   if (!cmd) {
     throw new Error("Missing board command.");
   }
-  if (cmd.length > MAX_COMMAND_CHARS) {
-    throw new Error(`Board command is too long (${cmd.length} chars, max ${MAX_COMMAND_CHARS}).`);
-  }
   validateBoardCommand(cmd);
   const boardName = normalizeRequestedBoardName(message.boardName || "");
 
@@ -1230,7 +1232,7 @@ async function handleRunBoardMessage(message) {
   });
 
   try {
-    console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} boardName=${boardName || "board"} target=${pane.id} cmd=${JSON.stringify(cmd)}`);
+    console.log(`[run-board] callKey=${callKey} seq=${message.seq || ""} boardName=${boardName || "board"} target=${pane.id} ${formatCommandForLog(cmd)}`);
     const result = await runTmuxBoard({
       cmd,
       pane,
@@ -2906,7 +2908,7 @@ function buildExecutedDuplicateResponse({ message, callKey, claim, cmd, cwd = ""
     id: message?.id,
     callKey,
     executionId,
-    cmd,
+    ...buildCommandEchoFields(cmd),
     boardName,
     cwd,
     target: pane?.id || previous.target || "",
@@ -3470,10 +3472,21 @@ function validateCommand(cmd) {
   }
 }
 
+function validateShellScriptSize(cmd) {
+  const bytes = Buffer.byteLength(String(cmd || ""), "utf8");
+  if (bytes > MAX_SHELL_SCRIPT_BYTES) {
+    throw new Error(`Shell script is too large (${bytes} bytes, max ${MAX_SHELL_SCRIPT_BYTES}).`);
+  }
+  return bytes;
+}
+
 function validateBoardCommand(cmd) {
   const normalized = String(cmd || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
   if (!normalized) {
     throw new Error("Missing board command.");
+  }
+  if (normalized.length > MAX_INTERACTIVE_COMMAND_CHARS) {
+    throw new Error(`Board command is too long (${normalized.length} chars, max ${MAX_INTERACTIVE_COMMAND_CHARS}).`);
   }
   if (normalized.includes("\n")) {
     throw new Error("Board helper body must contain exactly one command line.");
@@ -3501,8 +3514,8 @@ function validateVisionTmuxCommand(cmd) {
   if (normalized.includes("\n")) {
     throw new VisionValidationError("multiline-command", "Vision tmux run supports exactly one command line.");
   }
-  if (normalized.length > MAX_COMMAND_CHARS) {
-    throw new VisionValidationError("command-too-long", `Vision tmux command is too long (${normalized.length} chars, max ${MAX_COMMAND_CHARS}).`);
+  if (normalized.length > MAX_INTERACTIVE_COMMAND_CHARS) {
+    throw new VisionValidationError("command-too-long", `Vision tmux command is too long (${normalized.length} chars, max ${MAX_INTERACTIVE_COMMAND_CHARS}).`);
   }
   validateCommand(normalized);
   return normalized;
@@ -4920,7 +4933,7 @@ function buildBoardTargetErrorResponse({ message, cmd, boardName = "", panes, er
     ok: false,
     id: message.id,
     callKey: message.callKey || message.id || "",
-    cmd,
+    ...buildCommandEchoFields(cmd),
     boardName,
     targetRequired: false,
     error,
@@ -4934,7 +4947,7 @@ function buildTargetErrorResponse({ message, cmd, panes, error, targetRequired }
     ok: false,
     id: message.id,
     callKey: message.callKey || message.id || "",
-    cmd,
+    ...buildCommandEchoFields(cmd),
     targetRequired,
     error,
     tmuxPanes: panes,
@@ -6077,6 +6090,10 @@ function decodeTextFrames(buffer) {
       length = low;
     }
 
+    if (length > MAX_WEBSOCKET_MESSAGE_BYTES) {
+      throw new Error(`WebSocket message is too large (${length} bytes, max ${MAX_WEBSOCKET_MESSAGE_BYTES}).`);
+    }
+
     let mask;
     if (masked) {
       if (buffer.length - offset < 4) {
@@ -6161,6 +6178,34 @@ function hashText(input) {
     .slice(0, 32);
 }
 
+function buildCommandEchoFields(command) {
+  const cmd = String(command || "");
+  if (cmd.length <= COMMAND_ECHO_MAX_CHARS) {
+    return { cmd };
+  }
+  return {
+    cmdPreview: `${cmd.slice(0, COMMAND_PREVIEW_CHARS - 3)}...`,
+    cmdHash: hashText(cmd),
+    cmdChars: cmd.length,
+    cmdBytes: Buffer.byteLength(cmd, "utf8"),
+    cmdTruncated: true
+  };
+}
+
+function formatCommandForLog(command) {
+  const fields = buildCommandEchoFields(command);
+  if (fields.cmd !== undefined) {
+    return `cmd=${JSON.stringify(fields.cmd)}`;
+  }
+  return [
+    `cmdPreview=${JSON.stringify(fields.cmdPreview)}`,
+    `cmdHash=${fields.cmdHash}`,
+    `cmdChars=${fields.cmdChars}`,
+    `cmdBytes=${fields.cmdBytes}`,
+    "cmdTruncated=true"
+  ].join(" ");
+}
+
 function resolveCwd(rawCwd, fallbackCwd = "") {
   if (!rawCwd) {
     return fallbackCwd || os.homedir();
@@ -6177,9 +6222,13 @@ function resolveCwd(rawCwd, fallbackCwd = "") {
 
 module.exports = {
   HELPER_PROTOCOL_VERSION,
+  MAX_INTERACTIVE_COMMAND_CHARS,
+  MAX_SHELL_SCRIPT_BYTES,
+  MAX_WEBSOCKET_MESSAGE_BYTES,
   SERVER_PROTOCOL_VERSION,
   acquirePersistentTmuxPaneOwner,
   buildBoardHelperExample,
+  buildCommandEchoFields,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
   buildServerExecutionKey,
@@ -6245,6 +6294,7 @@ module.exports = {
   startServer,
   stitchOcrPages,
   validateBoardCommand,
+  validateShellScriptSize,
   validateVisionAppName,
   validateVisionTmuxCommand,
   validateVisionKey,

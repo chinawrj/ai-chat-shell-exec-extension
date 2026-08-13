@@ -5,9 +5,12 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {
+  MAX_INTERACTIVE_COMMAND_CHARS,
+  MAX_SHELL_SCRIPT_BYTES,
   buildBoardHelperExample,
   buildBoardLogPath,
   buildBoardTargetErrorResponse,
+  buildCommandEchoFields,
   buildTmuxPaneExecutionTarget,
   buildTmuxShellQueueKey,
   buildDefaultTargetErrorResponse,
@@ -30,6 +33,7 @@ const {
   resolveDownloadsFilePath,
   resolveTmuxTarget,
   validateBoardCommand,
+  validateShellScriptSize,
   writeDownloadsFile
 } = require("../server/shell_server.js");
 
@@ -309,6 +313,24 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
 }
 
 {
+  const formerlyRejectedScript = `# ${"x".repeat(9000)}\nprintf 'large helper ok\\n'`;
+  assert.ok(formerlyRejectedScript.length > MAX_INTERACTIVE_COMMAND_CHARS);
+  assert.equal(validateShellScriptSize(formerlyRejectedScript), Buffer.byteLength(formerlyRejectedScript, "utf8"));
+  assert.equal(validateShellScriptSize("界".repeat(100)), 300, "Shell size limits must use UTF-8 bytes rather than JavaScript characters.");
+  assert.throws(
+    () => validateShellScriptSize("x".repeat(MAX_SHELL_SCRIPT_BYTES + 1)),
+    /Shell script is too large/
+  );
+
+  assert.deepEqual(buildCommandEchoFields("printf ok"), { cmd: "printf ok" });
+  const largeEcho = buildCommandEchoFields(formerlyRejectedScript);
+  assert.equal(largeEcho.cmd, undefined);
+  assert.equal(largeEcho.cmdTruncated, true);
+  assert.equal(largeEcho.cmdChars, formerlyRejectedScript.length);
+  assert.equal(largeEcho.cmdBytes, Buffer.byteLength(formerlyRejectedScript, "utf8"));
+  assert.match(largeEcho.cmdHash, /^[a-f0-9]{32}$/);
+  assert.ok(largeEcho.cmdPreview.length <= 512);
+
   assert.equal(normalizeBoardOutput("\u001b[32mESP>\u001b[0m\r\nok\rESP> "), "ESP>\nESP>");
   assert.equal(normalizeBoardOutput("prompt % \u001b[Kp\bps\r\n  PID TTY\r\n\u001b[1m\u001b[7m%\u001b[27m\u001b[0m          \r \b\u001b[Kprompt % \u001b[K"), "prompt % ps\n  PID TTY\nprompt %");
   assert.equal(normalizeBoardOutput("a\tb\r\n\u001b[4Cindented"), "a       b\n    indented");
@@ -316,6 +338,7 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.equal(outputEndsWithBoardPrompt("version\n1.2.3\nESP32>   ", "ESP32>"), true);
   assert.equal(outputEndsWithBoardPrompt("version\n1.2.3\nbusy", "ESP32>"), false);
   assert.doesNotThrow(() => validateBoardCommand("version"));
+  assert.throws(() => validateBoardCommand("x".repeat(MAX_INTERACTIVE_COMMAND_CHARS + 1)), /Board command is too long/);
   assert.throws(() => validateBoardCommand("version\nhelp"), /exactly one command line/);
   assert.throws(() => validateBoardCommand("ai-helper-board-start"), /copied shell-output text/);
   assert.throws(() => validateBoardCommand("ai-helper-board-R1-start"), /copied shell-output text/);

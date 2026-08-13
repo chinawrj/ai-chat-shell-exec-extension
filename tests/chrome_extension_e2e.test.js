@@ -61,7 +61,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      6,
+      7,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -781,6 +781,31 @@ async function main() {
   await waitForEvaluate(page, "document.readyState === 'complete'", "test page reload after heartbeat");
   await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, "extension status after heartbeat reload");
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
+
+  const largeCommandToken = `ai-chat-shell-large-command-${Date.now()}`;
+  const largeCommand = `# ${"x".repeat(9000)}\nprintf '${largeCommandToken}'`;
+  assert.ok(largeCommand.length > 8000, "The long-command e2e fixture must exceed the removed legacy limit.");
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:large-command-e2e",
+      ${JSON.stringify(largeCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const largeCommandText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("Shell call result:") &&
+      text.includes("cmdHash:") &&
+      text.includes(${JSON.stringify(`stdout:\n${largeCommandToken}`)}) ? text : "";
+  })()`, "shell helper command longer than the legacy 8000-character limit");
+  assert.ok(largeCommandText.includes(`stdout:\n${largeCommandToken}`));
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(largeCommandToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "large shell result to be submitted before the next helper");
 
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;
