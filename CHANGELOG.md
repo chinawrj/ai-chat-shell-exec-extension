@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-08-13
+
+- Replaces the legacy 8000-character shell-helper cap with a 1 MiB UTF-8 script-body limit now that helpers execute from temporary script files.
+- Keeps interactive board and vision commands on their independent 8000-character single-line limit, and rejects complete WebSocket messages above 2 MiB from the announced frame length before buffering the payload.
+- Bounds long command response echoes, server logs, and pending-delivery accounting with previews, hashes, and total-storage limits.
+- Bumps the server protocol to 7, exposes the active script/interactive/transport limits in server health, and adds unit plus real Chromium coverage for a 9000-character helper script.
+
 ## [0.9.8] - 2026-07-22
 
 - Fixes M365 Copilot results that were written into `Message Copilot` but never sent: the post-write ownership guard now recognizes M365 Lexical's exact newline flattening and caret sentinel, then lets the unchanged v0.8.9 send actuator run.
