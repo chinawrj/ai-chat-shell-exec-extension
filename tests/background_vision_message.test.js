@@ -198,8 +198,8 @@ function currentHealthBody() {
     allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
     releaseVersion: "0.6.0",
     serverReleaseVersion: "0.6.0",
-    protocolVersion: 6,
-    serverProtocolVersion: 6,
+    protocolVersion: 7,
+    serverProtocolVersion: 7,
     helperProtocolVersion: 2
   };
 }

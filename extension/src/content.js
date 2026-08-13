@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.8";
+const CONTENT_SCRIPT_VERSION = "0.9.9";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -928,12 +928,17 @@ function prunePendingHelperDeliveryEntries(entries, now = Date.now()) {
   while (valid.length > PENDING_HELPER_DELIVERY_MAX_ENTRIES) {
     valid.shift();
   }
-  let totalChars = valid.reduce((sum, entry) => sum + String(entry.reply || "").length, 0);
+  let totalChars = valid.reduce((sum, entry) => sum + pendingHelperDeliveryStoredChars(entry), 0);
   while (valid.length > 1 && totalChars > PENDING_HELPER_DELIVERY_MAX_TOTAL_CHARS) {
     const removed = valid.shift();
-    totalChars -= String(removed?.reply || "").length;
+    totalChars -= pendingHelperDeliveryStoredChars(removed);
   }
   return valid;
+}
+
+function pendingHelperDeliveryStoredChars(entry) {
+  return String(entry?.reply || "").length +
+    String(entry?.call?.cmd || "").length;
 }
 
 function isStoredPendingHelperDelivery(entry, now = Date.now()) {

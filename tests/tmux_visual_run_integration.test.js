@@ -7,6 +7,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const {
+  MAX_INTERACTIVE_COMMAND_CHARS,
   buildTmuxLiteralLineArgs,
   handleVisionMessage,
   listTmuxPanes,
@@ -79,6 +80,10 @@ function runTmux(socketPath, args, options = {}) {
 
     assert.equal(validateVisionTmuxCommand("false && echo no || echo yes"), "false && echo no || echo yes");
     assert.throws(() => validateVisionTmuxCommand("echo one\necho two"), /one command line/);
+    assert.throws(
+      () => validateVisionTmuxCommand("x".repeat(MAX_INTERACTIVE_COMMAND_CHARS + 1)),
+      /Vision tmux command is too long/
+    );
 
     const disabledVisualMessage = await handleVisionMessage({
       type: "vision-tmux-run-line",

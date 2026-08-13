@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 
 const assert = require("node:assert/strict");
-const { decodeTextFrames, encodeTextFrame, writeWebSocketResponse } = require("../server/shell_server.js");
+const {
+  MAX_WEBSOCKET_MESSAGE_BYTES,
+  decodeTextFrames,
+  encodeTextFrame,
+  writeWebSocketResponse
+} = require("../server/shell_server.js");
 
 function maskedClientFrame(text) {
   const payload = Buffer.from(text, "utf8");
@@ -88,6 +93,19 @@ function decodeIncrementally(frame, chunkSizes) {
   const decoded = decodeTextFrames(frame);
   assert.deepEqual(decoded.messages, ["server response"]);
   assert.equal(decoded.remaining.length, 0);
+}
+
+{
+  const oversizedHeader = Buffer.alloc(10);
+  oversizedHeader[0] = 0x81;
+  oversizedHeader[1] = 0x80 | 127;
+  oversizedHeader.writeUInt32BE(0, 2);
+  oversizedHeader.writeUInt32BE(MAX_WEBSOCKET_MESSAGE_BYTES + 1, 6);
+  assert.throws(
+    () => decodeTextFrames(oversizedHeader),
+    /WebSocket message is too large/,
+    "The decoder must reject an announced oversized frame before buffering its payload."
+  );
 }
 
 {
