@@ -61,7 +61,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      8,
+      9,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -811,6 +811,48 @@ async function main() {
   assert.ok(!refreshDuplicateUiAfter.userText.includes("replayedOutput: true"));
   assert.equal(fs.statSync(refreshMarkerPath).mtimeMs, refreshMarkerMtimeMs, "duplicate adjudication must not execute the old command again");
 
+  const settingsPage = await openChromePage(debugPort, `${EXPECTED_EXTENSION_ORIGIN}/popup.html`);
+  cleanup.push(() => settingsPage.close());
+  await settingsPage.send("Runtime.enable");
+  await waitForEvaluate(settingsPage, "document.readyState === 'complete'", "extension settings page load");
+  await settingsPage.evaluate("chrome.storage.sync.set({ defaultTimeoutMs: 1000 })");
+
+  const idleControlToken = `ai-chat-shell-idle-control-${Date.now()}`;
+  const idleControlCommand = `printf '${idleControlToken}\\n'; sleep 60; printf 'IDLE_CONTROL_SHOULD_NOT_FINISH\\n'`;
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:idle-control-e2e",
+      ${JSON.stringify(idleControlCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const control = document.getElementById("ai-chat-shell-exec-run-control");
+    return control && control.hidden === false && control.innerText.includes("No output update");
+  })()`, "idle timeout control prompt");
+  await page.evaluate(`(() => {
+    document.querySelector('[data-shell-tool-action="continue-helper"]')?.click();
+    return true;
+  })()`);
+  await waitForEvaluate(page, `document.getElementById("ai-chat-shell-exec-run-control")?.hidden === true`, "idle timeout continue acknowledgement");
+  await waitForEvaluate(page, `(() => {
+    const control = document.getElementById("ai-chat-shell-exec-run-control");
+    return control && control.hidden === false && control.innerText.includes("No output update");
+  })()`, "idle timeout prompt after continued wait");
+  await page.evaluate(`(() => {
+    document.querySelector('[data-shell-tool-action="terminate-helper"]')?.click();
+    return true;
+  })()`);
+  const idleTerminatedText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`stdout:\n${idleControlToken}`)}) &&
+      text.includes("exitCode: 130") ? text : "";
+  })()`, "idle helper result after panel termination");
+  assert.match(idleTerminatedText, /^interrupted: true$/m);
+  assert.match(idleTerminatedText, /^interruptSignal: INT$/m);
+  await settingsPage.evaluate("chrome.storage.sync.set({ defaultTimeoutMs: 180000 })");
+
   const heartbeatToken = `ai-chat-shell-heartbeat-${Date.now()}`;
   const heartbeatCommand = `sleep 32; printf '${heartbeatToken}'`;
   await page.evaluate(`(() => {
@@ -825,7 +867,7 @@ async function main() {
     const text = document.body.innerText || "";
     return text.includes("Shell call result:") &&
       text.includes(${JSON.stringify(`stdout:\n${heartbeatToken}`)}) ? text : "";
-  })()`, "shell helper result after crossing the MV3 30-second idle threshold");
+  })()`, "shell helper result after a long MV3 service-worker interval");
   assert.ok(heartbeatText.includes(`stdout:\n${heartbeatToken}`));
   await page.evaluate(`(() => {
     document.getElementById("send")?.click();

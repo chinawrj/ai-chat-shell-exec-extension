@@ -148,8 +148,8 @@ const context = {
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       releaseVersion: "0.6.0",
       serverReleaseVersion: "0.6.0",
-      protocolVersion: 8,
-      serverProtocolVersion: 8,
+      protocolVersion: 9,
+      serverProtocolVersion: 9,
       helperProtocolVersion: 2
     })
   }),
@@ -255,7 +255,7 @@ async function main() {
   assert.equal(sentPayloads[2].agentId, "slave-a");
   assert.equal(sentPayloads[2].cmd, "version");
   assert.equal(sentPayloads[2].boardName, "");
-  assert.equal(sentPayloads[2].timeoutMs, 30000);
+  assert.equal(sentPayloads[2].timeoutMs, 180000);
   assert.equal(sentPayloads[2].maxOutputChars, 20000);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].state, "completed");
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].target, "%40");

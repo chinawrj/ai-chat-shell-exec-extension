@@ -3,7 +3,7 @@ const DEFAULTS = {
   enabledHosts: ["chatgpt.com", "m365.cloud.microsoft"],
   requireApproval: false,
   autoSend: true,
-  defaultTimeoutMs: 30000,
+  defaultTimeoutMs: 180000,
   maxOutputChars: 20000,
   maxChainCalls: 100,
   disableAuthorRoleFilter: true

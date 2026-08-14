@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-08-14
+
+- Redefines the shell command timeout as an output-idle timeout: observable output resets the clock, the default increases from 30 seconds to 3 minutes, and existing installations using the old default migrate automatically while custom values remain unchanged.
+- Persists an `awaiting-user` run phase and streams idle progress to the originating tab without closing the shell result channel or fabricating a completed result.
+- Adds a floating-panel idle alert with `Continue waiting` and `Force terminate`, plus an always-available `Stop helper` action. Continue resets the idle interval; termination is scoped to the current None/Master/Slave role and revalidates the exact tmux owner before signaling its foreground process group.
+- Preserves idle state through runtime-channel loss, page refresh, and shell-server recovery using the server ledger and persistent tmux owner metadata.
+- Bumps the server protocol to 9 and adds private-tmux plus real Chromium coverage for output heartbeat reset, repeated idle alerts, Continue, role isolation, and panel termination.
+
 ## [0.9.10] - 2026-08-14
 
 - Persists the active None/Master/Slave profile in extension-owned per-tab session storage, so a page refresh keeps both the floating-panel display and actual shell/board/agent routing on the same tmux workspace even when the page clears its own session storage.

@@ -7,6 +7,7 @@ const path = require("node:path");
 const rootDir = path.join(__dirname, "..");
 const expectedHosts = ["chatgpt.com", "m365.cloud.microsoft"];
 const expectedMaxChainCalls = 100;
+const expectedIdleTimeoutMs = 180000;
 
 assert.deepEqual(readConstArray("extension/src/background.js", "DEFAULT_ENABLED_HOSTS"), expectedHosts);
 assert.deepEqual(readConstArray("extension/src/content.js", "DEFAULT_ENABLED_HOSTS"), expectedHosts);
@@ -14,6 +15,9 @@ assert.deepEqual(readObjectArray("extension/src/popup.js", "enabledHosts"), expe
 assert.equal(readConstNumber("extension/src/background.js", "DEFAULT_MAX_CHAIN_CALLS"), expectedMaxChainCalls);
 assert.equal(readConstNumber("extension/src/content.js", "DEFAULT_MAX_CHAIN_CALLS"), expectedMaxChainCalls);
 assert.equal(readObjectNumber("extension/src/popup.js", "maxChainCalls"), expectedMaxChainCalls);
+assert.equal(readObjectNumber("extension/src/background.js", "defaultTimeoutMs"), expectedIdleTimeoutMs);
+assert.equal(readObjectNumber("extension/src/popup.js", "defaultTimeoutMs"), expectedIdleTimeoutMs);
+assert.equal(readConstNumber("server/shell_server.js", "DEFAULT_TIMEOUT_MS"), expectedIdleTimeoutMs);
 
 console.log("default settings tests passed");
 

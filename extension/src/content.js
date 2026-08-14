@@ -21,8 +21,9 @@ const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
+const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.10";
+const CONTENT_SCRIPT_VERSION = "0.9.11";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -42,6 +43,7 @@ const MANUAL_TMUX_LIST_RESPONSE = "ai-chat-shell-exec:tmux-list-response";
 const MANUAL_AGENT_REQUEST = "ai-chat-shell-exec:agent-request";
 const MANUAL_AGENT_RESPONSE = "ai-chat-shell-exec:agent-response";
 const AGENT_POLL_INTERVAL_MS = 2000;
+const SHELL_RUN_MONITOR_INTERVAL_MS = 5000;
 const RUN_STATUS_POLL_INTERVAL_MS = 1000;
 const RUN_STATUS_MAX_NOT_FOUND = 5;
 const RUN_STATUS_MAX_TRANSPORT_FAILURES = 5;
@@ -114,6 +116,10 @@ let pendingHelperDeliveryStorageTail = Promise.resolve();
 // block silently skipped. Default to off so the latest helper block always
 // runs; the popup / panel toggle can re-enable strict filtering when needed.
 let authorRoleFilterEnabled = false;
+let activeShellRunNotice = null;
+let shellRunMonitorTimer = 0;
+let shellRunControlBusy = false;
+let shellRunStatusPollInFlight = false;
 
 bootstrapActivation().catch(() => {});
 
@@ -126,6 +132,14 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     updateRoleFilterButton();
     scheduleScan();
   }
+});
+
+chrome.runtime.onMessage?.addListener?.((message) => {
+  if (message?.type !== "shell-run-progress") {
+    return false;
+  }
+  handleShellRunProgress(message).catch(() => {});
+  return false;
 });
 
 async function bootstrapActivation() {
@@ -159,6 +173,7 @@ async function activateExtension() {
   observeThread();
   installPageEventListeners();
   startAgentPolling();
+  startShellRunMonitor();
   schedulePendingHelperDeliveryRetry();
   scheduleScan();
 }
@@ -178,6 +193,7 @@ function deactivateExtension() {
   clearTimeout(scanTimer);
   clearPendingForceRun();
   stopAgentPolling();
+  stopShellRunMonitor();
   threadObserver?.disconnect();
   threadObserver = null;
   removePageEventListeners();
@@ -2596,6 +2612,9 @@ async function runAndReply(callId, call, options = {}) {
   };
   activeCallId = callId;
   activeCallToken = callToken;
+  if (!isFileHelperCall(call) && !isBoardHelperCall(call) && !isAgentMessageHelperCall(call) && !isAgentRosterHelperCall(call) && !isAgentTaskStatusHelperCall(call)) {
+    updateStopHelperButton(true);
+  }
   chainCallCount += 1;
   setStatus(buildRunningStatus(call, force), "running");
   const startedAt = new Date().toISOString();
@@ -2616,6 +2635,10 @@ async function runAndReply(callId, call, options = {}) {
       await sendAgentTaskStatusQuery(callId, call, force) :
       await sendRunShellMessage(callId, call, force);
     callToken.phase = "response-received";
+    if (!isFileHelperCall(call) && !isBoardHelperCall(call)) {
+      clearShellRunNotice(response?.executionId || "");
+      updateStopHelperButton(false);
+    }
 
     if (!isCurrentCallToken(callToken)) {
       return { retryable: false, abandoned: true };
@@ -2739,6 +2762,9 @@ async function runAndReply(callId, call, options = {}) {
       deliveryFailed: !delivered
     };
   } finally {
+    if (!isFileHelperCall(call) && !isBoardHelperCall(call)) {
+      updateStopHelperButton(false);
+    }
     releaseActiveCall(callToken);
   }
 }
@@ -3013,6 +3039,20 @@ async function recoverRunShellResult(callKey, originalError, lifecycle = {}) {
 
     notFoundCount = 0;
     if (status.state === "running") {
+      if (status.phase === "awaiting-user") {
+        await handleShellRunProgress({
+          type: "shell-run-progress",
+          state: "awaiting-user",
+          callKey,
+          executionId: status.executionId || status.attemptId || "",
+          agentId: status.agentId || "",
+          target: status.target || "",
+          targetName: status.targetName || "",
+          idleForMs: status.idleForMs || 0,
+          idleTimeoutMs: status.idleTimeoutMs || 180000,
+          lastOutputAt: status.lastOutputAt || 0
+        });
+      }
       await sleep(RUN_STATUS_POLL_INTERVAL_MS);
       continue;
     }
@@ -4061,6 +4101,8 @@ function formatShellOutput(call, response, startedAt) {
     response.processKnown === false ? "processKnown: false" : "",
     response.processAlive === true ? "processAlive: true" : "",
     response.processAlive === false ? "processAlive: false" : "",
+    response.idleTimeoutReached === true ? "idleTimeoutReached: true" : "",
+    Number.isFinite(response.idleTimeoutMs) && response.idleTimeoutMs > 0 ? `idleTimeoutMs: ${response.idleTimeoutMs}` : "",
     response.continuedAfterTimeout ? "continuedAfterTimeout: true" : "",
     response.truncated ? "truncated: true" : ""
   ].filter(Boolean);
@@ -5520,6 +5562,11 @@ function injectStatus() {
       label: "Force run",
       title: "Force run latest helper block (bypass dedup ledger)"
     },
+    {
+      mode: "stop-helper",
+      label: "Stop helper",
+      title: "Terminate the currently running shell helper for this page role"
+    },
     { mode: "site", label: "Enable site" },
     {
       mode: "role-filter",
@@ -5550,6 +5597,28 @@ function injectStatus() {
     actions.appendChild(button);
   }
   panel.appendChild(actions);
+
+  const shellRunControl = document.createElement("div");
+  shellRunControl.id = SHELL_RUN_CONTROL_ID;
+  shellRunControl.hidden = true;
+  shellRunControl.style.cssText = [
+    "margin-top:6px",
+    "padding:7px",
+    "border-radius:6px",
+    "background:#92400e",
+    "color:#fff7ed",
+    "font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "line-height:1.35"
+  ].join(";");
+  shellRunControl.innerHTML = [
+    '<div data-shell-run-control-text style="margin-bottom:6px"></div>',
+    '<div style="display:flex;gap:4px;flex-wrap:wrap">',
+    '<button type="button" data-shell-tool-action="continue-helper" style="border:0;border-radius:6px;padding:4px 7px;background:#065f46;color:#fff;cursor:pointer">Continue waiting</button>',
+    '<button type="button" data-shell-tool-action="terminate-helper" style="border:0;border-radius:6px;padding:4px 7px;background:#b91c1c;color:#fff;cursor:pointer">Force terminate</button>',
+    '</div>'
+  ].join("");
+  panel.appendChild(shellRunControl);
+  updateShellRunControlPanel();
 
   const agentControls = document.createElement("div");
   agentControls.style.cssText = "display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto auto;gap:4px;align-items:center;margin-top:6px";
@@ -5691,6 +5760,197 @@ function setStatus(text, state = "idle") {
     error: "#b91c1c"
   };
   panel.style.background = colors[effectiveState] || colors.idle;
+}
+
+async function handleShellRunProgress(message) {
+  if (!extensionActive) {
+    return;
+  }
+  const agentId = await getCurrentShellRoleAgentId();
+  if (String(message.agentId || "") !== agentId) {
+    return;
+  }
+  if (message.state === "awaiting-user") {
+    startShellRunMonitor();
+    activeShellRunNotice = normalizeShellRunNotice(message);
+    updateShellRunControlPanel();
+    setStatus(
+      `Shell helper has produced no output for ${formatIdleDuration(activeShellRunNotice.idleForMs)}; choose Continue waiting or Force terminate`,
+      "running"
+    );
+    return;
+  }
+  if (message.state === "running") {
+    clearShellRunNotice(message.executionId || "");
+  }
+}
+
+function normalizeShellRunNotice(value = {}) {
+  return {
+    executionId: String(value.executionId || ""),
+    callKey: String(value.callKey || ""),
+    agentId: String(value.agentId || ""),
+    target: String(value.target || ""),
+    targetName: String(value.targetName || ""),
+    idleForMs: Math.max(0, Number(value.idleForMs || 0)),
+    idleTimeoutMs: Math.max(1000, Number(value.idleTimeoutMs || 180000)),
+    lastOutputAt: Number(value.lastOutputAt || 0)
+  };
+}
+
+function updateShellRunControlPanel() {
+  const container = document.getElementById(SHELL_RUN_CONTROL_ID);
+  if (!container) {
+    return;
+  }
+  container.hidden = !activeShellRunNotice;
+  const text = container.querySelector("[data-shell-run-control-text]");
+  if (text && activeShellRunNotice) {
+    const target = activeShellRunNotice.targetName || activeShellRunNotice.target || "current role host";
+    text.textContent = `No output update for ${formatIdleDuration(activeShellRunNotice.idleForMs)} on ${target}. The process is still running.`;
+  }
+  for (const button of container.querySelectorAll("button")) {
+    button.disabled = shellRunControlBusy;
+    button.style.opacity = shellRunControlBusy ? ".6" : "1";
+  }
+}
+
+function clearShellRunNotice(executionId = "") {
+  if (
+    executionId &&
+    activeShellRunNotice?.executionId &&
+    executionId !== activeShellRunNotice.executionId
+  ) {
+    return;
+  }
+  activeShellRunNotice = null;
+  updateShellRunControlPanel();
+}
+
+function formatIdleDuration(value) {
+  const totalSeconds = Math.max(1, Math.round(Number(value || 0) / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+async function getCurrentShellRoleAgentId() {
+  const profile = await getCurrentAgentProfile();
+  return profile.role !== "none" ? String(profile.agentId || "") : "";
+}
+
+function startShellRunMonitor() {
+  if (shellRunMonitorTimer || typeof setInterval !== "function") {
+    return;
+  }
+  refreshShellRunControlStatus({ quiet: true }).catch(() => {});
+  shellRunMonitorTimer = setInterval(() => {
+    refreshShellRunControlStatus({ quiet: true }).catch(() => {});
+  }, SHELL_RUN_MONITOR_INTERVAL_MS);
+}
+
+function stopShellRunMonitor() {
+  if (shellRunMonitorTimer) {
+    clearInterval(shellRunMonitorTimer);
+  }
+  shellRunMonitorTimer = 0;
+}
+
+async function refreshShellRunControlStatus({ quiet = false } = {}) {
+  if (!extensionActive || shellRunControlBusy || shellRunStatusPollInFlight) {
+    return null;
+  }
+  shellRunStatusPollInFlight = true;
+  try {
+    const agentId = await getCurrentShellRoleAgentId();
+    const response = await chrome.runtime.sendMessage({
+      type: "shell-run-control",
+      action: "status",
+      agentId
+    });
+    if (!response?.ok) {
+      if (!quiet) {
+        throw new Error(response?.error || "Could not inspect the current shell helper.");
+      }
+      return response;
+    }
+    updateStopHelperButton(response.active === true);
+    if (response.active === true && response.phase === "awaiting-user") {
+      activeShellRunNotice = normalizeShellRunNotice(response);
+      updateShellRunControlPanel();
+    } else if (response.active !== true || response.phase === "running") {
+      clearShellRunNotice();
+    }
+    if (response.active !== true && !activeCallId) {
+      stopShellRunMonitor();
+    }
+    return response;
+  } finally {
+    shellRunStatusPollInFlight = false;
+  }
+}
+
+function updateStopHelperButton(active) {
+  const button = document.querySelector?.(`#${STATUS_ID} [data-shell-tool-action="stop-helper"]`);
+  if (!button) {
+    return;
+  }
+  button.style.background = active ? "#b91c1c" : "#374151";
+  button.title = active
+    ? "Terminate the currently running shell helper for this page role"
+    : "No active helper detected; click to check the current page role";
+}
+
+async function continueCurrentShellHelper() {
+  return sendCurrentShellRunControl("continue");
+}
+
+async function terminateCurrentShellHelper({ requireConfirmation = false } = {}) {
+  if (requireConfirmation) {
+    const agentId = await getCurrentShellRoleAgentId();
+    const roleTarget = agentId ? `ForAI-${agentId}:host` : "ForAI:host";
+    if (!window.confirm(`Terminate the active shell helper in ${roleTarget}?`)) {
+      setStatus("Stop helper cancelled", "idle");
+      return null;
+    }
+  }
+  return sendCurrentShellRunControl("terminate");
+}
+
+async function sendCurrentShellRunControl(action) {
+  if (shellRunControlBusy) {
+    return null;
+  }
+  shellRunControlBusy = true;
+  updateShellRunControlPanel();
+  try {
+    const agentId = await getCurrentShellRoleAgentId();
+    const response = await chrome.runtime.sendMessage({
+      type: "shell-run-control",
+      action,
+      agentId,
+      executionId: activeShellRunNotice?.executionId || ""
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || `Shell helper ${action} failed.`);
+    }
+    if (action === "continue") {
+      clearShellRunNotice(response.executionId || "");
+      updateStopHelperButton(response.active === true);
+      setStatus(response.active === true ? "Continued waiting for shell helper output" : "No active shell helper to continue", response.active === true ? "running" : "idle");
+    } else {
+      clearShellRunNotice(response.executionId || "");
+      updateStopHelperButton(response.active === true);
+      setStatus(response.requested === true ? "Shell helper termination requested" : "No active shell helper to terminate", response.active === true ? "running" : "idle");
+    }
+    return response;
+  } finally {
+    shellRunControlBusy = false;
+    updateShellRunControlPanel();
+  }
 }
 
 function getDisplayVersion() {
@@ -5977,6 +6237,27 @@ function handlePanelAction(action) {
   if (action === "force") {
     forceRunLatestShellCall().catch((error) => {
       setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "stop-helper") {
+    terminateCurrentShellHelper({ requireConfirmation: true }).catch((error) => {
+      setStatus(`Stop helper failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "continue-helper") {
+    continueCurrentShellHelper().catch((error) => {
+      setStatus(`Continue helper failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "terminate-helper") {
+    terminateCurrentShellHelper({ requireConfirmation: false }).catch((error) => {
+      setStatus(`Terminate helper failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
   }

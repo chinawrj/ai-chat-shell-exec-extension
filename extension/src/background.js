@@ -6,10 +6,11 @@ const DEFAULT_ENABLED_HOSTS = ["chatgpt.com", "m365.cloud.microsoft"];
 const LEGACY_DEFAULT_ENABLED_HOSTS = ["m365.cloud.microsoft"];
 const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
+const LEGACY_DEFAULT_TIMEOUT_MS = 30000;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
-const SETTINGS_MIGRATION_VERSION = 2;
+const SETTINGS_MIGRATION_VERSION = 3;
 const TAB_AGENT_PROFILE_PREFIX = "tabAgentProfile:v1:";
-const REQUIRED_SERVER_PROTOCOL_VERSION = 8;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 9;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 2;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
@@ -40,7 +41,7 @@ const DEFAULT_SETTINGS = {
   enabledHosts: DEFAULT_ENABLED_HOSTS,
   requireApproval: false,
   autoSend: true,
-  defaultTimeoutMs: 30000,
+  defaultTimeoutMs: 180000,
   maxOutputChars: 20000,
   maxChainCalls: DEFAULT_MAX_CHAIN_CALLS,
   disableAuthorRoleFilter: true
@@ -163,6 +164,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "shell-run-control") {
+    handleShellRunControlMessage(message)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
   if (message.type === "run-board-status") {
     handleRunBoardStatusMessage(message)
       .then(sendResponse)
@@ -207,7 +218,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  handleRunShellMessage(message)
+  handleRunShellMessage(message, sender)
     .then(sendResponse)
     .catch((error) => sendResponse({
       ok: false,
@@ -282,9 +293,9 @@ async function handleWriteFileMessage(message) {
   }
 }
 
-async function handleRunShellMessage(message) {
+async function handleRunShellMessage(message, sender = {}) {
   const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
-  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
+  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 180000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
   const force = isForceMessage(message);
@@ -306,7 +317,9 @@ async function handleRunShellMessage(message) {
   payload.seq = claim.seq;
   try {
     await requireShellServerReady();
-    const response = await runShellViaWebSocket(payload);
+    const response = await runShellViaWebSocket(payload, {
+      onEvent: (event) => forwardShellRunProgress(event, sender)
+    });
     await markShellCall(callKey, response?.ok === false ? "failed" : "completed", {
       completedAt: Date.now(),
       exitCode: response?.exitCode,
@@ -322,6 +335,37 @@ async function handleRunShellMessage(message) {
       error: error.message || String(error)
     });
     throw error;
+  }
+}
+
+async function handleShellRunControlMessage(message) {
+  const action = String(message.action || "status").trim().toLowerCase();
+  if (!new Set(["status", "continue", "terminate"]).has(action)) {
+    throw new Error("Shell run control action must be status, continue, or terminate.");
+  }
+  await requireShellServerReady();
+  return runShellViaWebSocket({
+    type: "shell-run-control",
+    id: message.id || `shell-run-control:${action}:${Date.now()}`,
+    action,
+    agentId: message.agentId || "",
+    executionId: message.executionId || "",
+    timeoutMs: action === "terminate" ? 15000 : 5000
+  });
+}
+
+function forwardShellRunProgress(event, sender = {}) {
+  if (!event || event.type !== "shell-run-progress" || !Number.isInteger(sender?.tab?.id)) {
+    return;
+  }
+  try {
+    const pending = chrome.tabs.sendMessage(sender.tab.id, event);
+    if (pending && typeof pending.catch === "function") {
+      pending.catch(() => {});
+    }
+  } catch (_error) {
+    // The originating tab may have navigated or reloaded. The server ledger
+    // keeps the idle state recoverable through shell-run-control/status.
   }
 }
 
@@ -401,7 +445,7 @@ async function handleRunResultPresentedMessage(message) {
 
 async function handleRunBoardMessage(message) {
   const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
-  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 30000;
+  const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 180000;
   const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
   const callKey = message.callKey || message.id || "";
   const force = isForceMessage(message);
@@ -605,13 +649,20 @@ function ensureDefaultSettings() {
     }
 
     const migrationVersion = Number(current[SETTINGS_MIGRATION_VERSION_KEY] || 0);
-    if (migrationVersion < SETTINGS_MIGRATION_VERSION) {
+    if (migrationVersion < 2) {
       if (current.enabledHosts !== undefined && isLegacyDefaultEnabledHosts(current.enabledHosts)) {
         missing.enabledHosts = DEFAULT_ENABLED_HOSTS;
       }
       if (current.maxChainCalls !== undefined && isLegacyDefaultMaxChainCalls(current.maxChainCalls)) {
         missing.maxChainCalls = DEFAULT_MAX_CHAIN_CALLS;
       }
+    }
+    if (migrationVersion < 3) {
+      if (current.defaultTimeoutMs !== undefined && Number(current.defaultTimeoutMs) === LEGACY_DEFAULT_TIMEOUT_MS) {
+        missing.defaultTimeoutMs = DEFAULT_SETTINGS.defaultTimeoutMs;
+      }
+    }
+    if (migrationVersion < SETTINGS_MIGRATION_VERSION) {
       missing[SETTINGS_MIGRATION_VERSION_KEY] = SETTINGS_MIGRATION_VERSION;
     }
 
@@ -830,7 +881,7 @@ function normalizePageAgentProfile(value = {}) {
   return { role, agentId };
 }
 
-function runShellViaWebSocket(payload) {
+function runShellViaWebSocket(payload, options = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let heartbeatTimer = 0;
@@ -869,10 +920,18 @@ function runShellViaWebSocket(payload) {
 
     socket.addEventListener("message", (event) => {
       try {
-        finish(resolve, JSON.parse(event.data));
+        const response = JSON.parse(event.data);
+        if (response?.event === true) {
+          if (typeof options.onEvent === "function") {
+            options.onEvent(response);
+          }
+          return;
+        }
+        finish(resolve, response);
       } catch (error) {
         finish(reject, error);
-      } finally {
+      }
+      if (settled) {
         clearTimeout(timeout);
         tryClose(socket);
       }

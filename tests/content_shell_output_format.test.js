@@ -92,9 +92,13 @@ assert.match(timeoutOutput, /stderr:\nTimed out waiting/);
 
 const continuedOutput = context.formatShellOutput({ cmd: "sleep 2" }, {
   ...response,
-  continuedAfterTimeout: true
+  continuedAfterTimeout: true,
+  idleTimeoutReached: true,
+  idleTimeoutMs: 180000
 }, "2026-05-22T00:00:00.000Z");
 assert.match(continuedOutput, /^continuedAfterTimeout: true$/m);
+assert.match(continuedOutput, /^idleTimeoutReached: true$/m);
+assert.match(continuedOutput, /^idleTimeoutMs: 180000$/m);
 
 const queuedOutput = context.formatShellOutput({ cmd: "printf queued" }, {
   ...response,

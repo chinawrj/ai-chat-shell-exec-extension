@@ -11,7 +11,7 @@ const HOST = "127.0.0.1";
 const PORT = 17371;
 const EXTENSION_ID = "lkmeogidbglhedgekjgbpbfjkpapnhke";
 const ALLOWED_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_MAX_OUTPUT_CHARS = 20000;
 const MAX_SHELL_SCRIPT_BYTES = 1024 * 1024;
 const MAX_INTERACTIVE_COMMAND_CHARS = 8000;
@@ -19,7 +19,7 @@ const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 const COMMAND_ECHO_MAX_CHARS = 8000;
 const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 8;
+const SERVER_PROTOCOL_VERSION = 9;
 const HELPER_PROTOCOL_VERSION = 2;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -94,6 +94,7 @@ let serverLedger = loadServerLedger();
 let agentHubState = createAgentHubState();
 const tmuxShellPaneQueues = new Map();
 const tmuxShellPaneQueueDepths = new Map();
+const activeTmuxShellRuns = new Map();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -169,7 +170,9 @@ server.on("upgrade", (req, socket) => {
       }
 
       requestInFlight = true;
-      handleMessageText(message)
+      handleMessageText(message, {
+        emit: (event) => writeWebSocketEvent(socket, event)
+      })
         .then((response) => {
           writeWebSocketResponse(socket, response);
         })
@@ -199,6 +202,19 @@ function writeWebSocketResponse(socket, response) {
     return true;
   } catch (error) {
     console.log(`[socket] response could not be delivered: ${error.message || String(error)}`);
+    return false;
+  }
+}
+
+function writeWebSocketEvent(socket, event) {
+  if (!socket || socket.destroyed || socket.writable !== true) {
+    return false;
+  }
+  try {
+    socket.write(encodeTextFrame(JSON.stringify(event)));
+    return true;
+  } catch (error) {
+    console.log(`[socket] progress event could not be delivered: ${error.message || String(error)}`);
     return false;
   }
 }
@@ -409,7 +425,7 @@ function withProtocolMetadata(response) {
   };
 }
 
-async function handleMessageText(text) {
+async function handleMessageText(text, context = {}) {
   ensureStateDirReady({ create: true });
   const message = JSON.parse(text);
   if (!message || !message.type) {
@@ -426,6 +442,10 @@ async function handleMessageText(text) {
 
   if (message.type === "run-status") {
     return handleRunStatusMessage(message);
+  }
+
+  if (message.type === "shell-run-control") {
+    return handleShellRunControlMessage(message);
   }
 
   if (message.type === "run-result-presented") {
@@ -489,6 +509,7 @@ async function handleMessageText(text) {
   ].join("\n")));
   const reservation = reserveServerShellCall(callKey, {
     kind: "shell",
+    agentId: config.agentId || "",
     cmd,
     target: pane.id,
     timeoutMs,
@@ -511,6 +532,7 @@ async function handleMessageText(text) {
       const cwd = resolveCwd(message.cwd, currentPane.currentPath);
       claim = adjudicateReservedServerShellCall(reservation.ledgerKey, {
         cmd,
+        agentId: config.agentId || "",
         cwd,
         target: currentPane.id,
         executionTarget: buildTmuxPaneExecutionTarget(currentPane),
@@ -548,7 +570,11 @@ async function handleMessageText(text) {
         timeoutMs,
         maxOutputChars,
         ownerContext: queueContext.owner,
-        ledgerKey: claim.ledgerKey
+        ledgerKey: claim.ledgerKey,
+        onProgress: typeof context.emit === "function" ? context.emit : null,
+        executionId: claim.attemptId,
+        callKey,
+        agentId: config.agentId || ""
       });
       console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
@@ -898,7 +924,7 @@ async function readPersistentTmuxPaneOwner(pane = {}) {
   }
   try {
     const owner = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-    return owner && typeof owner === "object" && owner.token ? owner : null;
+    return owner && typeof owner === "object" && owner.token ? { ...owner, encoded } : null;
   } catch (_error) {
     return {
       token: "invalid-owner-value",
@@ -912,6 +938,7 @@ function encodePersistentTmuxPaneOwner(owner) {
   const persisted = { ...owner };
   delete persisted.pane;
   delete persisted.waited;
+  delete persisted.encoded;
   return Buffer.from(JSON.stringify(persisted), "utf8").toString("base64url");
 }
 
@@ -2753,6 +2780,7 @@ function reserveServerShellCall(callKey, payload = {}) {
     pathname: payload.callMeta?.pathname || "",
     promptHash: payload.callMeta?.promptHash || "",
     forced: force,
+    agentId: payload.agentId || "",
     handlerProcessPid: process.pid
   };
   saveServerLedger();
@@ -2813,7 +2841,8 @@ function adjudicateReservedServerShellCall(ledgerKey, payload = {}) {
     origin: payload.callMeta?.origin || reservation.origin || "",
     pathname: payload.callMeta?.pathname || reservation.pathname || "",
     promptHash: payload.callMeta?.promptHash || reservation.promptHash || "",
-    forced: force
+    forced: force,
+    agentId: payload.agentId || reservation.agentId || ""
   };
   saveServerLedger();
   return {
@@ -2969,6 +2998,8 @@ function completeServerShellCall(ledgerKey, response) {
     queued: response.queued === true,
     queuedMs: Number(response.queuedMs || 0),
     continuedAfterTimeout: response.continuedAfterTimeout === true,
+    idleTimeoutReached: response.idleTimeoutReached === true,
+    idleTimeoutMs: Number(response.idleTimeoutMs || response.timeoutMs || 0),
     processKnown: response.processKnown === true,
     processAlive: response.processAlive === true,
     processPid: Number(response.processPid || 0),
@@ -3025,6 +3056,43 @@ function failServerShellCall(ledgerKey, error, extra = {}) {
     error: summarizeError(error)
   };
   pruneServerLedger();
+  saveServerLedger();
+  return true;
+}
+
+function markServerShellCallAwaitingUser(ledgerKey, extra = {}) {
+  serverLedger.calls ||= {};
+  const entry = serverLedger.calls[ledgerKey];
+  if (!ledgerKey || !entry || entry.state !== "running") {
+    return false;
+  }
+  serverLedger.calls[ledgerKey] = {
+    ...entry,
+    phase: "awaiting-user",
+    idleState: "awaiting-user",
+    idleSince: Number(extra.idleSince || Date.now()),
+    lastOutputAt: Number(extra.lastOutputAt || entry.lastOutputAt || Date.now()),
+    idleTimeoutMs: Number(extra.idleTimeoutMs || entry.timeoutMs || DEFAULT_TIMEOUT_MS),
+    processPid: Number(extra.processPid || entry.processPid || 0)
+  };
+  saveServerLedger();
+  return true;
+}
+
+function markServerShellCallRunning(ledgerKey, extra = {}) {
+  serverLedger.calls ||= {};
+  const entry = serverLedger.calls[ledgerKey];
+  if (!ledgerKey || !entry || entry.state !== "running") {
+    return false;
+  }
+  serverLedger.calls[ledgerKey] = {
+    ...entry,
+    phase: "running",
+    idleState: "running",
+    idleSince: 0,
+    lastOutputAt: Number(extra.lastOutputAt || entry.lastOutputAt || Date.now()),
+    idleResumedReason: extra.idleResumedReason || ""
+  };
   saveServerLedger();
   return true;
 }
@@ -3093,6 +3161,16 @@ async function handleRunStatusMessage(message) {
     state: entry.state || "running",
     phase: entry.phase || entry.state || "running",
     queued: entry.queued === true,
+    agentId: entry.agentId || "",
+    executionId: entry.executionId || entry.attemptId || ledgerKey,
+    target: entry.target || "",
+    targetName: entry.targetName || "",
+    idleTimeoutMs: Number(entry.idleTimeoutMs || entry.timeoutMs || 0),
+    lastOutputAt: Number(entry.lastOutputAt || 0),
+    idleSince: Number(entry.idleSince || 0),
+    idleForMs: entry.phase === "awaiting-user"
+      ? Math.max(0, Date.now() - Number(entry.lastOutputAt || entry.idleSince || Date.now()))
+      : 0,
     startedAt: Number(entry.startedAt || 0),
     completedAt: Number(entry.completedAt || 0)
   };
@@ -3104,6 +3182,265 @@ async function handleRunStatusMessage(message) {
       : "Shell execution failed.");
   }
   return withProtocolMetadata(response);
+}
+
+async function handleShellRunControlMessage(message) {
+  const action = String(message?.action || "status").trim().toLowerCase();
+  if (!new Set(["status", "continue", "terminate"]).has(action)) {
+    throw new Error("Shell run control action must be status, continue, or terminate.");
+  }
+
+  const config = getRunTmuxConfig(message);
+  const layout = await ensureForAiTmuxLayout(config);
+  const pane = resolveDefaultShellPane(layout.panes, config).pane;
+  if (!pane) {
+    return withProtocolMetadata({
+      ok: false,
+      type: "shell-run-control",
+      action,
+      active: false,
+      agentId: config.agentId || "",
+      error: `Default shell target is unavailable for ${config.sessionName}:host.`
+    });
+  }
+
+  let owner = await readPersistentTmuxPaneOwner(pane);
+  if (!owner || owner.kind !== "shell" || !owner.pidPath || !owner.statusPath) {
+    return withProtocolMetadata({
+      ok: true,
+      type: "shell-run-control",
+      action,
+      active: false,
+      agentId: config.agentId || "",
+      target: pane.id,
+      targetName: pane.label || ""
+    });
+  }
+
+  const entry = serverLedger.calls?.[owner.ledgerKey] || {};
+  const executionId = String(entry.executionId || entry.attemptId || "");
+  const requestedExecutionId = String(message.executionId || "").trim();
+  if (requestedExecutionId && requestedExecutionId !== executionId) {
+    return withProtocolMetadata({
+      ok: false,
+      type: "shell-run-control",
+      action,
+      active: true,
+      stale: true,
+      agentId: config.agentId || "",
+      executionId,
+      target: pane.id,
+      error: "The selected helper is no longer the active run for this role."
+    });
+  }
+
+  const state = readTmuxShellRunState(owner.pidPath, owner.statusPath);
+  if (state.completed) {
+    await settlePersistentTmuxPaneOwner(owner, pane, getTmuxSocketPath() || "default-socket");
+    return withProtocolMetadata({
+      ok: true,
+      type: "shell-run-control",
+      action,
+      active: false,
+      completed: true,
+      agentId: config.agentId || "",
+      executionId,
+      target: pane.id
+    });
+  }
+
+  const activeControl = activeTmuxShellRuns.get(owner.token);
+  if (action === "continue") {
+    const resumedAt = Date.now();
+    if (activeControl) {
+      activeControl.resumeRequestedAt = resumedAt;
+    } else {
+      owner = await patchPersistentTmuxPaneOwner(pane, owner, {
+        idleState: "running",
+        idleSince: 0,
+        lastOutputAt: resumedAt,
+        idleResumeGeneration: Number(owner.idleResumeGeneration || 0) + 1
+      });
+      markServerShellCallRunning(owner.ledgerKey, {
+        idleState: "running",
+        lastOutputAt: resumedAt,
+        idleResumedReason: "user-continued"
+      });
+    }
+    return withProtocolMetadata({
+      ok: true,
+      type: "shell-run-control",
+      action,
+      active: true,
+      state: "running",
+      phase: "running",
+      resumedAt,
+      agentId: config.agentId || "",
+      executionId,
+      target: pane.id,
+      targetName: pane.label || ""
+    });
+  }
+
+  if (action === "terminate") {
+    const termination = await terminatePersistentTmuxShellOwner(owner, pane);
+    return withProtocolMetadata({
+      ok: termination.requested === true,
+      type: "shell-run-control",
+      action,
+      active: termination.active === true,
+      state: termination.active === true ? "terminating" : "completed",
+      phase: termination.active === true ? "terminating" : "completed",
+      agentId: config.agentId || "",
+      executionId,
+      target: pane.id,
+      targetName: pane.label || "",
+      ...termination
+    });
+  }
+
+  if (!activeControl) {
+    owner = await observePersistentTmuxShellIdle(owner, pane);
+  }
+  const latestEntry = serverLedger.calls?.[owner.ledgerKey] || entry;
+  const phase = activeControl?.awaitingUser === true || owner.idleState === "awaiting-user" || latestEntry.phase === "awaiting-user"
+    ? "awaiting-user"
+    : "running";
+  const lastOutputAt = Number(activeControl?.lastOutputAt || owner.lastOutputAt || latestEntry.lastOutputAt || owner.createdAt || Date.now());
+  return withProtocolMetadata({
+    ok: true,
+    type: "shell-run-control",
+    action,
+    active: state.processAlive === true,
+    state: phase,
+    phase,
+    agentId: config.agentId || "",
+    executionId,
+    callKey: entry.callKey || "",
+    target: pane.id,
+    targetName: pane.label || "",
+    idleTimeoutMs: Number(owner.idleTimeoutMs || entry.timeoutMs || DEFAULT_TIMEOUT_MS),
+    lastOutputAt,
+    idleForMs: Math.max(0, Date.now() - lastOutputAt)
+  });
+}
+
+async function observePersistentTmuxShellIdle(owner, pane) {
+  const timeoutMs = clampNumber(owner.idleTimeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
+  const captured = owner.startMarker && owner.doneMarker
+    ? await captureTmuxPane(pane.id).catch(() => "")
+    : "";
+  const extracted = owner.startMarker && owner.doneMarker
+    ? extractTmuxRunOutput(captured, owner.startMarker, owner.doneMarker, owner.maxOutputChars || DEFAULT_MAX_OUTPUT_CHARS)
+    : { foundStart: false, outputFingerprint: "" };
+  const now = Date.now();
+  let lastOutputAt = Number(owner.lastOutputAt || owner.createdAt || now);
+  let idleState = String(owner.idleState || "running");
+  const outputChanged = extracted.foundStart && extracted.outputFingerprint !== String(owner.idleOutputFingerprint || "");
+  if (outputChanged) {
+    lastOutputAt = now;
+    idleState = "running";
+  } else if (now - lastOutputAt >= timeoutMs) {
+    idleState = "awaiting-user";
+  }
+  if (
+    outputChanged ||
+    idleState !== String(owner.idleState || "running")
+  ) {
+    owner = await patchPersistentTmuxPaneOwner(pane, owner, {
+      idleState,
+      idleSince: idleState === "awaiting-user" ? lastOutputAt : 0,
+      lastOutputAt,
+      idleTimeoutMs: timeoutMs,
+      idleOutputFingerprint: extracted.outputFingerprint || String(owner.idleOutputFingerprint || "")
+    });
+    if (idleState === "awaiting-user") {
+      markServerShellCallAwaitingUser(owner.ledgerKey, {
+        idleSince: lastOutputAt,
+        lastOutputAt,
+        idleTimeoutMs: timeoutMs
+      });
+    } else {
+      markServerShellCallRunning(owner.ledgerKey, {
+        idleState: "running",
+        lastOutputAt,
+        idleResumedReason: "output-updated"
+      });
+    }
+  }
+  return owner;
+}
+
+async function patchPersistentTmuxPaneOwner(pane, owner, patch) {
+  const next = { ...owner, ...patch };
+  const currentEncoded = owner.encoded || encodePersistentTmuxPaneOwner(owner);
+  const nextEncoded = encodePersistentTmuxPaneOwner(next);
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},${currentEncoded}}`;
+  const setCommand = `set-option -p -t ${shellQuote(pane.id)} ${TMUX_PANE_OWNER_OPTION} ${shellQuote(nextEncoded)}`;
+  await runTmuxCommand(["if-shell", "-F", "-t", pane.id, condition, setCommand, ""], { timeoutMs: 5000 });
+  const current = await readPersistentTmuxPaneOwner(pane);
+  if (current?.token !== owner.token) {
+    throw new Error(`Lost persistent tmux pane ownership for ${pane.id} while controlling the active helper.`);
+  }
+  return current;
+}
+
+async function terminatePersistentTmuxShellOwner(owner, pane) {
+  const encoded = owner.encoded || encodePersistentTmuxPaneOwner(owner);
+  const condition = `#{==:#{${TMUX_PANE_OWNER_OPTION}},${encoded}}`;
+  const sendInterrupt = `send-keys -t ${shellQuote(pane.id)} C-c`;
+  await runTmuxCommand(["if-shell", "-F", "-t", pane.id, condition, sendInterrupt, ""], { timeoutMs: 5000 });
+  let state = readTmuxShellRunState(owner.pidPath, owner.statusPath);
+  for (let attempt = 0; attempt < 8 && state.processAlive; attempt += 1) {
+    await sleep(TMUX_POLL_INTERVAL_MS);
+    state = readTmuxShellRunState(owner.pidPath, owner.statusPath);
+  }
+  if (!state.processAlive) {
+    return { requested: true, active: false, signal: "INT", escalated: false };
+  }
+
+  const current = await readPersistentTmuxPaneOwner(pane);
+  if (current?.token !== owner.token) {
+    return { requested: false, active: false, stale: true, error: "Helper ownership changed before termination escalation." };
+  }
+  const processGroups = await readTmuxPaneProcessGroups(pane.panePid, pane.paneTty);
+  if (!processGroups.known || processGroups.foregroundPgid === processGroups.shellPgid) {
+    return { requested: true, active: true, signal: "INT", escalated: false };
+  }
+  try {
+    process.kill(-processGroups.foregroundPgid, "SIGTERM");
+  } catch (error) {
+    if (error?.code !== "ESRCH") {
+      throw error;
+    }
+  }
+  for (let attempt = 0; attempt < 8 && state.processAlive; attempt += 1) {
+    await sleep(TMUX_POLL_INTERVAL_MS);
+    state = readTmuxShellRunState(owner.pidPath, owner.statusPath);
+  }
+  let finalSignal = "TERM";
+  if (state.processAlive) {
+    const latestOwner = await readPersistentTmuxPaneOwner(pane);
+    if (latestOwner?.token === owner.token) {
+      const latestGroups = await readTmuxPaneProcessGroups(pane.panePid, pane.paneTty);
+      if (latestGroups.known && latestGroups.foregroundPgid !== latestGroups.shellPgid) {
+        try {
+          process.kill(-latestGroups.foregroundPgid, "SIGKILL");
+          finalSignal = "KILL";
+        } catch (error) {
+          if (error?.code !== "ESRCH") {
+            throw error;
+          }
+        }
+      }
+    }
+  }
+  return {
+    requested: true,
+    active: readTmuxShellRunState(owner.pidPath, owner.statusPath).processAlive === true,
+    signal: finalSignal,
+    escalated: true
+  };
 }
 
 function handleRunResultPresentedMessage(message) {
@@ -3176,6 +3513,8 @@ function buildStoredShellResult(entry = {}) {
     queued: entry.queued === true,
     queuedMs: Number(entry.queuedMs || 0),
     continuedAfterTimeout: entry.continuedAfterTimeout === true,
+    idleTimeoutReached: entry.idleTimeoutReached === true,
+    idleTimeoutMs: Number(entry.idleTimeoutMs || entry.timeoutMs || 0),
     processKnown: entry.processKnown === true,
     processAlive: entry.processAlive === true,
     processPid: Number(entry.processPid || 0),
@@ -3211,7 +3550,10 @@ async function recoverPersistentOwnerForLedgerKey(ledgerKey) {
     if (owner?.ledgerKey !== ledgerKey) {
       continue;
     }
-    await settlePersistentTmuxPaneOwner(owner, pane, socketPath);
+    const settled = await settlePersistentTmuxPaneOwner(owner, pane, socketPath);
+    if (!settled && owner.kind === "shell") {
+      await observePersistentTmuxShellIdle(owner, pane);
+    }
     return true;
   }
   return false;
@@ -3523,7 +3865,36 @@ function validateVisionTmuxCommand(cmd) {
   return normalized;
 }
 
-async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerContext = null, ledgerKey = "" }) {
+function emitShellRunProgress(onProgress, payload) {
+  if (typeof onProgress !== "function") {
+    return false;
+  }
+  try {
+    return onProgress(withProtocolMetadata({
+      ok: true,
+      event: true,
+      type: "shell-run-progress",
+      ...payload
+    })) !== false;
+  } catch (error) {
+    console.log(`[run-progress] delivery failed: ${error.message || String(error)}`);
+    return false;
+  }
+}
+
+async function runTmuxShell({
+  cmd,
+  cwd,
+  pane,
+  timeoutMs,
+  maxOutputChars,
+  ownerContext = null,
+  ledgerKey = "",
+  onProgress = null,
+  executionId = "",
+  callKey = "",
+  agentId = ""
+}) {
   const runId = crypto.randomBytes(8).toString("hex");
   const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
   const doneMarker = `__AI_CHAT_SHELL_EXEC_DONE_${runId}__`;
@@ -3564,15 +3935,35 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
     pidPath,
     statusPath,
     executedPath,
-    interruptedPath
+    interruptedPath,
+    idleTimeoutMs: timeoutMs,
+    lastOutputAt: Date.now(),
+    idleState: "running",
+    idleOutputFingerprint: ""
   });
 
   const started = Date.now();
   const markerLossGraceMs = 2000;
+  const control = {
+    token: ownerContext?.token || "",
+    paneId: pane.id,
+    ledgerKey,
+    executionId,
+    callKey,
+    agentId,
+    awaitingUser: false,
+    resumeRequestedAt: 0,
+    lastHandledResumeAt: 0,
+    lastOutputAt: started
+  };
+  if (control.token) {
+    activeTmuxShellRuns.set(control.token, control);
+  }
   let processExitMissingSince = 0;
   let unknownStateSince = 0;
   let continuedAfterTimeout = false;
   let lastCapture = "";
+  let lastOutputFingerprint = "";
   try {
     await sendTmuxLiteralLine(pane.id, `/bin/sh ${shellQuote(launcherPath)}`);
 
@@ -3580,6 +3971,62 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
       await sleep(TMUX_POLL_INTERVAL_MS);
       lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
       const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+      if (extracted.foundStart && extracted.outputFingerprint !== lastOutputFingerprint) {
+        lastOutputFingerprint = extracted.outputFingerprint;
+        control.lastOutputAt = Date.now();
+        if (control.awaitingUser) {
+          control.awaitingUser = false;
+          markServerShellCallRunning(ledgerKey, {
+            idleState: "running",
+            lastOutputAt: control.lastOutputAt,
+            idleResumedReason: "output-updated"
+          });
+          await updatePersistentTmuxPaneOwner(ownerContext, {
+            idleState: "running",
+            lastOutputAt: control.lastOutputAt,
+            idleSince: 0,
+            idleOutputFingerprint: lastOutputFingerprint
+          });
+          emitShellRunProgress(onProgress, {
+            state: "running",
+            reason: "output-updated",
+            callKey,
+            executionId,
+            agentId,
+            target: pane.id,
+            idleTimeoutMs: timeoutMs,
+            lastOutputAt: control.lastOutputAt
+          });
+        }
+      }
+
+      if (control.resumeRequestedAt > control.lastHandledResumeAt) {
+        control.lastHandledResumeAt = control.resumeRequestedAt;
+        control.lastOutputAt = control.resumeRequestedAt;
+        control.awaitingUser = false;
+        markServerShellCallRunning(ledgerKey, {
+          idleState: "running",
+          lastOutputAt: control.lastOutputAt,
+          idleResumedReason: "user-continued"
+        });
+        await updatePersistentTmuxPaneOwner(ownerContext, {
+          idleState: "running",
+          lastOutputAt: control.lastOutputAt,
+          idleSince: 0,
+          idleOutputFingerprint: lastOutputFingerprint
+        });
+        emitShellRunProgress(onProgress, {
+          state: "running",
+          reason: "user-continued",
+          callKey,
+          executionId,
+          agentId,
+          target: pane.id,
+          idleTimeoutMs: timeoutMs,
+          lastOutputAt: control.lastOutputAt
+        });
+      }
+
       if (extracted.foundDone) {
         const executed = fs.existsSync(executedPath);
         const interruptSignal = readTmuxShellInterruptSignal(interruptedPath);
@@ -3596,6 +4043,8 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
           truncated: extracted.truncated,
           timedOut: false,
           continuedAfterTimeout,
+          idleTimeoutReached: continuedAfterTimeout,
+          idleTimeoutMs: timeoutMs,
           target: pane.id,
           targetName: pane.label
         };
@@ -3628,19 +4077,46 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
           processAlive: false,
           processPid: state.pid || 0,
           continuedAfterTimeout,
+          idleTimeoutReached: continuedAfterTimeout,
+          idleTimeoutMs: timeoutMs,
           target: pane.id,
           targetName: pane.label
         };
       }
 
-      if (Date.now() - started < timeoutMs) {
-        continue;
-      }
-
       if (state.processAlive) {
-        continuedAfterTimeout = true;
         processExitMissingSince = 0;
         unknownStateSince = 0;
+        const idleForMs = Date.now() - control.lastOutputAt;
+        if (!control.awaitingUser && idleForMs >= timeoutMs) {
+          continuedAfterTimeout = true;
+          control.awaitingUser = true;
+          markServerShellCallAwaitingUser(ledgerKey, {
+            idleSince: control.lastOutputAt,
+            lastOutputAt: control.lastOutputAt,
+            idleTimeoutMs: timeoutMs,
+            processPid: state.pid || 0
+          });
+          await updatePersistentTmuxPaneOwner(ownerContext, {
+            idleState: "awaiting-user",
+            idleSince: control.lastOutputAt,
+            lastOutputAt: control.lastOutputAt,
+            idleTimeoutMs: timeoutMs,
+            idleOutputFingerprint: lastOutputFingerprint
+          });
+          emitShellRunProgress(onProgress, {
+            state: "awaiting-user",
+            reason: "output-idle-timeout",
+            callKey,
+            executionId,
+            agentId,
+            target: pane.id,
+            targetName: pane.label,
+            idleForMs,
+            idleTimeoutMs: timeoutMs,
+            lastOutputAt: control.lastOutputAt
+          });
+        }
         continue;
       }
 
@@ -3663,12 +4139,17 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
           processAlive: false,
           processPid: state.pid || 0,
           continuedAfterTimeout,
+          idleTimeoutReached: continuedAfterTimeout,
+          idleTimeoutMs: timeoutMs,
           target: pane.id,
           targetName: pane.label
         };
       }
 
       unknownStateSince = unknownStateSince || Date.now();
+      if (Date.now() - started < timeoutMs) {
+        continue;
+      }
       if (Date.now() - unknownStateSince < markerLossGraceMs) {
         continue;
       }
@@ -3686,11 +4167,16 @@ async function runTmuxShell({ cmd, cwd, pane, timeoutMs, maxOutputChars, ownerCo
         processAlive: false,
         processPid: 0,
         continuedAfterTimeout,
+        idleTimeoutReached: continuedAfterTimeout,
+        idleTimeoutMs: timeoutMs,
         target: pane.id,
         targetName: pane.label
       };
     }
   } finally {
+    if (control.token && activeTmuxShellRuns.get(control.token) === control) {
+      activeTmuxShellRuns.delete(control.token);
+    }
     if (!ownerContext) {
       cleanupPersistentTmuxOwnerFiles({
         scriptPath,
@@ -5965,7 +6451,8 @@ function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars 
       foundDone: false,
       exitCode: 124,
       stdout: "",
-      truncated: false
+      truncated: false,
+      outputFingerprint: ""
     };
   }
 
@@ -5981,7 +6468,8 @@ function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars 
     foundDone: doneIndex >= 0,
     exitCode: exitMatch ? Number(exitMatch[1]) : 124,
     stdout,
-    truncated: output.length > stdout.length
+    truncated: output.length > stdout.length,
+    outputFingerprint: hashText(output)
   };
 }
 

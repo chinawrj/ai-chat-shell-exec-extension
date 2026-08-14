@@ -154,6 +154,124 @@ async function main() {
   assert.match(longResponse.stdout, new RegExp(longToken));
   assert.ok(Date.now() - longStarted >= 1500, JSON.stringify(longResponse));
 
+  const idleContinueToken = `FORAI_IDLE_CONTINUE_${Date.now()}`;
+  const idleContinueCallKey = `forai-idle-continue-${Date.now()}`;
+  const idleContinueEvents = [];
+  const idleContinuePromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-idle-continue",
+    callKey: idleContinueCallKey,
+    cmd: `sleep 3\nprintf '${idleContinueToken}\\n'`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }), {
+    emit(event) {
+      idleContinueEvents.push(event);
+      return true;
+    }
+  });
+  await waitForCondition(
+    () => idleContinueEvents.some((event) => event.state === "awaiting-user"),
+    5000,
+    "idle timeout progress event"
+  );
+  const idleEvent = idleContinueEvents.find((event) => event.state === "awaiting-user");
+  assert.equal(idleEvent.reason, "output-idle-timeout", JSON.stringify(idleEvent));
+  assert.equal(idleEvent.callKey, idleContinueCallKey);
+  assert.equal(idleEvent.idleTimeoutMs, 1000);
+  const idleStatus = await handleMessageText(JSON.stringify({
+    type: "shell-run-control",
+    action: "status"
+  }));
+  assert.equal(idleStatus.active, true, JSON.stringify(idleStatus));
+  assert.equal(idleStatus.phase, "awaiting-user", JSON.stringify(idleStatus));
+  assert.equal(idleStatus.executionId, idleEvent.executionId);
+  const continued = await handleMessageText(JSON.stringify({
+    type: "shell-run-control",
+    action: "continue",
+    executionId: idleEvent.executionId
+  }));
+  assert.equal(continued.ok, true, JSON.stringify(continued));
+  assert.equal(continued.phase, "running", JSON.stringify(continued));
+  await waitForCondition(
+    () => idleContinueEvents.some((event) => event.reason === "user-continued"),
+    3000,
+    "continued idle timer acknowledgement"
+  );
+  const idleContinueResponse = await idleContinuePromise;
+  assert.equal(idleContinueResponse.exitCode, 0, JSON.stringify(idleContinueResponse));
+  assert.match(idleContinueResponse.stdout, new RegExp(idleContinueToken));
+
+  const outputHeartbeatEvents = [];
+  const outputHeartbeatResponse = await handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-output-heartbeat",
+    callKey: `forai-output-heartbeat-${Date.now()}`,
+    cmd: "for i in 1 2 3 4 5; do printf 'OUTPUT_HEARTBEAT_%s\\n' \"$i\"; sleep 0.4; done",
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }), {
+    emit(event) {
+      outputHeartbeatEvents.push(event);
+      return true;
+    }
+  });
+  assert.equal(outputHeartbeatResponse.exitCode, 0, JSON.stringify(outputHeartbeatResponse));
+  assert.equal(outputHeartbeatEvents.some((event) => event.state === "awaiting-user"), false, JSON.stringify(outputHeartbeatEvents));
+
+  const roleIdleToken = `FORAI_ROLE_IDLE_${Date.now()}`;
+  const roleIdleEvents = [];
+  const roleIdlePromise = handleMessageText(JSON.stringify({
+    type: "run",
+    id: "forai-role-idle",
+    callKey: `forai-role-idle-${Date.now()}`,
+    agentId: "slave-a",
+    cmd: `printf '${roleIdleToken}\\n'; sleep 60`,
+    timeoutMs: 1000,
+    maxOutputChars: 20000
+  }), {
+    emit(event) {
+      roleIdleEvents.push(event);
+      return true;
+    }
+  });
+  await waitForCondition(
+    () => roleIdleEvents.some((event) => event.state === "awaiting-user"),
+    5000,
+    "role-scoped idle timeout progress event"
+  );
+  const roleIdleEvent = roleIdleEvents.find((event) => event.state === "awaiting-user");
+  const defaultRoleStatus = await handleMessageText(JSON.stringify({
+    type: "shell-run-control",
+    action: "status"
+  }));
+  assert.equal(defaultRoleStatus.active, false, JSON.stringify(defaultRoleStatus));
+  const agentRoleStatus = await handleMessageText(JSON.stringify({
+    type: "shell-run-control",
+    action: "status",
+    agentId: "slave-a"
+  }));
+  assert.equal(agentRoleStatus.active, true, JSON.stringify(agentRoleStatus));
+  assert.equal(agentRoleStatus.phase, "awaiting-user", JSON.stringify(agentRoleStatus));
+  assert.equal(agentRoleStatus.executionId, roleIdleEvent.executionId);
+  const terminatedRole = await handleMessageText(JSON.stringify({
+    type: "shell-run-control",
+    action: "terminate",
+    agentId: "slave-a",
+    executionId: roleIdleEvent.executionId
+  }));
+  assert.equal(terminatedRole.ok, true, JSON.stringify(terminatedRole));
+  assert.equal(terminatedRole.requested, true, JSON.stringify(terminatedRole));
+  const terminatedRoleResponse = await Promise.race([
+    roleIdlePromise,
+    sleep(5000).then(() => {
+      throw new Error("Role-scoped helper did not return after termination.");
+    })
+  ]);
+  assert.equal(terminatedRoleResponse.exitCode, 130, JSON.stringify(terminatedRoleResponse));
+  assert.equal(terminatedRoleResponse.interrupted, true, JSON.stringify(terminatedRoleResponse));
+  assert.match(terminatedRoleResponse.stdout, new RegExp(roleIdleToken));
+
   const refreshOldToken = `FORAI_REFRESH_OLD_${Date.now()}`;
   const refreshNewToken = `FORAI_REFRESH_NEW_${Date.now()}`;
   const refreshOldPromise = handleMessageText(JSON.stringify({

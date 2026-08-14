@@ -65,7 +65,8 @@ function runBackgroundWithStore(syncStore) {
   assert.equal(JSON.stringify(writes), JSON.stringify([{
     enabledHosts: ["chatgpt.com", "m365.cloud.microsoft"],
     maxChainCalls: 100,
-    settingsMigrationVersion: 2
+    defaultTimeoutMs: 180000,
+    settingsMigrationVersion: 3
   }]));
 }
 
@@ -76,7 +77,22 @@ function runBackgroundWithStore(syncStore) {
     settingsMigrationVersion: 2
   };
   const writes = runBackgroundWithStore(store);
-  assert.equal(JSON.stringify(writes), "[]");
+  assert.equal(JSON.stringify(writes), JSON.stringify([{
+    defaultTimeoutMs: 180000,
+    settingsMigrationVersion: 3
+  }]));
+}
+
+{
+  const store = {
+    ...defaultStore,
+    defaultTimeoutMs: 45000,
+    settingsMigrationVersion: 2
+  };
+  const writes = runBackgroundWithStore(store);
+  assert.equal(JSON.stringify(writes), JSON.stringify([{
+    settingsMigrationVersion: 3
+  }]));
 }
 
 {
@@ -84,7 +100,8 @@ function runBackgroundWithStore(syncStore) {
   // seed the new default (true) so the role filter stays off by default.
   const store = { ...defaultStore };
   delete store.disableAuthorRoleFilter;
-  store.settingsMigrationVersion = 2;
+  store.defaultTimeoutMs = 180000;
+  store.settingsMigrationVersion = 3;
   const writes = runBackgroundWithStore(store);
   assert.equal(JSON.stringify(writes), JSON.stringify([{
     disableAuthorRoleFilter: true
