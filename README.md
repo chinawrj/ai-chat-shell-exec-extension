@@ -200,13 +200,13 @@ The floating status panel also has calibration controls for unknown chat systems
 
 - `Test`: insert and send a full-chain self-test prompt. The prompt asks the AI to return an ai-helper shell block; the extension only treats the test as passed when the executed command and `stdout` contain that test's token. Unexpected helper blocks are ignored instead of being run.
 - `Server Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
-- `Reset tmux`: recreate the default `ForAI` tmux session with `host` and `board` windows. This kills only the current `ForAI` session.
+- `Reset tmux`: recreate only this tab's active tmux session. Role `None` resets the default `ForAI`; `Master` or `Slave` resets that role's exact `ForAI-<agentId>` session without touching the default or other agents.
 - `Force run`: manually recheck the current page once and explicitly rerun the latest helper block, bypassing the shell server's completed-execution duplicate decision.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered helper/code block area.
 - `Clear`: remove the saved bindings for the current origin.
-- Agent controls: choose `master` or `slave`, enter an agent id, click `Save`, use `Roster` to list online agents, and use `Agent Check` to explain whether this tab, the local agent hub, browser-tab slaves, tmux panes, and tmux-ai slaves are ready.
+- Agent controls: choose `master` or `slave`, enter an agent id, click `Save`, use `Roster` to list online agents, and use `Agent Check` to explain whether this tab, the local agent hub, browser-tab slaves, tmux panes, and tmux-ai slaves are ready. The active role is tab-scoped and survives page refresh; opening another tab does not silently reuse it.
 - Tmux AI controls: from a saved master page, click `Refresh`, select the tmux pane where the AI slave is already running, enter a slave id, then click `Register`.
 
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.

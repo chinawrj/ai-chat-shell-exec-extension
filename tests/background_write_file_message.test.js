@@ -148,8 +148,8 @@ const context = {
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       releaseVersion: "0.6.0",
       serverReleaseVersion: "0.6.0",
-      protocolVersion: 7,
-      serverProtocolVersion: 7,
+      protocolVersion: 8,
+      serverProtocolVersion: 8,
       helperProtocolVersion: 2
     })
   }),
@@ -243,6 +243,7 @@ async function main() {
     type: "run-board",
     id: "board-1",
     callKey: "board-key-1",
+    agentId: "slave-a",
     cmd: "version",
     callMeta: { origin: "https://chatgpt.com" }
   });
@@ -251,6 +252,7 @@ async function main() {
   assert.equal(boardResponse.stdout, "board-ok\nBOARD> ");
   assert.equal(sentPayloads.length, 3);
   assert.equal(sentPayloads[2].type, "run-board");
+  assert.equal(sentPayloads[2].agentId, "slave-a");
   assert.equal(sentPayloads[2].cmd, "version");
   assert.equal(sentPayloads[2].boardName, "");
   assert.equal(sentPayloads[2].timeoutMs, 30000);

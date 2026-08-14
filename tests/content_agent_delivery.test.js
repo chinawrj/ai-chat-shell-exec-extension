@@ -107,6 +107,43 @@ async function testSavedOriginProfileDoesNotAutoPollNewTab() {
   assert.deepEqual(sentMessages, []);
 }
 
+async function testExtensionTabProfileRestoresRoleRoutingAfterPageStorageLoss() {
+  const sessionStore = {};
+  const context = loadContentContext({ sessionStore });
+  const sentMessages = [];
+  context.setStatus = () => {};
+  context.getLastUserMessageText = () => "";
+  context.chrome.runtime.sendMessage = async (message) => {
+    sentMessages.push(message);
+    if (message.type === "agent-page-profile-get") {
+      return { ok: true, profile: { role: "slave", agentId: "slave-a" } };
+    }
+    if (message.type === "run-shell") {
+      return { ok: true, exitCode: 0, targetName: "ForAI-slave-a:0.0 host" };
+    }
+    if (message.type === "tmux-reset-forai") {
+      return {
+        ok: true,
+        sessionName: "ForAI-slave-a",
+        defaultTarget: "%4",
+        boardTarget: "%5"
+      };
+    }
+    throw new Error(`Unexpected message type: ${message.type}`);
+  };
+
+  const profile = await context.hydrateCurrentAgentProfile();
+  assert.deepEqual(JSON.parse(JSON.stringify(profile)), { role: "slave", agentId: "slave-a" });
+  assert.deepEqual(JSON.parse(sessionStore.aiChatShellExecAgentProfile), { role: "slave", agentId: "slave-a" });
+
+  await context.sendRunShellMessage("restored-role-shell", { cmd: "printf restored" }, false);
+  await context.resetForAiTmux();
+  assert.deepEqual(
+    sentMessages.map((message) => `${message.type}:${message.agentId || ""}`),
+    ["agent-page-profile-get:", "run-shell:slave-a", "tmux-reset-forai:slave-a"]
+  );
+}
+
 async function testAutoReregisterWhenRosterIsLost() {
   const context = loadContentContext();
   const messages = [];
@@ -862,6 +899,9 @@ async function testProfileSwitchCancelsOldAgentDeliveryToken() {
     releaseClick = resolve;
   });
   context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "agent-page-profile-set") {
+      return { ok: true, profile: payload.profile };
+    }
     if (payload.type === "agent-ack") {
       ackCount += 1;
       return { ok: true };
@@ -1516,6 +1556,7 @@ async function waitFor(predicate, label) {
 
 (async () => {
   await testSavedOriginProfileDoesNotAutoPollNewTab();
+  await testExtensionTabProfileRestoresRoleRoutingAfterPageStorageLoss();
   await testAutoReregisterWhenRosterIsLost();
   await testUnsentAgentMessageIsNotInsertedTwice();
   await testAgentMessageStaysPendingUntilPageIsReady();

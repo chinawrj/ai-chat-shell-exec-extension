@@ -6,6 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const sentPayloads = [];
+const sessionStore = {};
 
 class FakeWebSocket {
   constructor(url) {
@@ -44,6 +45,7 @@ class FakeWebSocket {
 
 const context = {
   AbortController,
+  URL,
   chrome: {
     runtime: {
       id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
@@ -73,6 +75,15 @@ const context = {
           }
           return Promise.resolve();
         }
+      },
+      session: {
+        get: async (keys) => Object.fromEntries(keys.map((key) => [key, sessionStore[key]])),
+        set: async (values) => Object.assign(sessionStore, values),
+        remove: async (keys) => {
+          for (const key of keys) {
+            delete sessionStore[key];
+          }
+        }
       }
     }
   },
@@ -84,7 +95,7 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       releaseVersion: "0.6.0",
-      serverProtocolVersion: 7,
+      serverProtocolVersion: 8,
       helperProtocolVersion: 2,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       pid: 123
@@ -99,7 +110,38 @@ const script = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "b
 vm.runInContext(script, context, { filename: "background.js" });
 
 (async () => {
-  let response = await context.handleAgentMessage({
+  let response = await context.handlePageAgentProfileMessage({
+    type: "agent-page-profile-set",
+    origin: "https://chatgpt.com",
+    profile: { role: "slave", agentId: "slave-a" }
+  }, { tab: { id: 42 }, url: "https://chatgpt.com/c/agent-test" });
+  assert.deepEqual(JSON.parse(JSON.stringify(response.profile)), { role: "slave", agentId: "slave-a" });
+  response = await context.handlePageAgentProfileMessage({
+    type: "agent-page-profile-get",
+    origin: "https://chatgpt.com"
+  }, { tab: { id: 42 }, url: "https://chatgpt.com/c/agent-test" });
+  assert.deepEqual(JSON.parse(JSON.stringify(response.profile)), { role: "slave", agentId: "slave-a" });
+  response = await context.handlePageAgentProfileMessage({
+    type: "agent-page-profile-get",
+    origin: "https://m365.cloud.microsoft"
+  }, { tab: { id: 42 }, url: "https://m365.cloud.microsoft/chat" });
+  assert.deepEqual(JSON.parse(JSON.stringify(response.profile)), { role: "none", agentId: "" });
+  await assert.rejects(
+    () => context.handlePageAgentProfileMessage({
+      type: "agent-page-profile-get",
+      origin: "https://chatgpt.com"
+    }, {}),
+    /browser tab context/
+  );
+  await assert.rejects(
+    () => context.handlePageAgentProfileMessage({
+      type: "agent-page-profile-get",
+      origin: "https://evil.example"
+    }, { tab: { id: 42 }, url: "https://chatgpt.com/c/agent-test" }),
+    /origin does not match/
+  );
+
+  response = await context.handleAgentMessage({
     type: "agent-register",
     agentId: "master",
     role: "master"
@@ -176,6 +218,13 @@ vm.runInContext(script, context, { filename: "background.js" });
   assert.equal(response.ok, false);
   assert.match(response.error, /Unsupported background agent message type/);
   assert.equal(sentPayloads.length, 8);
+
+  await context.ensureTmuxTargets({ agentId: "slave-a" });
+  await context.resetForAiTmuxTargets({ agentId: "slave-a" });
+  assert.equal(sentPayloads[8].type, "tmux-ensure");
+  assert.equal(sentPayloads[8].agentId, "slave-a");
+  assert.equal(sentPayloads[9].type, "tmux-reset-forai");
+  assert.equal(sentPayloads[9].agentId, "slave-a");
 
   console.log("background agent message tests passed");
 })();

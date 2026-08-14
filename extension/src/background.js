@@ -8,7 +8,8 @@ const DEFAULT_MAX_CHAIN_CALLS = 100;
 const LEGACY_DEFAULT_MAX_CHAIN_CALLS = 5;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 2;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 7;
+const TAB_AGENT_PROFILE_PREFIX = "tabAgentProfile:v1:";
+const REQUIRED_SERVER_PROTOCOL_VERSION = 8;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 2;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
@@ -53,9 +54,13 @@ chrome.runtime.onStartup.addListener(() => {
   ensureDefaultSettings();
 });
 
+chrome.tabs?.onRemoved?.addListener((tabId) => {
+  chrome.storage.session.remove([`${TAB_AGENT_PROFILE_PREFIX}${tabId}`]).catch(() => {});
+});
+
 ensureDefaultSettings();
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) {
     return false;
   }
@@ -85,6 +90,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "agent-page-profile-get" || message.type === "agent-page-profile-set") {
+    handlePageAgentProfileMessage(message, sender)
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
   if (message.type === "tmux-list") {
     listTmuxTargets()
       .then(sendResponse)
@@ -97,7 +112,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "tmux-ensure") {
-    ensureTmuxTargets()
+    ensureTmuxTargets(message)
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -108,7 +123,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "tmux-reset-forai") {
-    resetForAiTmuxTargets()
+    resetForAiTmuxTargets(message)
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -394,6 +409,7 @@ async function handleRunBoardMessage(message) {
     type: "run-board",
     id: message.id,
     callKey,
+    agentId: message.agentId || "",
     boardName: message.boardName || "",
     cmd: message.cmd,
     timeoutMs,
@@ -734,14 +750,84 @@ function listTmuxTargets() {
     .then(() => runShellViaWebSocket({ type: "tmux-list", timeoutMs: 5000 }));
 }
 
-function ensureTmuxTargets() {
+function ensureTmuxTargets(message = {}) {
   return requireShellServerReady()
-    .then(() => runShellViaWebSocket({ type: "tmux-ensure", timeoutMs: 5000 }));
+    .then(() => runShellViaWebSocket({
+      type: "tmux-ensure",
+      agentId: message.agentId || "",
+      timeoutMs: 5000
+    }));
 }
 
-function resetForAiTmuxTargets() {
+function resetForAiTmuxTargets(message = {}) {
   return requireShellServerReady()
-    .then(() => runShellViaWebSocket({ type: "tmux-reset-forai", timeoutMs: 10000 }));
+    .then(() => runShellViaWebSocket({
+      type: "tmux-reset-forai",
+      agentId: message.agentId || "",
+      timeoutMs: 10000
+    }));
+}
+
+async function handlePageAgentProfileMessage(message, sender = {}) {
+  const tabId = Number(sender?.tab?.id);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    throw new Error("Agent page profile requires a browser tab context.");
+  }
+  const senderOrigin = getPageAgentProfileOrigin(message, sender);
+  const key = `${TAB_AGENT_PROFILE_PREFIX}${tabId}`;
+  if (message.type === "agent-page-profile-get") {
+    const stored = await chrome.storage.session.get([key]);
+    const entry = stored[key] || {};
+    return {
+      ok: true,
+      type: message.type,
+      profile: entry.origin === senderOrigin
+        ? normalizePageAgentProfile(entry.profile)
+        : { role: "none", agentId: "" }
+    };
+  }
+
+  const profile = normalizePageAgentProfile(message.profile);
+  if (profile.role === "none") {
+    await chrome.storage.session.remove([key]);
+  } else {
+    await chrome.storage.session.set({
+      [key]: {
+        origin: senderOrigin,
+        profile
+      }
+    });
+  }
+  return { ok: true, type: message.type, profile };
+}
+
+function getPageAgentProfileOrigin(message, sender = {}) {
+  let senderOrigin = "";
+  try {
+    senderOrigin = new URL(sender.origin || sender.url || "").origin;
+  } catch (_unused) {
+    // Rejected below with one stable error message.
+  }
+  const requestedOrigin = String(message.origin || "").trim();
+  if (!senderOrigin || requestedOrigin !== senderOrigin) {
+    throw new Error("Agent page profile origin does not match the sender.");
+  }
+  return senderOrigin;
+}
+
+function normalizePageAgentProfile(value = {}) {
+  const role = String(value?.role || "none").trim();
+  const agentId = String(value?.agentId || "").trim();
+  if (role === "none" || !agentId) {
+    return { role: "none", agentId: "" };
+  }
+  if (!["master", "slave"].includes(role)) {
+    throw new Error("Role must be none, master, or slave.");
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(agentId)) {
+    throw new Error("Agent id must be 1-64 safe characters and start with a letter or number.");
+  }
+  return { role, agentId };
 }
 
 function runShellViaWebSocket(payload) {

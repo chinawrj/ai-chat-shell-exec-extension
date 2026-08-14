@@ -19,7 +19,7 @@ const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 const COMMAND_ECHO_MAX_CHARS = 8000;
 const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 7;
+const SERVER_PROTOCOL_VERSION = 8;
 const HELPER_PROTOCOL_VERSION = 2;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -433,11 +433,11 @@ async function handleMessageText(text) {
   }
 
   if (message.type === "tmux-ensure") {
-    return withProtocolMetadata(await ensureForAiTmuxLayout());
+    return withProtocolMetadata(await ensureForAiTmuxLayout(getRunTmuxConfig(message)));
   }
 
   if (message.type === "tmux-reset-forai") {
-    return withProtocolMetadata(await resetForAiTmuxLayout());
+    return withProtocolMetadata(await resetForAiTmuxLayout(getRunTmuxConfig(message)));
   }
 
   if (message.type === "write-file") {
@@ -1194,9 +1194,10 @@ async function handleRunBoardMessage(message) {
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
-  const layout = await ensureForAiTmuxLayout();
+  const config = getRunTmuxConfig(message);
+  const layout = await ensureForAiTmuxLayout(config);
   const panes = layout.panes;
-  const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "", boardName);
+  const resolved = resolveBoardPane(panes, process.env.AI_CHAT_SHELL_BOARD_TARGET || "", boardName, config);
   if (!resolved.pane) {
     return buildBoardTargetErrorResponse({
       message,
@@ -1256,6 +1257,7 @@ async function handleRunBoardMessage(message) {
       id: message.id,
       callKey,
       executionId: reservation.attemptId,
+      agentId: config.agentId || "",
       cmd,
       boardName,
       cwd,
@@ -4731,13 +4733,12 @@ async function ensureForAiTmuxLayout(config = getForAiTmuxConfig()) {
   };
 }
 
-async function resetForAiTmuxLayout() {
-  const config = getForAiTmuxConfig();
+async function resetForAiTmuxLayout(config = getForAiTmuxConfig()) {
   const sessionCheck = await runTmuxCommandRaw(["has-session", "-t", exactTmuxSessionTarget(config.sessionName)], { timeoutMs: 5000 });
   if (sessionCheck.ok) {
     await runTmuxCommand(["kill-session", "-t", exactTmuxSessionTarget(config.sessionName)], { timeoutMs: 5000 });
   }
-  const layout = await ensureForAiTmuxLayout();
+  const layout = await ensureForAiTmuxLayout(config);
   return {
     ...layout,
     reset: true,
@@ -4839,7 +4840,7 @@ function resolveTmuxTarget(target, panes) {
   return byWindowName.length === 1 ? byWindowName[0] : null;
 }
 
-function resolveBoardPane(panes, configuredTarget = "", boardName = "") {
+function resolveBoardPane(panes, configuredTarget = "", boardName = "", config = getForAiTmuxConfig()) {
   const target = normalizeTmuxTarget(configuredTarget);
   if (target) {
     const pane = resolveTmuxTarget(target, panes);
@@ -4852,7 +4853,7 @@ function resolveBoardPane(panes, configuredTarget = "", boardName = "") {
     };
   }
 
-  return resolveDefaultBoardPane(panes, getForAiTmuxConfig(), boardName);
+  return resolveDefaultBoardPane(panes, config, boardName);
 }
 
 function resolveDefaultShellPane(panes, config = getForAiTmuxConfig()) {
