@@ -61,7 +61,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      7,
+      8,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -265,6 +265,66 @@ async function main() {
     deliveryState.isolatedWorlds = isolatedWorlds;
     throw new Error(`${error.message}; deliveryState=${JSON.stringify(deliveryState)}`);
   }
+
+  const defaultPaneBeforeRoleReset = getTmuxWindowPaneId(
+    socketPath,
+    expectedDefaultSession,
+    expectedDefaultHostWindow
+  );
+  const agentPaneBeforeRoleReset = getTmuxWindowPaneId(socketPath, "ForAI-slave-a", "host");
+  await page.evaluate("window.sessionStorage.clear(); true");
+  await page.send("Page.reload", { ignoreCache: true });
+  await waitForEvaluate(page, "document.readyState === 'complete'", "role refresh page load");
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return panel?.querySelector("[data-shell-agent-role]")?.value === "slave" &&
+      panel?.querySelector("[data-shell-agent-id]")?.value === "slave-a";
+  })()`, "per-tab role restoration after page session storage was cleared");
+
+  const refreshedAgentTmuxToken = `agent-tmux-refresh-e2e-${Date.now()}`;
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:agent-tmux-refresh-e2e",
+      ${JSON.stringify(`printf ${refreshedAgentTmuxToken}`)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  const refreshedAgentTmuxText = await waitForEvaluateValue(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes("targetName: ForAI-slave-a") &&
+      text.includes(${JSON.stringify(`stdout:\n${refreshedAgentTmuxToken}`)}) ? text : "";
+  })()`, "refreshed role shell helper uses per-agent tmux");
+  assert.match(refreshedAgentTmuxText, /targetName: ForAI-slave-a/);
+
+  const resetResults = await page.evaluateAcrossContexts(`(async () => {
+    if (typeof resetForAiTmux !== "function") {
+      return null;
+    }
+    window.confirm = () => true;
+    await resetForAiTmux();
+    return document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "";
+  })()`);
+  assert.ok(
+    resetResults.some((entry) => entry.value.includes("Reset ForAI-slave-a tmux")),
+    `Role-scoped Reset tmux did not report the agent session: ${JSON.stringify(resetResults)}`
+  );
+  const defaultPaneAfterRoleReset = getTmuxWindowPaneId(
+    socketPath,
+    expectedDefaultSession,
+    expectedDefaultHostWindow
+  );
+  const agentPaneAfterRoleReset = getTmuxWindowPaneId(socketPath, "ForAI-slave-a", "host");
+  assert.equal(
+    defaultPaneAfterRoleReset,
+    defaultPaneBeforeRoleReset,
+    "Reset tmux from a slave role must not replace the default ForAI session."
+  );
+  assert.notEqual(
+    agentPaneAfterRoleReset,
+    agentPaneBeforeRoleReset,
+    "Reset tmux from a slave role must replace only ForAI-slave-a."
+  );
 
   const masterPage = await openChromePage(debugPort, TEST_PAGE_URL);
   cleanup.push(() => masterPage.close());
@@ -1193,6 +1253,23 @@ function startTmuxCatSession(socketPath, sessionName) {
 
 function killTmuxSession(socketPath, sessionName) {
   spawnSync("tmux", [...tmuxSocketArgs(socketPath), "kill-session", "-t", sessionName], { encoding: "utf8" });
+}
+
+function getTmuxWindowPaneId(socketPath, sessionName, windowName) {
+  const result = runTmux(socketPath, [
+    "list-panes",
+    "-t",
+    `=${sessionName}`,
+    "-F",
+    "#{window_name}\t#{pane_id}"
+  ]);
+  const matches = String(result.stdout || "")
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.split("\t"))
+    .filter(([name, paneId]) => name === windowName && paneId);
+  assert.equal(matches.length, 1, `Expected one ${sessionName}:${windowName} pane, got ${result.stdout}`);
+  return matches[0][1];
 }
 
 function runTmux(socketPath, args) {

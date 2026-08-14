@@ -373,6 +373,43 @@ async function main() {
   assert.match(agentResponse.targetName, /ForAI-slave-a:.* host/);
   assert.equal(agentResponse.cwd, expectedForAiCwd);
 
+  const defaultPaneBeforeAgentReset = resolveDefaultShellPane(await listTmuxPanes()).pane.id;
+  const agentEnsure = await handleMessageText(JSON.stringify({
+    type: "tmux-ensure",
+    agentId: "slave-a"
+  }));
+  assert.equal(agentEnsure.ok, true, JSON.stringify(agentEnsure));
+  assert.equal(agentEnsure.sessionName, "ForAI-slave-a");
+  const agentPaneBeforeReset = agentEnsure.defaultTarget;
+  const agentReset = await handleMessageText(JSON.stringify({
+    type: "tmux-reset-forai",
+    agentId: "slave-a"
+  }));
+  assert.equal(agentReset.ok, true, JSON.stringify(agentReset));
+  assert.equal(agentReset.sessionName, "ForAI-slave-a");
+  assert.equal(agentReset.reset, true);
+  assert.equal(agentReset.killedExistingSession, true);
+  assert.notEqual(agentReset.defaultTarget, agentPaneBeforeReset);
+  assert.equal(
+    resolveDefaultShellPane(await listTmuxPanes()).pane.id,
+    defaultPaneBeforeAgentReset,
+    "Resetting an agent role must leave the default ForAI session untouched."
+  );
+  const agentBoardToken = `FORAI_AGENT_BOARD_${Date.now()}`;
+  const agentBoardResponse = await handleMessageText(JSON.stringify({
+    type: "run-board",
+    id: "forai-agent-board-run",
+    callKey: `forai-agent-board-run-${Date.now()}`,
+    agentId: "slave-a",
+    cmd: `printf '${agentBoardToken}\\n'`,
+    timeoutMs: 10000,
+    maxOutputChars: 20000
+  }));
+  assert.equal(agentBoardResponse.ok, true, JSON.stringify(agentBoardResponse));
+  assert.equal(agentBoardResponse.agentId, "slave-a");
+  assert.match(agentBoardResponse.targetName, /ForAI-slave-a:.* board/);
+  assert.match(agentBoardResponse.stdout, new RegExp(agentBoardToken));
+
   const ignoredTargetToken = `FORAI_IGNORED_TARGET_${Date.now()}`;
   const ignoredTargetResponse = await handleMessageText(JSON.stringify({
     type: "run",

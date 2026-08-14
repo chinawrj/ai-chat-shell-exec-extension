@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-08-14
+
+- Persists the active None/Master/Slave profile in extension-owned per-tab session storage, so a page refresh keeps both the floating-panel display and actual shell/board/agent routing on the same tmux workspace even when the page clears its own session storage.
+- Routes panel startup checks, health checks, full-chain tests, shell helpers, and board helpers through the active role's `ForAI-<agentId>` session; Role=None continues to use the default `ForAI` session.
+- Scopes the floating panel's `Reset tmux` action to the active role's exact session, leaving default and other agent sessions untouched.
+- Bumps the server protocol to 8 and adds unit, private-tmux integration, and real Chromium refresh/reset coverage.
+
 ## [0.9.9] - 2026-08-13
 
 - Replaces the legacy 8000-character shell-helper cap with a 1 MiB UTF-8 script-body limit now that helpers execute from temporary script files.

@@ -22,7 +22,7 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.9";
+const CONTENT_SCRIPT_VERSION = "0.9.10";
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -100,6 +100,7 @@ let pendingAgentDeliveryMessageId = "";
 let pendingAgentDelivery = null;
 let pendingAgentDeliveryLoaded = false;
 let consecutiveAgentPollFailures = 0;
+let activeAgentProfile = readSessionAgentProfile();
 let pendingHelperDeliveries = new Map();
 let locallyPresentedHelperExecutions = new Map();
 let pendingHelperDeliveriesLoadedKey = "";
@@ -151,6 +152,7 @@ async function activateExtension() {
   extensionActive = true;
   beginPageLifecycle();
   initialThreadSettled = false;
+  await hydrateCurrentAgentProfile();
   injectStatus();
   await loadLocalProfiles();
   await loadPendingHelperDeliveriesForCurrentPage();
@@ -3048,6 +3050,8 @@ function sendWriteFileMessage(callId, call, force) {
 }
 
 async function sendRunBoardMessage(callId, call, force) {
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.agentId && profile.role !== "none" ? profile.agentId : "";
   const recoveryLifecycle = {
     pageIdentity: getCurrentPageIdentity(),
     generation: pageLifecycleGeneration
@@ -3056,6 +3060,7 @@ async function sendRunBoardMessage(callId, call, force) {
     type: "run-board",
     id: callId,
     callKey: callId,
+    agentId,
     boardName: call.boardName || "",
     cmd: call.cmd,
     timeoutMs: call.timeoutMs,
@@ -3220,38 +3225,80 @@ async function sendAgentTaskStatusQuery(_callId, call, _force) {
 }
 
 async function getCurrentAgentProfile() {
-  return readSessionAgentProfile();
+  return { ...activeAgentProfile };
 }
 
-async function getSavedAgentProfileDefaults() {
-  const key = agentProfileKey();
-  const profiles = await chrome.storage.local.get([key]);
-  const profile = profiles[key] || {};
-  return {
-    role: normalizeCommand(profile.role || "none"),
-    agentId: normalizeCommand(profile.agentId || "")
-  };
+async function hydrateCurrentAgentProfile() {
+  const legacyProfile = readSessionAgentProfile();
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "agent-page-profile-get",
+      origin: location.origin
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "Could not restore the tab agent profile.");
+    }
+    const storedProfile = normalizeAgentProfile(response.profile);
+    if (storedProfile.role !== "none") {
+      activeAgentProfile = storedProfile;
+    } else if (legacyProfile.role !== "none") {
+      activeAgentProfile = legacyProfile;
+      const migrated = await chrome.runtime.sendMessage({
+        type: "agent-page-profile-set",
+        origin: location.origin,
+        profile: legacyProfile
+      });
+      if (!migrated?.ok) {
+        throw new Error(migrated?.error || "Could not migrate the tab agent profile.");
+      }
+    } else {
+      activeAgentProfile = { role: "none", agentId: "" };
+    }
+  } catch (_unused) {
+    activeAgentProfile = legacyProfile;
+  }
+  writeSessionAgentProfile(activeAgentProfile);
+  return { ...activeAgentProfile };
 }
 
 async function setCurrentAgentProfile(role, agentId) {
-  const previous = readSessionAgentProfile();
-  const profile = {
-    role: normalizeCommand(role || "none"),
-    agentId: normalizeCommand(agentId || "")
-  };
+  const previous = activeAgentProfile;
+  const profile = normalizeAgentProfile({ role, agentId });
   if (previous.role !== profile.role || previous.agentId !== profile.agentId) {
     cancelAgentDeliveryLifecycle();
     clearPendingAgentDelivery();
     pendingAgentDeliveryLoaded = false;
   }
-  try {
-    window.sessionStorage.setItem(AGENT_SESSION_PROFILE_KEY, JSON.stringify(profile));
-  } catch (_unused) {
-    // Session storage is best effort; local storage still preserves a default.
+  const tabProfile = await chrome.runtime.sendMessage({
+    type: "agent-page-profile-set",
+    origin: location.origin,
+    profile
+  });
+  if (!tabProfile?.ok) {
+    throw new Error(tabProfile?.error || "Could not save the tab agent profile.");
   }
+  activeAgentProfile = profile;
+  writeSessionAgentProfile(profile);
   await chrome.storage.local.set({
     [agentProfileKey()]: profile
   });
+}
+
+function normalizeAgentProfile(value = {}) {
+  const role = normalizeCommand(value?.role || "none");
+  const agentId = normalizeCommand(value?.agentId || "");
+  if (role === "none" || !agentId) {
+    return { role: "none", agentId: "" };
+  }
+  return { role, agentId };
+}
+
+function writeSessionAgentProfile(profile) {
+  try {
+    window.sessionStorage.setItem(AGENT_SESSION_PROFILE_KEY, JSON.stringify(profile));
+  } catch (_unused) {
+    // Compatibility mirror only. The extension-owned per-tab profile is authoritative.
+  }
 }
 
 function getSuggestedAgentIdForRole(role) {
@@ -5698,7 +5745,9 @@ async function checkStartupTmux() {
     setStatus(healthError, "error");
     return;
   }
-  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure" });
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.role !== "none" ? profile.agentId : "";
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure", agentId });
   if (!tmux?.ok) {
     setStatus(`ForAI tmux unavailable: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
     return;
@@ -5710,7 +5759,7 @@ function formatForAiStatus(tmux) {
   const host = tmux?.defaultTarget ? `host ${tmux.defaultTarget}` : "host missing";
   const board = tmux?.boardTarget ? `board ${tmux.boardTarget}` : "board missing";
   const cwd = tmux?.cwd ? `cwd ${summarizeCommand(tmux.cwd)}` : "";
-  return ["ForAI ready", host, board, cwd].filter(Boolean).join("; ");
+  return [`${tmux?.sessionName || "ForAI"} ready`, host, board, cwd].filter(Boolean).join("; ");
 }
 
 function getShellHealthStatusError(health) {
@@ -5981,10 +6030,7 @@ function handlePanelAction(action) {
 }
 
 async function loadAgentControls() {
-  const activeProfile = await getCurrentAgentProfile();
-  const profile = activeProfile.agentId || activeProfile.role !== "none"
-    ? activeProfile
-    : await getSavedAgentProfileDefaults();
+  const profile = await getCurrentAgentProfile();
   const role = document.querySelector(`#${STATUS_ID} [data-shell-agent-role]`);
   const agentId = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
   if (role) {
@@ -6251,18 +6297,21 @@ async function forceRunLatestShellCall() {
 }
 
 async function resetForAiTmux() {
-  if (!window.confirm("Reset the ForAI tmux session? This kills the current ForAI host and board windows.")) {
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.role !== "none" ? profile.agentId : "";
+  const sessionName = agentId ? `ForAI-${agentId}` : "ForAI";
+  if (!window.confirm(`Reset the ${sessionName} tmux session? This kills only its host and board windows.`)) {
     setStatus("Reset tmux cancelled", "idle");
     return;
   }
 
-  setStatus("Resetting ForAI tmux session", "running");
-  const tmux = await chrome.runtime.sendMessage({ type: "tmux-reset-forai" });
+  setStatus(`Resetting ${sessionName} tmux session`, "running");
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-reset-forai", agentId });
   if (!tmux?.ok) {
     setStatus(`Reset tmux failed: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
     return;
   }
-  setStatus(`Reset ForAI tmux; ${formatForAiStatus(tmux)}`, "ok");
+  setStatus(`Reset ${sessionName} tmux; ${formatForAiStatus(tmux)}`, "ok");
 }
 
 async function toggleCurrentSiteEnabled() {
@@ -6311,10 +6360,12 @@ function updateRoleFilterButton() {
 
 async function runHealthCheck() {
   setStatus("Checking shell server and bindings", "running");
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.role !== "none" ? profile.agentId : "";
   const [version, health, tmux, profiles] = await Promise.all([
     getBackgroundVersionInfo(),
     chrome.runtime.sendMessage({ type: "shell-health" }),
-    chrome.runtime.sendMessage({ type: "tmux-ensure" }),
+    chrome.runtime.sendMessage({ type: "tmux-ensure", agentId }),
     chrome.storage.local.get([composerProfileKey(), sendProfileKey(), shellProfileKey()])
   ]);
   updateVersionTooltip(version);
@@ -6351,7 +6402,9 @@ async function runFullChainTest() {
     return;
   }
 
-  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure" });
+  const profile = await getCurrentAgentProfile();
+  const agentId = profile.role !== "none" ? profile.agentId : "";
+  const tmux = await chrome.runtime.sendMessage({ type: "tmux-ensure", agentId });
   if (!tmux?.ok || !tmux.defaultTarget) {
     setStatus(`Test failed: ${summarizeCommand(tmux?.error || "default ForAI host target unavailable")}`, "error");
     return;
@@ -6369,7 +6422,7 @@ async function runFullChainTest() {
     "````"
   ].join("\n");
 
-  setStatus(`Starting full test on default ForAI:host ${tmux.defaultTarget}: ${token}`, "running");
+  setStatus(`Starting full test on ${tmux.sessionName || "ForAI"}:host ${tmux.defaultTarget}: ${token}`, "running");
   const composer = await insertReply(prompt);
   const sent = await runOriginalSendActuatorForOwnedComposer(
     composer,
