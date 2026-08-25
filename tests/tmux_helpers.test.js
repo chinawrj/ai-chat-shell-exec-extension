@@ -35,6 +35,7 @@ const {
   resolveTmuxTarget,
   validateBoardCommand,
   validateShellScriptSize,
+  validateVisionTmuxCommand,
   writeDownloadsFile
 } = require("../server/shell_server.js");
 
@@ -341,9 +342,27 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.doesNotThrow(() => validateBoardCommand("version"));
   assert.throws(() => validateBoardCommand("x".repeat(MAX_INTERACTIVE_COMMAND_CHARS + 1)), /Board command is too long/);
   assert.throws(() => validateBoardCommand("version\nhelp"), /exactly one command line/);
-  assert.throws(() => validateBoardCommand("ai-helper-board-start"), /copied shell-output text/);
-  assert.throws(() => validateBoardCommand("ai-helper-board-R1-start"), /copied shell-output text/);
-  assert.throws(() => validateBoardCommand("ai-helper-board-R1-end"), /copied shell-output text/);
+  for (const commandText of [
+    "ai-helper-board-start",
+    "ai-helper-board-R1-start",
+    "ai-helper-board-R1-end",
+    "printf 'shell call result:'",
+    "printf '```shell-output'",
+    "$ command copied from documentation"
+  ]) {
+    assert.doesNotThrow(
+      () => validateBoardCommand(commandText),
+      `Board command text must not be classified by output keywords: ${commandText}`
+    );
+    assert.equal(validateVisionTmuxCommand(commandText), commandText);
+  }
+  assert.doesNotThrow(() => validateShellScriptSize([
+    "cat <<'EOF'",
+    "stdout:",
+    "cwd: documentation",
+    "ai-helper-shell-start",
+    "EOF"
+  ].join("\n")));
 }
 
 {

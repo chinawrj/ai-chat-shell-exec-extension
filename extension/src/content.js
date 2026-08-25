@@ -25,7 +25,7 @@ const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.10.1";
+const CONTENT_SCRIPT_VERSION = "0.10.2";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -646,10 +646,6 @@ async function scanForShellCall(options = {}) {
   const validation = validateHelperCall(call);
   if (!validation.ok) {
     markCallProcessed(candidate, callKey, semanticCallKey);
-    if (isCopiedOutputRejectionReason(validation.reason)) {
-      setStatus(`Suppressed copied shell output: ${summarizeCommand(call.cmd)}`, "ok");
-      return;
-    }
     await replyWithRejectedCall(call, validation.reason);
     return;
   }
@@ -2345,7 +2341,7 @@ function resetChainForNewHumanPrompt() {
   }
 
   lastUserMessageText = text;
-  if (!isShellOutputText(text)) {
+  if (!isStructuredShellOutputText(text)) {
     chainCallCount = 0;
   }
 }
@@ -2361,7 +2357,7 @@ function getLastUserMessageText() {
     .filter(isVisibleElement)
     .map((node) => normalizeCommand(node.innerText || node.textContent || ""))
     .filter((text) => text && text.length <= 5000)
-    .filter((text) => !isShellOutputText(text))
+    .filter((text) => !isStructuredShellOutputText(text))
     .filter(containsToolLanguageHint);
 
   if (promptLike.length > 0) {
@@ -2371,18 +2367,51 @@ function getLastUserMessageText() {
   const toolOutputLike = Array.from(document.querySelectorAll("article, [role='article'], [data-testid], main > div"))
     .filter(isVisibleElement)
     .map((node) => normalizeCommand(node.innerText || node.textContent || ""))
-    .filter(isShellOutputText);
+    .filter(isStructuredShellOutputText);
 
   return toolOutputLike.length > 0 ? toolOutputLike[toolOutputLike.length - 1] : "";
 }
 
-function isShellOutputText(text) {
-  const lower = String(text || "").toLowerCase();
-  return lower.includes("shell call result:") ||
-    lower.includes("shell call failed:") ||
-    lower.includes("shell call rejected:") ||
-    lower.includes("```shell-output") ||
-    lower.includes("shell-output");
+function isStructuredShellOutputText(text) {
+  const normalized = String(text || "").replace(/\r\n?/g, "\n").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const candidates = [normalized];
+  const lines = normalized.split("\n");
+  if (/^(?:user|you|you said:)$/i.test(lines[0]?.trim() || "")) {
+    candidates.push(lines.slice(1).join("\n").trim());
+  }
+
+  const headings = [
+    "Shell call result:",
+    "Shell call failed:",
+    "Shell call rejected:",
+    "Board command result:",
+    "Board command failed:",
+    "Board command rejected:",
+    "File write result:",
+    "File write failed:",
+    "File helper rejected:",
+    "Agent message result:",
+    "Agent message failed:",
+    "Agent message rejected:",
+    "Agent roster result:",
+    "Agent roster query failed:",
+    "Agent roster query rejected:",
+    "Agent task status result:",
+    "Agent task status query failed:",
+    "Agent task status query rejected:"
+  ];
+  return candidates.some((candidate) => headings.some((heading) => {
+    if (!candidate.startsWith(heading)) {
+      return false;
+    }
+    const body = candidate.slice(heading.length);
+    return /^\n(?:\n)?(?:```shell-output|shell-output)(?:\n|$)/.test(body) ||
+      (location.hostname === "m365.cloud.microsoft" && body.startsWith("```shell-output"));
+  }));
 }
 
 function isShellOutputCandidate(candidate) {
@@ -2436,34 +2465,6 @@ function isHelperLineInsideShellOutput(text, helperStartLine) {
   return inside;
 }
 
-function isSameCommandAsShellOutput(command, shellOutputText) {
-  const previousCommandHash = extractCommandHashFromShellOutput(shellOutputText);
-  if (previousCommandHash) {
-    return stableHash(normalizeCommand(command)) === previousCommandHash;
-  }
-
-  const previousCommand = extractCommandFromShellOutput(shellOutputText);
-  return previousCommand && normalizeCommand(command) === previousCommand;
-}
-
-function extractCommandHashFromShellOutput(text) {
-  const normalized = normalizeCommand(text);
-  const match = normalized.match(/^cmdHash:\s*([a-f0-9]+)\s*$/im);
-  return match?.[1] || "";
-}
-
-function extractCommandFromShellOutput(text) {
-  const normalized = normalizeCommand(text);
-  const compactMatch = normalized.match(/\$\s+([\s\S]*?)(?:\s*cmdHash:|\s*target:|\s*cwd:|\s*exitCode:|\s*durationMs:|```|$)/);
-  if (compactMatch?.[1]) {
-    return compactMatch[1].trim();
-  }
-
-  const lines = normalized.split("\n");
-  const commandLine = lines.find((line) => line.trim().startsWith("$ "));
-  return commandLine ? commandLine.trim().slice(2).trim() : "";
-}
-
 function validateHelperCall(call) {
   if (call?.helperMarkerError) {
     return { ok: false, reason: call.helperMarkerError };
@@ -2515,7 +2516,7 @@ function validateBoardCall(call) {
     return { ok: false, reason: "Board helper body must contain exactly one command line." };
   }
 
-  return validateShellLikeCommandText(cmd);
+  return { ok: true };
 }
 
 function validateAgentMessageCall(call) {
@@ -2586,58 +2587,7 @@ function validateShellCall(call) {
     return { ok: false, reason: "Command is empty." };
   }
 
-  return validateShellLikeCommandText(cmd);
-}
-
-function validateShellLikeCommandText(cmd) {
-  const lower = cmd.toLowerCase();
-  const lines = cmd.split("\n").map((line) => line.trim()).filter(Boolean);
-  const suspiciousLine = lines.find((line) =>
-    line === "$" ||
-    line.startsWith("$ ") ||
-    line === "shell-output" ||
-    getHelperStartKind(line) ||
-    isHelperEndForKind("shell", line) ||
-    isHelperEndForKind("file", line) ||
-    isHelperEndForKind("drawio", line) ||
-    isHelperEndForKind("board", line) ||
-    /^ai-helper-board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-end$/.test(line) ||
-    isHelperEndForKind("agent-message", line) ||
-    isHelperEndForKind("agent-roster", line) ||
-    isHelperEndForKind("agent-task-status", line) ||
-    UNSUPPORTED_HELPER_MARKERS.has(line) ||
-    line === "stdout:" ||
-    line === "stderr:" ||
-    line === "native messaging" ||
-    line === "shell-call" ||
-    line.startsWith("startedat:") ||
-    line.startsWith("exitcode:") ||
-    line.startsWith("durationms:") ||
-    line.startsWith("cwd:")
-  );
-
-  if (suspiciousLine) {
-    return {
-      ok: false,
-      reason: `Looks like copied terminal/output text instead of a command: ${suspiciousLine}`
-    };
-  }
-
-  if (lower.includes("```") || lower.includes("shell call result") || lower.includes("shell call failed")) {
-    return {
-      ok: false,
-      reason: "Looks like a shell-output reply or markdown wrapper, not a runnable command."
-    };
-  }
-
   return { ok: true };
-}
-
-function isCopiedOutputRejectionReason(reason) {
-  const lower = String(reason || "").toLowerCase();
-  return lower.includes("copied terminal/output text") ||
-    lower.includes("shell-output reply") ||
-    lower.includes("markdown wrapper");
 }
 
 async function replyWithRejectedCall(call, reason) {

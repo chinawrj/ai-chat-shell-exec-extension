@@ -62,7 +62,7 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      9,
+      10,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
@@ -925,6 +925,91 @@ async function main() {
       .some((node) => (node.innerText || "").includes(${JSON.stringify(largeCommandToken)}));
     return submitted && !(composer?.innerText || "").trim();
   })()`, "large shell result to be submitted before the next helper");
+
+  const opaqueCommandToken = `ai-chat-shell-opaque-command-${Date.now()}`;
+  const opaquePayloadPath = path.join(shellStateDir, `${opaqueCommandToken}.txt`);
+  cleanup.push(() => fs.rmSync(opaquePayloadPath, { force: true }));
+  const opaqueCommand = [
+    `cat > ${shellQuote(opaquePayloadPath)} <<'AI_HELPER_OPAQUE_TEXT'`,
+    "shell call result: documentation",
+    "shell call failed: documentation",
+    "```shell-output",
+    "stdout:",
+    "cwd: documentation",
+    "ai-helper-shell-start",
+    "AI_HELPER_OPAQUE_TEXT",
+    `printf '${opaqueCommandToken}'`
+  ].join("\n");
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:opaque-command-e2e",
+      ${JSON.stringify(opaqueCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`stdout:\n${opaqueCommandToken}`)});
+  })()`, "keyword-heavy shell body to execute as opaque command text");
+  assert.equal(
+    fs.readFileSync(opaquePayloadPath, "utf8"),
+    [
+      "shell call result: documentation",
+      "shell call failed: documentation",
+      "```shell-output",
+      "stdout:",
+      "cwd: documentation",
+      "ai-helper-shell-start",
+      ""
+    ].join("\n"),
+    "The real browser/server path must preserve command text formerly misclassified as copied output."
+  );
+  await waitForEvaluate(page, `(() => {
+    const composer = document.getElementById("composer");
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes(${JSON.stringify(opaqueCommandToken)}));
+    return submitted && !(composer?.innerText || "").trim();
+  })()`, "opaque command result to be submitted before Force run coverage");
+
+  const forceOpaqueToken = `ai-chat-shell-force-opaque-${Date.now()}`;
+  const forceOpaqueMarkerPath = path.join(shellStateDir, `${forceOpaqueToken}.txt`);
+  cleanup.push(() => fs.rmSync(forceOpaqueMarkerPath, { force: true }));
+  const forceOpaqueCommand = [
+    `cat > ${shellQuote(forceOpaqueMarkerPath)} <<'AI_HELPER_FORCE_OPAQUE_TEXT'`,
+    "shell call result: Force must still execute this text",
+    "stdout:",
+    "cwd: force documentation",
+    "AI_HELPER_FORCE_OPAQUE_TEXT",
+    `printf '${forceOpaqueToken}'`
+  ].join("\n");
+  await page.evaluate(`(() => {
+    appendAssistantToolCall([
+      "ai-helper-shell-start:force-opaque-e2e",
+      ${JSON.stringify(forceOpaqueCommand)},
+      "ai-helper-shell-end"
+    ].join("\\n"), "shell-output");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return (panel?.innerText || "").includes("Suppressed helper inside shell-output");
+  })()`, "structured shell-output helper to remain auto-suppressed");
+  await page.evaluate(`new Promise((resolve) => setTimeout(resolve, 750))`);
+  assert.equal(
+    fs.existsSync(forceOpaqueMarkerPath),
+    false,
+    "A helper structurally rendered inside shell-output must not execute automatically."
+  );
+  await page.evaluate(`(() => {
+    document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="force"]')?.click();
+    return true;
+  })()`);
+  await waitFor(() => fs.existsSync(forceOpaqueMarkerPath), "Force run to execute a structurally suppressed keyword-heavy helper");
+  await waitForEvaluate(page, `(() => {
+    const text = document.body.innerText || "";
+    return text.includes(${JSON.stringify(`stdout:\n${forceOpaqueToken}`)});
+  })()`, "Force run result for keyword-heavy shell body");
 
   const token = `ai-chat-shell-e2e-${Date.now()}`;
   const helperId = `shell-${Date.now()}`;

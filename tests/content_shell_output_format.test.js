@@ -59,21 +59,20 @@ const longOutput = context.formatShellOutput({ cmd: longCommand }, response, "20
 const longCommandLine = longOutput.split("\n").find((line) => line.startsWith("$ "));
 assert.ok(longCommandLine.length <= 66, longCommandLine);
 assert.match(longOutput, /^cmdHash: [a-f0-9]+$/m);
-assert.equal(context.isSameCommandAsShellOutput(longCommand, longOutput), true);
-assert.equal(context.isSameCommandAsShellOutput(`${longCommand}x`, longOutput), false);
 assert.match(longOutput, /stdout:\nok/);
 
 const shortCommand = "pwd";
 const shortOutput = context.formatShellOutput({ cmd: shortCommand }, response, "2026-05-22T00:00:00.000Z");
 assert.match(shortOutput, /^\$ pwd$/m);
 assert.doesNotMatch(shortOutput, /^cmdHash:/m);
-assert.equal(context.isSameCommandAsShellOutput(shortCommand, shortOutput), true);
 
 const multilineCommand = "printf one\nprintf two";
 const multilineOutput = context.formatShellOutput({ cmd: multilineCommand }, response, "2026-05-22T00:00:00.000Z");
 assert.match(multilineOutput, /^\$ printf one printf two$/m);
 assert.match(multilineOutput, /^cmdHash: [a-f0-9]+$/m);
-assert.equal(context.isSameCommandAsShellOutput(multilineCommand, multilineOutput), true);
+assert.equal(typeof context.isSameCommandAsShellOutput, "undefined", "Legacy frontend shell-output command-history parsing must remain removed.");
+assert.equal(typeof context.extractCommandHashFromShellOutput, "undefined");
+assert.equal(typeof context.extractCommandFromShellOutput, "undefined");
 
 const timeoutOutput = context.formatShellOutput({ cmd: "sleep 10" }, {
   ...response,

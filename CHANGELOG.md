@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-25
+
+- Removes extension-side and shell-server command-body heuristics that incorrectly rejected valid scripts containing `shell-output`, result headings, Markdown fences, terminal prompts, metadata labels, or helper markers.
+- Keeps automatic feedback-loop protection tied to exact fenced/DOM `shell-output` provenance instead of command keywords; an explicit **Force run** can execute a structurally suppressed helper and is no longer vetoed by either endpoint's text classifier.
+- Removes legacy frontend parsing of commands from historical shell-output and narrows tool-result classification to complete known output envelopes so ordinary user discussion of `shell-output` still resets chain state.
+- Adds unit and real-Chromium regressions for ordinary keyword-heavy heredoc execution, structural auto-suppression, and successful Force execution through the real shell server.
+- Bumps the shell server protocol to 10 so the updated extension detects a still-running older server; restart the foreground shell server after updating.
+
 ## [0.10.1] - 2026-08-25
 
 - Lets `AI_HELPER_FILE_PATH` replace `$HOME/Downloads` as the server-side destination for `ai-helper-file` output while retaining single-file-name and traversal protections. An explicitly empty override fails closed.

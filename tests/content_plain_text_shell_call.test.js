@@ -66,7 +66,7 @@ assert.equal(extracted.helperId, parsed.helperId);
 assert.equal(extracted.target, undefined);
 assert.equal(extracted.cmd, command);
 assert.equal(context.validateHelperCall(parsed).ok, true);
-assert.equal(context.validateShellCall({ cmd: block }).ok, false);
+assert.equal(context.validateShellCall({ cmd: block }).ok, true, "A parsed command field is opaque even when it contains helper-envelope text.");
 
 const [fencedExtracted] = context.parsePlainTextHelperBlocks(`\`\`\`\`\n${block}\n\`\`\`\``);
 assert.equal(fencedExtracted.target, undefined);
@@ -131,7 +131,7 @@ const shellStartAlias = context.parseCallPayload("ai-helper-start-shell\n%24\npw
 assert.equal(shellStartAlias.cmd, "");
 assert.equal(shellStartAlias.target, undefined);
 assert.equal(context.containsToolLanguageHint("ai-helper-start-shell\n%24\npwd\nai-helper-end-shell"), false);
-assert.equal(context.validateShellCall({ cmd: "ai-helper-start-shell\n%24\npwd\nai-helper-end-shell" }).ok, false);
+assert.equal(context.validateShellCall({ cmd: "ai-helper-start-shell\n%24\npwd\nai-helper-end-shell" }).ok, true);
 
 const suffixedShellA = context.parseCallPayload("ai-helper-shell-start:1001\npwd\nai-helper-shell-end");
 const suffixedShellB = context.parseCallPayload("ai-helper-shell-start:1002\npwd\nai-helper-shell-end");
@@ -161,6 +161,50 @@ const heredocShell = context.parseCallPayload([
 assert.equal(heredocShell.target, undefined);
 assert.equal(heredocShell.cmd, "cat > /tmp/ai-helper-heredoc.txt <<'EOF'\nhello\nEOF\nprintf done");
 assert.equal(context.validateHelperCall(heredocShell).ok, true);
+
+for (const cmd of [
+  "printf 'shell call result: legitimate text\\n'",
+  "printf '%s\\n' '```shell-output'",
+  "cat <<'EOF'\nstdout:\ncwd: documentation\nai-helper-shell-start\nEOF",
+  "$ command copied from documentation"
+]) {
+  assert.equal(
+    context.validateShellCall({ cmd }).ok,
+    true,
+    `Shell command text must remain opaque executable data: ${cmd}`
+  );
+}
+assert.equal(typeof context.validateShellLikeCommandText, "undefined");
+assert.equal(typeof context.isCopiedOutputRejectionReason, "undefined");
+assert.equal(context.isStructuredShellOutputText("Discuss the shell-output format"), false);
+assert.equal(context.isStructuredShellOutputText("printf 'shell call result: legitimate text'"), false);
+assert.equal(context.isStructuredShellOutputText([
+  "Shell call result:",
+  "",
+  "```shell-output",
+  "$ printf ok",
+  "stdout:",
+  "ok",
+  "```"
+].join("\n")), true);
+for (const heading of [
+  "File helper rejected:",
+  "Agent roster result:",
+  "Agent task status result:"
+]) {
+  assert.equal(
+    context.isStructuredShellOutputText(`${heading}\nshell-output\npayload`),
+    true,
+    `Known rendered output heading must keep chain-loop classification exact: ${heading}`
+  );
+}
+context.location.hostname = "m365.cloud.microsoft";
+assert.equal(
+  context.isStructuredShellOutputText("You said:\nShell call result:```shell-output$ printf okstdout:ok```"),
+  true,
+  "Exact M365 flattened output envelopes remain distinguishable from ordinary keyword mentions."
+);
+context.location.hostname = "chatgpt.com";
 
 const legacyTargetLineIsCommand = context.parseCallPayload("ai-helper-shell-start\n%24\npwd\nai-helper-shell-end");
 assert.equal(legacyTargetLineIsCommand.target, undefined);
@@ -307,8 +351,7 @@ assert.equal(context.validateHelperCall(emptyBoard).ok, false);
 assert.match(context.validateHelperCall(emptyBoard).reason, /empty/);
 
 const boardWithMarker = context.parseCallPayload("ai-helper-board-start\nai-helper-shell-start\nai-helper-board-end");
-assert.equal(context.validateHelperCall(boardWithMarker).ok, false);
-assert.match(context.validateHelperCall(boardWithMarker).reason, /copied terminal\/output text/);
+assert.equal(context.validateHelperCall(boardWithMarker).ok, true);
 
 const agentMessageBlock = [
   "ai-helper-agent-message-start",
@@ -479,8 +522,7 @@ const rosterWithMarkerAsShell = context.parseCallPayload([
   "ai-helper-agent-roster-end",
   "ai-helper-shell-end"
 ].join("\n"));
-assert.equal(context.validateHelperCall(rosterWithMarkerAsShell).ok, false);
-assert.match(context.validateHelperCall(rosterWithMarkerAsShell).reason, /copied terminal\/output text/);
+assert.equal(context.validateHelperCall(rosterWithMarkerAsShell).ok, true);
 
 const slaveInboundPrompt = context.formatInboundAgentPrompt({
   role: "slave",

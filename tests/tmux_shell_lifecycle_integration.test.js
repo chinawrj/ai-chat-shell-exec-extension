@@ -288,7 +288,10 @@ async function testServerRestartRecovery() {
       `printf '${leaderToken}\\n'`,
       "sleep 5",
       "printf 'leader-done\\n'"
-    ].join("; "), 1000);
+    ].join("; "), 1000).then(
+      (response) => ({ response, error: null }),
+      (error) => ({ response: null, error })
+    );
     await waitForFileText(leaderStartedPath, "started", 5000);
 
     // Loading a fresh module instance models the loss of all in-memory queue
@@ -308,11 +311,19 @@ async function testServerRestartRecovery() {
     const followerSettledWhileLeaderWasBusy = followerSettled;
     const paneTextWhileLeaderWasBusy = capturePane(fixture.socketPath, pane.id);
 
-    const leaderResponse = await withDeadline(leaderPromise, 8000, "leader after simulated server restart");
+    const leaderOutcome = await withDeadline(leaderPromise, 8000, "leader after simulated server restart");
     const followerResponse = await withDeadline(followerPromise, 8000, "follower after simulated server restart");
     assert.equal(followerSettledWhileLeaderWasBusy, false, "A restarted server must recover the busy-pane lease instead of injecting a second runner.");
     assert.doesNotMatch(paneTextWhileLeaderWasBusy, new RegExp(followerToken));
-    assert.equal(leaderResponse.exitCode, 0, JSON.stringify(leaderResponse));
+    if (leaderOutcome.response) {
+      assert.equal(leaderOutcome.response.exitCode, 0, JSON.stringify(leaderOutcome.response));
+    } else {
+      assert.match(
+        String(leaderOutcome.error?.message || leaderOutcome.error || ""),
+        /Lost persistent tmux pane ownership/,
+        "The simulated old server may lose its response channel only after the restarted module adopts the persistent owner."
+      );
+    }
     assert.equal(followerResponse.exitCode, 0, JSON.stringify(followerResponse));
     assert.equal(followerResponse.executed, true, JSON.stringify(followerResponse));
     assert.equal(followerResponse.executionCompleted, true, JSON.stringify(followerResponse));
@@ -320,6 +331,8 @@ async function testServerRestartRecovery() {
     assert.match(followerResponse.stdout, new RegExp(followerToken));
 
     const paneText = capturePane(fixture.socketPath, pane.id);
+    assert.match(paneText, new RegExp(leaderToken));
+    assert.match(paneText, /leader-done/);
     assert.doesNotMatch(paneText, /can't open input file|No such file or directory/);
   });
 }

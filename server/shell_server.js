@@ -19,7 +19,7 @@ const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 const COMMAND_ECHO_MAX_CHARS = 8000;
 const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 9;
+const SERVER_PROTOCOL_VERSION = 10;
 const HELPER_PROTOCOL_VERSION = 3;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
@@ -64,12 +64,9 @@ const DEFAULT_BOARD_PROMPT_IDLE_MS = 200;
 const DEFAULT_BOARD_POLL_MS = 100;
 const HELPER_SHELL_START = "ai-helper-shell-start";
 const HELPER_SHELL_END = "ai-helper-shell-end";
-const HELPER_FILE_START = "ai-helper-file-start";
-const HELPER_FILE_END = "ai-helper-file-end";
 const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
 const BOARD_NAME_SUFFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const SHELL_RUNNER = process.env.AI_CHAT_SHELL_RUNNER || (fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh");
 const ALLOW_UNTRUSTED_ORIGINS = process.env.AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS === "1";
 const DEFAULT_VISION_HELPER_PATH = path.join(STATE_DIR, "bin", "macos-vision-helper");
@@ -485,8 +482,6 @@ async function handleMessageText(text, context = {}) {
     throw new Error("Missing command.");
   }
   validateShellScriptSize(cmd);
-
-  validateCommand(cmd);
 
   const timeoutMs = clampNumber(message.timeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const maxOutputChars = clampNumber(message.maxOutputChars, 1000, 200000, DEFAULT_MAX_OUTPUT_CHARS);
@@ -3794,40 +3789,6 @@ function normalizeCallKey(value) {
   return hashText(raw || `${Date.now()}:${Math.random()}`);
 }
 
-function validateCommand(cmd) {
-  const lower = cmd.toLowerCase();
-  if (lower.includes("```") || lower.includes("shell call result") || lower.includes("shell call failed")) {
-    throw new Error("Refusing to execute markdown/output text. Provide only the shell command.");
-  }
-
-  const lines = cmd.split("\n").map((line) => line.trim()).filter(Boolean);
-  const suspicious = lines.find((line) =>
-    line === "$" ||
-    line.startsWith("$ ") ||
-    line === "shell-output" ||
-    line === HELPER_SHELL_START ||
-    line === HELPER_SHELL_END ||
-    line === HELPER_FILE_START ||
-    line === HELPER_FILE_END ||
-    line === HELPER_BOARD_START ||
-    line === HELPER_BOARD_END ||
-    /^ai-helper-board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-(?:start|end)(?::[A-Za-z0-9._:-]{1,128})?$/.test(line) ||
-    UNSUPPORTED_HELPER_MARKERS.has(line) ||
-    line === "stdout:" ||
-    line === "stderr:" ||
-    line === "native messaging" ||
-    line === "shell-call" ||
-    line.startsWith("startedat:") ||
-    line.startsWith("exitcode:") ||
-    line.startsWith("durationms:") ||
-    line.startsWith("cwd:")
-  );
-
-  if (suspicious) {
-    throw new Error(`Refusing to execute copied shell-output text: ${suspicious}`);
-  }
-}
-
 function validateShellScriptSize(cmd) {
   const bytes = Buffer.byteLength(String(cmd || ""), "utf8");
   if (bytes > MAX_SHELL_SCRIPT_BYTES) {
@@ -3847,7 +3808,6 @@ function validateBoardCommand(cmd) {
   if (normalized.includes("\n")) {
     throw new Error("Board helper body must contain exactly one command line.");
   }
-  validateCommand(normalized);
 }
 
 function normalizeRequestedBoardName(value) {
@@ -3873,7 +3833,6 @@ function validateVisionTmuxCommand(cmd) {
   if (normalized.length > MAX_INTERACTIVE_COMMAND_CHARS) {
     throw new VisionValidationError("command-too-long", `Vision tmux command is too long (${normalized.length} chars, max ${MAX_INTERACTIVE_COMMAND_CHARS}).`);
   }
-  validateCommand(normalized);
   return normalized;
 }
 
