@@ -63,6 +63,39 @@ Goal: let users simulate a small local agent team with multiple chat tabs before
 - Keep each registered agent tab's shell helpers isolated in a per-agent `ForAI-<agentId>:host` tmux workspace.
 - Preserve the existing direct tmux workflow for non-agent pages.
 
+### Shipped in v0.10.0: Inline Draw.io File Helper
+
+Goal: let an AI place the complete contents of a native `.drawio` file in a helper block so the extension can render it as a user-facing SVG/image in a floating preview. This helper contains data, not a shell command.
+
+````
+ai-helper-drawio-start
+<mxfile>...</mxfile>
+ai-helper-drawio-end
+````
+
+The exact XML between the marker lines is the artifact. Preserve it byte-for-byte apart from normalising the chat renderer's line endings when necessary; do not trim, command-normalise, interpret a target/cwd line, or treat any XML line as shell text. An optional diagnostic identity suffix may follow the same safe suffix grammar as shell/file helpers, while an unsuffixed block derives its stable artifact identity from the complete payload hash.
+
+Draw.io helpers are a separate, non-executable path:
+
+- `ai-helper-shell-start` continues to send command text through background/server/tmux and the server remains the execution-duplicate authority.
+- `ai-helper-drawio-start` is parsed and validated by the extension and must never be forwarded to tmux, the shell server, a board, or the chat composer.
+- Rendering is a local, idempotent UI effect. It does not use canonical shell `executionId`, Force run, command ledgers, `shell-output`, result-presentation receipts, or the persistent composer-delivery queue.
+- Across all visible candidates, only the last complete helper whose entire payload parses as valid draw.io XML is eligible to display. A newer incomplete or invalid helper never clears, hides, or replaces the current diagram. Scan-debounce the exact rendered helper/root and complete payload hash so streaming, DOM mutation, and a framework redraw of identical content cannot reopen or remount it. A Reopen control may deliberately show the already-rendered payload again without rescanning or contacting a backend.
+
+The extension owns presentation. After the complete end marker is present and the message has settled, validate a bounded UTF-8 XML payload rooted at `<mxfile>` (and decide explicitly whether raw `<mxGraphModel>` is supported). Send the XML as data to a pinned, packaged draw.io viewer inside an isolated extension iframe. Render a changed candidate in a hidden, nonzero-size staging surface while the old SVG remains visible; attach a scan-generation token, discard any staging result that becomes stale, and atomically replace the visible diagram only after the still-latest candidate has produced a ready SVG. Never blank the preview between versions. The viewer renders vector graphics for the user; the content script supplies only the movable/resizable frame and Close, Reopen, Fit/Zoom, page/layer, and Download `.drawio` controls.
+
+Do not use `innerHTML` for XML or inline untrusted SVG in the chat page. Keep rendered SVG inside the isolated viewer, or cross an image/blob boundary before displaying it. The sandboxed viewer must have no extension privileges, remote script execution, popups, top navigation, or unrestricted external image/font/link fetching. If `https://embed.diagrams.net` is ever offered, make it an explicit online mode because it sends the diagram outside the local page.
+
+The diagram is for the user, not the AI. Do not insert XML, SVG, PNG, or automatic render output into the composer. A separate opt-in `Confirm to AI` action may send a short text-only acknowledgement after the user inspects the diagram, but diagram visibility and local reopen state must not depend on composer delivery.
+
+The v0.10.0 implementation fixes these decisions:
+
+- helper protocol `3`, a 1 MiB UTF-8 limit, strict `<mxfile>` plus `<diagram>` validation, optional identity suffixes, and an end-marker collision guard for XML CDATA/comments;
+- packaged draw.io viewer `v31.1.5` with recorded SHA-256 and Apache-2.0 license, isolated by the manifest sandbox/CSP with no runtime renderer CDN;
+- an in-memory per-page preview lifecycle with Close/Reopen and `.drawio` download; route/reload clears the artifact instead of persisting potentially sensitive diagram data;
+- bounded invalid/render error logs in both the preview and browser console, while preserving the last successful SVG;
+- parser/unit tests plus real-Chromium coverage for incomplete streaming, rapid helpers, identical DOM redraw, malformed XML, renderer failure, old-SVG retention, and non-execution/composer isolation.
+
 ### Parked: Horizon Visual Adapter
 
 Goal: reuse the local visual adapter model against VMware Horizon Web Access.

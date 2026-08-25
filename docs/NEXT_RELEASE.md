@@ -1,11 +1,11 @@
 # Next Release Plan
 
-Target version: v0.6.x maintenance, unless a user explicitly asks for Horizon work.
+Target version: v0.10.x maintenance after the v0.10.0 Draw.io preview release, unless a user explicitly asks for Horizon work.
 Target date: as needed for reliability, compatibility, or security fixes.
 
 ## Theme
 
-Keep the default direct tmux workflow simple and reliable. Do not start the Horizon visual adapter unless a user directly asks for it.
+Keep the default direct tmux workflow simple and reliable while maintaining the local-only Draw.io artifact preview. Do not start the Horizon visual adapter unless a user directly asks for it.
 
 See `docs/ROADMAP.md` for the longer visual-control plan.
 
@@ -25,6 +25,8 @@ See `docs/ROADMAP.md` for the longer visual-control plan.
    - Preserve explicit helper blocks, duplicate suppression, and protocol checks.
    - Keep release version, server protocol, and helper protocol compatibility checks aligned.
    - Keep docs and tests aligned with the current no-target shell helper protocol.
+   - Keep Draw.io XML non-executable, offline, sandboxed, and isolated from composer delivery.
+   - Preserve the last successful SVG across streaming, malformed XML, and renderer failures without flicker.
 
 4. Release quality gate
    - `./scripts/test_all.sh` passes.

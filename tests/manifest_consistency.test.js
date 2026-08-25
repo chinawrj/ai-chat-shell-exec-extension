@@ -20,6 +20,19 @@ assert.equal(Number(rootManifest.minimum_chrome_version), 116);
 assert.equal(rootManifest.key, extensionManifest.key);
 assert.deepEqual(rootManifest.permissions, extensionManifest.permissions);
 assert.deepEqual(rootManifest.host_permissions, extensionManifest.host_permissions);
+assert.deepEqual(rootManifest.content_security_policy, extensionManifest.content_security_policy);
+assert.deepEqual(rootManifest.sandbox.pages, extensionManifest.sandbox.pages.map(prefixExtensionPath));
+assert.equal(rootManifest.web_accessible_resources.length, extensionManifest.web_accessible_resources.length);
+for (let index = 0; index < extensionManifest.web_accessible_resources.length; index += 1) {
+  assert.deepEqual(
+    rootManifest.web_accessible_resources[index].resources,
+    extensionManifest.web_accessible_resources[index].resources.map(prefixExtensionPath)
+  );
+  assert.deepEqual(
+    rootManifest.web_accessible_resources[index].matches,
+    extensionManifest.web_accessible_resources[index].matches
+  );
+}
 
 assert.equal(rootManifest.background.service_worker, prefixExtensionPath(extensionManifest.background.service_worker));
 assert.equal(rootManifest.background.type, extensionManifest.background.type);
@@ -57,7 +70,7 @@ assert.match(backgroundSource, /message\.type === "extension-version"/);
 assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /message\.type === "tmux-reset-forai"/);
 assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 9/);
-assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 2/);
+assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 3/);
 assert.match(backgroundSource, /startsWith\("vision-"\)/);
 assert.match(backgroundSource, /function handleVisionMessage\(/);
 assert.match(backgroundSource, /BACKGROUND_VISION_MESSAGE_TYPES/);

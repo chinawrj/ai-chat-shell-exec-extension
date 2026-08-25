@@ -2,6 +2,8 @@ const HELPER_SHELL_START = "ai-helper-shell-start";
 const HELPER_SHELL_END = "ai-helper-shell-end";
 const HELPER_FILE_START = "ai-helper-file-start";
 const HELPER_FILE_END = "ai-helper-file-end";
+const HELPER_DRAWIO_START = "ai-helper-drawio-start";
+const HELPER_DRAWIO_END = "ai-helper-drawio-end";
 const HELPER_BOARD_START = "ai-helper-board-start";
 const HELPER_BOARD_END = "ai-helper-board-end";
 const HELPER_AGENT_MESSAGE_START = "ai-helper-agent-message-start";
@@ -23,7 +25,8 @@ const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.9.11";
+const CONTENT_SCRIPT_VERSION = "0.10.0";
+const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
 const SEND_PROFILE_PREFIX = "sendProfile:";
@@ -198,6 +201,7 @@ function deactivateExtension() {
   threadObserver = null;
   removePageEventListeners();
   document.getElementById(STATUS_ID)?.remove();
+  globalThis.AiChatDrawioPreview?.resetForPage?.();
 }
 
 async function loadLocalProfiles() {
@@ -549,7 +553,9 @@ async function scanForShellCall(options = {}) {
   const threadText = normalizeText(thread.innerText || thread.textContent || "");
   const now = Date.now();
 
-  const candidate = getLastShellCallCandidate(thread);
+  const allCandidates = extractShellCallCandidates(thread);
+  const candidate = getLastRunnableHelperCandidate(allCandidates, thread);
+  const hasDrawioCandidate = allCandidates.some((entry) => isDrawioHelperCall(entry.call));
 
   if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
@@ -565,7 +571,7 @@ async function scanForShellCall(options = {}) {
 
   resetChainForNewHumanPrompt();
 
-  if (!candidate) {
+  if (!candidate && !hasDrawioCandidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
     if (force) {
@@ -578,6 +584,15 @@ async function scanForShellCall(options = {}) {
   if (!force && !initialThreadSettled) {
     initialThreadSettled = true;
     setStatus("Shell tool ready; existing history ignored", "idle");
+    return;
+  }
+
+  if (!force && hasDrawioCandidate) {
+    processLatestDrawioCandidates(allCandidates);
+  }
+
+  if (!candidate) {
+    expirePendingSelfTest();
     return;
   }
 
@@ -689,6 +704,7 @@ function buildSemanticCallKey(call) {
     normalizeCommand(call.cmd || ""),
     normalizeCommand(call.filename || ""),
     normalizeCommand(call.content || ""),
+    String(call.xml || ""),
     normalizeCommand(call.to || ""),
     normalizeCommand(call.taskId || ""),
     normalizeCommand(call.messageId || ""),
@@ -797,6 +813,7 @@ function beginPageLifecycle(options = {}) {
     preserveInsertedOwnership: options.routeTransition === true
   });
   clearPendingForceRun();
+  globalThis.AiChatDrawioPreview?.resetForPage?.();
 
   if (routeHandoffEntries.length > 0) {
     const nextPageIdentity = getCurrentPageIdentity();
@@ -1491,6 +1508,9 @@ function helperPreviewText(call) {
   if (isFileHelperCall(call)) {
     return call.filename || call.content || "";
   }
+  if (isDrawioHelperCall(call)) {
+    return call.xml || "";
+  }
   if (isAgentMessageHelperCall(call)) {
     return call.body || call.to || "";
   }
@@ -1601,7 +1621,11 @@ function isAssistantGenerating() {
 }
 
 function getLastShellCallCandidate(root) {
-  const candidates = extractShellCallCandidates(root)
+  return getLastRunnableHelperCandidate(extractShellCallCandidates(root), root);
+}
+
+function getLastRunnableHelperCandidate(allCandidates, root = null) {
+  const candidates = allCandidates
     .filter((candidate) => isRunnableHelperCall(candidate.call))
     .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
 
@@ -1615,6 +1639,83 @@ function getLastShellCallCandidate(root) {
     ? candidates.filter(isRunnableAuthoredCandidate)
     : candidates;
   return filtered.length > 0 ? filtered[filtered.length - 1] : null;
+}
+
+function processLatestDrawioCandidates(allCandidates) {
+  const preview = globalThis.AiChatDrawioPreview;
+  if (!preview?.validateDrawioXml || !preview?.consider) {
+    console.error("[AI Chat Draw.io] Preview runtime is unavailable.");
+    return;
+  }
+
+  let candidates = allCandidates
+    .filter((candidate) => isDrawioHelperCall(candidate.call))
+    .filter((candidate) => candidate.node === getConversationRoot() || isVisibleElement(candidate.node));
+  if (authorRoleFilterEnabled) {
+    candidates = candidates.filter(isRunnableAuthoredCandidate);
+  }
+
+  let latestValid = null;
+  let latestInvalid = null;
+  candidates.forEach((candidate, position) => {
+    const validation = preview.validateDrawioXml(candidate.call.xml);
+    if (validation.ok) {
+      latestValid = { candidate, position, validation };
+    } else {
+      latestInvalid = { candidate, position, validation };
+    }
+  });
+
+  const invalidAfterLatestValid = latestInvalid &&
+    (!latestValid || latestInvalid.position > latestValid.position)
+    ? latestInvalid
+    : null;
+  const reportLatestInvalid = () => {
+    if (!invalidAfterLatestValid) {
+      return;
+    }
+    const invalidCandidate = invalidAfterLatestValid.candidate;
+    preview.reportInvalid({
+      key: buildDrawioCandidateKey(invalidCandidate, invalidAfterLatestValid.validation),
+      artifactId: preview.hashDrawioXml(invalidCandidate.call.xml),
+      error: invalidAfterLatestValid.validation.error
+    });
+  };
+
+  if (!latestValid) {
+    reportLatestInvalid();
+    return;
+  }
+
+  const validCandidate = latestValid.candidate;
+  const renderPromise = preview.consider({
+    xml: validCandidate.call.xml,
+    validation: latestValid.validation,
+    artifactId: preview.hashDrawioXml(validCandidate.call.xml),
+    candidateKey: buildDrawioCandidateKey(validCandidate, latestValid.validation)
+  });
+  Promise.resolve(renderPromise)
+    .catch((error) => {
+      preview.reportInvalid({
+        key: `${buildDrawioCandidateKey(validCandidate, latestValid.validation)}:unexpected`,
+        artifactId: preview.hashDrawioXml(validCandidate.call.xml),
+        error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
+      });
+    })
+    .finally(reportLatestInvalid);
+}
+
+function buildDrawioCandidateKey(candidate, validation) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  return [
+    getCurrentPageIdentity(),
+    getHelperRenderRootId(renderRoot),
+    getHelperRenderRootGeneration(renderRoot),
+    candidate?.source || "",
+    candidate?.blockIndex ?? candidate?.index ?? "",
+    validation?.ok === true ? "valid" : validation?.error || "invalid",
+    globalThis.AiChatDrawioPreview?.hashDrawioXml?.(candidate?.call?.xml || "") || ""
+  ].join("\n");
 }
 
 function extractShellCallCandidates(root) {
@@ -1683,8 +1784,11 @@ function getTextScanRoots(root) {
   const nodes = Array.from(root.querySelectorAll(selector))
     .filter((node) => {
       const text = node.innerText || node.textContent || "";
+      const maxChars = text.toLowerCase().includes(HELPER_DRAWIO_START)
+        ? DRAWIO_HELPER_MAX_SCAN_CHARS
+        : 30000;
       return text.length > 0 &&
-        text.length <= 30000 &&
+        text.length <= maxChars &&
         containsToolLanguageHint(text);
     });
 
@@ -1699,6 +1803,7 @@ function containsToolLanguageHint(text) {
   const lower = String(text || "").toLowerCase();
   return lower.includes(HELPER_SHELL_START) ||
     lower.includes(HELPER_FILE_START) ||
+    lower.includes(HELPER_DRAWIO_START) ||
     lower.includes(HELPER_BOARD_START) ||
     /ai-helper-board-[a-z0-9][a-z0-9._-]{0,63}-start/.test(lower) ||
     lower.includes(HELPER_AGENT_MESSAGE_START) ||
@@ -1780,7 +1885,7 @@ function parsePlainTextHelperBlocks(text) {
 
     const fenceEndIndex = findHelperFenceEndIndex(lines, index, start);
     const endIndex = findHelperEndIndex(lines, index, valueLineIndex, start, fenceEndIndex);
-    const inferredEndMarker = endIndex < 0 && fenceEndIndex >= 0;
+    const inferredEndMarker = start.kind !== "drawio" && endIndex < 0 && fenceEndIndex >= 0;
     const blockEndIndex = inferredEndMarker ? fenceEndIndex : endIndex;
     if (blockEndIndex < 0) {
       break;
@@ -1803,6 +1908,15 @@ function parsePlainTextHelperBlocks(text) {
         inferredEndMarker,
         filename: normalizeCommand(lines[valueLineIndex]),
         content: lines.slice(valueLineIndex + 1, blockEndIndex).join("\n")
+      });
+    } else if (start.kind === "drawio") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        inferredEndMarker: false,
+        xml: lines.slice(valueLineIndex, blockEndIndex).join("\n")
       });
     } else if (start.kind === "board") {
       calls.push({
@@ -1865,11 +1979,45 @@ function parsePlainTextHelperBlocks(text) {
 function findHelperEndIndex(lines, startIndex, valueLineIndex, start, fenceEndIndex) {
   const kind = start.kind;
   const minEndIndex = kind === "board" || kind === "agent-roster" || kind === "agent-task-status" ? startIndex : valueLineIndex;
+  if (kind === "drawio") {
+    let lastExplicitEndIndex = -1;
+    for (let lineIndex = minEndIndex + 1; lineIndex < lines.length; lineIndex += 1) {
+      if (fenceEndIndex >= 0 && lineIndex >= fenceEndIndex) {
+        break;
+      }
+      if (!isHelperEndForStart(start, lines[lineIndex])) {
+        continue;
+      }
+      const xml = lines.slice(valueLineIndex, lineIndex).join("\n");
+      if (isInsideDrawioXmlLiteral(xml)) {
+        continue;
+      }
+      lastExplicitEndIndex = lineIndex;
+      const structurallyComplete = globalThis.AiChatDrawioPreview?.isLikelyCompleteDrawioXml?.(xml) ??
+        /<\/mxfile>\s*$/i.test(xml.trim());
+      if (structurallyComplete) {
+        return lineIndex;
+      }
+    }
+    return lastExplicitEndIndex;
+  }
   return lines.findIndex((line, lineIndex) =>
     lineIndex > minEndIndex &&
     (fenceEndIndex < 0 || lineIndex < fenceEndIndex) &&
     isHelperEndForStart(start, line)
   );
+}
+
+function isInsideDrawioXmlLiteral(xmlPrefix) {
+  const text = String(xmlPrefix || "");
+  const cdataOpen = text.lastIndexOf("<![CDATA[");
+  const cdataClose = text.lastIndexOf("]]>");
+  if (cdataOpen > cdataClose) {
+    return true;
+  }
+  const commentOpen = text.lastIndexOf("<!--");
+  const commentClose = text.lastIndexOf("-->");
+  return commentOpen > commentClose;
 }
 
 function findHelperFenceEndIndex(lines, startIndex, start) {
@@ -1916,6 +2064,10 @@ function parseHelperStartMarker(line) {
   const file = parseSpecificHelperStartMarker(text, HELPER_FILE_START, "file");
   if (file.kind) {
     return file;
+  }
+  const drawio = parseSpecificHelperStartMarker(text, HELPER_DRAWIO_START, "drawio");
+  if (drawio.kind) {
+    return drawio;
   }
   const board = parseBoardHelperStartMarker(text);
   if (board.kind) {
@@ -2021,6 +2173,9 @@ function expectedHelperEndMarker(kind) {
   }
   if (kind === "file") {
     return HELPER_FILE_END;
+  }
+  if (kind === "drawio") {
+    return HELPER_DRAWIO_END;
   }
   if (kind === "board") {
     return HELPER_BOARD_END;
@@ -2136,6 +2291,10 @@ function isFileHelperCall(call) {
   return call?.kind === "file";
 }
 
+function isDrawioHelperCall(call) {
+  return call?.kind === "drawio";
+}
+
 function isBoardHelperCall(call) {
   return call?.kind === "board";
 }
@@ -2161,6 +2320,9 @@ function isRepeatableAgentQueryHelperCall(call) {
 }
 
 function isRunnableHelperCall(call) {
+  if (isDrawioHelperCall(call)) {
+    return false;
+  }
   if (isFileHelperCall(call)) {
     return call.filename !== undefined;
   }
@@ -2437,6 +2599,7 @@ function validateShellLikeCommandText(cmd) {
     getHelperStartKind(line) ||
     isHelperEndForKind("shell", line) ||
     isHelperEndForKind("file", line) ||
+    isHelperEndForKind("drawio", line) ||
     isHelperEndForKind("board", line) ||
     /^ai-helper-board-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-end$/.test(line) ||
     isHelperEndForKind("agent-message", line) ||
@@ -5567,6 +5730,11 @@ function injectStatus() {
       label: "Stop helper",
       title: "Terminate the currently running shell helper for this page role"
     },
+    {
+      mode: "drawio-reopen",
+      label: "Draw.io",
+      title: "Reopen the latest draw.io SVG preview or its error log"
+    },
     { mode: "site", label: "Enable site" },
     {
       mode: "role-filter",
@@ -6199,6 +6367,13 @@ function isSuppressionStatusText(text) {
 }
 
 function handlePanelAction(action) {
+  if (action === "drawio-reopen") {
+    if (!globalThis.AiChatDrawioPreview?.reopen?.()) {
+      setStatus("No draw.io preview or render log is available yet", "idle");
+    }
+    return;
+  }
+
   if (action === "test") {
     runFullChainTest().catch((error) => {
       setStatus(`Test failed: ${summarizeCommand(error.message || String(error))}`, "error");

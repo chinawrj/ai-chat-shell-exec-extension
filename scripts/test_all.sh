@@ -12,6 +12,8 @@ run() {
 }
 
 run node --check extension/src/content.js
+run node --check extension/src/drawio-preview.js
+run node --check extension/drawio/viewer.js
 run node --check extension/src/background.js
 run node --check extension/src/popup.js
 run node --check server/shell_server.js

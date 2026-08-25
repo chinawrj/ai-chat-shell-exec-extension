@@ -13,6 +13,7 @@ const ROOT_DIR = path.join(__dirname, "..");
 const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
 const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
+const DRAWIO_PREVIEW_ID = "ai-chat-shell-exec-drawio-preview";
 const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
 const E2E_TIMEOUT_MS = 45000;
 const MIN_CHROMIUM_MAJOR = 116;
@@ -66,7 +67,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.helperProtocolVersion,
-      2,
+      3,
       `Existing shell helper protocol is ${serverHealth.helperProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -198,6 +199,8 @@ async function main() {
   });
   assert.equal(agentResponse.ok, true);
   assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a" && agent.role === "slave"));
+
+  await runDrawioPreviewE2E(page);
 
   const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
   await page.evaluate(`(() => {
@@ -1562,6 +1565,145 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
+function drawioXml(name, label = name) {
+  return [
+    '<mxfile host="app.diagrams.net" version="24.7.17">',
+    `  <diagram id="${name.replace(/[^A-Za-z0-9_-]/g, "-")}" name="${name}">`,
+    '    <mxGraphModel dx="900" dy="600" grid="1" gridSize="10" page="1" pageWidth="827" pageHeight="1169">',
+    "      <root>",
+    '        <mxCell id="0"/>',
+    '        <mxCell id="1" parent="0"/>',
+    `        <mxCell id="2" value="${label}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">`,
+    '          <mxGeometry x="120" y="100" width="220" height="80" as="geometry"/>',
+    "        </mxCell>",
+    "      </root>",
+    "    </mxGraphModel>",
+    "  </diagram>",
+    "</mxfile>"
+  ].join("\n");
+}
+
+function drawioHelper(xml, identity) {
+  return [
+    `ai-helper-drawio-start:${identity}`,
+    xml,
+    "ai-helper-drawio-end"
+  ].join("\n");
+}
+
+async function runDrawioPreviewE2E(page) {
+  const baseline = await page.evaluate(`(() => ({
+    composer: document.getElementById("composer")?.innerText || "",
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    shellResults: (document.body.innerText.match(/Shell call result:/g) || []).length
+  }))()`);
+  const firstXml = drawioXml("Draw.io E2E v1", "Last valid helper v1");
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(firstXml, "drawio-e2e-v1"))}, "text")`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return host?.dataset.state === "ready" &&
+      host.dataset.currentTitle === "Draw.io E2E v1" &&
+      host.shadowRoot?.querySelector(".drawio-frame-current iframe");
+  })()`, "first draw.io SVG preview");
+
+  const firstState = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId };
+  })()`);
+  assert.equal(firstState.renderCount, 1);
+  assert.ok(firstState.artifactId);
+
+  const streamingXml = drawioXml("Draw.io E2E v2", "Streaming must not flicker");
+  const streamingPrefix = `ai-helper-drawio-start:drawio-e2e-v2\n${streamingXml.slice(0, Math.floor(streamingXml.length / 2))}`;
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(streamingPrefix)}, "text")`);
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3200))");
+  let state = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { title: host.dataset.currentTitle, renderCount: Number(host.dataset.renderCount), state: host.dataset.state };
+  })()`);
+  assert.equal(state.title, "Draw.io E2E v1", "An incomplete streamed helper must keep the old SVG visible.");
+  assert.equal(state.renderCount, 1, "An incomplete streamed helper must not mount a renderer.");
+
+  await page.evaluate(`(() => {
+    const code = document.querySelector("#thread article:last-child code");
+    code.textContent = ${JSON.stringify(drawioHelper(streamingXml, "drawio-e2e-v2"))};
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return host?.dataset.state === "ready" && host.dataset.currentTitle === "Draw.io E2E v2";
+  })()`, "completed streamed draw.io SVG preview");
+  state = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { renderCount: Number(host.dataset.renderCount), errorCount: Number(host.dataset.errorCount) };
+  })()`);
+  assert.equal(state.renderCount, 2);
+
+  const rapidV3 = drawioHelper(drawioXml("Draw.io E2E v3"), "drawio-e2e-v3");
+  const rapidV4 = drawioHelper(drawioXml("Draw.io E2E v4", "Only this rapid helper should render"), "drawio-e2e-v4");
+  await page.evaluate(`(() => {
+    appendAssistantToolCall(${JSON.stringify(rapidV3)}, "text");
+    appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text");
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return host?.dataset.state === "ready" && host.dataset.currentTitle === "Draw.io E2E v4";
+  })()`, "last of two rapid draw.io helpers");
+  state = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId };
+  })()`);
+  assert.equal(state.renderCount, 3, "Two helpers added within one debounce window must produce one renderer mount.");
+  const v4ArtifactId = state.artifactId;
+
+  const malformed = [
+    "ai-helper-drawio-start:drawio-e2e-malformed",
+    '<mxfile><diagram name="Malformed"><mxGraphModel></diagram></mxfile>',
+    "ai-helper-drawio-end"
+  ].join("\n");
+  const errorCountBeforeMalformed = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(malformed)}, "text")`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeMalformed} &&
+      host.dataset.state === "ready-with-error" &&
+      host.dataset.currentArtifactId === ${JSON.stringify(v4ArtifactId)} &&
+      /malformed/i.test(host.dataset.lastError || "") &&
+      /helper rejected/i.test(host.shadowRoot?.querySelector("details pre")?.innerText || "");
+  })()`, "malformed draw.io helper error log while retaining old SVG");
+
+  const brokenRendererXml = '<mxfile><diagram name="Broken renderer">definitely-not-valid-compressed-drawio-data</diagram></mxfile>';
+  const errorCountBeforeRenderFailure = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(brokenRendererXml, "drawio-e2e-render-fail"))}, "text")`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeRenderFailure} &&
+      host.dataset.state === "ready-with-error" &&
+      host.dataset.currentArtifactId === ${JSON.stringify(v4ArtifactId)} &&
+      /render failed/i.test(host.dataset.lastError || "") &&
+      /previous SVG was kept/i.test(host.shadowRoot?.querySelector(".status")?.innerText || "");
+  })()`, "draw.io renderer failure diagnostics while retaining old SVG");
+  assert.ok(
+    page.consoleMessages.some((entry) => entry.text.includes("[AI Chat Draw.io]") && /render failed/i.test(entry.text)),
+    "A renderer failure must be emitted to the browser console as well as the preview log."
+  );
+
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text")`);
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3200))");
+  state = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId };
+  })()`);
+  assert.equal(state.renderCount, 3, "A redrawn helper with the same XML artifact must not remount or flicker.");
+  assert.equal(state.artifactId, v4ArtifactId);
+
+  const finalPageState = await page.evaluate(`(() => ({
+    composer: document.getElementById("composer")?.innerText || "",
+    userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    shellResults: (document.body.innerText.match(/Shell call result:/g) || []).length
+  }))()`);
+  assert.deepEqual(finalPageState, baseline, "Draw.io previews must not call the backend or write/send the composer.");
+}
+
 async function sendLocalAgentRequest(page, payload) {
   const expression = `new Promise((resolve, reject) => {
     const requestId = "agent-e2e-" + Date.now() + "-" + Math.random().toString(16).slice(2);
@@ -1597,6 +1739,7 @@ class CdpClient {
     this.nextId = 1;
     this.pending = new Map();
     this.executionContexts = new Map();
+    this.consoleMessages = [];
     ws.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
       if (!message.id) {
@@ -1606,6 +1749,13 @@ class CdpClient {
           this.executionContexts.delete(message.params?.executionContextId);
         } else if (message.method === "Runtime.executionContextsCleared") {
           this.executionContexts.clear();
+        } else if (message.method === "Runtime.consoleAPICalled") {
+          const text = (message.params?.args || [])
+            .map((arg) => arg.value === undefined ? arg.description || "" : String(arg.value))
+            .filter(Boolean)
+            .join(" ");
+          this.consoleMessages.push({ type: message.params?.type || "", text });
+          this.consoleMessages = this.consoleMessages.slice(-200);
         }
         return;
       }

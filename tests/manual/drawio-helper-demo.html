@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Draw.io helper preview demo</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f4f6fa;
+        color: #172033;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at 12% 12%, rgba(99, 102, 241, .10), transparent 34%),
+          #f4f6fa;
+      }
+
+      button {
+        border: 1px solid #cbd2df;
+        border-radius: 9px;
+        padding: 8px 11px;
+        background: #fff;
+        color: #26324a;
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+      }
+
+      button:hover { border-color: #8391aa; background: #f8fafc; }
+      button.primary { background: #4057d6; color: #fff; border-color: #4057d6; }
+      button.ghost { padding: 5px 8px; border-color: transparent; background: transparent; }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        min-height: 100vh;
+      }
+
+      aside {
+        padding: 24px 20px;
+        border-right: 1px solid #dce1eb;
+        background: rgba(255, 255, 255, .88);
+        backdrop-filter: blur(16px);
+      }
+
+      h1 { margin: 0 0 8px; font-size: 20px; letter-spacing: -.02em; }
+      h2 { margin: 22px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: #66728a; }
+      p { margin: 0; color: #5e687d; font-size: 13px; line-height: 1.55; }
+
+      .controls { display: grid; gap: 8px; margin-top: 14px; }
+
+      .metrics {
+        display: grid;
+        gap: 6px;
+        margin-top: 10px;
+        padding: 12px;
+        border-radius: 10px;
+        background: #111827;
+        color: #dbe5ff;
+        font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
+      .metric { display: flex; justify-content: space-between; gap: 12px; }
+      .metric span:first-child { color: #8fa0be; }
+
+      main { padding: 30px 34px 140px; }
+      .chat { max-width: 780px; margin: 0 auto; }
+      .chat-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+      .chat-title strong { font-size: 16px; }
+      .live { display: inline-flex; gap: 7px; align-items: center; color: #60708d; font-size: 12px; }
+      .live::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 4px rgba(34, 197, 94, .12); }
+
+      #thread { display: grid; gap: 14px; }
+      .message {
+        max-width: 88%;
+        padding: 14px 16px;
+        border: 1px solid #dce2ec;
+        border-radius: 15px;
+        background: #fff;
+        box-shadow: 0 4px 20px rgba(30, 41, 59, .04);
+      }
+      .message.user { justify-self: end; background: #e9edff; border-color: #d5dcff; }
+      .role { margin-bottom: 7px; color: #68758e; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+      pre {
+        margin: 8px 0 0;
+        padding: 12px;
+        max-height: 190px;
+        overflow: auto;
+        border-radius: 10px;
+        background: #111827;
+        color: #dce7ff;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font: 11px/1.48 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
+      #preview {
+        position: fixed;
+        top: 48px;
+        right: 34px;
+        z-index: 1000;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        width: min(720px, calc(100vw - 380px));
+        height: min(570px, calc(100vh - 96px));
+        min-width: 420px;
+        min-height: 330px;
+        overflow: hidden;
+        resize: both;
+        border: 1px solid rgba(100, 116, 139, .38);
+        border-radius: 16px;
+        background: #fff;
+        box-shadow: 0 28px 80px rgba(15, 23, 42, .22), 0 4px 18px rgba(15, 23, 42, .10);
+      }
+      #preview[hidden] { display: none; }
+
+      .preview-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 11px 12px 11px 15px;
+        border-bottom: 1px solid #e4e8ef;
+        background: rgba(250, 251, 253, .96);
+        cursor: move;
+        user-select: none;
+      }
+      .preview-title { min-width: 0; }
+      .preview-title strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+      .preview-title span { display: block; margin-top: 2px; color: #748097; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .preview-actions { display: flex; gap: 3px; flex-shrink: 0; }
+
+      #previewViewport {
+        position: relative;
+        min-height: 0;
+        overflow: auto;
+        background-color: #fafbfd;
+        background-image: radial-gradient(#d9dfeb 0.8px, transparent 0.8px);
+        background-size: 18px 18px;
+      }
+      #previewContent { min-width: 100%; min-height: 100%; padding: 24px; }
+      #previewContent > .rendered-diagram { min-width: 100%; min-height: 100%; }
+      #previewContent svg { display: block; max-width: 100%; height: auto; margin: auto; }
+
+      .preview-foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 9px 12px;
+        border-top: 1px solid #e4e8ef;
+        background: #fff;
+        color: #67748c;
+        font-size: 11px;
+      }
+      .preview-foot .ready { color: #15803d; font-weight: 700; }
+
+      #staging {
+        position: fixed;
+        left: -12000px;
+        top: 0;
+        width: 720px;
+        min-height: 480px;
+        visibility: hidden;
+        pointer-events: none;
+      }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 26px;
+        z-index: 1200;
+        transform: translateX(-50%);
+        padding: 9px 14px;
+        border-radius: 999px;
+        background: #111827;
+        color: #fff;
+        opacity: 0;
+        transition: opacity .18s ease;
+        pointer-events: none;
+        font-size: 12px;
+      }
+      .toast.show { opacity: 1; }
+
+      @media (max-width: 900px) {
+        .layout { grid-template-columns: 1fr; }
+        aside { border-right: 0; border-bottom: 1px solid #dce1eb; }
+        #preview { width: calc(100vw - 28px); right: 14px; top: 100px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside>
+        <h1>Draw.io helper demo</h1>
+        <p>只展示最后一个完整且 XML 有效的 helper。新内容尚未准备好时，保留旧 SVG，不清空、不闪白。</p>
+
+        <div class="controls">
+          <button id="stream" class="primary" type="button">流式生成下一张图</button>
+          <button id="rapid" type="button">快速连续加入两张有效图</button>
+          <button id="invalid" type="button">追加无效 helper</button>
+          <button id="redraw" type="button">模拟 DOM 重绘同一 helper</button>
+          <button id="reopen" type="button">重新打开当前图</button>
+          <button id="reset" type="button">重置 demo</button>
+        </div>
+
+        <h2>防闪烁观测</h2>
+        <div class="metrics" aria-live="polite">
+          <div class="metric"><span>有效候选</span><strong id="validCount">0</strong></div>
+          <div class="metric"><span>当前版本</span><strong id="currentVersion">-</strong></div>
+          <div class="metric"><span>原子替换</span><strong id="mountCount">0</strong></div>
+          <div class="metric"><span>相同内容忽略</span><strong id="ignoredCount">0</strong></div>
+          <div class="metric"><span>渲染器</span><strong id="rendererMode">等待加载</strong></div>
+          <div class="metric"><span>扫描状态</span><strong id="scanState">初始化</strong></div>
+        </div>
+      </aside>
+
+      <main>
+        <div class="chat">
+          <div class="chat-title">
+            <strong>模拟 AI 对话</strong>
+            <span class="live">MutationObserver active</span>
+          </div>
+          <section id="thread" aria-label="Conversation thread"></section>
+        </div>
+      </main>
+    </div>
+
+    <section id="preview" aria-label="Draw.io preview" hidden>
+      <header class="preview-head" id="previewHandle">
+        <div class="preview-title">
+          <strong id="previewTitle">Draw.io preview</strong>
+          <span id="previewHash">artifact -</span>
+        </div>
+        <div class="preview-actions">
+          <button id="download" class="ghost" type="button" title="下载 .drawio">下载</button>
+          <button id="confirm" class="ghost" type="button" title="只发送文字确认，不发送图形">确认给 AI</button>
+          <button id="close" class="ghost" type="button" title="关闭">关闭</button>
+        </div>
+      </header>
+      <div id="previewViewport"><div id="previewContent"></div></div>
+      <footer class="preview-foot">
+        <span class="ready">● SVG 已就绪</span>
+        <span id="previewFoot">只对用户展示 · 未写入 composer</span>
+      </footer>
+    </section>
+
+    <div id="staging" aria-hidden="true"></div>
+    <div id="toast" class="toast" role="status"></div>
+
+    <script>
+      const START = "ai-helper-drawio-start";
+      const END = "ai-helper-drawio-end";
+      const thread = document.getElementById("thread");
+      const preview = document.getElementById("preview");
+      const previewContent = document.getElementById("previewContent");
+      const staging = document.getElementById("staging");
+      const metrics = {
+        validCount: document.getElementById("validCount"),
+        currentVersion: document.getElementById("currentVersion"),
+        mountCount: document.getElementById("mountCount"),
+        ignoredCount: document.getElementById("ignoredCount"),
+        rendererMode: document.getElementById("rendererMode"),
+        scanState: document.getElementById("scanState")
+      };
+
+      let scanTimer = 0;
+      let scanGeneration = 0;
+      let currentArtifact = null;
+      let mountCount = 0;
+      let ignoredCount = 0;
+      let demoVersion = 1;
+      let toastTimer = 0;
+      let viewerLoadState = "loading";
+
+      const palettes = [
+        { primary: "#4057d6", soft: "#e8ecff", accent: "#8b5cf6", title: "Current architecture · v1" },
+        { primary: "#0f766e", soft: "#dcf7f1", accent: "#14b8a6", title: "Streaming-safe pipeline · v2" },
+        { primary: "#b45309", soft: "#fff1d6", accent: "#f59e0b", title: "Atomic SVG swap · v3" },
+        { primary: "#be185d", soft: "#fce7f3", accent: "#ec4899", title: "Last valid helper only · v4" }
+      ];
+
+      function diagramXml(version) {
+        const palette = palettes[(version - 1) % palettes.length];
+        const suffix = `v${version}`;
+        return [
+          '<mxfile host="ai-chat-shell-exec" type="device">',
+          `  <diagram id="${suffix}" name="Preview ${suffix}">`,
+          '    <mxGraphModel dx="1200" dy="760" grid="1" gridSize="10" page="1" pageWidth="1169" pageHeight="827">',
+          '      <root>',
+          '        <mxCell id="0"/>',
+          '        <mxCell id="1" parent="0"/>',
+          `        <mxCell id="title" value="${palette.title}" style="text;html=1;align=left;verticalAlign=middle;fontSize=23;fontStyle=1;fontColor=#172033;" vertex="1" parent="1">`,
+          '          <mxGeometry x="55" y="42" width="620" height="42" as="geometry"/>',
+          '        </mxCell>',
+          `        <mxCell id="source" value="AI helper&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;complete .drawio XML&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${palette.soft};strokeColor=${palette.primary};strokeWidth=2;fontColor=#172033;" vertex="1" parent="1">`,
+          '          <mxGeometry x="55" y="135" width="190" height="92" as="geometry"/>',
+          '        </mxCell>',
+          `        <mxCell id="scan" value="Last-valid scanner&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;hash + XML validation&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=${palette.primary};strokeWidth=2;fontColor=#172033;" vertex="1" parent="1">`,
+          '          <mxGeometry x="320" y="135" width="210" height="92" as="geometry"/>',
+          '        </mxCell>',
+          `        <mxCell id="stage" value="Hidden staging&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;old SVG remains visible&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=${palette.primary};strokeWidth=2;fontColor=#172033;" vertex="1" parent="1">`,
+          '          <mxGeometry x="605" y="135" width="210" height="92" as="geometry"/>',
+          '        </mxCell>',
+          `        <mxCell id="previewNode" value="User SVG preview&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;atomic replacement&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${palette.soft};strokeColor=${palette.primary};strokeWidth=2;fontColor=#172033;" vertex="1" parent="1">`,
+          '          <mxGeometry x="890" y="135" width="210" height="92" as="geometry"/>',
+          '        </mxCell>',
+          `        <mxCell id="edge1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=${palette.primary};strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="source" target="scan"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+          `        <mxCell id="edge2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=${palette.primary};strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="scan" target="stage"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+          `        <mxCell id="edge3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=${palette.primary};strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="stage" target="previewNode"><mxGeometry relative="1" as="geometry"/></mxCell>`,
+          `        <mxCell id="note" value="Only the newest complete + valid helper may replace the current SVG" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${palette.primary};strokeColor=${palette.primary};fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">`,
+          '          <mxGeometry x="320" y="300" width="495" height="62" as="geometry"/>',
+          '        </mxCell>',
+          '      </root>',
+          '    </mxGraphModel>',
+          '  </diagram>',
+          '</mxfile>'
+        ].join("\n");
+      }
+
+      function helperText(xml, id = "") {
+        return `${START}${id ? `:${id}` : ""}\n${xml}\n${END}`;
+      }
+
+      function appendMessage(role, text, options = {}) {
+        const article = document.createElement("article");
+        article.className = `message ${role}`;
+        article.dataset.messageAuthorRole = role;
+        const roleNode = document.createElement("div");
+        roleNode.className = "role";
+        roleNode.textContent = role === "assistant" ? "Assistant" : "User";
+        const body = options.code ? document.createElement("pre") : document.createElement("div");
+        if (options.code) {
+          const code = document.createElement("code");
+          code.textContent = text;
+          body.appendChild(code);
+        } else {
+          body.textContent = text;
+        }
+        article.append(roleNode, body);
+        thread.appendChild(article);
+        return article;
+      }
+
+      function parseValidDrawioBlocks(text) {
+        const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+        const valid = [];
+        for (let startIndex = 0; startIndex < lines.length; startIndex += 1) {
+          const marker = lines[startIndex];
+          const match = marker.match(/^ai-helper-drawio-start(?::([A-Za-z0-9._:-]{1,128}))?$/);
+          if (!match) continue;
+          for (let endIndex = startIndex + 1; endIndex < lines.length; endIndex += 1) {
+            if (lines[endIndex] !== END) continue;
+            const xml = lines.slice(startIndex + 1, endIndex).join("\n");
+            const parsed = parseDrawioXml(xml);
+            if (!parsed) continue;
+            valid.push({ xml, helperId: match[1] || "", name: parsed.name || "Draw.io preview" });
+            startIndex = endIndex;
+            break;
+          }
+        }
+        return valid;
+      }
+
+      function parseDrawioXml(xml) {
+        if (!xml || new TextEncoder().encode(xml).byteLength > 1024 * 1024) return null;
+        const doc = new DOMParser().parseFromString(xml, "application/xml");
+        if (doc.querySelector("parsererror") || doc.documentElement?.localName !== "mxfile") return null;
+        return { doc, name: doc.querySelector("diagram")?.getAttribute("name") || "" };
+      }
+
+      async function sha256(text) {
+        const bytes = new TextEncoder().encode(text);
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+      }
+
+      function collectLatestValidCandidate() {
+        const candidates = [];
+        for (const code of thread.querySelectorAll('[data-message-author-role="assistant"] code')) {
+          for (const block of parseValidDrawioBlocks(code.textContent || "")) {
+            candidates.push({ ...block, node: code });
+          }
+        }
+        metrics.validCount.textContent = String(candidates.length);
+        return candidates.at(-1) || null;
+      }
+
+      function scheduleScan(reason = "DOM mutation") {
+        clearTimeout(scanTimer);
+        metrics.scanState.textContent = `${reason} · 等待稳定`;
+        scanTimer = setTimeout(() => scanLatestValidHelper().catch(showError), 140);
+      }
+
+      async function scanLatestValidHelper() {
+        const generation = ++scanGeneration;
+        const candidate = collectLatestValidCandidate();
+        if (!candidate) {
+          metrics.scanState.textContent = "没有新的有效 helper · 保留旧图";
+          return;
+        }
+        const hash = await sha256(candidate.xml);
+        if (generation !== scanGeneration) return;
+        if (currentArtifact?.hash === hash) {
+          ignoredCount += 1;
+          metrics.ignoredCount.textContent = String(ignoredCount);
+          metrics.scanState.textContent = "payload 未变化 · 不重新渲染";
+          return;
+        }
+
+        metrics.scanState.textContent = "后台 staging 渲染中 · 旧图保持显示";
+        const staged = await renderOffscreen(candidate.xml, generation);
+        if (!staged || generation !== scanGeneration) {
+          staged?.remove();
+          return;
+        }
+
+        const stillLatest = collectLatestValidCandidate();
+        const stillLatestHash = stillLatest ? await sha256(stillLatest.xml) : "";
+        if (generation !== scanGeneration || stillLatestHash !== hash) {
+          staged.remove();
+          metrics.scanState.textContent = "丢弃过期 staging · 等待最新图";
+          return;
+        }
+
+        staged.classList.add("rendered-diagram");
+        previewContent.replaceChildren(staged);
+        currentArtifact = {
+          hash,
+          xml: candidate.xml,
+          name: candidate.name,
+          helperId: candidate.helperId,
+          version: diagramVersion(candidate.xml)
+        };
+        mountCount += 1;
+        metrics.mountCount.textContent = String(mountCount);
+        metrics.currentVersion.textContent = currentArtifact.version;
+        metrics.scanState.textContent = "最新有效 SVG 已原子替换";
+        document.getElementById("previewTitle").textContent = candidate.name;
+        document.getElementById("previewHash").textContent = `artifact ${hash.slice(0, 12)}`;
+        document.getElementById("previewFoot").textContent = `只对用户展示 · ${new TextEncoder().encode(candidate.xml).byteLength.toLocaleString()} bytes`;
+        preview.hidden = false;
+      }
+
+      function diagramVersion(xml) {
+        return parseDrawioXml(xml)?.doc.querySelector("diagram")?.getAttribute("id") || "unknown";
+      }
+
+      async function renderOffscreen(xml, generation) {
+        const stage = document.createElement("div");
+        stage.style.minWidth = "680px";
+        stage.style.minHeight = "430px";
+        staging.appendChild(stage);
+
+        if (viewerLoadState === "ready" && window.GraphViewer?.processElements) {
+          stage.className = "mxgraph";
+          stage.setAttribute("data-mxgraph", JSON.stringify({
+            highlight: "#4057d6",
+            nav: false,
+            resize: true,
+            toolbar: "zoom layers",
+            toolbarPosition: "bottom",
+            lightbox: false,
+            editable: false,
+            tooltips: false,
+            xml
+          }));
+          window.GraphViewer.processElements();
+          const ready = await waitForSvg(stage, generation, 4500);
+          if (ready) {
+            metrics.rendererMode.textContent = "draw.io GraphViewer";
+            return stage;
+          }
+        }
+
+        stage.replaceChildren(renderFallbackSvg(xml));
+        metrics.rendererMode.textContent = "内置 SVG fallback";
+        return stage;
+      }
+
+      function waitForSvg(stage, generation, timeoutMs) {
+        if (stage.querySelector("svg")) return Promise.resolve(true);
+        return new Promise(resolve => {
+          let settled = false;
+          const finish = value => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            observer.disconnect();
+            resolve(value);
+          };
+          const observer = new MutationObserver(() => {
+            if (generation !== scanGeneration) finish(false);
+            else if (stage.querySelector("svg")) finish(true);
+          });
+          observer.observe(stage, { childList: true, subtree: true });
+          const timer = setTimeout(() => finish(false), timeoutMs);
+        });
+      }
+
+      function renderFallbackSvg(xml) {
+        const parsed = parseDrawioXml(xml);
+        const doc = parsed.doc;
+        const cells = Array.from(doc.querySelectorAll("mxCell"));
+        const vertices = new Map();
+        for (const cell of cells.filter(cell => cell.getAttribute("vertex") === "1")) {
+          const geometry = cell.querySelector("mxGeometry");
+          if (!geometry) continue;
+          vertices.set(cell.id, {
+            id: cell.id,
+            value: decodeLabel(cell.getAttribute("value") || ""),
+            style: parseStyle(cell.getAttribute("style") || ""),
+            x: Number(geometry.getAttribute("x") || 0),
+            y: Number(geometry.getAttribute("y") || 0),
+            width: Number(geometry.getAttribute("width") || 120),
+            height: Number(geometry.getAttribute("height") || 60)
+          });
+        }
+        const ns = "http://www.w3.org/2000/svg";
+        const svg = document.createElementNS(ns, "svg");
+        svg.setAttribute("viewBox", "25 20 1110 390");
+        svg.setAttribute("role", "img");
+        svg.setAttribute("aria-label", parsed.name || "Draw.io preview");
+        svg.style.background = "#fff";
+        const defs = document.createElementNS(ns, "defs");
+        defs.innerHTML = '<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4057d6"/></marker>';
+        svg.appendChild(defs);
+        for (const edge of cells.filter(cell => cell.getAttribute("edge") === "1")) {
+          const source = vertices.get(edge.getAttribute("source"));
+          const target = vertices.get(edge.getAttribute("target"));
+          if (!source || !target) continue;
+          const path = document.createElementNS(ns, "path");
+          const x1 = source.x + source.width;
+          const y1 = source.y + source.height / 2;
+          const x2 = target.x;
+          const y2 = target.y + target.height / 2;
+          const mid = (x1 + x2) / 2;
+          path.setAttribute("d", `M ${x1} ${y1} L ${mid} ${y1} L ${mid} ${y2} L ${x2} ${y2}`);
+          path.setAttribute("fill", "none");
+          path.setAttribute("stroke", edge.getAttribute("style")?.match(/strokeColor=([^;]+)/)?.[1] || "#4057d6");
+          path.setAttribute("stroke-width", "2");
+          path.setAttribute("marker-end", "url(#arrow)");
+          svg.appendChild(path);
+        }
+        for (const vertex of vertices.values()) {
+          const group = document.createElementNS(ns, "g");
+          const rect = document.createElementNS(ns, "rect");
+          rect.setAttribute("x", vertex.x);
+          rect.setAttribute("y", vertex.y);
+          rect.setAttribute("width", vertex.width);
+          rect.setAttribute("height", vertex.height);
+          rect.setAttribute("rx", vertex.style.rounded === "1" ? "12" : "2");
+          rect.setAttribute("fill", vertex.style.fillColor || (vertex.style.text ? "transparent" : "#fff"));
+          rect.setAttribute("stroke", vertex.style.strokeColor || (vertex.style.text ? "transparent" : "#4057d6"));
+          rect.setAttribute("stroke-width", vertex.style.strokeWidth || "1.5");
+          group.appendChild(rect);
+          const lines = vertex.value.split("\n").filter(Boolean);
+          lines.forEach((line, index) => {
+            const text = document.createElementNS(ns, "text");
+            text.setAttribute("x", vertex.style.text ? vertex.x : vertex.x + vertex.width / 2);
+            text.setAttribute("y", vertex.y + vertex.height / 2 + (index - (lines.length - 1) / 2) * 18 + 5);
+            text.setAttribute("text-anchor", vertex.style.text ? "start" : "middle");
+            text.setAttribute("font-family", "Inter, -apple-system, sans-serif");
+            text.setAttribute("font-size", index === 0 ? (vertex.style.fontSize || "14") : "11");
+            text.setAttribute("font-weight", vertex.style.fontStyle === "1" || index === 0 ? "700" : "400");
+            text.setAttribute("fill", vertex.style.fontColor || "#172033");
+            text.textContent = line;
+            group.appendChild(text);
+          });
+          svg.appendChild(group);
+        }
+        return svg;
+      }
+
+      function parseStyle(styleText) {
+        return Object.fromEntries(styleText.split(";").filter(Boolean).map(item => {
+          const [key, ...rest] = item.split("=");
+          return [key, rest.length ? rest.join("=") : "1"];
+        }));
+      }
+
+      function decodeLabel(value) {
+        return String(value || "")
+          .replace(/<br\s*\/?>/gi, "\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&nbsp;/gi, " ");
+      }
+
+      function showError(error) {
+        metrics.scanState.textContent = `错误：${error?.message || error}`;
+      }
+
+      function toast(message) {
+        const node = document.getElementById("toast");
+        node.textContent = message;
+        node.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => node.classList.remove("show"), 1800);
+      }
+
+      function resetDemo() {
+        scanGeneration += 1;
+        currentArtifact = null;
+        mountCount = 0;
+        ignoredCount = 0;
+        demoVersion = 1;
+        preview.hidden = true;
+        previewContent.replaceChildren();
+        staging.replaceChildren();
+        thread.replaceChildren();
+        metrics.mountCount.textContent = "0";
+        metrics.ignoredCount.textContent = "0";
+        metrics.currentVersion.textContent = "-";
+        appendMessage("user", "请用 draw.io 图展示 helper 渲染架构。", { code: false });
+        appendMessage("assistant", helperText(diagramXml(1), "architecture-v1"), { code: true });
+        scheduleScan("demo reset");
+      }
+
+      document.getElementById("stream").addEventListener("click", () => {
+        const version = ++demoVersion;
+        const xml = diagramXml(version);
+        const cut1 = Math.floor(xml.length * .36);
+        const cut2 = Math.floor(xml.length * .74);
+        const article = appendMessage("assistant", `${START}:stream-${version}\n${xml.slice(0, cut1)}`, { code: true });
+        const code = article.querySelector("code");
+        toast("开始流式输出：旧图保持显示");
+        setTimeout(() => { code.textContent = `${START}:stream-${version}\n${xml.slice(0, cut2)}`; }, 520);
+        setTimeout(() => { code.textContent = helperText(xml, `stream-${version}`); }, 1080);
+      });
+
+      document.getElementById("rapid").addEventListener("click", () => {
+        const first = ++demoVersion;
+        const second = ++demoVersion;
+        appendMessage("assistant", helperText(diagramXml(first), `rapid-${first}`), { code: true });
+        setTimeout(() => appendMessage("assistant", helperText(diagramXml(second), `rapid-${second}`), { code: true }), 35);
+        toast("两张有效图快速到达：只挂载最后一张");
+      });
+
+      document.getElementById("invalid").addEventListener("click", () => {
+        appendMessage("assistant", `${START}:broken\n<mxfile><diagram>still streaming`, { code: true });
+        toast("无效 helper 已追加：当前图不会清空");
+      });
+
+      document.getElementById("redraw").addEventListener("click", () => {
+        const last = Array.from(thread.querySelectorAll('[data-message-author-role="assistant"]'))
+          .reverse()
+          .find(article => parseValidDrawioBlocks(article.querySelector("code")?.textContent || "").length > 0);
+        if (!last) return;
+        const clone = last.cloneNode(true);
+        last.replaceWith(clone);
+        toast("DOM 节点已替换：相同 hash 不重新挂载");
+      });
+
+      document.getElementById("reopen").addEventListener("click", () => {
+        if (!currentArtifact) return toast("当前还没有有效图");
+        preview.hidden = false;
+        toast("仅重新显示现有 SVG，没有重新扫描或渲染");
+      });
+
+      document.getElementById("reset").addEventListener("click", resetDemo);
+      document.getElementById("close").addEventListener("click", () => { preview.hidden = true; });
+      document.getElementById("confirm").addEventListener("click", () => {
+        if (!currentArtifact) return;
+        appendMessage("user", `Draw.io ${currentArtifact.version} 已正确渲染。`, { code: false });
+        toast("仅向 AI 追加了文字确认，没有发送 XML/SVG");
+      });
+      document.getElementById("download").addEventListener("click", () => {
+        if (!currentArtifact) return;
+        const url = URL.createObjectURL(new Blob([currentArtifact.xml], { type: "application/xml" }));
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${currentArtifact.version || "diagram"}.drawio`;
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+
+      function installDrag() {
+        const handle = document.getElementById("previewHandle");
+        let drag = null;
+        handle.addEventListener("pointerdown", event => {
+          if (event.target.closest("button")) return;
+          const rect = preview.getBoundingClientRect();
+          drag = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+          handle.setPointerCapture(event.pointerId);
+        });
+        handle.addEventListener("pointermove", event => {
+          if (!drag) return;
+          preview.style.left = `${Math.max(8, Math.min(event.clientX - drag.x, innerWidth - preview.offsetWidth - 8))}px`;
+          preview.style.top = `${Math.max(8, Math.min(event.clientY - drag.y, innerHeight - preview.offsetHeight - 8))}px`;
+          preview.style.right = "auto";
+        });
+        handle.addEventListener("pointerup", () => { drag = null; });
+      }
+
+      new MutationObserver(() => scheduleScan()).observe(thread, { childList: true, subtree: true, characterData: true });
+      installDrag();
+      resetDemo();
+    </script>
+    <script
+      src="https://viewer.diagrams.net/js/viewer-static.min.js"
+      onload="viewerLoadState='ready'; metrics.rendererMode.textContent='draw.io GraphViewer'; scheduleScan('viewer ready')"
+      onerror="viewerLoadState='failed'; metrics.rendererMode.textContent='内置 SVG fallback'; scheduleScan('viewer fallback')">
+    </script>
+  </body>
+</html>

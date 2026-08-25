@@ -4,11 +4,12 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes six helper block types:
+With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes seven helper block types:
 
 - Shell helper: request local terminal output from the default `ForAI` tmux session.
 - Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
 - File helper: write one file under `$HOME/Downloads`.
+- Draw.io helper: preview a complete native `.drawio` XML file locally as SVG without contacting the shell server or composer.
 - Agent message helper: send a task or result to another locally registered agent tab.
 - Agent roster helper: let an AI master query online agents before delegating.
 - Agent task-status helper: let an AI master check a delegated task by `message-id` or `task-id`.
@@ -39,6 +40,20 @@ second line
 ai-helper-file-end
 ````
 
+Draw.io helper:
+
+````
+ai-helper-drawio-start
+<mxfile>
+  <diagram name="Architecture">
+    <mxGraphModel>...</mxGraphModel>
+  </diagram>
+</mxfile>
+ai-helper-drawio-end
+````
+
+The Draw.io helper body is the file itself, not a command. After streaming settles, the extension validates complete `<mxfile>` XML and renders only the last valid helper in a movable/resizable floating SVG preview. A newer incomplete, malformed, or renderer-failing helper leaves the previous diagram visible and adds a bounded local error log. Rendering uses a pinned packaged viewer in a sandboxed extension iframe, never tmux, the local WebSocket server, `shell-output`, or automatic composer delivery.
+
 Agent message helper:
 
 ````
@@ -68,9 +83,9 @@ ai-helper-agent-task-status-end
 
 By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. A named board marker such as `ai-helper-board-R1-start` targets `ForAI:board-R1` when no environment override is set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
 
-For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
+For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-drawio-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
-The content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
+For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io helpers instead remain entirely in the extension's local preview path and never produce composer output. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
 
 ## Basic Helper Screenshots
 
@@ -86,12 +101,14 @@ File helper result reply:
 
 Chrome extensions cannot directly execute local shell commands. This project uses:
 
-- `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. The execution trigger is still limited to explicit ai-helper blocks.
+- `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. Executable requests remain limited to explicit shell/board/file/agent helpers; complete Draw.io helpers take a separate local-only sandboxed preview path.
 - `server/`: Local WebSocket server bound to `127.0.0.1:17371` that ensures the default `ForAI` tmux workspace, sends shell commands into `ForAI:host`, sends board commands into the configured board pane, and hosts the local in-memory agent hub.
 
 Flow:
 
-`AI chat page -> content script -> extension background -> ws://127.0.0.1:17371/shell -> tmux pane or agent hub -> shell-output / agent-message reply`
+Executable helpers: `AI chat page -> content script -> extension background -> ws://127.0.0.1:17371/shell -> tmux pane or agent hub -> shell-output / agent-message reply`
+
+Draw.io helpers: `AI chat page -> content script -> isolated packaged viewer iframe -> floating SVG preview for the user`
 
 ## Install
 
@@ -142,7 +159,7 @@ Start with:
 The short version is:
 
 `````text
-I can act as your human helper for local terminal output, board output, and helper files.
+I can act as your human helper for local terminal output, board output, helper files, and local diagram previews.
 
 When output would help, reply with exactly one fenced code block and no prose.
 
@@ -168,11 +185,19 @@ exact file content here
 ai-helper-file-end
 ````
 
+For displaying a complete native Draw.io file locally, use:
+````
+ai-helper-drawio-start
+<mxfile><diagram name="Architecture"><mxGraphModel>...</mxGraphModel></diagram></mxfile>
+ai-helper-drawio-end
+````
+
 Rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - Shell helpers do not include a tmux target; the entire helper body is the shell command and runs in the default `ForAI` `host` window.
 - Board helpers must contain exactly one non-empty board command line and no target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` to send to the `ForAI:board-R1` window.
 - File helpers must put a single file name, not a path, on the second line.
+- Draw.io helpers contain the complete `.drawio` `<mxfile>` document itself. The extension shows only the last complete valid helper locally as SVG; it does not send the diagram to tmux or the composer, and you cannot see its render. Rely on my textual confirmation.
 - A simple no-space suffix such as `ai-helper-shell-start:2` may be used as an optional request identity for diagnostics. It is not required for a new retry helper and does not force rerun a command that the server already executed on the resolved tmux pane.
 - After I send back shell-output, use that output to continue.
 - Do not repeat a command after shell-output confirms execution. A command explicitly reported as not executed may be retried with a new identical helper.
@@ -474,7 +499,7 @@ ai-helper-board-end
 
 The board helper body is exactly one non-empty board command line. It does not include a target or cwd. The server resolves the target from `AI_CHAT_SHELL_BOARD_TARGET` when set, otherwise from the `board` window in the `ForAI` tmux session. To send to another board window, use a safe suffix in both markers, for example `ai-helper-board-R1-start` and `ai-helper-board-R1-end` target `ForAI:board-R1`. Each board request first probes the current board prompt; if the prompt cannot be identified, the command is not sent. A shell-backed board pane also uses foreground-process-group readiness. A generic non-shell board TUI exposes only prompt text that command output can imitate, so its prompt-based serialization is best effort rather than an authoritative completion guarantee; board prompt evidence is never used for duplicate suppression.
 
-The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, `ai-helper-board-R1-start:20260529-1`, or `ai-helper-file-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
+The start marker can include an optional helper identity suffix, for example `ai-helper-shell-start:20260529-1`, `ai-helper-board-start:20260529-1`, `ai-helper-board-R1-start:20260529-1`, `ai-helper-file-start:20260529-1`, or `ai-helper-drawio-start:20260529-1`. Use a simple no-space nonce, number, or timestamp when an otherwise identical helper payload should be treated as a new request. Without a suffix, the extension derives a stable identity from the plain text helper payload.
 
 To write a file under `$HOME/Downloads`, use:
 
@@ -487,6 +512,16 @@ ai-helper-file-end
 ````
 
 The file helper format maps the second line to the file name and writes every following line up to, but not including, `ai-helper-file-end`.
+
+For a user-facing diagram preview, use:
+
+````
+ai-helper-drawio-start
+<mxfile><diagram name="Architecture"><mxGraphModel>...</mxGraphModel></diagram></mxfile>
+ai-helper-drawio-end
+````
+
+The Draw.io body is the complete native file, not a command, path, target, or shell-encoded payload. The content script validates a bounded `<mxfile>` document and gives only the last complete valid candidate to the packaged sandbox viewer. It never forwards the XML to background/server/tmux and never posts a rendered image or `shell-output` to the composer. The user sees the SVG; the AI must rely on the user's textual feedback.
 
 For agent messages, use:
 
@@ -539,7 +574,7 @@ The result is a `shell-output` block with task state and `nextAction` guidance f
 The extension does not hard-code a ChatGPT, Claude, or Copilot DOM contract. The default strategy is:
 
 - detect editable chat inputs from standard browser semantics such as `textarea`, `input`, `contenteditable`, and `role="textbox"`;
-- detect tool requests from explicit shell, board, and file helper blocks;
+- detect tool requests from explicit shell, board, file, and agent helper blocks, plus non-executable Draw.io preview blocks;
 - post results by writing into the remembered editable input;
 - submit first through generic form submission and synthetic Enter key events;
 - fall back to a saved user-bound send control, then broad send-button heuristics if needed.
@@ -548,7 +583,8 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 
 ## Safety Defaults
 
-- The extension runs only explicit shell, board, file, agent-message, agent-roster, and agent-task-status helper blocks. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
+- The extension routes only explicit shell, board, file, agent-message, agent-roster, and agent-task-status helper blocks as operations. Ordinary `bash`, `sh`, `zsh`, `shell`, and JSON code blocks are not executable tool requests.
+- Draw.io helpers are non-executable local artifacts. Their bounded XML is rendered only in an unprivileged sandbox iframe with network access blocked by Content Security Policy; it is never sent to the server, tmux, or composer.
 - Shell helper commands always run in `ForAI:host`; target lines are not part of the shell helper protocol.
 - Agent-message helpers only route messages through the local agent hub. They do not execute commands unless the receiving agent later emits its own explicit helper block.
 - Agent-roster and agent-task-status helpers are read-only local hub queries; they do not execute shell commands.
@@ -643,4 +679,10 @@ Build release archives:
 
 ## License
 
-MIT
+Original project code is licensed under MIT; see [LICENSE](LICENSE).
+
+The bundled draw.io viewer remains under Apache License 2.0 and is not
+relicensed by this project's MIT License. Its license, source/version/hash,
+upstream asset conditions, and trademark independence statement are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and travel with the extension
+under `extension/vendor/drawio/`.

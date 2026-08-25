@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-20
+
+- Adds `ai-helper-drawio-start[:identity]` / `ai-helper-drawio-end`, whose body is a complete native `.drawio` `<mxfile>` document and is never treated as a command or sent to background/server/tmux/composer delivery.
+- Displays only the last complete XML-valid helper in a movable, resizable user-facing SVG preview. New artifacts render in hidden staging and replace the previous iframe atomically only after fresh SVG readiness, preventing streaming and update flicker.
+- Keeps the last successful SVG visible when newer XML is malformed or the renderer fails, with bounded in-preview and browser-console error diagnostics plus Close, Reopen, zoom/layer toolbar, and `.drawio` download controls.
+- Packages the official draw.io `v31.1.5` static viewer locally with recorded SHA-256, Apache-2.0 license, third-party attribution, asset terms, and trademark independence statement; the Chrome release archive includes the viewer and notices and runs it offline in an unprivileged manifest sandbox iframe under restrictive CSP.
+- Adds parser/unit and real-Chromium coverage for incomplete streaming, two rapid helpers, identical DOM redraw, end-marker-looking CDATA, size/root/page validation, malformed XML, renderer failure, old-SVG retention, and zero backend/composer side effects.
+- Bumps the extension to `0.10.0` and helper protocol to `3`; restart the foreground shell server after updating.
+
 ## [0.9.11] - 2026-08-14
 
 - Redefines the shell command timeout as an output-idle timeout: observable output resets the clock, the default increases from 30 seconds to 3 minutes, and existing installations using the old default migrate automatically while custom values remain unchanged.
