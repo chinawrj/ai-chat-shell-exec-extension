@@ -188,6 +188,65 @@ async function main() {
   await waitForExtensionTarget(debugPort);
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
 
+  const compactPanelState = await page.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const common = panel?.querySelector('[data-shell-panel-group="common"]');
+    const advanced = panel?.querySelector('#ai-chat-shell-exec-advanced-controls');
+    const visibleCommonActions = Array.from(common?.querySelectorAll('[data-shell-tool-action]') || [])
+      .filter((button) => getComputedStyle(button).display !== "none")
+      .map((button) => button.dataset.shellToolAction);
+    return {
+      width: panel?.getBoundingClientRect().width || 0,
+      advancedHidden: advanced?.hidden === true,
+      advancedOpen: panel?.dataset.advancedOpen || "",
+      visibleCommonActions,
+      stopDisabled: panel?.querySelector('[data-shell-tool-action="stop-helper"]')?.disabled === true,
+      stopHidden: panel?.querySelector('[data-shell-tool-action="stop-helper"]')?.hidden === true,
+      advancedActionsPresent: [
+        "check", "test", "site", "reset-tmux", "role-filter",
+        "input", "send", "shell", "clear",
+        "agent-register", "agent-list", "agent-check",
+        "tmux-ai-refresh", "tmux-ai-register"
+      ].every((action) => Boolean(advanced?.querySelector('[data-shell-tool-action="' + action + '"]'))),
+      drawioHidden: panel?.querySelector('#ai-chat-shell-exec-drawio-action')?.hidden === true,
+      drawioInAdvanced: Boolean(advanced?.querySelector('[data-shell-tool-action="drawio-reopen"]')),
+      groups: Array.from(panel?.querySelectorAll('[data-shell-panel-group]') || [])
+        .map((element) => element.dataset.shellPanelGroup)
+    };
+  })()`);
+  assert.ok(compactPanelState.width > 0 && compactPanelState.width <= 300, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.advancedHidden, true, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.advancedOpen, "", JSON.stringify(compactPanelState));
+  assert.deepEqual(compactPanelState.visibleCommonActions, ["more"]);
+  assert.equal(compactPanelState.stopDisabled, true, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.stopHidden, true, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.advancedActionsPresent, true, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.drawioHidden, true, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.drawioInAdvanced, false, JSON.stringify(compactPanelState));
+  assert.deepEqual(compactPanelState.groups, [
+    "common",
+    "setup-recovery",
+    "page-binding",
+    "agent-tmux-ai",
+    "tools-diagnostics"
+  ]);
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-idle.png"));
+  }
+
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const advanced = panel?.querySelector('#ai-chat-shell-exec-advanced-controls');
+    const more = panel?.querySelector('[data-shell-tool-action="more"]');
+    return advanced?.hidden === false && more?.getAttribute("aria-expanded") === "true";
+  })()`, "compact panel advanced controls to expand");
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-advanced.png"));
+  }
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
+  await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
+
   // A developer may rerun this E2E against an already-running foreground
   // server after a prior browser process crashed before unregistering. Clear
   // the fixed test identities so stale mailbox/roster state cannot make the
@@ -836,6 +895,11 @@ async function main() {
 
   const idleControlToken = `ai-chat-shell-idle-control-${Date.now()}`;
   const idleControlCommand = `printf '${idleControlToken}\\n'; sleep 60; printf 'IDLE_CONTROL_SHOULD_NOT_FINISH\\n'`;
+  assert.equal(
+    await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="stop-helper"]')?.disabled === true`),
+    true,
+    "Stop helper must be disabled while no helper is active."
+  );
   await page.evaluate(`(() => {
     appendAssistantToolCall([
       "ai-helper-shell-start:idle-control-e2e",
@@ -844,6 +908,15 @@ async function main() {
     ].join("\\n"), "text");
     return true;
   })()`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const stop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
+    const force = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="force"]');
+    return stop?.hidden === false && stop.disabled === false && force?.hidden === true;
+  })()`, "Stop helper to replace Force run while a helper is active");
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-running.png"));
+  }
   await waitForEvaluate(page, `(() => {
     const control = document.getElementById("ai-chat-shell-exec-run-control");
     return control && control.hidden === false && control.innerText.includes("No output update");
@@ -858,9 +931,9 @@ async function main() {
     return control && control.hidden === false && control.innerText.includes("No output update");
   })()`, "idle timeout prompt after continued wait");
   await page.evaluate(`(() => {
-    document.querySelector('[data-shell-tool-action="terminate-helper"]')?.click();
+    document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="stop-helper"]')?.click();
     return true;
-  })()`);
+  })()`, { acceptDialogs: true });
   const idleTerminatedText = await waitForEvaluateValue(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes(${JSON.stringify(`stdout:\n${idleControlToken}`)}) &&
@@ -995,6 +1068,14 @@ async function main() {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     return (panel?.innerText || "").includes("Suppressed helper inside shell-output");
   })()`, "structured shell-output helper to remain auto-suppressed");
+  await waitForEvaluate(page, `(() => {
+    const force = document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="common"] [data-shell-tool-action="force"]');
+    const stop = document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
+    return force?.hidden === false && stop?.hidden === true;
+  })()`, "Force run to appear only when a rendered helper is actionable");
+  if (SCREENSHOT_DIR) {
+    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-force.png"));
+  }
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, 750))`);
   assert.equal(
     fs.existsSync(forceOpaqueMarkerPath),
@@ -1769,6 +1850,22 @@ async function runDrawioPreviewE2E(page) {
       host.dataset.currentTitle === "Draw.io E2E v1" &&
       host.shadowRoot?.querySelector(".drawio-frame-current iframe");
   })()`, "first draw.io SVG preview");
+  await waitForEvaluate(page, `(() => {
+    const button = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-drawio-action');
+    return button?.hidden === false && button.textContent === "Draw.io preview";
+  })()`, "contextual Draw.io panel action to appear after an artifact exists");
+  await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    host?.shadowRoot?.querySelector('[data-action="close"]')?.click();
+    return host?.hidden === true;
+  })()`);
+  assert.equal(
+    await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.hidden === true`),
+    true,
+    "Closing the Draw.io window must retain the contextual reopen action."
+  );
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-drawio-action')?.click()`);
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.hidden === false`, "contextual Draw.io action to reopen the preview");
 
   const firstState = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
@@ -1904,6 +2001,7 @@ class CdpClient {
     this.pending = new Map();
     this.executionContexts = new Map();
     this.consoleMessages = [];
+    this.acceptNextDialog = false;
     ws.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
       if (!message.id) {
@@ -1920,6 +2018,9 @@ class CdpClient {
             .join(" ");
           this.consoleMessages.push({ type: message.params?.type || "", text });
           this.consoleMessages = this.consoleMessages.slice(-200);
+        } else if (message.method === "Page.javascriptDialogOpening" && this.acceptNextDialog) {
+          this.acceptNextDialog = false;
+          this.send("Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
         }
         return;
       }
@@ -1960,7 +2061,10 @@ class CdpClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`CDP ${method} timed out`));
+        const operation = method === "Runtime.evaluate"
+          ? `: ${String(params.expression || "").replace(/\s+/g, " ").slice(0, 240)}`
+          : "";
+        reject(new Error(`CDP ${method} timed out${operation}`));
       }, E2E_TIMEOUT_MS);
       timeout.unref?.();
       this.pending.set(id, { resolve, reject, timeout });
@@ -1968,12 +2072,20 @@ class CdpClient {
     });
   }
 
-  async evaluate(expression) {
-    const result = await this.send("Runtime.evaluate", {
-      expression,
-      awaitPromise: true,
-      returnByValue: true
-    });
+  async evaluate(expression, options = {}) {
+    if (options.acceptDialogs === true) {
+      this.acceptNextDialog = true;
+    }
+    let result;
+    try {
+      result = await this.send("Runtime.evaluate", {
+        expression,
+        awaitPromise: true,
+        returnByValue: true
+      });
+    } finally {
+      this.acceptNextDialog = false;
+    }
     if (result.exceptionDetails) {
       throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");
     }

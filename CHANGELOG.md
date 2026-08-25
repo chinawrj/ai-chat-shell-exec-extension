@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-08-25
+
+- Replaces the oversized floating panel with a compact, state-driven 292px bar: idle shows only server status and `More`, errors add `Server Check`, a runnable helper adds `Force run`, and an active shell helper replaces it with `Stop helper`.
+- Preserves every existing setup, binding, Agent, tmux-ai, and debug capability in four labelled advanced groups that remain collapsed by default; Draw.io appears contextually only after a preview or error log exists and remains available for reopening after Close.
+- Uses one user-facing stop concept: `Stop helper` is hidden while idle, shown only for an active helper, and remains the exact-owner termination control when an output-idle run asks the user to continue or stop.
+- Adds source-level and real-Chromium regression coverage for compact defaults, advanced control preservation and grouping, expand/collapse behavior, contextual Continue, and active-only Stop.
+
 ## [0.10.2] - 2026-08-25
 
 - Removes extension-side and shell-server command-body heuristics that incorrectly rejected valid scripts containing `shell-output`, result headings, Markdown fences, terminal prompts, metadata labels, or helper markers.

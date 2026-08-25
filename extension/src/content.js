@@ -21,11 +21,15 @@ const AGENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 const STATUS_ID = "ai-chat-shell-exec-status";
 const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
+const STATUS_INDICATOR_ID = "ai-chat-shell-exec-status-indicator";
+const STATUS_DETAIL_ID = "ai-chat-shell-exec-status-detail";
+const ADVANCED_CONTROLS_ID = "ai-chat-shell-exec-advanced-controls";
+const DRAWIO_CONTEXT_ACTION_ID = "ai-chat-shell-exec-drawio-action";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.10.2";
+const CONTENT_SCRIPT_VERSION = "0.10.3";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -123,6 +127,8 @@ let activeShellRunNotice = null;
 let shellRunMonitorTimer = 0;
 let shellRunControlBusy = false;
 let shellRunStatusPollInFlight = false;
+let panelForceRunAvailable = false;
+let panelShellHelperActive = false;
 
 bootstrapActivation().catch(() => {});
 
@@ -193,6 +199,8 @@ function deactivateExtension() {
   bindingMode = "";
   pendingSelfTest = null;
   lastPointerTarget = null;
+  panelForceRunAvailable = false;
+  panelShellHelperActive = false;
   clearTimeout(scanTimer);
   clearPendingForceRun();
   stopAgentPolling();
@@ -202,6 +210,7 @@ function deactivateExtension() {
   removePageEventListeners();
   document.getElementById(STATUS_ID)?.remove();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
+  updateDrawioContextAction();
 }
 
 async function loadLocalProfiles() {
@@ -519,7 +528,9 @@ async function scanForShellCall(options = {}) {
   try {
     const conversationRoot = getConversationRoot();
     const allCandidates = extractShellCallCandidates(conversationRoot);
+    const runnableCandidate = getLastRunnableHelperCandidate(allCandidates, conversationRoot);
     updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
+    setPanelForceRunAvailable(Boolean(runnableCandidate));
   } catch (_unused) {
     // Detection runs on a partially-rendered DOM during streaming; never
     // let a transient scan failure block the rest of the scanner.
@@ -810,6 +821,7 @@ function beginPageLifecycle(options = {}) {
   });
   clearPendingForceRun();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
+  updateDrawioContextAction();
 
   if (routeHandoffEntries.length > 0) {
     const nextPageIdentity = getCurrentPageIdentity();
@@ -1668,6 +1680,7 @@ function processLatestDrawioCandidates(allCandidates) {
     : null;
   const reportLatestInvalid = () => {
     if (!invalidAfterLatestValid) {
+      updateDrawioContextAction();
       return;
     }
     const invalidCandidate = invalidAfterLatestValid.candidate;
@@ -1676,6 +1689,7 @@ function processLatestDrawioCandidates(allCandidates) {
       artifactId: preview.hashDrawioXml(invalidCandidate.call.xml),
       error: invalidAfterLatestValid.validation.error
     });
+    updateDrawioContextAction();
   };
 
   if (!latestValid) {
@@ -1698,7 +1712,10 @@ function processLatestDrawioCandidates(allCandidates) {
         error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
       });
     })
-    .finally(reportLatestInvalid);
+    .finally(() => {
+      reportLatestInvalid();
+      updateDrawioContextAction();
+    });
 }
 
 function buildDrawioCandidateKey(candidate, validation) {
@@ -3014,6 +3031,7 @@ function releaseActiveCall(callToken) {
   }
   activeCallId = "";
   activeCallToken = null;
+  updateContextualPanelActions();
 }
 
 function formatBoardApprovalTarget(call) {
@@ -5628,6 +5646,57 @@ function debugProfileKey() {
   return `${DEBUG_PROFILE_PREFIX}${location.origin}`;
 }
 
+function createPanelActionButton(action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = action.label;
+  button.dataset.shellToolAction = action.mode;
+  if (action.title) {
+    button.title = action.title;
+  }
+  button.style.cssText = [
+    "min-width:0",
+    "min-height:30px",
+    "border:1px solid #4b5563",
+    "border-radius:7px",
+    "padding:4px 5px",
+    "font:500 11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "background:#374151",
+    "color:#fff",
+    "cursor:pointer",
+    "white-space:normal"
+  ].join(";");
+  return button;
+}
+
+function createPanelButtonGrid(actions, columns = 2, options = {}) {
+  const grid = document.createElement("div");
+  grid.style.cssText = [
+    "display:grid",
+    `grid-template-columns:repeat(${columns},minmax(0,1fr))`,
+    "gap:4px",
+    options.marginTop ? "margin-top:4px" : ""
+  ].filter(Boolean).join(";");
+  for (const action of actions) {
+    grid.appendChild(createPanelActionButton(action));
+  }
+  return grid;
+}
+
+function createPanelSection(title, group) {
+  const section = document.createElement("section");
+  section.dataset.shellPanelGroup = group;
+  section.style.cssText = "margin-top:10px";
+
+  const heading = document.createElement("div");
+  heading.textContent = title;
+  heading.style.cssText = "margin-bottom:5px;color:#b8c1d1;font:500 10px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;letter-spacing:.04em;text-transform:uppercase";
+
+  const body = document.createElement("div");
+  section.append(heading, body);
+  return { section, body };
+}
+
 function injectStatus() {
   if (document.getElementById(STATUS_ID)) {
     return;
@@ -5641,35 +5710,45 @@ function injectStatus() {
     "right:16px",
     "bottom:16px",
     "z-index:2147483647",
-    "max-width:420px",
-    "padding:8px",
-    "border-radius:8px",
+    "box-sizing:border-box",
+    "width:min(292px,calc(100vw - 32px))",
+    "max-width:calc(100vw - 32px)",
+    "padding:10px",
+    "border:1px solid #39455c",
+    "border-radius:11px",
     "font:12px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
     "background:#111827",
     "color:#fff",
-    "box-shadow:0 6px 24px rgba(0,0,0,.18)",
-    "opacity:.88",
+    "box-shadow:0 10px 28px rgba(0,0,0,.28)",
+    "opacity:.94",
     "pointer-events:auto",
     "user-select:none"
   ].join(";");
 
+  const statusRow = document.createElement("div");
+  statusRow.style.cssText = "display:flex;align-items:center;gap:7px;min-height:24px;margin-bottom:8px";
+
+  const statusIndicator = document.createElement("span");
+  statusIndicator.id = STATUS_INDICATOR_ID;
+  statusIndicator.setAttribute("aria-hidden", "true");
+  statusIndicator.style.cssText = "flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#64748b;box-shadow:0 0 0 3px rgba(100,116,139,.16)";
+  statusRow.appendChild(statusIndicator);
+
   const statusText = document.createElement("div");
   statusText.id = STATUS_TEXT_ID;
   statusText.textContent = `Shell tool ready v${getDisplayVersion()}`;
-  statusText.style.cssText = "margin-bottom:6px;line-height:1.3;cursor:move";
+  statusText.setAttribute("aria-live", "polite");
+  statusText.style.cssText = "min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3;cursor:move;font-weight:500";
   statusText.title = "Drag to move";
-  panel.appendChild(statusText);
+  statusRow.appendChild(statusText);
+
+  panel.appendChild(statusRow);
 
   const actions = document.createElement("div");
-  actions.style.cssText = "display:flex;gap:4px;flex-wrap:wrap";
+  actions.dataset.shellPanelGroup = "common";
+  actions.style.cssText = "display:grid;grid-template-columns:32px;justify-content:end;gap:4px";
   for (const action of [
-    { mode: "test", label: "Test" },
     { mode: "check", label: "Server Check" },
-    {
-      mode: "reset-tmux",
-      label: "Reset tmux",
-      title: "Recreate the default ForAI tmux session with host and board windows"
-    },
     {
       mode: "force",
       label: "Force run",
@@ -5681,40 +5760,46 @@ function injectStatus() {
       title: "Terminate the currently running shell helper for this page role"
     },
     {
-      mode: "drawio-reopen",
-      label: "Draw.io",
-      title: "Reopen the latest draw.io SVG preview or its error log"
-    },
-    { mode: "site", label: "Enable site" },
-    {
-      mode: "role-filter",
-      label: "Role filter",
-      title: "Toggle author-role filter (when off, the newest visible helper block is always executed)"
-    },
-    { mode: "input", label: "Bind input" },
-    { mode: "send", label: "Bind send" },
-    { mode: "shell", label: "Bind shell" },
-    { mode: "clear", label: "Clear" }
-  ]) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = action.label;
-    button.dataset.shellToolAction = action.mode;
-    if (action.title) {
-      button.title = action.title;
+      mode: "more",
+      label: "•••",
+      title: "Show setup, binding, agent, and diagnostic controls"
     }
-    button.style.cssText = [
-      "border:0",
-      "border-radius:6px",
-      "padding:4px 6px",
-      "font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
-      "background:#374151",
-      "color:#fff",
-      "cursor:pointer"
-    ].join(";");
+  ]) {
+    const button = createPanelActionButton(action);
+    if (action.mode === "check") {
+      button.hidden = true;
+    } else if (action.mode === "force") {
+      button.hidden = true;
+      button.style.background = "#78350f";
+      button.style.color = "#fde68a";
+    } else if (action.mode === "stop-helper") {
+      button.hidden = true;
+      button.disabled = true;
+      button.style.color = "#748096";
+    } else if (action.mode === "more") {
+      button.setAttribute("aria-label", "More controls");
+      button.setAttribute("aria-expanded", "false");
+      button.setAttribute("aria-controls", ADVANCED_CONTROLS_ID);
+      button.style.fontSize = "15px";
+      button.style.letterSpacing = "1px";
+    }
     actions.appendChild(button);
   }
   panel.appendChild(actions);
+
+  const drawioContextAction = createPanelActionButton({
+    mode: "drawio-reopen",
+    label: "Draw.io preview",
+    title: "Reopen the latest Draw.io SVG preview or its error log"
+  });
+  drawioContextAction.id = DRAWIO_CONTEXT_ACTION_ID;
+  drawioContextAction.hidden = true;
+  drawioContextAction.style.width = "100%";
+  drawioContextAction.style.marginTop = "6px";
+  drawioContextAction.style.background = "#1e3a5f";
+  drawioContextAction.style.borderColor = "#315782";
+  drawioContextAction.style.color = "#dbeafe";
+  panel.appendChild(drawioContextAction);
 
   const shellRunControl = document.createElement("div");
   shellRunControl.id = SHELL_RUN_CONTROL_ID;
@@ -5731,15 +5816,48 @@ function injectStatus() {
   shellRunControl.innerHTML = [
     '<div data-shell-run-control-text style="margin-bottom:6px"></div>',
     '<div style="display:flex;gap:4px;flex-wrap:wrap">',
-    '<button type="button" data-shell-tool-action="continue-helper" style="border:0;border-radius:6px;padding:4px 7px;background:#065f46;color:#fff;cursor:pointer">Continue waiting</button>',
-    '<button type="button" data-shell-tool-action="terminate-helper" style="border:0;border-radius:6px;padding:4px 7px;background:#b91c1c;color:#fff;cursor:pointer">Force terminate</button>',
+    '<button type="button" data-shell-tool-action="continue-helper" style="width:100%;border:0;border-radius:6px;padding:5px 7px;background:#065f46;color:#fff;cursor:pointer">Continue waiting</button>',
     '</div>'
   ].join("");
   panel.appendChild(shellRunControl);
   updateShellRunControlPanel();
 
+  const advancedControls = document.createElement("div");
+  advancedControls.id = ADVANCED_CONTROLS_ID;
+  advancedControls.hidden = true;
+  advancedControls.style.cssText = "max-height:min(70vh,560px);margin-top:9px;padding-top:9px;border-top:1px solid #39455c;overflow:auto";
+
+  const setupSection = createPanelSection("Setup & recovery", "setup-recovery");
+  setupSection.body.appendChild(createPanelButtonGrid([
+    { mode: "check", label: "Server Check" },
+    { mode: "test", label: "Test" },
+    { mode: "site", label: "Enable site" },
+    {
+      mode: "reset-tmux",
+      label: "Reset tmux",
+      title: "Recreate the default ForAI tmux session with host and board windows"
+    },
+    {
+      mode: "role-filter",
+      label: "Role filter",
+      title: "Toggle author-role filter (when off, the newest visible helper block is always executed)"
+    }
+  ], 2));
+  advancedControls.appendChild(setupSection.section);
+
+  const bindingSection = createPanelSection("Page binding", "page-binding");
+  bindingSection.body.appendChild(createPanelButtonGrid([
+    { mode: "input", label: "Bind input" },
+    { mode: "send", label: "Bind send" },
+    { mode: "shell", label: "Bind shell" },
+    { mode: "clear", label: "Clear" }
+  ], 2));
+  advancedControls.appendChild(bindingSection.section);
+
+  const agentSection = createPanelSection("Agent & tmux-ai", "agent-tmux-ai");
+
   const agentControls = document.createElement("div");
-  agentControls.style.cssText = "display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto auto;gap:4px;align-items:center;margin-top:6px";
+  agentControls.style.cssText = "display:grid;grid-template-columns:minmax(70px,.8fr) minmax(90px,1.2fr);gap:4px;align-items:center";
   agentControls.innerHTML = [
     '<select data-shell-agent-role title="Agent role" style="border:0;border-radius:6px;padding:3px 4px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;">',
     '<option value="none">none</option>',
@@ -5747,23 +5865,28 @@ function injectStatus() {
     '<option value="slave">slave</option>',
     '</select>',
     '<input data-shell-agent-id title="Agent id" placeholder="agentId" style="min-width:72px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
-    '<button type="button" data-shell-tool-action="agent-register" title="Save this page agent role and register it with the local hub" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Save</button>',
-    '<button type="button" data-shell-tool-action="agent-list" title="Show local agent roster and pending message counts" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Roster</button>',
-    '<button type="button" data-shell-tool-action="agent-check" title="Explain whether master/slave/tmux-ai setup is ready" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Agent Check</button>'
   ].join("");
-  panel.appendChild(agentControls);
+  agentSection.body.appendChild(agentControls);
+  agentSection.body.appendChild(createPanelButtonGrid([
+    { mode: "agent-register", label: "Save", title: "Save this page agent role and register it with the local hub" },
+    { mode: "agent-list", label: "Roster", title: "Show local agent roster and pending message counts" },
+    { mode: "agent-check", label: "Agent Check", title: "Explain whether master/slave/tmux-ai setup is ready" }
+  ], 3, { marginTop: true }));
 
   const tmuxAiControls = document.createElement("div");
-  tmuxAiControls.style.cssText = "display:grid;grid-template-columns:minmax(78px,1fr) minmax(120px,1.5fr) auto auto;gap:4px;align-items:center;margin-top:6px";
+  tmuxAiControls.style.cssText = "display:grid;grid-template-columns:minmax(78px,.8fr) minmax(120px,1.2fr);gap:4px;align-items:center;margin-top:6px";
   tmuxAiControls.innerHTML = [
     '<input data-shell-tmux-ai-id title="Tmux AI slave agent id" placeholder="slave-tmux" style="min-width:78px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
     '<select data-shell-tmux-ai-target title="Tmux AI target pane" style="min-width:120px;border:0;border-radius:6px;padding:4px 6px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f9fafb;color:#111827;">',
     '<option value="">tmux target</option>',
-    '</select>',
-    '<button type="button" data-shell-tool-action="tmux-ai-refresh" title="Refresh available tmux panes for tmux-ai slaves" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Refresh</button>',
-    '<button type="button" data-shell-tool-action="tmux-ai-register" title="Register this tmux pane as a slave managed by the local server" style="border:0;border-radius:6px;padding:4px 6px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#374151;color:#fff;cursor:pointer;">Register</button>'
+    '</select>'
   ].join("");
-  panel.appendChild(tmuxAiControls);
+  agentSection.body.appendChild(tmuxAiControls);
+  agentSection.body.appendChild(createPanelButtonGrid([
+    { mode: "tmux-ai-refresh", label: "Refresh", title: "Refresh available tmux panes for tmux-ai slaves" },
+    { mode: "tmux-ai-register", label: "Register", title: "Register this tmux pane as a slave managed by the local server" }
+  ], 2, { marginTop: true }));
+  advancedControls.appendChild(agentSection.section);
 
   const pendingAgentDeliveryPanel = document.createElement("div");
   pendingAgentDeliveryPanel.id = PENDING_AGENT_DELIVERY_ID;
@@ -5781,8 +5904,15 @@ function injectStatus() {
     "max-height:120px",
     "overflow:auto"
   ].join(";");
-  panel.appendChild(pendingAgentDeliveryPanel);
+  agentSection.body.appendChild(pendingAgentDeliveryPanel);
   updatePendingAgentDeliveryPanel();
+
+  const diagnosticSection = createPanelSection("Tools & diagnostics", "tools-diagnostics");
+  const statusDetail = document.createElement("div");
+  statusDetail.id = STATUS_DETAIL_ID;
+  statusDetail.textContent = statusText.textContent;
+  statusDetail.style.cssText = "margin-top:6px;padding:6px;border-radius:6px;background:#1f2937;color:#dbeafe;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.35;white-space:pre-wrap;word-break:break-word;max-height:100px;overflow:auto";
+  diagnosticSection.body.appendChild(statusDetail);
 
   const debugPanel = document.createElement("details");
   debugPanel.id = "ai-chat-shell-exec-debug";
@@ -5795,7 +5925,9 @@ function injectStatus() {
   debugBody.style.cssText = "margin:4px 0 0;padding:6px;background:#0b1220;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;color:#d1d5db;";
   debugBody.textContent = "(no helper block detected yet)";
   debugPanel.append(debugSummary, debugBody);
-  panel.appendChild(debugPanel);
+  diagnosticSection.body.appendChild(debugPanel);
+  advancedControls.appendChild(diagnosticSection.section);
+  panel.appendChild(advancedControls);
 
   chrome.storage.local.get([debugProfileKey()]).then((stored) => {
     if (stored[debugProfileKey()]) {
@@ -5845,11 +5977,83 @@ function injectStatus() {
   });
   loadAgentControls().catch(() => {});
   refreshTmuxAiTargetOptions({ quiet: true }).catch(() => {});
+  updateDrawioContextAction();
+  updateContextualPanelActions();
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
   checkStartupTmux().catch((error) => {
     setStatus(`ForAI tmux startup check failed: ${summarizeCommand(error.message || String(error))}`, "error");
   });
+}
+
+function setAdvancedPanelOpen(open) {
+  const panel = document.getElementById(STATUS_ID);
+  const advancedControls = document.getElementById(ADVANCED_CONTROLS_ID);
+  const button = panel?.querySelector?.('[data-shell-tool-action="more"]');
+  if (!panel || !advancedControls || !button) {
+    return;
+  }
+  const expanded = open === true;
+  advancedControls.hidden = !expanded;
+  button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  button.setAttribute("aria-label", expanded ? "Hide more controls" : "More controls");
+  button.title = expanded
+    ? "Hide setup, binding, agent, and diagnostic controls"
+    : "Show setup, binding, agent, and diagnostic controls";
+  panel.dataset.advancedOpen = expanded ? "true" : "false";
+}
+
+function toggleAdvancedPanel() {
+  const advancedControls = document.getElementById(ADVANCED_CONTROLS_ID);
+  setAdvancedPanelOpen(Boolean(advancedControls?.hidden));
+}
+
+function updateDrawioContextAction() {
+  const button = document.getElementById(DRAWIO_CONTEXT_ACTION_ID);
+  if (!button) {
+    return;
+  }
+  const diagnostics = globalThis.AiChatDrawioPreview?.getDiagnostics?.() || {};
+  const hasArtifact = Boolean(diagnostics.currentArtifactId);
+  const hasErrors = Array.isArray(diagnostics.errors) && diagnostics.errors.length > 0;
+  button.hidden = !hasArtifact && !hasErrors;
+  button.textContent = hasArtifact ? "Draw.io preview" : "Draw.io error log";
+  button.title = hasArtifact
+    ? "Reopen the latest Draw.io SVG preview"
+    : "Open the latest Draw.io render error log";
+}
+
+function setPanelForceRunAvailable(available) {
+  panelForceRunAvailable = available === true;
+  updateContextualPanelActions();
+}
+
+function updateContextualPanelActions() {
+  const panel = document.getElementById(STATUS_ID);
+  const actions = panel?.querySelector?.('[data-shell-panel-group="common"]');
+  if (!panel || !actions) {
+    return;
+  }
+  const check = actions.querySelector('[data-shell-tool-action="check"]');
+  const force = actions.querySelector('[data-shell-tool-action="force"]');
+  const stop = actions.querySelector('[data-shell-tool-action="stop-helper"]');
+  const more = actions.querySelector('[data-shell-tool-action="more"]');
+  const backendBusy = Boolean(activeCallId);
+  const showCheck = !backendBusy && !panelShellHelperActive && panel.dataset.state === "error";
+  const showForce = !backendBusy && !panelShellHelperActive && panelForceRunAvailable;
+  if (check) {
+    check.hidden = !showCheck;
+  }
+  if (force) {
+    force.hidden = !showForce;
+  }
+  if (stop) {
+    stop.hidden = !panelShellHelperActive;
+  }
+  const visibleActions = [check, force, stop, more].filter((button) => button && !button.hidden);
+  actions.style.gridTemplateColumns = visibleActions
+    .map((button) => button === more ? "32px" : "minmax(0,1fr)")
+    .join(" ");
 }
 
 function setStatus(text, state = "idle") {
@@ -5870,14 +6074,25 @@ function setStatus(text, state = "idle") {
     setForceButtonHighlight(false);
   }
   statusText.textContent = lastSuppressedCallStatus ? `${effectiveText} (${FORCE_RUN_STATUS_HINT})` : effectiveText;
+  statusText.setAttribute("aria-label", statusText.textContent);
+  const statusDetail = document.getElementById(STATUS_DETAIL_ID);
+  if (statusDetail) {
+    statusDetail.textContent = statusText.textContent;
+  }
   panel.dataset.state = effectiveState;
+  updateContextualPanelActions();
   const colors = {
-    idle: "#111827",
-    running: "#1d4ed8",
-    ok: "#047857",
-    error: "#b91c1c"
+    idle: { dot: "#64748b", ring: "rgba(100,116,139,.16)" },
+    running: { dot: "#60a5fa", ring: "rgba(96,165,250,.18)" },
+    ok: { dot: "#34d399", ring: "rgba(52,211,153,.16)" },
+    error: { dot: "#fb7185", ring: "rgba(251,113,133,.18)" }
   };
-  panel.style.background = colors[effectiveState] || colors.idle;
+  const indicator = document.getElementById(STATUS_INDICATOR_ID);
+  const color = colors[effectiveState] || colors.idle;
+  if (indicator) {
+    indicator.style.background = color.dot;
+    indicator.style.boxShadow = `0 0 0 3px ${color.ring}`;
+  }
 }
 
 async function handleShellRunProgress(message) {
@@ -5893,7 +6108,7 @@ async function handleShellRunProgress(message) {
     activeShellRunNotice = normalizeShellRunNotice(message);
     updateShellRunControlPanel();
     setStatus(
-      `Shell helper has produced no output for ${formatIdleDuration(activeShellRunNotice.idleForMs)}; choose Continue waiting or Force terminate`,
+      `Shell helper has produced no output for ${formatIdleDuration(activeShellRunNotice.idleForMs)}; choose Continue waiting or Stop helper`,
       "running"
     );
     return;
@@ -6016,10 +6231,16 @@ function updateStopHelperButton(active) {
   if (!button) {
     return;
   }
-  button.style.background = active ? "#b91c1c" : "#374151";
-  button.title = active
+  panelShellHelperActive = active === true;
+  button.disabled = !panelShellHelperActive;
+  button.style.background = panelShellHelperActive ? "#4c1f2a" : "#374151";
+  button.style.borderColor = panelShellHelperActive ? "#753041" : "#4b5563";
+  button.style.color = panelShellHelperActive ? "#fecdd3" : "#748096";
+  button.style.cursor = panelShellHelperActive ? "pointer" : "default";
+  button.title = panelShellHelperActive
     ? "Terminate the currently running shell helper for this page role"
-    : "No active helper detected; click to check the current page role";
+    : "No active helper detected for the current page role";
+  updateContextualPanelActions();
 }
 
 async function continueCurrentShellHelper() {
@@ -6210,7 +6431,8 @@ function setForceButtonHighlight(highlight) {
   if (!(button instanceof HTMLElement)) {
     return;
   }
-  button.style.background = highlight ? "#b45309" : "#374151";
+  button.style.background = highlight ? "#b45309" : "#78350f";
+  button.style.color = "#fde68a";
 }
 
 function rememberSuppressedCallStatus(status) {
@@ -6317,6 +6539,11 @@ function isSuppressionStatusText(text) {
 }
 
 function handlePanelAction(action) {
+  if (action === "more") {
+    toggleAdvancedPanel();
+    return;
+  }
+
   if (action === "drawio-reopen") {
     if (!globalThis.AiChatDrawioPreview?.reopen?.()) {
       setStatus("No draw.io preview or render log is available yet", "idle");
@@ -6376,13 +6603,6 @@ function handlePanelAction(action) {
   if (action === "continue-helper") {
     continueCurrentShellHelper().catch((error) => {
       setStatus(`Continue helper failed: ${summarizeCommand(error.message || String(error))}`, "error");
-    });
-    return;
-  }
-
-  if (action === "terminate-helper") {
-    terminateCurrentShellHelper({ requireConfirmation: false }).catch((error) => {
-      setStatus(`Terminate helper failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
   }
