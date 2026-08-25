@@ -94,7 +94,7 @@ The v0.10.0 implementation fixes these decisions:
 - packaged draw.io viewer `v31.1.5` with recorded SHA-256 and Apache-2.0 license, isolated by the manifest sandbox/CSP with no runtime renderer CDN;
 - an in-memory per-page preview lifecycle with Close/Reopen and `.drawio` download; route/reload clears the artifact instead of persisting potentially sensitive diagram data;
 - bounded invalid/render error logs in both the preview and browser console, while preserving the last successful SVG;
-- parser/unit tests plus real-Chromium coverage for incomplete streaming, rapid helpers, identical DOM redraw, malformed XML, renderer failure, old-SVG retention, and non-execution/composer isolation.
+- parser/unit tests plus real-Chromium coverage for incomplete streaming, rapid helpers, identical DOM redraw, malformed XML, renderer failure, latest-outcome replacement, bounded one-time error delivery, success silence, viewport maximize/restore, and shell-backend isolation.
 
 ### Parked: Horizon Visual Adapter
 

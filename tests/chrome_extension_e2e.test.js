@@ -1937,6 +1937,33 @@ async function runDrawioPreviewE2E(page) {
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-drawio-action')?.click()`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.hidden === false`, "contextual Draw.io action to reopen the preview");
 
+  const normalPreviewRect = await page.evaluate(`(() => {
+    const windowNode = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.shadowRoot?.querySelector(".window");
+    const rect = windowNode?.getBoundingClientRect();
+    return rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null;
+  })()`);
+  assert.ok(normalPreviewRect?.width > 400 && normalPreviewRect.width < 900);
+  await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.shadowRoot?.querySelector('[data-action="maximize"]')?.click()`);
+  const maximizedPreview = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    const button = host?.shadowRoot?.querySelector('[data-action="maximize"]');
+    const rect = host?.shadowRoot?.querySelector(".window")?.getBoundingClientRect();
+    return rect ? { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, viewportWidth: innerWidth, viewportHeight: innerHeight, label: button?.textContent, pressed: button?.getAttribute("aria-pressed"), maximized: host?.dataset.maximized } : null;
+  })()`);
+  assert.ok(maximizedPreview.left <= 9 && maximizedPreview.top <= 9);
+  assert.ok(Math.abs(maximizedPreview.right - (maximizedPreview.viewportWidth - 8)) <= 2, "Maximized preview should reach the browser viewport width.");
+  assert.ok(Math.abs(maximizedPreview.bottom - (maximizedPreview.viewportHeight - 8)) <= 2, "Maximized preview should reach the browser viewport height.");
+  assert.equal(maximizedPreview.label, "Restore");
+  assert.equal(maximizedPreview.pressed, "true");
+  assert.equal(maximizedPreview.maximized, "true");
+  await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.shadowRoot?.querySelector('[data-action="maximize"]')?.click()`);
+  const restoredPreviewRect = await page.evaluate(`(() => {
+    const rect = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.shadowRoot?.querySelector(".window")?.getBoundingClientRect();
+    return rect ? { width: rect.width, height: rect.height } : null;
+  })()`);
+  assert.ok(Math.abs(restoredPreviewRect.width - normalPreviewRect.width) <= 2);
+  assert.ok(Math.abs(restoredPreviewRect.height - normalPreviewRect.height) <= 2);
+
   const firstState = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId };
@@ -2015,11 +2042,17 @@ async function runDrawioPreviewE2E(page) {
   await waitForEvaluate(page, `(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeMalformed} &&
-      host.dataset.state === "ready-with-error" &&
-      host.dataset.currentArtifactId === ${JSON.stringify(v4ArtifactId)} &&
+      host.dataset.state === "error" &&
+      host.dataset.currentArtifactId === "" &&
+      !host.shadowRoot?.querySelector(".drawio-frame-current") &&
+      host.shadowRoot?.querySelector('[data-action="download"]')?.disabled === true &&
       /malformed/i.test(host.dataset.lastError || "") &&
       /helper rejected/i.test(host.shadowRoot?.querySelector("details pre")?.innerText || "");
-  })()`, "malformed draw.io helper error log while retaining old SVG");
+  })()`, "malformed latest draw.io helper replacing the old render with an error-only state");
+  await waitForEvaluate(page, `(() => {
+    const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    return users.length === ${baseline.userCount + 1} && /Draw\.io helper failed:/.test(users.at(-1)?.innerText || "") && /drawio-e2e-malformed/.test(users.at(-1)?.innerText || "");
+  })()`, "malformed Draw.io error to be sent once to the AI");
 
   const brokenRendererXml = '<mxfile><diagram name="Broken renderer">definitely-not-valid-compressed-drawio-data</diagram></mxfile>';
   const errorCountBeforeRenderFailure = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);
@@ -2027,31 +2060,52 @@ async function runDrawioPreviewE2E(page) {
   await waitForEvaluate(page, `(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeRenderFailure} &&
-      host.dataset.state === "ready-with-error" &&
-      host.dataset.currentArtifactId === ${JSON.stringify(v4ArtifactId)} &&
+      host.dataset.state === "error" &&
+      host.dataset.currentArtifactId === "" &&
       /render failed/i.test(host.dataset.lastError || "") &&
-      /previous SVG was kept/i.test(host.shadowRoot?.querySelector(".status")?.innerText || "");
-  })()`, "draw.io renderer failure diagnostics while retaining old SVG");
+      !/malformed/i.test(host.shadowRoot?.querySelector("details pre")?.innerText || "");
+  })()`, "latest draw.io renderer failure replacing the previous error log");
+  await waitForEvaluate(page, `(() => {
+    const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    return users.length === ${baseline.userCount + 2} && /Draw\.io helper failed:/.test(users.at(-1)?.innerText || "") && /drawio-e2e-render-fail/.test(users.at(-1)?.innerText || "");
+  })()`, "render failure to be sent once to the AI");
   assert.ok(
     page.consoleMessages.some((entry) => entry.text.includes("[AI Chat Draw.io]") && /render failed/i.test(entry.text)),
     "A renderer failure must be emitted to the browser console as well as the preview log."
   );
 
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text")`);
+  await waitForEvaluate(page, `(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return host?.dataset.state === "ready" && host.dataset.currentArtifactId === ${JSON.stringify(v4ArtifactId)} &&
+      host.shadowRoot?.querySelector("details")?.hidden === true &&
+      (host.shadowRoot?.querySelector("details pre")?.innerText || "") === "";
+  })()`, "successful latest Draw.io helper to clear the prior error without replying");
+  state = await page.evaluate(`(() => {
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId, userCount: document.querySelectorAll('[data-message-author-role="user"]').length };
+  })()`);
+  assert.equal(state.renderCount, 4, "The latest success after an error must produce a fresh render.");
+  assert.equal(state.artifactId, v4ArtifactId);
+  assert.equal(state.userCount, baseline.userCount + 2, "A successful Draw.io helper must not send a reply.");
+
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text")`);
   await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3200))");
   state = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
-    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId };
+    return { renderCount: Number(host.dataset.renderCount), artifactId: host.dataset.currentArtifactId, userCount: document.querySelectorAll('[data-message-author-role="user"]').length };
   })()`);
-  assert.equal(state.renderCount, 3, "A redrawn helper with the same XML artifact must not remount or flicker.");
-  assert.equal(state.artifactId, v4ArtifactId);
+  assert.equal(state.renderCount, 4, "A redrawn helper with the same XML artifact must not remount or flicker.");
+  assert.equal(state.userCount, baseline.userCount + 2, "A successful redraw must not send any reply.");
 
   const finalPageState = await page.evaluate(`(() => ({
     composer: document.getElementById("composer")?.innerText || "",
     userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
     shellResults: (document.body.innerText.match(/Shell call result:/g) || []).length
   }))()`);
-  assert.deepEqual(finalPageState, baseline, "Draw.io previews must not call the backend or write/send the composer.");
+  assert.equal(finalPageState.composer, baseline.composer);
+  assert.equal(finalPageState.shellResults, baseline.shellResults, "Draw.io previews must never call the shell backend.");
+  assert.equal(finalPageState.userCount, baseline.userCount + 2, "Only the two latest-helper failures should be sent to the AI.");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-drawio.png"));
   }

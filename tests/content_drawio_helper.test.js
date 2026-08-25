@@ -8,18 +8,19 @@ const vm = require("node:vm");
 class FakeElement {}
 
 class MockNode extends FakeElement {
-  constructor(text = "", order = 1) {
+  constructor(text = "", order = 1, role = "assistant") {
     super();
     this.innerText = text;
     this.textContent = text;
     this.order = order;
+    this.role = role;
     this.parentElement = null;
   }
 
   closest() { return this; }
   contains() { return false; }
   querySelectorAll() { return []; }
-  getAttribute(name) { return name === "data-message-author-role" ? "assistant" : ""; }
+  getAttribute(name) { return name === "data-message-author-role" ? this.role : ""; }
   getBoundingClientRect() { return { width: 640, height: 240 }; }
   compareDocumentPosition(other) { return this.order < other.order ? 4 : this.order > other.order ? 2 : 0; }
 }
@@ -52,7 +53,10 @@ function loadContext() {
     },
     hashDrawioXml(xml) { return `hash-${String(xml || "").length}-${String(xml || "").slice(-12)}`; },
     consider(value) { previewCalls.push(value); return Promise.resolve({ ok: true }); },
-    reportInvalid(value) { invalidCalls.push(value); return true; },
+    reportInvalid(value) {
+      invalidCalls.push(value);
+      return { ok: false, validationError: true, newError: true, artifactId: value.artifactId, error: value.error };
+    },
     resetForPage() {},
     reopen() { return false; }
   };
@@ -155,15 +159,30 @@ function loadContext() {
 }
 
 {
+  const { context, previewCalls } = loadContext();
+  const assistant = { call: context.parsePlainTextHelperBlocks(helper(drawioXml("Assistant")))[0], node: new MockNode("assistant", 1, "assistant"), textRoot: new MockNode("assistant", 1, "assistant"), source: "plain-text-block", blockIndex: 0 };
+  const explicitUser = { call: context.parsePlainTextHelperBlocks(helper(drawioXml("User copy")))[0], node: new MockNode("user", 2, "user"), textRoot: new MockNode("user", 2, "user"), source: "plain-text-block", blockIndex: 0 };
+  context.processLatestDrawioCandidates([assistant, explicitUser]);
+  assert.equal(previewCalls.length, 1);
+  assert.match(previewCalls[0].xml, /name="Assistant"/, "An explicitly identified user helper must not become the Draw.io outcome.");
+
+  const unknown = { call: context.parsePlainTextHelperBlocks(helper(drawioXml("Unknown host container")))[0], node: new MockNode("unknown", 3, ""), textRoot: new MockNode("unknown", 3, ""), source: "plain-text-block", blockIndex: 0 };
+  context.processLatestDrawioCandidates([assistant, unknown]);
+  assert.equal(previewCalls.length, 2);
+  assert.match(previewCalls[1].xml, /name="Unknown host container"/, "Draw.io must not depend on the optional role filter recognizing a host container.");
+}
+
+{
   const { context, previewCalls, invalidCalls } = loadContext();
   const valid = { call: context.parsePlainTextHelperBlocks(helper(drawioXml("Keep me")))[0], node: new MockNode("valid", 1), textRoot: new MockNode("valid", 1), source: "plain-text-block", blockIndex: 0 };
   const malformed = { call: context.parsePlainTextHelperBlocks(helper("<mxfile><diagram></diagram></mxfile>"))[0], node: new MockNode("bad", 2), textRoot: new MockNode("bad", 2), source: "plain-text-block", blockIndex: 0 };
   malformed.call.xml = "<not-mxfile><diagram/></not-mxfile>";
   context.processLatestDrawioCandidates([valid, malformed]);
-  assert.equal(previewCalls.length, 1);
-  assert.match(previewCalls[0].xml, /name="Keep me"/);
+  assert.equal(previewCalls.length, 0, "A newer complete failure must not fall back to an older valid render.");
+  assert.equal(invalidCalls.length, 1);
+  assert.match(invalidCalls[0].error, /malformed/);
   setImmediate(() => {
-    assert.equal(invalidCalls.length, 1, "A newer complete invalid helper is logged while the last valid preview remains selected.");
+    assert.equal(invalidCalls.length, 1, "Only the newest complete helper outcome is reported.");
     console.log("content drawio helper tests passed");
   });
 }

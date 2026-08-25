@@ -4,7 +4,6 @@
   const DRAWIO_PREVIEW_HOST_ID = "ai-chat-shell-exec-drawio-preview";
   const DRAWIO_XML_MAX_BYTES = 1024 * 1024;
   const DRAWIO_RENDER_TIMEOUT_MS = 7000;
-  const DRAWIO_ERROR_LOG_LIMIT = 12;
   const DRAWIO_INVALID_LOG_KEYS_LIMIT = 64;
 
   let previewHost = null;
@@ -18,7 +17,9 @@
   let activeStage = null;
   let errorLog = [];
   let invalidLogKeys = new Set();
-  let failedRenderKeys = new Set();
+  let failedRenderResults = new Map();
+  let maximized = false;
+  let restoreWindowStyle = null;
 
   function validateDrawioXml(xml) {
     const text = String(xml || "");
@@ -112,20 +113,24 @@
     const artifactId = String(candidate?.artifactId || hashDrawioXml(xml));
     const candidateKey = String(candidate?.candidateKey || artifactId);
     if (!validation.ok) {
-      reportInvalid({
+      const result = reportInvalid({
         key: candidate?.candidateKey || `${artifactId}:${validation.error}`,
         artifactId,
         error: validation.error
       });
-      return Promise.resolve({ ok: false, validationError: true, error: validation.error });
+      return Promise.resolve(result);
     }
     if (currentArtifact?.artifactId === artifactId || pendingArtifactId === artifactId) {
       updateHostDiagnostics();
       return Promise.resolve({ ok: true, unchanged: true, artifactId });
     }
-    if (failedRenderKeys.has(candidateKey)) {
+    if (failedRenderResults.has(candidateKey)) {
       updateHostDiagnostics();
-      return Promise.resolve({ ok: false, unchanged: true, previousRenderError: true, artifactId });
+      return Promise.resolve({
+        ...failedRenderResults.get(candidateKey),
+        unchanged: true,
+        newError: false
+      });
     }
 
     renderGeneration += 1;
@@ -133,6 +138,7 @@
     pendingArtifactId = artifactId;
     ensurePreview();
     previewHost.hidden = false;
+    clearErrorLog();
     setPreviewState("staging");
     setPreviewStatus(currentArtifact
       ? "Rendering the latest valid helper in staging; the current SVG remains visible."
@@ -192,7 +198,7 @@
         pendingArtifactId = "";
       }
       if (options.log === true) {
-        appendErrorLog(`Draw.io staging cancelled: ${reason}`, artifact.artifactId);
+        replaceErrorLog(`Draw.io staging cancelled: ${reason}`, artifact.artifactId);
       }
       resolvePromise({ ok: false, cancelled: true, error: reason, artifactId: artifact.artifactId });
     }
@@ -210,13 +216,19 @@
       if (activeStage?.artifactId === artifact.artifactId) {
         activeStage = null;
       }
-      rememberFailedRenderKey(artifact.candidateKey);
-      appendErrorLog(`Draw.io render failed: ${compactText(message, 500)}`, artifact.artifactId);
-      setPreviewState(currentArtifact ? "ready-with-error" : "error");
-      setPreviewStatus(currentArtifact
-        ? "The latest helper failed to render. The previous SVG was kept."
-        : "The latest helper failed to render. Open the error log for details.");
-      resolvePromise({ ok: false, renderError: true, error: message, artifactId: artifact.artifactId });
+      const result = {
+        ok: false,
+        renderError: true,
+        newError: true,
+        error: `Draw.io render failed: ${compactText(message, 500)}`,
+        artifactId: artifact.artifactId
+      };
+      rememberFailedRenderResult(artifact.candidateKey, result);
+      clearCurrentArtifact("No render is available for the latest helper.");
+      replaceErrorLog(result.error, artifact.artifactId);
+      setPreviewState("error");
+      setPreviewStatus("The latest helper failed to render. Open the error log for details.");
+      resolvePromise(result);
     }
 
     function succeed(message) {
@@ -249,8 +261,9 @@
       previewElements.title.textContent = currentArtifact.title;
       previewElements.meta.textContent = `${currentArtifact.pageCount} page${currentArtifact.pageCount === 1 ? "" : "s"} · ${currentArtifact.byteLength.toLocaleString()} bytes · ${currentArtifact.artifactId.slice(0, 12)}`;
       previewElements.download.disabled = false;
+      clearErrorLog();
       setPreviewState("ready");
-      setPreviewStatus("SVG ready. Only the latest valid helper is displayed.");
+      setPreviewStatus("SVG ready. Only the latest complete helper is displayed.");
       updateHostDiagnostics();
       resolvePromise({ ok: true, rendered: true, artifactId: artifact.artifactId });
     }
@@ -299,7 +312,14 @@
   function reportInvalid({ key, artifactId, error }) {
     const logKey = String(key || `${artifactId || "invalid"}:${error || "unknown"}`);
     if (invalidLogKeys.has(logKey)) {
-      return false;
+      return {
+        ok: false,
+        validationError: true,
+        unchanged: true,
+        newError: false,
+        artifactId: String(artifactId || ""),
+        error: `Draw.io helper rejected: ${compactText(error || "invalid XML", 500)}`
+      };
     }
     invalidLogKeys.add(logKey);
     if (invalidLogKeys.size > DRAWIO_INVALID_LOG_KEYS_LIMIT) {
@@ -307,40 +327,72 @@
     }
     ensurePreview();
     previewHost.hidden = false;
-    appendErrorLog(`Draw.io helper rejected: ${compactText(error || "invalid XML", 500)}`, artifactId || "invalid");
-    setPreviewState(currentArtifact ? "ready-with-error" : "error");
-    setPreviewStatus(currentArtifact
-      ? "A newer helper is invalid. The previous SVG was kept."
-      : "The latest complete draw.io helper is invalid.");
-    return true;
+    renderGeneration += 1;
+    pendingArtifactId = "";
+    activeStage?.cancel("superseded by the latest invalid helper", { log: false });
+    activeStage = null;
+    const message = `Draw.io helper rejected: ${compactText(error || "invalid XML", 500)}`;
+    clearCurrentArtifact("No render is available for the latest helper.");
+    replaceErrorLog(message, artifactId || "invalid");
+    setPreviewState("error");
+    setPreviewStatus("The latest complete draw.io helper is invalid.");
+    return {
+      ok: false,
+      validationError: true,
+      newError: true,
+      artifactId: String(artifactId || ""),
+      error: message
+    };
   }
 
-  function rememberFailedRenderKey(key) {
+  function rememberFailedRenderResult(key, result) {
     const value = String(key || "");
     if (!value) {
       return;
     }
-    failedRenderKeys.add(value);
-    if (failedRenderKeys.size > DRAWIO_INVALID_LOG_KEYS_LIMIT) {
-      failedRenderKeys.delete(failedRenderKeys.values().next().value);
+    failedRenderResults.set(value, { ...result });
+    if (failedRenderResults.size > DRAWIO_INVALID_LOG_KEYS_LIMIT) {
+      failedRenderResults.delete(failedRenderResults.keys().next().value);
     }
   }
 
-  function appendErrorLog(message, artifactId) {
+  function clearCurrentArtifact(emptyText) {
+    previewElements?.viewport?.querySelector?.(".drawio-frame-current")?.remove();
+    currentArtifact = null;
+    if (!previewElements) {
+      return;
+    }
+    previewElements.title.textContent = "Draw.io preview";
+    previewElements.meta.textContent = "Latest helper has no render";
+    previewElements.download.disabled = true;
+    previewElements.empty.textContent = String(emptyText || "Waiting for the latest complete draw.io helper.");
+    previewElements.empty.hidden = false;
+  }
+
+  function clearErrorLog() {
+    errorLog = [];
+    if (!previewElements) {
+      updateHostDiagnostics();
+      return;
+    }
+    previewElements.log.textContent = "";
+    previewElements.logDetails.open = false;
+    previewElements.logDetails.hidden = true;
+    updateHostDiagnostics();
+  }
+
+  function replaceErrorLog(message, artifactId) {
     renderErrorCount += 1;
     const entry = {
       at: new Date().toISOString(),
       artifactId: String(artifactId || ""),
       message: compactText(message, 800)
     };
-    errorLog.push(entry);
-    errorLog = errorLog.slice(-DRAWIO_ERROR_LOG_LIMIT);
+    errorLog = [entry];
     ensurePreview();
     previewElements.logDetails.hidden = false;
     previewElements.logDetails.open = true;
-    previewElements.log.textContent = errorLog
-      .map((item) => `[${item.at}] ${item.artifactId ? `${item.artifactId.slice(0, 12)} ` : ""}${item.message}`)
-      .join("\n");
+    previewElements.log.textContent = `[${entry.at}] ${entry.artifactId ? `${entry.artifactId.slice(0, 12)} ` : ""}${entry.message}`;
     console.error(`[AI Chat Draw.io] ${entry.message}`, {
       artifactId: entry.artifactId,
       renderGeneration
@@ -363,6 +415,7 @@
       <style>
         :host { all: initial; }
         .window { position: fixed; right: 24px; top: 36px; z-index: 2147483646; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; width: min(760px, calc(100vw - 48px)); height: min(590px, calc(100vh - 72px)); min-width: 420px; min-height: 320px; resize: both; overflow: hidden; border: 1px solid rgba(100,116,139,.42); border-radius: 14px; background: #fff; box-shadow: 0 26px 80px rgba(15,23,42,.28), 0 5px 20px rgba(15,23,42,.13); color: #172033; font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+        .window.maximized { left: 8px; right: 8px; top: 8px; bottom: 8px; width: auto; height: auto; min-width: 0; min-height: 0; resize: none; border-radius: 10px; }
         header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 11px 10px 14px; border-bottom: 1px solid #e3e7ee; background: #f8fafc; cursor: move; user-select: none; }
         .heading { min-width: 0; }
         .title { display: block; overflow: hidden; color: #172033; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
@@ -388,7 +441,7 @@
       <section class="window" role="dialog" aria-label="Draw.io preview">
         <header data-drawio-drag-handle>
           <div class="heading"><span class="title">Draw.io preview</span><span class="meta">Waiting for a valid helper</span></div>
-          <div class="actions"><button type="button" data-action="download" disabled>Download .drawio</button><button type="button" data-action="close">Close</button></div>
+          <div class="actions"><button type="button" data-action="download" disabled>Download .drawio</button><button type="button" data-action="maximize" title="Maximize preview to the browser viewport" aria-pressed="false">Maximize</button><button type="button" data-action="close">Close</button></div>
         </header>
         <div class="viewport"><div class="empty">Waiting for the last complete and valid draw.io helper.</div></div>
         <div class="status" aria-live="polite">Draw.io preview is idle.</div>
@@ -405,11 +458,13 @@
       logDetails: previewShadow.querySelector("details"),
       log: previewShadow.querySelector("pre"),
       download: previewShadow.querySelector('[data-action="download"]'),
+      maximize: previewShadow.querySelector('[data-action="maximize"]'),
       close: previewShadow.querySelector('[data-action="close"]'),
       dragHandle: previewShadow.querySelector("[data-drawio-drag-handle]")
     };
     previewElements.close.addEventListener("click", close);
     previewElements.download.addEventListener("click", downloadCurrent);
+    previewElements.maximize.addEventListener("click", toggleMaximize);
     installDrag(previewElements.window, previewElements.dragHandle);
     document.documentElement.appendChild(previewHost);
     updateHostDiagnostics();
@@ -419,7 +474,7 @@
   function installDrag(windowNode, handle) {
     let drag = null;
     handle.addEventListener("pointerdown", (event) => {
-      if (event.target?.closest?.("button")) {
+      if (maximized || event.target?.closest?.("button")) {
         return;
       }
       const rect = windowNode.getBoundingClientRect();
@@ -472,6 +527,31 @@
     }
   }
 
+  function toggleMaximize() {
+    ensurePreview();
+    if (!maximized) {
+      restoreWindowStyle = previewElements.window.getAttribute("style");
+      previewElements.window.removeAttribute("style");
+      previewElements.window.classList.add("maximized");
+      maximized = true;
+    } else {
+      previewElements.window.classList.remove("maximized");
+      if (restoreWindowStyle === null) {
+        previewElements.window.removeAttribute("style");
+      } else {
+        previewElements.window.setAttribute("style", restoreWindowStyle);
+      }
+      restoreWindowStyle = null;
+      maximized = false;
+    }
+    previewElements.maximize.textContent = maximized ? "Restore" : "Maximize";
+    previewElements.maximize.title = maximized
+      ? "Restore preview window"
+      : "Maximize preview to the browser viewport";
+    previewElements.maximize.setAttribute("aria-pressed", maximized ? "true" : "false");
+    previewHost.dataset.maximized = maximized ? "true" : "false";
+  }
+
   function reopen() {
     if (!currentArtifact && errorLog.length === 0) {
       return false;
@@ -502,7 +582,9 @@
     currentArtifact = null;
     errorLog = [];
     invalidLogKeys = new Set();
-    failedRenderKeys = new Set();
+    failedRenderResults = new Map();
+    maximized = false;
+    restoreWindowStyle = null;
     renderCount = 0;
     renderErrorCount = 0;
     previewHost?.remove();
@@ -521,6 +603,7 @@
       renderGeneration,
       renderCount,
       renderErrorCount,
+      maximized,
       errors: errorLog.map((entry) => ({ ...entry }))
     };
   }

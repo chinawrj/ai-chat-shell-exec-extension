@@ -41,7 +41,7 @@ ai-helper-drawio-start
 ai-helper-drawio-end
 ````
 
-The body must be the complete `.drawio` `<mxfile>` document itself, not a shell command, path, or prose. The extension displays only the last complete valid helper as a local SVG preview. It does not send the diagram to tmux, return the render to you, or insert anything into the composer. You cannot see the preview; rely only on my textual confirmation or description. Keep the UTF-8 XML below 1 MiB and do not require remote scripts, images, fonts, or links.
+The body must be the complete `.drawio` `<mxfile>` document itself, not a shell command, path, or prose. The last complete helper alone controls the local preview. Valid XML displays an SVG without a reply; invalid XML or rendering failure clears the preview and returns a bounded error report. The diagram never goes to tmux and the rendered image is never returned to you. You cannot see a successful preview; rely only on my textual confirmation or description. Keep the UTF-8 XML below 1 MiB and do not require remote scripts, images, fonts, or links.
 `````
 
 ## Recommended
@@ -130,7 +130,7 @@ Draw.io rules:
 - The body is the complete `.drawio` XML file itself, not a shell command, path, target, or encoded shell request.
 - Use an `<mxfile>` root containing at least one `<diagram>` page. Put the exact XML after the start marker and the final marker on its own line.
 - An optional diagnostic identity may be added as `ai-helper-drawio-start:<identity>`.
-- The extension displays only the last complete valid helper locally as SVG. It does not send the diagram to tmux, return a render to you, or insert anything into the composer.
+- The last complete helper is the sole current preview outcome. Valid XML is displayed locally as SVG and returns no message; invalid XML or a renderer failure clears the preview and returns a bounded error report. The diagram is never sent to tmux and the render is never returned to you.
 - If I say the preview is correct or describe a problem, continue from my text. Do not assume you can see the rendered SVG.
 - Keep the file below 1 MiB UTF-8 and do not reference remote scripts, images, fonts, or links that are required for understanding the diagram.
 `````
@@ -182,7 +182,7 @@ Workflow rules:
 - For shell helpers, do not include a tmux target; the command runs in `ForAI:host`.
 - For board helpers, the body must be exactly one non-empty board command line and must not include a tmux target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` only when the command should go to `ForAI:board-R1`.
 - For file helpers, the second line must be a single file name and the following lines must be the exact file content.
-- For Draw.io helpers, the body is the complete `<mxfile>` document. It is displayed locally to the user and never returned to you automatically; rely on the user's textual confirmation.
+- For Draw.io helpers, the body is the complete `<mxfile>` document. Success is displayed locally and returns no message; validation or rendering failure returns a bounded error report. You still cannot see the rendered image, so rely on the user's textual confirmation of successful previews.
 - You may add a simple no-space request identity after the colon in a start marker, such as `ai-helper-shell-start:2` or `ai-helper-board-R1-start:2`, for diagnostics. It is optional and does not bypass a server-confirmed completed execution; ask the user to use Force run when an already executed command must intentionally run again.
 - Wait for shell-output before making claims about command results or file write results.
 - Treat `queued: true` as a completed execution that waited for the same tmux pane, not as a retry or timeout signal.
@@ -303,7 +303,7 @@ Do not treat terminal text alone as a completed reply. The master receives your 
 ## One-Off Prompt
 
 ```text
-For this conversation, I can act as your human helper when local terminal output, board output, or a local diagram preview would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the full shell command body after it, and ai-helper-shell-end as the final line; it runs in the default ForAI host tmux window and does not support a target line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line; to use ForAI:board-R1, use ai-helper-board-R1-start and ai-helper-board-R1-end. To show me a diagram, use ai-helper-drawio-start, the complete native `.drawio` `<mxfile>` XML body, and ai-helper-drawio-end. The Draw.io body is data, not a command; it is rendered only for me and no image or automatic result is returned to you, so rely on my textual feedback. If I ask you to repeat an identical helper request as a new request, you may add a simple no-space identity suffix to its start marker. Wait for my shell-output reply after executable helpers, but do not expect shell-output for Draw.io previews. Do not repeat a command after shell-output is returned.
+For this conversation, I can act as your human helper when local terminal output, board output, or a local diagram preview would help. Ask me by replying with exactly one plain unlabeled four-backtick fenced code block and no prose. For shell output, use ai-helper-shell-start as the first line, the full shell command body after it, and ai-helper-shell-end as the final line; it runs in the default ForAI host tmux window and does not support a target line. For board output, use ai-helper-board-start as the first line, exactly one board command line as the body, and ai-helper-board-end as the final line; to use ForAI:board-R1, use ai-helper-board-R1-start and ai-helper-board-R1-end. To show me a diagram, use ai-helper-drawio-start, the complete native `.drawio` `<mxfile>` XML body, and ai-helper-drawio-end. The Draw.io body is data, not a command; a successful render is shown only to me and returns no message, while validation/rendering failure returns a bounded error report. No image is returned to you, so rely on my textual feedback after success. If I ask you to repeat an identical helper request as a new request, you may add a simple no-space identity suffix to its start marker. Wait for shell-output after executable helpers and failed Draw.io previews, but do not expect a reply for successful Draw.io previews. Do not repeat a command after shell-output is returned.
 ```
 
 ## Test Prompt

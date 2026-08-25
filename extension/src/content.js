@@ -29,7 +29,7 @@ const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.10.4";
+const CONTENT_SCRIPT_VERSION = "0.10.5";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -981,7 +981,8 @@ function prunePendingHelperDeliveryEntries(entries, now = Date.now()) {
 
 function pendingHelperDeliveryStoredChars(entry) {
   return String(entry?.reply || "").length +
-    String(entry?.call?.cmd || "").length;
+    String(entry?.call?.cmd || "").length +
+    String(entry?.call?.error || "").length;
 }
 
 function isStoredPendingHelperDelivery(entry, now = Date.now()) {
@@ -989,6 +990,7 @@ function isStoredPendingHelperDelivery(entry, now = Date.now()) {
     "shell",
     "board",
     "file",
+    "drawio-error",
     "agent-message",
     "agent-roster",
     "agent-task-status"
@@ -1026,6 +1028,8 @@ function snapshotPendingHelperCall(call) {
     boardName: String(call?.boardName || ""),
     helperId: String(call?.helperId || ""),
     filename: String(call?.filename || ""),
+    artifactId: String(call?.artifactId || ""),
+    error: String(call?.error || ""),
     to: String(call?.to || ""),
     taskId: String(call?.taskId || ""),
     messageId: String(call?.messageId || ""),
@@ -1035,6 +1039,9 @@ function snapshotPendingHelperCall(call) {
 }
 
 function pendingHelperDeliveryKind(call) {
+  if (call?.kind === "drawio-error") {
+    return "drawio-error";
+  }
   if (isFileHelperCall(call)) {
     return "file";
   }
@@ -1057,6 +1064,7 @@ function pendingHelperDeliveryLabel(entry) {
   return {
     board: "Board helper",
     file: "File helper",
+    "drawio-error": "Draw.io error",
     "agent-message": "Agent message",
     "agent-roster": "Agent roster",
     "agent-task-status": "Agent task status",
@@ -1656,79 +1664,93 @@ function processLatestDrawioCandidates(allCandidates) {
     return;
   }
 
-  let candidates = allCandidates
+  const candidates = allCandidates
     .filter((candidate) => isDrawioHelperCall(candidate.call))
-    .filter((candidate) => candidate.node === getConversationRoot() || isVisibleElement(candidate.node));
-  if (authorRoleFilterEnabled) {
-    candidates = candidates.filter(isRunnableAuthoredCandidate);
-  }
-
-  let latestValid = null;
-  let latestInvalid = null;
-  candidates.forEach((candidate, position) => {
-    const validation = preview.validateDrawioXml(candidate.call.xml);
-    if (validation.ok) {
-      latestValid = { candidate, position, validation };
-    } else {
-      latestInvalid = { candidate, position, validation };
-    }
-  });
-
-  const invalidAfterLatestValid = latestInvalid &&
-    (!latestValid || latestInvalid.position > latestValid.position)
-    ? latestInvalid
-    : null;
-  const reportLatestInvalid = () => {
-    if (!invalidAfterLatestValid) {
-      updateDrawioContextAction();
-      return;
-    }
-    const invalidCandidate = invalidAfterLatestValid.candidate;
-    preview.reportInvalid({
-      key: buildDrawioCandidateKey(invalidCandidate, invalidAfterLatestValid.validation),
-      artifactId: preview.hashDrawioXml(invalidCandidate.call.xml),
-      error: invalidAfterLatestValid.validation.error
-    });
+    .filter((candidate) => candidate.node === getConversationRoot() || isVisibleElement(candidate.node))
+    // Draw.io selection deliberately does not depend on the optional global
+    // role filter. Reject only an explicitly identified user message; unknown
+    // host containers remain eligible so supported hosts do not silently skip
+    // the latest AI helper.
+    .filter((candidate) => getMessageAuthorRole(candidate.node) !== "user");
+  const latestCandidate = candidates.at(-1);
+  if (!latestCandidate) {
     updateDrawioContextAction();
-  };
-
-  if (!latestValid) {
-    reportLatestInvalid();
     return;
   }
 
-  const validCandidate = latestValid.candidate;
+  const validation = preview.validateDrawioXml(latestCandidate.call.xml);
+  const artifactId = preview.hashDrawioXml(latestCandidate.call.xml);
+  if (!validation.ok) {
+    const result = preview.reportInvalid({
+      key: `${artifactId}:${validation.error}`,
+      artifactId,
+      error: validation.error
+    });
+    queueDrawioErrorReply(latestCandidate, result).catch((error) => {
+      console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
+    });
+    updateDrawioContextAction();
+    return;
+  }
+
   const renderPromise = preview.consider({
-    xml: validCandidate.call.xml,
-    validation: latestValid.validation,
-    artifactId: preview.hashDrawioXml(validCandidate.call.xml),
-    candidateKey: buildDrawioCandidateKey(validCandidate, latestValid.validation)
+    xml: latestCandidate.call.xml,
+    validation,
+    artifactId,
+    candidateKey: artifactId
   });
   Promise.resolve(renderPromise)
-    .catch((error) => {
-      preview.reportInvalid({
-        key: `${buildDrawioCandidateKey(validCandidate, latestValid.validation)}:unexpected`,
-        artifactId: preview.hashDrawioXml(validCandidate.call.xml),
-        error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
+    .then((result) => {
+      queueDrawioErrorReply(latestCandidate, result).catch((error) => {
+        console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
       });
     })
+    .catch((error) => {
+      const result = preview.reportInvalid({
+        key: `${artifactId}:unexpected:${error?.message || String(error)}`,
+        artifactId,
+        error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
+      });
+      return queueDrawioErrorReply(latestCandidate, result);
+    })
     .finally(() => {
-      reportLatestInvalid();
       updateDrawioContextAction();
     });
 }
 
-function buildDrawioCandidateKey(candidate, validation) {
-  const renderRoot = getCandidateRenderRoot(candidate);
-  return [
-    getCurrentPageIdentity(),
-    getHelperRenderRootId(renderRoot),
-    getHelperRenderRootGeneration(renderRoot),
-    candidate?.source || "",
-    candidate?.blockIndex ?? candidate?.index ?? "",
-    validation?.ok === true ? "valid" : validation?.error || "invalid",
-    globalThis.AiChatDrawioPreview?.hashDrawioXml?.(candidate?.call?.xml || "") || ""
+async function queueDrawioErrorReply(candidate, result) {
+  if (!result || result.ok === true || result.cancelled === true || result.newError !== true) {
+    return false;
+  }
+  const settings = await chrome.storage.sync.get(["autoSend", "maxChainCalls"]);
+  const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
+  if (chainCallCount >= maxChainCalls) {
+    setStatus(`Draw.io error was kept local because the chain limit (${maxChainCalls}) was reached.`, "error");
+    return false;
+  }
+  const helperId = String(candidate?.call?.helperId || "");
+  const artifactId = String(result.artifactId || globalThis.AiChatDrawioPreview?.hashDrawioXml?.(candidate?.call?.xml || "") || "");
+  const error = summarizeCommand(result.error || "Draw.io preview failed");
+  const call = { kind: "drawio-error", helperId, artifactId, error };
+  const reply = [
+    "Draw.io helper failed:",
+    "",
+    "```shell-output",
+    `drawio helper: ${helperId || "unsuffixed"}`,
+    `artifactId: ${artifactId}`,
+    `error: ${error}`,
+    "```"
   ].join("\n");
+  const callId = `drawio-error:${stableHash(`${getCurrentPageIdentity()}\n${helperId}\n${artifactId}\n${error}`)}`;
+  chainCallCount += 1;
+  const pending = await rememberPendingHelperDelivery(
+    callId,
+    call,
+    { ok: false, error },
+    reply,
+    settings
+  );
+  return attemptPendingHelperDelivery(pending, settings);
 }
 
 function extractShellCallCandidates(root) {
@@ -2306,6 +2328,10 @@ function isFileHelperCall(call) {
 
 function isDrawioHelperCall(call) {
   return call?.kind === "drawio";
+}
+
+function isDrawioErrorDelivery(call) {
+  return call?.kind === "drawio-error";
 }
 
 function isBoardHelperCall(call) {
@@ -4124,6 +4150,11 @@ function setHelperCompletionStatus(call, response) {
       passed ? `Self-test passed: ${token}` : `Self-test failed: ${token}`,
       passed ? "ok" : "error"
     );
+    return;
+  }
+
+  if (isDrawioErrorDelivery(call)) {
+    setStatus("Draw.io error sent to the AI", "error");
     return;
   }
 

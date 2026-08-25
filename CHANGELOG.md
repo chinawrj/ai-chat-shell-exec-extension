@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-08-26
+
+- Makes the last complete Draw.io helper the sole current outcome: success shows only its SVG and clears old errors, while validation or render failure clears the old SVG/download and shows only the newest error.
+- Sends a bounded Draw.io failure report to the AI through the existing durable one-write composer delivery queue; successful renders remain local-only and produce no reply.
+- Adds a real Maximize/Restore control that expands the Draw.io preview to the browser viewport and restores its previous movable/resizable layout.
+- Keeps Draw.io selection independent of the optional role filter while continuing to reject helpers in explicitly identified user messages.
+- Adds unit and real-Chrome E2E regressions for latest-only selection, error replacement, one-time failure replies, success silence, no shell-backend contact, and viewport maximize/restore.
+
 ## [0.10.4] - 2026-08-25
 
 - Adds README documentation showing the real compact extension panel in healthy idle, expanded advanced-controls, contextual Draw.io, Force run, running Stop helper, and output-idle Continue/Stop states.

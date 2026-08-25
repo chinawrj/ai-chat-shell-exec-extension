@@ -68,7 +68,12 @@ assert.match(previewSource, /\.drawio-frame-staging \{ inset: 0 auto 0 -200vw; w
 assert.doesNotMatch(previewSource, /\.drawio-frame-staging \{ visibility: hidden/,
   "Chromium may skip SVG layout in a visibility-hidden staging iframe.");
 assert.match(previewSource, /oldLayer\?\.remove\(\)/, "The old SVG frame is removed only after a fresh renderer succeeds.");
-assert.match(previewSource, /previous SVG was kept/i);
+assert.match(previewSource, /clearCurrentArtifact\("No render is available for the latest helper\."\)/,
+  "A confirmed latest-helper failure must clear the older rendered artifact.");
+assert.match(previewSource, /errorLog = \[entry\]/,
+  "The user-facing error log must contain only the latest Draw.io failure.");
+assert.match(previewSource, /clearErrorLog\(\);\s*setPreviewState\("ready"\)/,
+  "A successful latest render must clear the previous error.");
 assert.match(previewSource, /stale renderer completion/);
 assert.match(previewSource, /superseded by a newer valid helper/);
 assert.match(previewSource, /console\.error\(`\[AI Chat Draw\.io\]/, "Preview failures must reach browser diagnostics.");
@@ -77,6 +82,11 @@ assert.doesNotMatch(previewSource, /innerHTML\s*=\s*(?:candidate|xml|artifact)/i
 assert.match(previewSource, /function close\(\)/);
 assert.match(previewSource, /function reopen\(\)/);
 assert.match(previewSource, /function downloadCurrent\(\)/);
+assert.match(previewSource, /data-action="maximize"/);
+assert.match(previewSource, /function toggleMaximize\(\)/);
+assert.match(previewSource, /\.window\.maximized \{ left: 8px; right: 8px; top: 8px; bottom: 8px;/,
+  "Maximize must fill the browser viewport with a small safe inset.");
+assert.match(previewSource, /maximized \? "Restore" : "Maximize"/);
 
 assert.match(viewerSource, /GraphViewer\?\.processElements/);
 assert.match(viewerSource, /ai-chat-drawio-render-error/);

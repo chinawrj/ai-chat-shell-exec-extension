@@ -85,7 +85,7 @@ By default, shell helpers run in the `host` window of the `ForAI` tmux session. 
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-drawio-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
-For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io helpers instead remain entirely in the extension's local preview path and never produce composer output. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
+For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io rendering remains entirely local and never contacts the shell backend: the last complete helper alone controls the preview, success stays silent, and a validation/render failure clears the old SVG, keeps only the latest error, and sends one bounded error report through the same reliable composer-delivery path. The preview includes Maximize/Restore for browser-viewport viewing. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
 
 ## Latest Extension Panel Screenshots
 
@@ -232,7 +232,7 @@ Rules:
 - Shell helpers do not include a tmux target; the entire helper body is the shell command and runs in the default `ForAI` `host` window.
 - Board helpers must contain exactly one non-empty board command line and no target. Use `ai-helper-board-R1-start` / `ai-helper-board-R1-end` to send to the `ForAI:board-R1` window.
 - File helpers must put a single file name, not a path, on the second line.
-- Draw.io helpers contain the complete `.drawio` `<mxfile>` document itself. The extension shows only the last complete valid helper locally as SVG; it does not send the diagram to tmux or the composer, and you cannot see its render. Rely on my textual confirmation.
+- Draw.io helpers contain the complete `.drawio` `<mxfile>` document itself. The last complete helper alone controls the local preview: success shows its SVG without a reply, while validation/render failure clears the SVG and returns a bounded error report. The diagram never goes to tmux, and you cannot see its render. Rely on my textual confirmation after success.
 - A simple no-space suffix such as `ai-helper-shell-start:2` may be used as an optional request identity for diagnostics. It is not required for a new retry helper and does not force rerun a command that the server already executed on the resolved tmux pane.
 - After I send back shell-output, use that output to continue.
 - Do not repeat a command after shell-output confirms execution. A command explicitly reported as not executed may be retried with a new identical helper.
@@ -565,7 +565,7 @@ ai-helper-drawio-start
 ai-helper-drawio-end
 ````
 
-The Draw.io body is the complete native file, not a command, path, target, or shell-encoded payload. The content script validates a bounded `<mxfile>` document and gives only the last complete valid candidate to the packaged sandbox viewer. It never forwards the XML to background/server/tmux and never posts a rendered image or `shell-output` to the composer. The user sees the SVG; the AI must rely on the user's textual feedback.
+The Draw.io body is the complete native file, not a command, path, target, or shell-encoded payload. The content script treats only the last complete candidate as current and gives valid XML to the packaged sandbox viewer. It never forwards XML to background/server/tmux or posts a rendered image to the composer. Success stays silent; validation or renderer failure clears the prior render, exposes only the latest local error, and sends a bounded `shell-output` error report through the extension's durable one-write delivery queue. The user sees the SVG; the AI must rely on the user's textual feedback after success. The preview can be moved, resized, closed/reopened, downloaded, or maximized to the browser viewport and restored.
 
 For agent messages, use:
 

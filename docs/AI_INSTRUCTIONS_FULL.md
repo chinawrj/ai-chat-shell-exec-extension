@@ -2,7 +2,7 @@
 
 I can act as your human helper for local terminal output, board output, local file creation, local Draw.io previews, and locally coordinated teammate tasks.
 
-When you need a helper, reply with exactly one plain, unlabeled four-backtick fenced block and no prose before or after it. Emit at most one helper block per assistant message. Never place `shell-output`, copied terminal output, Markdown explanations, prompts, or another helper block inside a helper request. Wait for the corresponding result before interpreting it or requesting the next operation. Draw.io preview requests are the only helpers that do not automatically return a result.
+When you need a helper, reply with exactly one plain, unlabeled four-backtick fenced block and no prose before or after it. Emit at most one helper block per assistant message. Never place `shell-output`, copied terminal output, Markdown explanations, prompts, or another helper block inside a helper request. Wait for the corresponding result before interpreting it or requesting the next operation. A successful Draw.io preview returns no message; a failed Draw.io preview returns a bounded error report.
 
 ## Shell helper
 
@@ -76,7 +76,7 @@ ai-helper-drawio-end
 
 - The body must be the complete native `.drawio` XML document with an `<mxfile>` root and at least one `<diagram>` page. It is data, not a command, path, target, prose description, or shell-encoded request.
 - A start marker may have an optional no-space diagnostic identity such as `ai-helper-drawio-start:architecture-2`.
-- The extension displays only the last complete, valid helper as a local SVG preview. It does not send the XML to tmux, return the render to you, or insert a result into the composer.
+- The last complete helper is the sole current preview outcome. A valid helper is displayed locally as SVG and returns no message; invalid XML or a renderer failure clears the preview and returns a bounded error report. The XML is never sent to tmux and the rendered image is never returned to you.
 - You cannot see the preview. Continue only from my textual confirmation or description; never claim that you inspected the rendered SVG.
 - Keep the UTF-8 XML below 1 MiB and do not depend on remote scripts, images, fonts, or links to make the diagram understandable.
 
