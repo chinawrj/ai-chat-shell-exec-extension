@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-08-25
+
+- Adds README documentation showing the real compact extension panel in healthy idle, expanded advanced-controls, contextual Draw.io, Force run, running Stop helper, and output-idle Continue/Stop states.
+- Places `Continue waiting` and `Stop helper` side by side in the output-idle decision card and hides the redundant upper Stop control, while preserving the existing confirmed exact-run termination path.
+- Keeps staged Draw.io replacement iframes renderable while visually transparent and offscreen, preventing Chromium from intermittently skipping SVG layout before the atomic preview swap.
+- Generates the documentation images as tightly cropped panel screenshots from the real unpacked-extension Chrome E2E flow instead of manually composed mockups.
+- Adds regression coverage that verifies every README panel image exists, is a valid PNG, and remains linked from the documented state table.
+
 ## [0.10.3] - 2026-08-25
 
 - Replaces the oversized floating panel with a compact, state-driven 292px bar: idle shows only server status and `More`, errors add `Server Check`, a runnable helper adds `Force run`, and an active shell helper replaces it with `Stop helper`.

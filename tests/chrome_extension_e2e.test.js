@@ -231,7 +231,7 @@ async function main() {
     "tools-diagnostics"
   ]);
   if (SCREENSHOT_DIR) {
-    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-idle.png"));
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-idle.png"));
   }
 
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
@@ -242,7 +242,7 @@ async function main() {
     return advanced?.hidden === false && more?.getAttribute("aria-expanded") === "true";
   })()`, "compact panel advanced controls to expand");
   if (SCREENSHOT_DIR) {
-    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-advanced.png"));
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-advanced.png"));
   }
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
@@ -915,23 +915,40 @@ async function main() {
     return stop?.hidden === false && stop.disabled === false && force?.hidden === true;
   })()`, "Stop helper to replace Force run while a helper is active");
   if (SCREENSHOT_DIR) {
-    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-running.png"));
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-running.png"));
   }
   await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const control = document.getElementById("ai-chat-shell-exec-run-control");
-    return control && control.hidden === false && control.innerText.includes("No output update");
-  })()`, "idle timeout control prompt");
+    const commonStop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
+    const continueButton = control?.querySelector('[data-shell-tool-action="continue-helper"]');
+    const contextualStop = control?.querySelector('[data-shell-tool-action="stop-helper"]');
+    return control?.hidden === false &&
+      control.innerText.includes("No output update") &&
+      commonStop?.hidden === true &&
+      continueButton?.disabled === false &&
+      contextualStop?.disabled === false;
+  })()`, "idle timeout decision prompt with adjacent Continue waiting and Stop helper controls");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-awaiting-user.png"));
+  }
   await page.evaluate(`(() => {
     document.querySelector('[data-shell-tool-action="continue-helper"]')?.click();
     return true;
   })()`);
   await waitForEvaluate(page, `document.getElementById("ai-chat-shell-exec-run-control")?.hidden === true`, "idle timeout continue acknowledgement");
   await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const control = document.getElementById("ai-chat-shell-exec-run-control");
-    return control && control.hidden === false && control.innerText.includes("No output update");
-  })()`, "idle timeout prompt after continued wait");
+    const commonStop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
+    const contextualStop = control?.querySelector('[data-shell-tool-action="stop-helper"]');
+    return control?.hidden === false &&
+      control.innerText.includes("No output update") &&
+      commonStop?.hidden === true &&
+      contextualStop?.disabled === false;
+  })()`, "idle timeout prompt with contextual Stop helper after continued wait");
   await page.evaluate(`(() => {
-    document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="stop-helper"]')?.click();
+    document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-run-control [data-shell-tool-action="stop-helper"]')?.click();
     return true;
   })()`, { acceptDialogs: true });
   const idleTerminatedText = await waitForEvaluateValue(page, `(() => {
@@ -1074,7 +1091,7 @@ async function main() {
     return force?.hidden === false && stop?.hidden === true;
   })()`, "Force run to appear only when a rendered helper is actionable");
   if (SCREENSHOT_DIR) {
-    await saveScreenshot(page, path.join(SCREENSHOT_DIR, "compact-panel-force.png"));
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-force.png"));
   }
   await page.evaluate(`new Promise((resolve) => setTimeout(resolve, 750))`);
   assert.equal(
@@ -1768,6 +1785,59 @@ async function saveScreenshot(page, filePath) {
   assert.ok(fs.statSync(filePath).size > 1000, `Screenshot was not written: ${filePath}`);
 }
 
+async function savePanelScreenshot(page, filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const clip = await page.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    if (!panel) {
+      return null;
+    }
+    document.getElementById("ai-chat-shell-exec-screenshot-stage")?.remove();
+    const padding = 18;
+    const stage = document.createElement("div");
+    stage.id = "ai-chat-shell-exec-screenshot-stage";
+    stage.style.cssText = [
+      "position:absolute",
+      "left:" + window.scrollX + "px",
+      "top:" + window.scrollY + "px",
+      "z-index:2147483647",
+      "padding:" + padding + "px",
+      "background:#f5f6f8",
+      "box-sizing:border-box"
+    ].join(";");
+    const clone = panel.cloneNode(true);
+    clone.id = "ai-chat-shell-exec-screenshot-panel";
+    clone.style.position = "relative";
+    clone.style.inset = "auto";
+    clone.style.right = "auto";
+    clone.style.bottom = "auto";
+    clone.style.opacity = "1";
+    clone.style.transform = "none";
+    stage.appendChild(clone);
+    document.documentElement.appendChild(stage);
+    const rect = stage.getBoundingClientRect();
+    return {
+      x: window.scrollX,
+      y: window.scrollY,
+      width: rect.width,
+      height: rect.height,
+      scale: 1
+    };
+  })()`);
+  assert.ok(clip?.width > 0 && clip?.height > 0, "Extension panel screenshot clip was not available.");
+  try {
+    const result = await page.send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: false,
+      clip
+    });
+    fs.writeFileSync(filePath, Buffer.from(result.data || "", "base64"));
+    assert.ok(fs.statSync(filePath).size > 1000, `Panel screenshot was not written: ${filePath}`);
+  } finally {
+    await page.evaluate(`document.getElementById("ai-chat-shell-exec-screenshot-stage")?.remove()`);
+  }
+}
+
 async function waitForEvaluate(page, expression, label, timeoutMs = E2E_TIMEOUT_MS) {
   await waitFor(async () => Boolean(await page.evaluate(expression)), label, timeoutMs);
 }
@@ -1889,10 +1959,29 @@ async function runDrawioPreviewE2E(page) {
     const code = document.querySelector("#thread article:last-child code");
     code.textContent = ${JSON.stringify(drawioHelper(streamingXml, "drawio-e2e-v2"))};
   })()`);
-  await waitForEvaluate(page, `(() => {
-    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
-    return host?.dataset.state === "ready" && host.dataset.currentTitle === "Draw.io E2E v2";
-  })()`, "completed streamed draw.io SVG preview", E2E_TIMEOUT_MS * 2);
+  try {
+    await waitForEvaluate(page, `(() => {
+      const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+      return host?.dataset.state === "ready" && host.dataset.currentTitle === "Draw.io E2E v2";
+    })()`, "completed streamed draw.io SVG preview", E2E_TIMEOUT_MS * 2);
+  } catch (error) {
+    const diagnostics = await page.evaluate(`(() => {
+      const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+      const code = document.querySelector("#thread article:last-child code");
+      return {
+        hostState: host?.dataset.state || "",
+        currentTitle: host?.dataset.currentTitle || "",
+        renderCount: Number(host?.dataset.renderCount || 0),
+        errorCount: Number(host?.dataset.errorCount || 0),
+        lastError: host?.dataset.lastError || "",
+        frameCount: host?.shadowRoot?.querySelectorAll("iframe")?.length || 0,
+        status: host?.shadowRoot?.querySelector(".status")?.innerText || "",
+        latestCodeStart: (code?.textContent || "").slice(0, 160),
+        helperDebug: document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || ""
+      };
+    })()`);
+    throw new Error(`${error.message}; drawioState=${JSON.stringify(diagnostics)}; console=${JSON.stringify(page.consoleMessages.slice(-20))}`);
+  }
   state = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return { renderCount: Number(host.dataset.renderCount), errorCount: Number(host.dataset.errorCount) };
@@ -1963,6 +2052,9 @@ async function runDrawioPreviewE2E(page) {
     shellResults: (document.body.innerText.match(/Shell call result:/g) || []).length
   }))()`);
   assert.deepEqual(finalPageState, baseline, "Draw.io previews must not call the backend or write/send the composer.");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-drawio.png"));
+  }
 }
 
 async function sendLocalAgentRequest(page, payload) {

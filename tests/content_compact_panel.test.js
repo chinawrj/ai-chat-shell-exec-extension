@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
 
-assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.10\.3";/);
+assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.10\.4";/);
 assert.match(source, /width:min\(292px,calc\(100vw - 32px\)\)/);
 assert.match(source, /statusText\.style\.cssText = "[^"]*text-overflow:ellipsis;white-space:nowrap/);
 assert.match(source, /statusIndicator\.id = STATUS_INDICATOR_ID/);
@@ -63,11 +63,17 @@ assert.match(source, /const backendBusy = Boolean\(activeCallId\);/);
 assert.match(source, /const showCheck = !backendBusy && !panelShellHelperActive && panel\.dataset\.state === "error";/);
 assert.match(source, /const showForce = !backendBusy && !panelShellHelperActive && panelForceRunAvailable;/);
 assert.match(source, /activeCallToken = null;\s*updateContextualPanelActions\(\);/);
-assert.match(source, /stop\.hidden = !panelShellHelperActive;/);
+assert.match(source, /stop\.hidden = !panelShellHelperActive \|\| Boolean\(activeShellRunNotice\);/);
 assert.match(source, /setPanelForceRunAvailable\(Boolean\(runnableCandidate\)\)/);
 assert.match(source, /createPanelSection\("Setup & recovery", "setup-recovery"\)[\s\S]*?mode: "check", label: "Server Check"/);
 assert.match(source, /choose Continue waiting or Stop helper/);
+const awaitingUserControls = source.match(/shellRunControl\.innerHTML = \[[\s\S]*?\]\.join\(""\);/)?.[0] || "";
+assert.ok(awaitingUserControls, "Output-idle decision controls must exist.");
+assert.match(awaitingUserControls, /grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/);
+assert.match(awaitingUserControls, /data-shell-tool-action="continue-helper"[^>]*>Continue waiting<\/button>/);
+assert.match(awaitingUserControls, /data-shell-tool-action="stop-helper"[^>]*>Stop helper<\/button>/);
 assert.doesNotMatch(source, /Force terminate/);
+assert.doesNotMatch(source, />Quit<\/button>/);
 assert.doesNotMatch(source, /data-shell-tool-action="terminate-helper"/);
 
 console.log("content compact panel tests passed");

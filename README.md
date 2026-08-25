@@ -87,6 +87,31 @@ For intentional repeated requests with the same payload, the AI may add a simple
 
 For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io helpers instead remain entirely in the extension's local preview path and never produce composer output. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
 
+## Latest Extension Panel Screenshots
+
+The panel is state-driven: it keeps the healthy idle view minimal and reveals an action only when that action is relevant. These images are cropped automatically from the real unpacked-extension Chrome E2E flow rather than composed mockups.
+
+| Healthy idle | Force run available |
+| --- | --- |
+| <img src="docs/release-assets/v0.10.4/extension-panel-idle.png" width="328" alt="Healthy idle extension panel showing status and More only"> | <img src="docs/release-assets/v0.10.4/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run and More controls"> |
+| Only the concise health status and `More` remain visible. | `Force run` appears when a rendered helper is available for an explicit forced attempt. |
+
+| Shell helper running | Waiting for user decision |
+| --- | --- |
+| <img src="docs/release-assets/v0.10.4/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.10.4/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
+| During execution, `Stop helper` replaces `Force run`. | After the output-idle interval, `Continue waiting` and `Stop helper` appear together in the decision card. |
+
+| Draw.io available |
+| --- |
+| <img src="docs/release-assets/v0.10.4/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
+| `Draw.io preview` appears only after a preview artifact or render error exists and remains available after closing the preview. |
+
+### Expanded advanced controls
+
+`More` reveals the complete setup/recovery, page-binding, Agent/tmux-ai, full-status, and debug controls without making them occupy the normal chat view.
+
+<img src="docs/release-assets/v0.10.4/extension-panel-advanced.png" width="328" alt="Expanded extension panel with categorized advanced controls">
+
 ## Basic Helper Screenshots
 
 These older screenshots show the basic shell/file helper reply shape. Multi-agent controls are described below.
@@ -246,7 +271,7 @@ The individual controls behave as follows:
 - `Server Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate only this tab's active tmux session. Role `None` resets the default `ForAI`; `Master` or `Slave` resets that role's exact `ForAI-<agentId>` session without touching the default or other agents.
 - `Force run`: manually recheck the current page once and explicitly rerun the latest helper block, bypassing the shell server's completed-execution duplicate decision.
-- `Stop helper`: terminate only the currently owned shell helper in this tab's active role workspace. It appears only while a helper is active. When a running helper produces no observable output for the configured idle timeout, the panel opens an alert with `Continue waiting`; use the same `Stop helper` control to terminate that exact waiting execution. Continuing resets the idle clock.
+- `Stop helper`: terminate only the currently owned shell helper in this tab's active role workspace. It appears only while a helper is active. When a running helper produces no observable output for the configured idle timeout, the panel places `Continue waiting` and `Stop helper` side by side in the same decision card and hides the redundant upper Stop control. Continuing resets the idle clock.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
 - `Bind shell`: click it, then click a rendered helper/code block area.

@@ -34,7 +34,7 @@
    AI_SHELL_E2E_SCREENSHOT_DIR=docs/release-assets/vX.Y.Z node tests/chrome_extension_e2e.test.js
    ```
 
-   Use absolute `https://github.com/.../releases/download/vX.Y.Z/...png` image URLs in release notes, because relative repository paths do not render from GitHub release pages. Keep the README `Latest Screenshots` section pointing at the latest committed screenshot files.
+   Use absolute `https://github.com/.../releases/download/vX.Y.Z/...png` image URLs in release notes, because relative repository paths do not render from GitHub release pages. Keep the README `Latest Extension Panel Screenshots` section pointing at the latest committed screenshot files.
 
 7. Create and push the tag:
 

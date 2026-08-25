@@ -63,6 +63,10 @@ assert.equal(preview.hashDrawioXml(valid), preview.hashDrawioXml(valid));
 assert.notEqual(preview.hashDrawioXml(valid), preview.hashDrawioXml(valid.replace("System", "Other")));
 
 assert.match(previewSource, /drawio-frame-staging/);
+assert.match(previewSource, /\.drawio-frame-staging \{ inset: 0 auto 0 -200vw; width: 100%; visibility: visible; opacity: 0; pointer-events: none; \}/,
+  "The staging iframe must remain renderable while it is visually hidden offscreen.");
+assert.doesNotMatch(previewSource, /\.drawio-frame-staging \{ visibility: hidden/,
+  "Chromium may skip SVG layout in a visibility-hidden staging iframe.");
 assert.match(previewSource, /oldLayer\?\.remove\(\)/, "The old SVG frame is removed only after a fresh renderer succeeds.");
 assert.match(previewSource, /previous SVG was kept/i);
 assert.match(previewSource, /stale renderer completion/);

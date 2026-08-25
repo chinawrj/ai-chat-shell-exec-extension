@@ -73,7 +73,13 @@
       }
       if (Date.now() - startedAt >= RENDER_TIMEOUT_MS) {
         clearInterval(timer);
-        fail("The draw.io viewer did not produce an SVG before the render timeout.", artifactId);
+        const rendererDetail = String(container.textContent || "").replace(/\s+/g, " ").trim();
+        fail(
+          rendererDetail
+            ? `The draw.io viewer did not produce an SVG before the render timeout. Renderer detail: ${rendererDetail}`
+            : "The draw.io viewer did not produce an SVG before the render timeout.",
+          artifactId
+        );
       }
     }, 50);
   }

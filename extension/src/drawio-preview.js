@@ -375,8 +375,8 @@
         .empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 30px; color: #64748b; text-align: center; }
         .drawio-frame-layer { position: absolute; inset: 0; background: #fff; }
         .drawio-frame-layer iframe { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
-        .drawio-frame-staging { visibility: hidden; pointer-events: none; }
-        .drawio-frame-current { visibility: visible; pointer-events: auto; }
+        .drawio-frame-staging { inset: 0 auto 0 -200vw; width: 100%; visibility: visible; opacity: 0; pointer-events: none; }
+        .drawio-frame-current { visibility: visible; opacity: 1; pointer-events: auto; }
         .status { padding: 8px 12px; border-top: 1px solid #e5e7eb; background: #fff; color: #526078; font-size: 11px; line-height: 1.35; }
         details { border-top: 1px solid #fecaca; background: #fff7f7; color: #7f1d1d; }
         details[hidden] { display: none; }

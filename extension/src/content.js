@@ -29,7 +29,7 @@ const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.10.3";
+const CONTENT_SCRIPT_VERSION = "0.10.4";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -5815,8 +5815,9 @@ function injectStatus() {
   ].join(";");
   shellRunControl.innerHTML = [
     '<div data-shell-run-control-text style="margin-bottom:6px"></div>',
-    '<div style="display:flex;gap:4px;flex-wrap:wrap">',
+    '<div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:4px">',
     '<button type="button" data-shell-tool-action="continue-helper" style="width:100%;border:0;border-radius:6px;padding:5px 7px;background:#065f46;color:#fff;cursor:pointer">Continue waiting</button>',
+    '<button type="button" data-shell-tool-action="stop-helper" style="width:100%;border:1px solid #753041;border-radius:6px;padding:5px 7px;background:#4c1f2a;color:#fecdd3;cursor:pointer">Stop helper</button>',
     '</div>'
   ].join("");
   panel.appendChild(shellRunControl);
@@ -6048,7 +6049,7 @@ function updateContextualPanelActions() {
     force.hidden = !showForce;
   }
   if (stop) {
-    stop.hidden = !panelShellHelperActive;
+    stop.hidden = !panelShellHelperActive || Boolean(activeShellRunNotice);
   }
   const visibleActions = [check, force, stop, more].filter((button) => button && !button.hidden);
   actions.style.gridTemplateColumns = visibleActions
@@ -6146,6 +6147,7 @@ function updateShellRunControlPanel() {
     button.disabled = shellRunControlBusy;
     button.style.opacity = shellRunControlBusy ? ".6" : "1";
   }
+  updateContextualPanelActions();
 }
 
 function clearShellRunNotice(executionId = "") {
