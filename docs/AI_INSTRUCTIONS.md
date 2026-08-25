@@ -108,7 +108,7 @@ File rules:
 - Use a plain unlabeled code fence (four backticks) exactly, with no text before or after the code block.
 - If you need the same file payload to be treated as a new request, the first line may be `ai-helper-file-start:<identity>`, where identity is a simple no-space nonce, number, or timestamp.
 - The second line must be a single file name, not a path.
-- The file will be placed under my Downloads directory.
+- The file will be placed under my configured helper-file directory, which defaults to Downloads.
 - Every line after the filename and before `ai-helper-file-end` is the exact file content.
 - The `ai-helper-file-end` line is not file content.
 - Do not use a file helper block for secrets unless I explicitly ask.

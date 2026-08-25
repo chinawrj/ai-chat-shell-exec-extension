@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-25
+
+- Lets `AI_HELPER_FILE_PATH` replace `$HOME/Downloads` as the server-side destination for `ai-helper-file` output while retaining single-file-name and traversal protections. An explicitly empty override fails closed.
+- Adds `docs/AI_INSTRUCTIONS_FULL.md`, one unified instruction set intended for direct Custom Instructions use, covering shell, board, file, Draw.io, and role-aware local agent helpers without the variant menu in `docs/AI_INSTRUCTIONS.md`.
+- Updates setup, AI-facing instructions, agent invariants, and feature/test documentation for the configurable file destination.
+
 ## [0.10.0] - 2026-08-20
 
 - Adds `ai-helper-drawio-start[:identity]` / `ai-helper-drawio-end`, whose body is a complete native `.drawio` `<mxfile>` document and is never treated as a command or sent to background/server/tmux/composer delivery.

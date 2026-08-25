@@ -1315,13 +1315,13 @@ function handleWriteFileMessage(message) {
   const started = Date.now();
   const filename = String(message.filename || "");
   const content = String(message.content || "");
-  const downloadsDir = path.join(os.homedir(), "Downloads");
-  const filePath = resolveDownloadsFilePath(filename, downloadsDir);
+  const helperFileDir = getHelperFileDirectory();
+  const filePath = resolveDownloadsFilePath(filename, helperFileDir);
   const callKey = normalizeCallKey(message.callKey || message.id || hashText([filename, content].join("\n")));
   const force = message.callMeta?.force === true || message.force === true;
   const claim = claimServerShellCall(callKey, {
     cmd: content,
-    cwd: downloadsDir,
+    cwd: helperFileDir,
     target: filePath,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     seq: message.seq,
@@ -1330,7 +1330,7 @@ function handleWriteFileMessage(message) {
   });
 
   try {
-    const written = writeDownloadsFile(filename, content, downloadsDir);
+    const written = writeDownloadsFile(filename, content, helperFileDir);
     const bytes = written.bytes;
     console.log(`[write-file] path=${filePath} bytes=${bytes}`);
     const response = {
@@ -2721,9 +2721,21 @@ async function runVisionTerminalSelfTestInPane(message, pane, started, ownerCont
   };
 }
 
-function writeDownloadsFile(filename, content, downloadsDir = path.join(os.homedir(), "Downloads")) {
+function getHelperFileDirectory(env = process.env, homeDir = os.homedir()) {
+  if (!Object.prototype.hasOwnProperty.call(env, "AI_HELPER_FILE_PATH")) {
+    return path.join(homeDir, "Downloads");
+  }
+
+  const configuredPath = String(env.AI_HELPER_FILE_PATH ?? "");
+  if (!configuredPath.trim()) {
+    throw new Error("AI_HELPER_FILE_PATH must name a non-empty directory.");
+  }
+  return path.resolve(configuredPath);
+}
+
+function writeDownloadsFile(filename, content, downloadsDir = getHelperFileDirectory()) {
   const filePath = resolveDownloadsFilePath(filename, downloadsDir);
-  fs.mkdirSync(downloadsDir, { recursive: true });
+  fs.mkdirSync(path.resolve(downloadsDir), { recursive: true });
   fs.writeFileSync(filePath, String(content || ""), "utf8");
   return {
     path: filePath,
@@ -2732,7 +2744,7 @@ function writeDownloadsFile(filename, content, downloadsDir = path.join(os.homed
   };
 }
 
-function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(), "Downloads")) {
+function resolveDownloadsFilePath(filename, downloadsDir = getHelperFileDirectory()) {
   const raw = String(filename || "");
   if (!raw.trim()) {
     throw new Error("Missing filename.");
@@ -2741,13 +2753,13 @@ function resolveDownloadsFilePath(filename, downloadsDir = path.join(os.homedir(
     throw new Error("Filename contains an invalid null byte.");
   }
   if (raw.includes("/") || raw.includes("\\") || raw === "." || raw === "..") {
-    throw new Error("Filename must be a single file name under Downloads.");
+    throw new Error("Filename must be a single file name in the helper file directory.");
   }
 
   const resolved = path.resolve(downloadsDir, raw);
   const root = path.resolve(downloadsDir);
   if (path.dirname(resolved) !== root) {
-    throw new Error("Filename must resolve directly under Downloads.");
+    throw new Error("Filename must resolve directly inside the helper file directory.");
   }
   return resolved;
 }
@@ -6746,6 +6758,7 @@ module.exports = {
   ensureForAiTmuxLayout,
   ensureStateDirReady,
   getForAiTmuxConfig,
+  getHelperFileDirectory,
   getProtocolMetadata,
   getReleaseVersion,
   getVisionAvailability,

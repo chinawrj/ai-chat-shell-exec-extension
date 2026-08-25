@@ -18,6 +18,7 @@ const {
   buildTmuxRunScript,
   extractTmuxRunOutput,
   extractBoardPromptSignature,
+  getHelperFileDirectory,
   getTmuxEnvSocketPath,
   getTmuxPaneReadiness,
   getForAiTmuxConfig,
@@ -382,6 +383,43 @@ fs.rmSync(fakeSocketDir, { recursive: true, force: true });
   assert.equal(written.bytes, Buffer.byteLength("alpha\nbeta", "utf8"));
   assert.equal(fs.readFileSync(written.path, "utf8"), "alpha\nbeta");
   fs.rmSync(downloadsDir, { recursive: true, force: true });
+}
+
+{
+  const fakeHome = path.join(os.tmpdir(), "ai-helper-home");
+  assert.equal(
+    getHelperFileDirectory({}, fakeHome),
+    path.join(fakeHome, "Downloads"),
+    "Downloads remains the default when AI_HELPER_FILE_PATH is absent"
+  );
+
+  const overrideDir = path.join(os.tmpdir(), `ai-helper-file-path-${process.pid}`);
+  assert.equal(
+    getHelperFileDirectory({ AI_HELPER_FILE_PATH: overrideDir }, fakeHome),
+    path.resolve(overrideDir),
+    "AI_HELPER_FILE_PATH overrides the Downloads default"
+  );
+  assert.throws(
+    () => getHelperFileDirectory({ AI_HELPER_FILE_PATH: "   " }, fakeHome),
+    /non-empty directory/,
+    "An explicitly configured empty override must fail instead of silently writing elsewhere"
+  );
+
+  const hadOverride = Object.prototype.hasOwnProperty.call(process.env, "AI_HELPER_FILE_PATH");
+  const previousOverride = process.env.AI_HELPER_FILE_PATH;
+  try {
+    process.env.AI_HELPER_FILE_PATH = overrideDir;
+    const written = writeDownloadsFile("override.txt", "configured destination");
+    assert.equal(written.path, path.join(overrideDir, "override.txt"));
+    assert.equal(fs.readFileSync(written.path, "utf8"), "configured destination");
+  } finally {
+    if (hadOverride) {
+      process.env.AI_HELPER_FILE_PATH = previousOverride;
+    } else {
+      delete process.env.AI_HELPER_FILE_PATH;
+    }
+    fs.rmSync(overrideDir, { recursive: true, force: true });
+  }
 }
 
 Promise.all([

@@ -8,7 +8,7 @@ With the AI-facing instructions in this repo, the AI asks its human helper by re
 
 - Shell helper: request local terminal output from the default `ForAI` tmux session.
 - Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
-- File helper: write one file under `$HOME/Downloads`.
+- File helper: write one file under `AI_HELPER_FILE_PATH`, or `$HOME/Downloads` when the environment variable is absent.
 - Draw.io helper: preview a complete native `.drawio` XML file locally as SVG without contacting the shell server or composer.
 - Agent message helper: send a task or result to another locally registered agent tab.
 - Agent roster helper: let an AI master query online agents before delegating.
@@ -81,7 +81,7 @@ message-id: msg-001
 ai-helper-agent-task-status-end
 ````
 
-By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. A named board marker such as `ai-helper-board-R1-start` targets `ForAI:board-R1` when no environment override is set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file.
+By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. A named board marker such as `ai-helper-board-R1-start` targets `ForAI:board-R1` when no environment override is set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file. File helpers write directly under `$HOME/Downloads` unless `AI_HELPER_FILE_PATH` exists in the shell server environment; set it to a non-empty directory path to replace the default destination.
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-drawio-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
@@ -142,6 +142,12 @@ If you use the release source archive, unzip it and run the commands below from 
 
    Runtime state and server logs default to `.state/` under this project directory. Set `AI_CHAT_SHELL_STATE_DIR=/path/to/state` only if you intentionally want runtime state elsewhere. If you use a named tmux socket, set `AI_CHAT_SHELL_TMUX_SOCKET` before starting the server.
 
+   To place file-helper output somewhere other than Downloads, set the destination before starting the server:
+
+   ```sh
+   AI_HELPER_FILE_PATH=/path/to/helper-files ./scripts/start_shell_server.sh
+   ```
+
    For compatibility with older setup instructions, `./scripts/install_shell_server_agent.sh` first removes any legacy macOS LaunchAgent and then starts the same foreground server. It does not install auto-start.
 
 6. Reload the extension and reload the AI chat page.
@@ -152,7 +158,11 @@ After every extension code change, click Reload on the unpacked extension in `ch
 
 For stable tool use, add human-helper instructions to the AI chat system you use. Put them in the chat system's custom instructions, project instructions, agent instructions, or the first message of a conversation. The AI-facing wording should say that you, the human, will serve helper blocks and return `shell-output`; it should not describe the format as an automatic script interface.
 
-Start with:
+For one complete instruction set that can be pasted directly into a chat product's Custom Instructions, use:
+
+`docs/AI_INSTRUCTIONS_FULL.md`
+
+For shorter and role-specific alternatives, see:
 
 `docs/AI_INSTRUCTIONS.md`
 
@@ -177,7 +187,7 @@ one board command here
 ai-helper-board-end
 ````
 
-For writing one helper file under my Downloads directory, use:
+For writing one helper file under my configured helper-file directory, use:
 ````
 ai-helper-file-start
 filename.ext

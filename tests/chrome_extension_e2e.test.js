@@ -79,13 +79,27 @@ async function main() {
   startTmuxCatSession(socketPath, tmuxAiSessionName);
   cleanup.push(() => killTmuxSession(socketPath, tmuxAiSessionName));
 
+  const helperFileTestHome = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-file-home-e2e-"));
+  const helperFileOverrideDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-file-override-e2e-"));
+  const shellStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-state-e2e-"));
+  cleanup.push(() => fs.rmSync(helperFileTestHome, { recursive: true, force: true }));
+  cleanup.push(() => fs.rmSync(helperFileOverrideDir, { recursive: true, force: true }));
+  cleanup.push(() => fs.rmSync(shellStateDir, { recursive: true, force: true }));
+
+  let managedShellServer = null;
+  const managedShellServerEnv = {
+    AI_CHAT_SHELL_TMUX_SOCKET: socketPath,
+    AI_CHAT_SHELL_RUNNER: fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh",
+    AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS: "1",
+    AI_CHAT_SHELL_STATE_DIR: shellStateDir,
+    HOME: helperFileTestHome
+  };
   if (!serverHealth?.ok) {
-    const server = spawnNode(["server/shell_server.js"], {
-      AI_CHAT_SHELL_TMUX_SOCKET: socketPath,
-      AI_CHAT_SHELL_RUNNER: fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh",
-      AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS: "1"
+    managedShellServer = spawnNode(["server/shell_server.js"], {
+      ...managedShellServerEnv,
+      AI_HELPER_FILE_PATH: null
     });
-    cleanup.push(() => stopProcess(server));
+    cleanup.push(() => stopProcess(managedShellServer));
     await waitForShellServer();
   }
 
@@ -994,6 +1008,9 @@ async function main() {
   const fileToken = `ai-chat-shell-file-e2e-${Date.now()}`;
   const filename = `${fileToken}.txt`;
   const fileContent = `file helper wrote ${fileToken}`;
+  const defaultHelperFileDir = managedShellServer
+    ? path.join(helperFileTestHome, "Downloads")
+    : path.join(os.homedir(), "Downloads");
   await masterPage.send("Page.bringToFront");
   await waitForEvaluate(
     page,
@@ -1001,7 +1018,7 @@ async function main() {
     "primary helper page to become a hidden tab before send-actuator timing coverage"
   );
   cleanup.push(() => {
-    fs.rmSync(path.join(os.homedir(), "Downloads", filename), { force: true });
+    fs.rmSync(path.join(defaultHelperFileDir, filename), { force: true });
   });
 
   await page.evaluate(`(() => {
@@ -1075,7 +1092,7 @@ async function main() {
 
   assert.match(fileText, /File write result:/);
   assert.match(fileText, new RegExp(escapeRegExp(`file: ${filename}`)));
-  assert.equal(fs.readFileSync(path.join(os.homedir(), "Downloads", filename), "utf8"), fileContent);
+  assert.equal(fs.readFileSync(path.join(defaultHelperFileDir, filename), "utf8"), fileContent);
   let fileDeliveryState;
   try {
     fileDeliveryState = await waitForEvaluateValue(page, `(() => {
@@ -1145,6 +1162,55 @@ async function main() {
   assert.equal(fileDeliveryState.composerText, "", "The current visible composer must be empty after file output submission.");
   assert.equal(fileDeliveryState.visibilityState, "hidden", "The original v0.8.9 send loop must finish while its page is backgrounded.");
   await page.send("Page.bringToFront");
+
+  if (managedShellServer) {
+    await stopProcess(managedShellServer);
+    await waitForShellServerToStop();
+    managedShellServer = spawnNode(["server/shell_server.js"], {
+      ...managedShellServerEnv,
+      AI_HELPER_FILE_PATH: helperFileOverrideDir
+    });
+    await waitForShellServer();
+
+    const overrideFileToken = `ai-chat-shell-file-override-e2e-${Date.now()}`;
+    const overrideFilename = `${overrideFileToken}.txt`;
+    const overrideFileContent = `file helper used AI_HELPER_FILE_PATH ${overrideFileToken}`;
+    const overrideUserCountBefore = await page.evaluate("document.querySelectorAll('[data-message-author-role=\"user\"]').length");
+    await page.evaluate(`(() => {
+      appendAssistantToolCall([
+        "ai-helper-file-start:file-path-override-e2e",
+        ${JSON.stringify(overrideFilename)},
+        ${JSON.stringify(overrideFileContent)},
+        "ai-helper-file-end"
+      ].join("\\n"), "text");
+      return true;
+    })()`);
+    const overrideFileText = await waitForEvaluateValue(page, `(() => {
+      const text = document.body.innerText || "";
+      return text.includes("File write result:") &&
+        text.includes(${JSON.stringify(`file: ${overrideFilename}`)}) ? text : "";
+    })()`, "file helper result with AI_HELPER_FILE_PATH override");
+    assert.match(overrideFileText, new RegExp(escapeRegExp(`file: ${overrideFilename}`)));
+    assert.equal(
+      fs.readFileSync(path.join(helperFileOverrideDir, overrideFilename), "utf8"),
+      overrideFileContent,
+      "The overridden E2E file must be written under AI_HELPER_FILE_PATH"
+    );
+    assert.equal(
+      fs.existsSync(path.join(helperFileTestHome, "Downloads", overrideFilename)),
+      false,
+      "The overridden E2E file must not also be written under Downloads"
+    );
+    await waitForEvaluate(page, `(() => {
+      const composer = document.getElementById("composer");
+      const userMessages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+      const submitted = userMessages.slice(${overrideUserCountBefore})
+        .some((node) => (node.innerText || "").includes(${JSON.stringify(overrideFileToken)}));
+      return submitted && !(composer?.innerText || "").trim();
+    })()`, "overridden file result to be submitted exactly once");
+  } else {
+    console.log("AI_HELPER_FILE_PATH browser E2E restart skipped because the fixed shell-server port is owned by an existing foreground server.");
+  }
 
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
@@ -1331,12 +1397,18 @@ function tmuxSocketArgs(socketPath) {
 }
 
 function spawnNode(args, extraEnv) {
+  const env = {
+    ...process.env,
+    ...extraEnv
+  };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === null || value === undefined) {
+      delete env[key];
+    }
+  }
   const child = spawn(process.execPath, args, {
     cwd: ROOT_DIR,
-    env: {
-      ...process.env,
-      ...extraEnv
-    },
+    env,
     stdio: ["ignore", "pipe", "pipe"]
   });
   captureProcessOutput(child, args[0]);
@@ -1377,6 +1449,13 @@ async function waitForShellServer() {
     const health = await getShellServerHealth().catch(() => null);
     return health?.ok === true;
   }, "shell server health");
+}
+
+async function waitForShellServerToStop() {
+  await waitFor(async () => {
+    const health = await getShellServerHealth().catch(() => null);
+    return health?.ok !== true;
+  }, "shell server to stop");
 }
 
 function getShellServerHealth() {
@@ -1631,7 +1710,7 @@ async function runDrawioPreviewE2E(page) {
   await waitForEvaluate(page, `(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return host?.dataset.state === "ready" && host.dataset.currentTitle === "Draw.io E2E v2";
-  })()`, "completed streamed draw.io SVG preview");
+  })()`, "completed streamed draw.io SVG preview", E2E_TIMEOUT_MS * 2);
   state = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     return { renderCount: Number(host.dataset.renderCount), errorCount: Number(host.dataset.errorCount) };
