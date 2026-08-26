@@ -148,9 +148,10 @@ const context = {
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       releaseVersion: "0.6.0",
       serverReleaseVersion: "0.6.0",
-      protocolVersion: 10,
-      serverProtocolVersion: 10,
-      helperProtocolVersion: 3
+      protocolVersion: 11,
+      serverProtocolVersion: 11,
+      helperProtocolVersion: 4,
+      skillProtocolVersion: 1
     })
   }),
   setTimeout,

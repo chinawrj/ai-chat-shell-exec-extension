@@ -23,10 +23,12 @@ async function main() {
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "extension", "manifest.json"), "utf8"));
     const doctorSource = fs.readFileSync(path.join(repoRoot, "scripts", "doctor.sh"), "utf8");
 
-    assert.equal(server.SERVER_PROTOCOL_VERSION, 10);
-    assert.equal(server.HELPER_PROTOCOL_VERSION, 3);
+    assert.equal(server.SERVER_PROTOCOL_VERSION, 11);
+    assert.equal(server.HELPER_PROTOCOL_VERSION, 4);
+    assert.equal(server.SKILL_PROTOCOL_VERSION, 1);
     assert.match(doctorSource, new RegExp(`EXPECTED_SERVER_PROTOCOL_VERSION=${server.SERVER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_HELPER_PROTOCOL_VERSION=${server.HELPER_PROTOCOL_VERSION}(?:\\n|$)`));
+    assert.match(doctorSource, new RegExp(`EXPECTED_SKILL_PROTOCOL_VERSION=${server.SKILL_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
     process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "Ghostty,Google Chrome,bad\napp";
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Ghostty"]);
@@ -37,9 +39,10 @@ async function main() {
     const metadata = server.getProtocolMetadata();
     assert.equal(metadata.releaseVersion, manifest.version);
     assert.equal(metadata.serverReleaseVersion, manifest.version);
-    assert.equal(metadata.protocolVersion, 10);
-    assert.equal(metadata.serverProtocolVersion, 10);
-    assert.equal(metadata.helperProtocolVersion, 3);
+    assert.equal(metadata.protocolVersion, 11);
+    assert.equal(metadata.serverProtocolVersion, 11);
+    assert.equal(metadata.helperProtocolVersion, 4);
+    assert.equal(metadata.skillProtocolVersion, 1);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
     assert.equal(metadata.visualProtocolVersion, 1);
     assert.deepEqual(metadata.visualTmuxApps, ["Terminal", "Ghostty"]);
@@ -48,8 +51,9 @@ async function main() {
     assert.equal(health.ok, true);
     assert.equal(health.service, "ai-chat-shell-exec-server");
     assert.equal(health.serverReleaseVersion, manifest.version);
-    assert.equal(health.serverProtocolVersion, 10);
-    assert.equal(health.helperProtocolVersion, 3);
+    assert.equal(health.serverProtocolVersion, 11);
+    assert.equal(health.helperProtocolVersion, 4);
+    assert.equal(health.skillProtocolVersion, 1);
     assert.equal(health.visualProtocolVersion, 1);
     assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
     assert.equal(health.executionBackend, "tmux");
@@ -65,17 +69,20 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 10,
-        serverProtocolVersion: 10,
-        helperProtocolVersion: 3
+        protocolVersion: 11,
+        serverProtocolVersion: 11,
+        helperProtocolVersion: 4,
+        skillProtocolVersion: 1
       },
       assertHealth: (result) => {
         assert.equal(result.ok, true);
         assert.equal(result.protocolMatches, true);
         assert.equal(result.helperProtocolMatches, true);
+        assert.equal(result.skillProtocolMatches, true);
         assert.equal(result.releaseMatches, true);
-        assert.equal(result.requiredServerProtocolVersion, 10);
-        assert.equal(result.requiredHelperProtocolVersion, 3);
+        assert.equal(result.requiredServerProtocolVersion, 11);
+        assert.equal(result.requiredHelperProtocolVersion, 4);
+        assert.equal(result.requiredSkillProtocolVersion, 1);
       }
     });
 
@@ -91,7 +98,7 @@ async function main() {
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 10 and helper protocol 3/);
+        assert.match(result.error, /Expected server protocol 11, helper protocol 4, and Skill protocol 1/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -103,15 +110,16 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 10,
-        serverProtocolVersion: 10,
-        helperProtocolVersion: 0
+        protocolVersion: 11,
+        serverProtocolVersion: 11,
+        helperProtocolVersion: 0,
+        skillProtocolVersion: 1
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);
         assert.equal(result.protocolMatches, true);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /helper protocol 3/);
+        assert.match(result.error, /helper protocol 4/);
       }
     });
 
@@ -122,8 +130,9 @@ async function main() {
         allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
         releaseVersion: manifest.version,
         serverReleaseVersion: manifest.version,
-        protocolVersion: 10,
-        serverProtocolVersion: 10
+        protocolVersion: 11,
+        serverProtocolVersion: 11,
+        skillProtocolVersion: 1
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);

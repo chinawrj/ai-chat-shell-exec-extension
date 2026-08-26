@@ -4,7 +4,7 @@ Chrome extension for explicit local command execution from AI chat pages such as
 
 This is local remote-code execution for AI chat. Install it only on machines you control, and only use it with conversations and models you trust enough to request local shell commands.
 
-With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes seven helper block types:
+With the AI-facing instructions in this repo, the AI asks its human helper by returning exactly one explicit fenced code block and no prose. The extension recognizes eight helper block types:
 
 - Shell helper: request local terminal output from the default `ForAI` tmux session.
 - Board helper: send one command line to the `ForAI` `board` tmux window or the configured board tmux pane.
@@ -13,6 +13,7 @@ With the AI-facing instructions in this repo, the AI asks its human helper by re
 - Agent message helper: send a task or result to another locally registered agent tab.
 - Agent roster helper: let an AI master query online agents before delegating.
 - Agent task-status helper: let an AI master check a delegated task by `message-id` or `task-id`.
+- Skill helper: list or load local Claude Code-style `SKILL.md` instructions and acknowledge a fixed AI memory catalog without running tmux commands.
 
 Shell helper:
 
@@ -52,7 +53,7 @@ ai-helper-drawio-start
 ai-helper-drawio-end
 ````
 
-The Draw.io helper body is the file itself, not a command. After streaming settles, the extension validates complete `<mxfile>` XML and renders only the last valid helper in a movable/resizable floating SVG preview. A newer incomplete, malformed, or renderer-failing helper leaves the previous diagram visible and adds a bounded local error log. Rendering uses a pinned packaged viewer in a sandboxed extension iframe, never tmux, the local WebSocket server, `shell-output`, or automatic composer delivery.
+The Draw.io helper body is the file itself, not a command. After streaming settles, the extension makes the last complete helper the sole current outcome in a movable/resizable floating preview. A valid helper replaces the preview with its SVG; a malformed or renderer-failing helper clears the previous SVG/download and exposes only its bounded error log. Rendering uses a pinned packaged viewer in a sandboxed extension iframe, never tmux or the local WebSocket server. Success stays silent, while failure uses the durable composer-delivery path for one bounded error report.
 
 Agent message helper:
 
@@ -81,7 +82,25 @@ message-id: msg-001
 ai-helper-agent-task-status-end
 ````
 
+Skill load helper:
+
+````
+ai-helper-skill-start
+cmd: load
+skill-id: exact-id-from-memory
+catalog-sha: complete-catalog-sha-from-memory
+ai-helper-skill-end
+````
+
 By default, shell helpers run in the `host` window of the `ForAI` tmux session. The local server creates the `ForAI` session plus `host` and `board` windows when the page plugin starts or when tmux targets are listed. New default windows start in the project root; set `AI_CHAT_SHELL_FORAI_CWD=/path/to/workspace` before starting the server to choose another default cwd. The board helper body is exactly one command line and defaults to the `ForAI` `board` window, or `AI_CHAT_SHELL_BOARD_TARGET` when set. A named board marker such as `ai-helper-board-R1-start` targets `ForAI:board-R1` when no environment override is set. The file helper's second line is a single file name, and the remaining lines are the exact file content. The file end marker is not written into the file. File helpers write directly under `$HOME/Downloads` unless `AI_HELPER_FILE_PATH` exists in the shell server environment; set it to a non-empty directory path to replace the default destination.
+
+The Skill catalog defaults to `$HOME/.claude/skills`. Set `AI_HELPER_SKILL_PATHS` before starting the shell server to scan one or more other roots recursively; separate roots with the platform path delimiter (`:` on macOS/Linux, `;` on Windows) or newlines. `AI_HELPER_SKILL_PATH` is accepted for one root. Each Skill must have a real, non-symlinked UTF-8 `SKILL.md` with Claude Code-style YAML `name` and `description` frontmatter, and names must be unique across all roots. The catalog version is persisted in `.state/skill-catalog-state.json` and increments only when the aggregate SHA of the raw `SKILL.md` files changes. Automatic status polling reuses a 10-second server snapshot so multiple tabs do not repeatedly block shell work; `View Skills`, `Rescan`, sync list/ACK validation, and loads force a fresh bounded scan.
+
+Catalog discovery accepts at most 500 files, directory depth 12, 384 KiB per `SKILL.md`, and 32 MiB across the configured roots. The actual pretty-printed catalog JSON must stay within 350,000 characters so the complete list and closing response contract always fit the durable composer-delivery bound. An exceeded boundary makes the whole catalog unhealthy; the plugin never acknowledges or silently truncates a partial catalog.
+
+An environment-expanded Skill body is capped at 450 KiB of JavaScript characters. Before returning a successful load, the server also constructs the exact dynamic Markdown-fence shape used by the extension and requires the complete composer reply to fit within 500,000 characters. The extension verifies that exact count again; a fence-amplified or formatter-mismatched body fails closed instead of entering the generic persistence truncation path.
+
+Environment substitution happens only during `cmd: load`; it never changes the raw file SHA or catalog version. `HOME`, `USER`, `LOGNAME`, `SHELL`, and `TMPDIR` are allowed by default. Add non-secret names with `AI_HELPER_SKILL_ENV_ALLOWLIST=NAME_A,NAME_B`. Non-allowlisted variables and Claude runtime placeholders stay literal, an allowlisted-but-missing variable fails the load instead of becoming empty, and `${CLAUDE_SKILL_DIR}` resolves to the validated Skill directory. Loading never executes backticks, `$()` expressions, or Claude dynamic-context commands.
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-drawio-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
@@ -91,26 +110,31 @@ For executable/file helpers, the content script waits until the assistant stops 
 
 The panel is state-driven: it keeps the healthy idle view minimal and reveals an action only when that action is relevant. These images are cropped automatically from the real unpacked-extension Chrome E2E flow rather than composed mockups.
 
-| Healthy idle | Force run available |
+| Healthy idle | Skills update available |
 | --- | --- |
-| <img src="docs/release-assets/v0.10.4/extension-panel-idle.png" width="328" alt="Healthy idle extension panel showing status and More only"> | <img src="docs/release-assets/v0.10.4/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run and More controls"> |
-| Only the concise health status and `More` remain visible. | `Force run` appears when a rendered helper is available for an explicit forced attempt. |
+| <img src="docs/release-assets/v0.11.0/extension-panel-idle.png" width="328" alt="Healthy idle extension panel showing the acknowledged Skills version and More"> | <img src="docs/release-assets/v0.11.0/extension-panel-skills-update.png" width="328" alt="Extension panel showing the green Skills update action"> |
+| The acknowledged `Skills vN` chip stays neutral beside the concise health status and `More`. | A changed local catalog turns the version chip into the green synchronization action. |
+
+| Force run available |
+| --- |
+| <img src="docs/release-assets/v0.11.0/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run and More controls"> |
+| `Force run` appears when a rendered executable helper is available for an explicit forced attempt. Skill helpers never make it appear. |
 
 | Shell helper running | Waiting for user decision |
 | --- | --- |
-| <img src="docs/release-assets/v0.10.4/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.10.4/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
+| <img src="docs/release-assets/v0.11.0/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.11.0/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
 | During execution, `Stop helper` replaces `Force run`. | After the output-idle interval, `Continue waiting` and `Stop helper` appear together in the decision card. |
 
 | Draw.io available |
 | --- |
-| <img src="docs/release-assets/v0.10.4/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
+| <img src="docs/release-assets/v0.11.0/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
 | `Draw.io preview` appears only after a preview artifact or render error exists and remains available after closing the preview. |
 
 ### Expanded advanced controls
 
-`More` reveals the complete setup/recovery, page-binding, Agent/tmux-ai, full-status, and debug controls without making them occupy the normal chat view.
+`More` reveals the complete setup/recovery, page-binding, Agent/tmux-ai, Skills, full-status, and debug controls without making them occupy the normal chat view.
 
-<img src="docs/release-assets/v0.10.4/extension-panel-advanced.png" width="328" alt="Expanded extension panel with categorized advanced controls">
+<img src="docs/release-assets/v0.11.0/extension-panel-advanced.png" width="328" alt="Expanded extension panel with categorized advanced controls including Skills">
 
 ## Basic Helper Screenshots
 
@@ -126,14 +150,16 @@ File helper result reply:
 
 Chrome extensions cannot directly execute local shell commands. This project uses:
 
-- `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. Executable requests remain limited to explicit shell/board/file/agent helpers; complete Draw.io helpers take a separate local-only sandboxed preview path.
-- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that ensures the default `ForAI` tmux workspace, sends shell commands into `ForAI:host`, sends board commands into the configured board pane, and hosts the local in-memory agent hub.
+- `extension/`: Manifest V3 Chrome extension injected on HTTPS pages. Executable requests remain limited to explicit shell/board/file/agent helpers; complete Draw.io helpers take a separate local-only sandboxed preview path, while Skill helpers use a dedicated non-tmux catalog protocol.
+- `server/`: Local WebSocket server bound to `127.0.0.1:17371` that ensures the default `ForAI` tmux workspace, sends shell commands into `ForAI:host`, sends board commands into the configured board pane, hosts the local in-memory agent hub, and safely scans/hashes/loads configured Skill roots.
 
 Flow:
 
 Executable helpers: `AI chat page -> content script -> extension background -> ws://127.0.0.1:17371/shell -> tmux pane or agent hub -> shell-output / agent-message reply`
 
 Draw.io helpers: `AI chat page -> content script -> isolated packaged viewer iframe -> floating SVG preview for the user`
+
+Skill helpers: `AI chat page -> content script -> extension background -> local Skill catalog API -> catalog/load response in the composer` (never tmux, shell ledger, or command duplicate control)
 
 ## Install
 
@@ -256,12 +282,15 @@ On an enabled chat site, click the chat input once. The content script remembers
 
 By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.microsoft`. On every other site, including `claude.ai`, the extension does not inject page UI, scan content, or bind page events until you add the hostname in the toolbar popup. To enable a site, open the extension popup, add the hostname to enabled sites, save, then refresh that page.
 
-The floating status panel defaults to a compact, state-driven 292px bar so it does not cover the chat. Normal idle shows only a one-line server status and `More`; an error adds `Server Check`, a runnable helper adds `Force run`, and active shell execution hides Force run and shows `Stop helper`. Select `More` to reveal the existing controls in four groups:
+The floating status panel defaults to a compact, state-driven 292px bar so it does not cover the chat. It shows the local `Skills vN` chip beside the concise status; the chip becomes a highlighted green action only when the latest catalog has not been acknowledged. An error adds `Server Check`, a runnable executable helper adds `Force run`, and active shell execution hides Force run and shows `Stop helper`. Select `More` to reveal the controls in five groups:
 
 - Setup & recovery: an always-available `Server Check`, `Test`, `Enable site`, `Reset tmux`, and `Role filter`.
 - Page binding: `Bind input`, `Bind send`, `Bind shell`, and `Clear`.
 - Agent & tmux-ai: page role/id, `Save`, `Roster`, `Agent Check`, tmux target refresh, and registration.
+- Skills: the full local version/SHA/ack status, `View Skills`, `Rescan`, and `Force sync`.
 - Tools & diagnostics: the full untruncated status and the detected-helper debug view.
+
+Clicking the green Skills chip starts one synchronization owner for the current AI-site origin. Other tabs on that origin show that another tab is handling it. The plugin sends a self-explanatory request that tells the AI which fixed memory entry to replace and, after the list is returned, the exact success/failure acknowledgement fields. Runtime prompts refer to the Skill helper delimiters indirectly so the plugin cannot scan its own prompt as a new helper. Only a matching latest catalog SHA, current challenge, fixed memory-entry name, scope, and owner tab clears the green update state. Accumulated local changes keep only the latest desired SHA; stale acknowledgements never clear it. `Force sync` creates a new challenge even when the SHA is unchanged or replaces a lost challenge owned by this same tab; another tab can never replace the active owner. `View Skills` stays local and never writes into the composer.
 
 `Draw.io preview` is contextual instead of permanent: it is hidden when no Draw.io artifact or error exists, appears automatically after the first preview/error, and remains available to reopen a preview after Close.
 
@@ -278,6 +307,7 @@ The individual controls behave as follows:
 - `Clear`: remove the saved bindings for the current origin.
 - Agent controls: choose `master` or `slave`, enter an agent id, click `Save`, use `Roster` to list online agents, and use `Agent Check` to explain whether this tab, the local agent hub, browser-tab slaves, tmux panes, and tmux-ai slaves are ready. The active role is tab-scoped and survives page refresh; opening another tab does not silently reuse it.
 - Tmux AI controls: from a saved master page, click `Refresh`, select the tmux pane where the AI slave is already running, enter a slave id, then click `Register`.
+- Skill controls: `View Skills` opens the local catalog without contacting the AI, `Rescan` refreshes configured roots, and `Force sync` asks the current tab's AI to replace `AI_CHAT_SHELL_SKILLS_CATALOG` again.
 
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.
 
@@ -618,7 +648,7 @@ The result is a `shell-output` block with task state and `nextAction` guidance f
 The extension does not hard-code a ChatGPT, Claude, or Copilot DOM contract. The default strategy is:
 
 - detect editable chat inputs from standard browser semantics such as `textarea`, `input`, `contenteditable`, and `role="textbox"`;
-- detect tool requests from explicit shell, board, file, and agent helper blocks, plus non-executable Draw.io preview blocks;
+- detect tool requests from explicit shell, board, file, agent, and Skill helper blocks, plus non-executable Draw.io preview blocks;
 - post results by writing into the remembered editable input;
 - submit first through generic form submission and synthetic Enter key events;
 - fall back to a saved user-bound send control, then broad send-button heuristics if needed.
@@ -632,6 +662,9 @@ For sites with unusual editors or send controls, use the floating panel to bind 
 - Shell helper commands always run in `ForAI:host`; target lines are not part of the shell helper protocol.
 - Agent-message helpers only route messages through the local agent hub. They do not execute commands unless the receiving agent later emits its own explicit helper block.
 - Agent-roster and agent-task-status helpers are read-only local hub queries; they do not execute shell commands.
+- Skill helpers use a dedicated high-level local API for catalog status/list/rescan/load. AI input can select only a current catalog id plus catalog SHA, never an arbitrary path or shell command; Skill operations never enter tmux, the shell ledger, duplicate adjudication, or Force run.
+- Skill roots and every scanned `SKILL.md` must be real paths inside configured roots; symlinks, traversal, duplicate names, malformed frontmatter, invalid UTF-8, oversized files, and stale catalog SHA loads fail closed. If any observed Skill is invalid, the catalog is unhealthy and cannot be acknowledged as a partial update.
+- Skill status scans are cached briefly and bounded by file count, depth, per-file bytes, total bytes, and actual serialized catalog size. Explicit list/load/rescan and final ACK validation are fresh. Public Skill errors expose stable codes, root indexes, and safe relative file names rather than absolute local paths; full filesystem diagnostics remain in the local shell-server console.
 - Reset actions kill and recreate only their displayed exact session. The floating panel uses the active role (`ForAI` for None or `ForAI-<agentId>` for Master/Slave); the popup resets only the default `ForAI` session.
 - Board helper blocks do not include a raw tmux target. They use `AI_CHAT_SHELL_BOARD_TARGET`, `ForAI:board`, or a safe named board marker such as `ai-helper-board-R1-start` for `ForAI:board-R1`; the server refuses to send the command if the board prompt probe fails.
 - File helper blocks write only a single file name directly under `$HOME/Downloads`; path separators and traversal are rejected.

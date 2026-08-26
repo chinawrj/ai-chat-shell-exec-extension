@@ -1,11 +1,11 @@
 # Next Release Plan
 
-Target version: v0.10.x maintenance after the v0.10.0 Draw.io preview release, unless a user explicitly asks for Horizon work.
+Target version: v0.11.x maintenance after the v0.11.0 local Skills catalog release, unless a user explicitly asks for Horizon work.
 Target date: as needed for reliability, compatibility, or security fixes.
 
 ## Theme
 
-Keep the default direct tmux workflow simple and reliable while maintaining the local-only Draw.io artifact preview. Do not start the Horizon visual adapter unless a user directly asks for it.
+Keep the default direct tmux workflow simple and reliable while maintaining the local-only Draw.io artifact preview and safe high-level Skills catalog service. Do not start the Horizon visual adapter unless a user directly asks for it.
 
 See `docs/ROADMAP.md` for the longer visual-control plan.
 
@@ -33,6 +33,11 @@ See `docs/ROADMAP.md` for the longer visual-control plan.
    - `docs/FEATURE_TEST_MATRIX.md` includes every product feature or invariant and every `tests/*.test.js` case.
    - `scripts/doctor.sh` passes with a foreground server.
    - Release source and extension archives contain the current committed files and validate against `SHA256SUMS.txt`.
+
+5. Local Skills catalog
+   - Keep catalog discovery, hashing, versioning, loading, and environment substitution inside bounded server APIs with no tmux or shell execution.
+   - Keep synchronization origin-scoped, latest-only, and bound to the fixed memory entry plus full catalog SHA.
+   - Keep runtime synchronization self-explaining without embedding complete Skill helper marker strings in prompts.
 
 ## Non-Goals
 

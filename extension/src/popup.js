@@ -167,12 +167,19 @@ function formatServerHealth(response) {
   const release = response?.serverReleaseVersion || response?.releaseVersion || "";
   const serverProtocol = response?.serverProtocolVersion ?? response?.protocolVersion;
   const helperProtocol = response?.helperProtocolVersion;
+  const skillProtocol = response?.skillProtocolVersion;
+  const skillCatalogVersion = response?.skillCatalogVersion;
+  const skillCount = response?.skillCount;
   const visionEnabled = response?.visionAvailable === true;
   const visualApps = visionEnabled && Array.isArray(response?.visualTmuxApps) ? response.visualTmuxApps.join("/") : "";
   return [
     release ? `Server v${release}` : "Server version unknown",
     serverProtocol !== undefined && serverProtocol !== null && serverProtocol !== "" ? `protocol ${serverProtocol}` : "protocol unknown",
     helperProtocol !== undefined && helperProtocol !== null && helperProtocol !== "" ? `helper ${helperProtocol}` : "helper unknown",
+    skillProtocol !== undefined && skillProtocol !== null && skillProtocol !== "" ? `skill ${skillProtocol}` : "skill unknown",
+    skillCatalogVersion !== undefined && skillCatalogVersion !== null && skillCatalogVersion !== ""
+      ? `Skills v${skillCatalogVersion}/${Number(skillCount || 0)}`
+      : "",
     visualApps ? `apps ${visualApps}` : "",
     visionEnabled ? "vision ok" : "",
     response?.pid ? `pid ${response.pid}` : ""

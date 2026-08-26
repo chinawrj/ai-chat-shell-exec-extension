@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-26
+
+- Adds a local Claude-compatible `SKILL.md` catalog backed by bounded server-side discovery, raw per-file SHA-256 hashing, one aggregate catalog SHA, and a persisted monotonic local version.
+- Adds exact id/SHA Skill loading with one-pass allowlisted environment substitution; Skill operations never execute shell commands, contact tmux, or participate in command ledgers and Force run.
+- Adds an origin-scoped, latest-only multi-tab synchronization handshake for the fixed `AI_CHAT_SHELL_SKILLS_CATALOG` memory entry. Runtime prompts explain the complete interaction and acknowledgement contract without embedding complete executable Skill helper markers.
+- Adds a compact `Skills vN` state chip plus advanced catalog list, rescan, and force-sync controls. Updates remain highlighted until the latest full SHA is acknowledged, while invalid catalogs expose diagnostics without disabling shell helpers.
+- Updates the stable AI instructions to load a Skill only when the fixed memory catalog indicates it is relevant, keeping catalog synchronization details in the runtime prompt.
+- Bumps the server protocol to 11, helper protocol to 4, and introduces Skill protocol 1 so incompatible foreground servers fail closed.
+- Adds dedicated positive and negative server, background, content, panel, and real-Chrome E2E regressions for catalog safety, environment expansion, multi-tab ownership, stale acknowledgements, prompt provenance, memory synchronization, and load behavior.
+- Coalesces automatic multi-tab scans behind a 10-second server snapshot while keeping explicit and final-validation operations fresh; total raw bytes and actual serialized catalog length now fail closed before they can block the server or truncate an AI response.
+- Hardens M365 user-message rejection and exact plugin-output provenance, permits same-owner force recovery without cross-tab takeover or closed-tab orphan locks, validates persisted version-state schema, and redacts absolute local paths from AI-facing Skill errors.
+- Sizes the exact final dynamically fenced Skill-load reply on both server and content sides, rejecting fence amplification beyond 500,000 characters before any successful body can be silently truncated; recent M365 plugin-output provenance now expires at 60 seconds and is bound to the same page identity.
+
 ## [0.10.5] - 2026-08-26
 
 - Makes the last complete Draw.io helper the sole current outcome: success shows only its SVG and clears old errors, while validation or render failure clears the old SVG/download and shows only the newest error.

@@ -4,6 +4,26 @@ These are AI-facing templates. They should frame the protocol as a request to yo
 
 After adding instructions, use the floating panel's `Test` button once on that site.
 
+## Skills Addendum
+
+Append this to the selected instruction template when local Skills are enabled. Catalog synchronization is deliberately not duplicated here: the extension sends complete, self-explanatory memory replacement and acknowledgement instructions when the local catalog changes.
+
+`````text
+The single memory entry named AI_CHAT_SHELL_SKILLS_CATALOG is my current local Skill catalog. At the beginning of every user task, consult its Skill names and descriptions. If a Skill is clearly relevant, load only the minimum relevant Skill before planning or executing the task. Never infer a Skill body from its description and do not load every Skill speculatively.
+
+Load one relevant Skill with exactly one plain four-backtick helper block and no prose:
+
+````
+ai-helper-skill-start
+cmd: load
+skill-id: exact-id-from-memory
+catalog-sha: complete-catalog-sha-from-memory
+ai-helper-skill-end
+````
+
+Use only an id and complete catalog SHA from AI_CHAT_SHELL_SKILLS_CATALOG. Wait for the returned Skill body before applying it. Keep the full body task-local; memory stores only the catalog. If loading reports that the catalog is stale, ask me to use the green Skills update control instead of guessing or using an arbitrary path. When a separate Skill synchronization message appears, follow that message's complete memory replacement and acknowledgement instructions exactly.
+`````
+
 ## Minimal
 
 `````text

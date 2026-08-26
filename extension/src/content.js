@@ -12,6 +12,8 @@ const HELPER_AGENT_ROSTER_START = "ai-helper-agent-roster-start";
 const HELPER_AGENT_ROSTER_END = "ai-helper-agent-roster-end";
 const HELPER_AGENT_TASK_STATUS_START = "ai-helper-agent-task-status-start";
 const HELPER_AGENT_TASK_STATUS_END = "ai-helper-agent-task-status-end";
+const HELPER_SKILL_START = "ai-helper-skill-start";
+const HELPER_SKILL_END = "ai-helper-skill-end";
 const HELPER_FENCE_MARKER = "````";
 const UNSUPPORTED_HELPER_MARKERS = new Set(["ai-helper-start-shell", "ai-helper-end-shell"]);
 const HELPER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -28,8 +30,14 @@ const DRAWIO_CONTEXT_ACTION_ID = "ai-chat-shell-exec-drawio-action";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
+const SKILL_STATUS_ACTION_ID = "ai-chat-shell-exec-skill-status";
+const SKILL_DETAIL_ID = "ai-chat-shell-exec-skill-detail";
+const SKILL_CATALOG_DIALOG_ID = "ai-chat-shell-exec-skill-dialog";
+const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
+const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
+const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.10.5";
+const CONTENT_SCRIPT_VERSION = "0.11.0";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -60,6 +68,7 @@ const PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS = 500_000;
 const PENDING_HELPER_DELIVERY_MAX_TOTAL_CHARS = 4_000_000;
 const PENDING_HELPER_DELIVERY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PENDING_HELPER_DELIVERY_RETRY_MS = 2000;
+const RECENT_SUBMITTED_PLUGIN_REPLY_MAX_AGE_MS = 60_000;
 const COMPOSER_HANDOFF_SETTLE_ATTEMPTS = 12;
 const COMPOSER_HANDOFF_SETTLE_DELAY_MS = 125;
 let helperRenderRootSequence = 0;
@@ -112,6 +121,7 @@ let consecutiveAgentPollFailures = 0;
 let activeAgentProfile = readSessionAgentProfile();
 let pendingHelperDeliveries = new Map();
 let locallyPresentedHelperExecutions = new Map();
+let recentSubmittedPluginReplies = [];
 let pendingHelperDeliveriesLoadedKey = "";
 let pendingHelperDeliveryRetryTimer = 0;
 let pendingHelperDeliveryRetryInFlight = false;
@@ -129,6 +139,10 @@ let shellRunControlBusy = false;
 let shellRunStatusPollInFlight = false;
 let panelForceRunAvailable = false;
 let panelShellHelperActive = false;
+let skillPanelState = null;
+let skillStatePollTimer = 0;
+let skillStatePollInFlight = false;
+let skillHelperInFlight = false;
 
 bootstrapActivation().catch(() => {});
 
@@ -140,6 +154,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     authorRoleFilterEnabled = changes.disableAuthorRoleFilter.newValue === false;
     updateRoleFilterButton();
     scheduleScan();
+  }
+  if (areaName === "local" && changes[`${SKILL_ACK_PREFIX}${location.origin}`]) {
+    refreshSkillState({ quiet: true }).catch(() => {});
   }
 });
 
@@ -183,6 +200,7 @@ async function activateExtension() {
   installPageEventListeners();
   startAgentPolling();
   startShellRunMonitor();
+  startSkillStatePolling();
   schedulePendingHelperDeliveryRetry();
   scheduleScan();
 }
@@ -205,10 +223,12 @@ function deactivateExtension() {
   clearPendingForceRun();
   stopAgentPolling();
   stopShellRunMonitor();
+  stopSkillStatePolling();
   threadObserver?.disconnect();
   threadObserver = null;
   removePageEventListeners();
   document.getElementById(STATUS_ID)?.remove();
+  document.getElementById(SKILL_CATALOG_DIALOG_ID)?.remove();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
 }
@@ -567,6 +587,7 @@ async function scanForShellCall(options = {}) {
   const allCandidates = extractShellCallCandidates(thread);
   const candidate = getLastRunnableHelperCandidate(allCandidates, thread);
   const hasDrawioCandidate = allCandidates.some((entry) => isDrawioHelperCall(entry.call));
+  const hasSkillCandidate = allCandidates.some((entry) => isSkillHelperCall(entry.call));
 
   if (!force && threadText !== lastThreadText) {
     lastThreadText = threadText;
@@ -582,7 +603,7 @@ async function scanForShellCall(options = {}) {
 
   resetChainForNewHumanPrompt();
 
-  if (!candidate && !hasDrawioCandidate) {
+  if (!candidate && !hasDrawioCandidate && !hasSkillCandidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
     if (force) {
@@ -600,6 +621,10 @@ async function scanForShellCall(options = {}) {
 
   if (!force && hasDrawioCandidate) {
     processLatestDrawioCandidates(allCandidates);
+  }
+
+  if (!force && hasSkillCandidate) {
+    await processLatestSkillCandidate(allCandidates, settings);
   }
 
   if (!candidate) {
@@ -719,6 +744,11 @@ function buildSemanticCallKey(call) {
     normalizeCommand(call.role || ""),
     normalizeCommand(call.surface || ""),
     normalizeCommand(call.body || ""),
+    normalizeCommand(call.challenge || ""),
+    normalizeCommand(call.catalogSha || ""),
+    normalizeCommand(call.memoryEntry || ""),
+    normalizeCommand(call.skillId || ""),
+    normalizeCommand(call.reason || ""),
     normalizeCommand(call.cwd || ""),
     call.timeoutMs || "",
     call.maxOutputChars || ""
@@ -993,7 +1023,11 @@ function isStoredPendingHelperDelivery(entry, now = Date.now()) {
     "drawio-error",
     "agent-message",
     "agent-roster",
-    "agent-task-status"
+    "agent-task-status",
+    "skill-sync-prompt",
+    "skill-list",
+    "skill-load",
+    "skill-error"
   ]);
   return Boolean(
     entry &&
@@ -1034,11 +1068,17 @@ function snapshotPendingHelperCall(call) {
     taskId: String(call?.taskId || ""),
     messageId: String(call?.messageId || ""),
     role: String(call?.role || ""),
-    surface: String(call?.surface || "")
+    surface: String(call?.surface || ""),
+    skillId: String(call?.skillId || ""),
+    catalogSha: String(call?.catalogSha || ""),
+    challenge: String(call?.challenge || "")
   };
 }
 
 function pendingHelperDeliveryKind(call) {
+  if (["skill-sync-prompt", "skill-list", "skill-load", "skill-error"].includes(call?.kind)) {
+    return call.kind;
+  }
   if (call?.kind === "drawio-error") {
     return "drawio-error";
   }
@@ -1068,6 +1108,10 @@ function pendingHelperDeliveryLabel(entry) {
     "agent-message": "Agent message",
     "agent-roster": "Agent roster",
     "agent-task-status": "Agent task status",
+    "skill-sync-prompt": "Skill sync prompt",
+    "skill-list": "Skill catalog",
+    "skill-load": "Skill load",
+    "skill-error": "Skill protocol",
     shell: "Shell helper"
   }[entry?.kind] || "Helper";
 }
@@ -1199,6 +1243,7 @@ async function acknowledgePendingHelperResultPresented(entry) {
 async function finalizePendingHelperDelivery(entry, phase) {
   entry.phase = phase;
   entry.updatedAt = Date.now();
+  rememberRecentSubmittedPluginReply(entry.reply);
   await persistPendingHelperDeliveries();
   await rememberLocallyPresentedHelperExecution(entry);
   const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
@@ -1753,6 +1798,252 @@ async function queueDrawioErrorReply(candidate, result) {
   return attemptPendingHelperDelivery(pending, settings);
 }
 
+async function processLatestSkillCandidate(allCandidates, settings = {}) {
+  if (skillHelperInFlight) {
+    return false;
+  }
+  const candidates = Array.from(allCandidates || [])
+    .filter((candidate) => isSkillHelperCall(candidate.call))
+    .filter((candidate) => candidate.node === getConversationRoot() || isVisibleElement(candidate.node));
+  const candidate = candidates.at(-1);
+  if (!candidate) {
+    return false;
+  }
+  const call = candidate.call;
+  const semanticCallKey = buildSemanticCallKey(call);
+  const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+  if (getHandledHelperReason(candidate, callKey, semanticCallKey, call)) {
+    return false;
+  }
+  if (getMessageAuthorRole(candidate.node) === "user" || isM365SubmittedUserMessageNode(candidate.node)) {
+    markCallProcessed(candidate, callKey, semanticCallKey);
+    setStatus("Ignored a Skill helper rendered inside an explicitly identified user message", "ok");
+    return false;
+  }
+  if (isShellOutputCandidate(candidate)) {
+    markCallProcessed(candidate, callKey, semanticCallKey);
+    setStatus("Ignored a Skill helper embedded in plugin-owned output", "ok");
+    return false;
+  }
+  const validation = validateSkillHelperCall(call);
+  markCallProcessed(candidate, callKey, semanticCallKey);
+  if (!validation.ok) {
+    await queueSkillComposerReply({
+      callId: `skill-rejected:${callKey}`,
+      call: { ...call, kind: "skill-error" },
+      response: { ok: false, error: validation.reason },
+      reply: formatSkillProtocolError(validation.reason)
+    });
+    return false;
+  }
+  const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
+  if (chainCallCount >= maxChainCalls) {
+    await queueSkillComposerReply({
+      callId: `skill-limit:${callKey}`,
+      call: { ...call, kind: "skill-error" },
+      response: { ok: false, error: `Chain limit reached (${maxChainCalls}).` },
+      reply: formatSkillProtocolError(`Chain limit reached (${maxChainCalls}). Ask the user before making more Skill requests.`)
+    });
+    return false;
+  }
+
+  skillHelperInFlight = true;
+  chainCallCount += 1;
+  try {
+    let response;
+    if (call.cmd === "list") {
+      response = await chrome.runtime.sendMessage({
+        type: "skill-sync-list",
+        challenge: call.challenge || ""
+      });
+      await queueSkillComposerReply({
+        callId: `skill-list:${callKey}`,
+        call: { ...call, kind: "skill-list" },
+        response,
+        reply: response?.ok === true
+          ? formatSkillCatalogReply(response)
+          : formatSkillProtocolError(response?.error || "The local Skill catalog could not be listed.", response)
+      });
+      return response?.ok === true;
+    }
+    if (call.cmd === "load") {
+      response = await chrome.runtime.sendMessage({
+        type: "skill-load",
+        skillId: call.skillId,
+        catalogSha: call.catalogSha
+      });
+      await queueSkillComposerReply({
+        callId: `skill-load:${callKey}`,
+        call: { ...call, kind: "skill-load" },
+        response,
+        reply: response?.ok === true
+          ? formatSkillLoadReply(response)
+          : formatSkillProtocolError(response?.error || `Skill ${call.skillId} could not be loaded.`, response)
+      });
+      return response?.ok === true;
+    }
+    if (call.cmd === "list-updated") {
+      response = await chrome.runtime.sendMessage({
+        type: "skill-sync-ack",
+        challenge: call.challenge,
+        catalogSha: call.catalogSha,
+        memoryEntry: call.memoryEntry
+      });
+      if (response?.ok === true) {
+        await refreshSkillState({ quiet: true });
+        setStatus(`Skills v${response.version || skillPanelState?.version || "?"} acknowledged in ${SKILL_MEMORY_ENTRY}`, "ok");
+        return true;
+      }
+      await queueSkillComposerReply({
+        callId: `skill-ack-rejected:${callKey}`,
+        call: { ...call, kind: "skill-error" },
+        response,
+        reply: formatSkillProtocolError(response?.error || "The Skill catalog acknowledgement was rejected.", response)
+      });
+      return false;
+    }
+
+    response = await chrome.runtime.sendMessage({
+      type: "skill-sync-failed",
+      challenge: call.challenge,
+      catalogSha: call.catalogSha,
+      reason: call.reason
+    });
+    await refreshSkillState({ quiet: true });
+    setStatus(
+      response?.ok === true
+        ? `Skill memory update failed: ${summarizeCommand(call.reason)}`
+        : `Skill failure report rejected: ${summarizeCommand(response?.error || "unknown error")}`,
+      "error"
+    );
+    return response?.ok === true;
+  } catch (error) {
+    await queueSkillComposerReply({
+      callId: `skill-error:${callKey}`,
+      call: { ...call, kind: "skill-error" },
+      response: { ok: false, error: error.message || String(error) },
+      reply: formatSkillProtocolError(error.message || String(error))
+    });
+    return false;
+  } finally {
+    skillHelperInFlight = false;
+  }
+}
+
+function formatSkillCatalogReply(response) {
+  const skills = Array.isArray(response?.skills) ? response.skills.map((skill) => ({
+    id: String(skill?.id || ""),
+    name: String(skill?.name || ""),
+    description: safeSkillPromptText(String(skill?.description || "")),
+    sha: String(skill?.sha || "")
+  })) : [];
+  const catalogJson = JSON.stringify({
+    catalogSha: String(response?.catalogSha || ""),
+    version: Number(response?.version || 0),
+    skills
+  }, null, 2);
+  const catalogBlock = wrapSkillOutput(catalogJson);
+  if (response?.syncRequired !== true) {
+    return [
+      "Local SKILLS catalog:",
+      `Catalog version: ${Number(response?.version || 0)}`,
+      `Catalog SHA: ${String(response?.catalogSha || "")}`,
+      "",
+      catalogBlock,
+      "",
+      "This was an inspection request. It does not acknowledge or change the fixed Skill memory entry."
+    ].join("\n");
+  }
+  return [
+    "Local SKILLS catalog synchronization response:",
+    "",
+    `Replace the single memory entry named ${SKILL_MEMORY_ENTRY}.`,
+    "Replace that entry entirely; do not append to its previous contents.",
+    "Store the catalog SHA, catalog version, and the complete id/name/description/SHA list below.",
+    "Remove entries for Skills that are not in this complete list.",
+    "Do not store complete SKILL.md bodies in memory; load a relevant Skill only when a task needs it.",
+    "",
+    catalogBlock,
+    "",
+    "After the memory entry has been replaced successfully, reply with exactly one plain helper block.",
+    "Use the words ai helper skill start and ai helper skill end as its delimiters, replacing the spaces with hyphens in the actual delimiters.",
+    "Put these four fields between those delimiters:",
+    "cmd: list-updated",
+    `catalog-sha: ${String(response?.catalogSha || "")}`,
+    `challenge: ${String(response?.challenge || "")}`,
+    `memory-entry: ${SKILL_MEMORY_ENTRY}`,
+    "",
+    "If memory cannot be updated, use the same indirect delimiters with these fields instead:",
+    "cmd: list-update-failed",
+    `catalog-sha: ${String(response?.catalogSha || "")}`,
+    `challenge: ${String(response?.challenge || "")}`,
+    "reason: <short reason>"
+  ].join("\n");
+}
+
+function formatSkillLoadReply(response) {
+  const skill = response?.skill || {};
+  const replaced = Array.isArray(response?.replacedVariables) && response.replacedVariables.length > 0
+    ? response.replacedVariables.join(", ")
+    : "none";
+  const reply = [
+    "Local Skill load result:",
+    `skill-id: ${String(skill.id || "")}`,
+    `skill-sha: ${String(skill.sha || "")}`,
+    `catalog-sha: ${String(response?.catalogSha || "")}`,
+    `environment variables replaced: ${replaced}`,
+    "",
+    wrapSkillOutput(String(response?.content || "")),
+    "",
+    "Use the loaded instructions only for the current task. The fixed memory entry remains a catalog, not a copy of this body."
+  ].join("\n");
+  if (reply.length > PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS ||
+      (Number.isSafeInteger(response?.formattedReplyChars) && response.formattedReplyChars !== reply.length)) {
+    throw new Error(
+      `Skill load reply exceeds or disagrees with the ${PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS}-character composer-delivery bound.`
+    );
+  }
+  return reply;
+}
+
+function formatSkillProtocolError(error, response = {}) {
+  const guidance = ["stale-skill-sync-ack", "catalog-sha-mismatch"].includes(response?.errorCode)
+    ? "Repeat the Skill list request with the same current challenge so the local response can provide the latest catalog and acknowledgement fields."
+    : "Ask the user to start or force a fresh Skill synchronization if the catalog or challenge is stale.";
+  return [
+    "Local Skill helper response:",
+    `error-code: ${String(response?.errorCode || "skill-helper-error")}`,
+    `error: ${safeSkillPromptText(summarizeCommand(error || "Skill helper failed"))}`,
+    response?.catalogSha ? `latest catalog-sha: ${String(response.catalogSha)}` : "",
+    response?.version ? `latest catalog version: ${Number(response.version)}` : "",
+    guidance
+  ].filter(Boolean).join("\n");
+}
+
+function safeSkillPromptText(value) {
+  return String(value || "")
+    .replaceAll(HELPER_SKILL_START, "ai helper skill start")
+    .replaceAll(HELPER_SKILL_END, "ai helper skill end");
+}
+
+function wrapSkillOutput(content) {
+  const text = String(content || "");
+  let longestRun = 0;
+  const pattern = /`+/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    longestRun = Math.max(longestRun, match[0].length);
+  }
+  const fence = "`".repeat(Math.max(4, longestRun + 1));
+  return `${fence}skill-output\n${text}\n${fence}`;
+}
+
+async function queueSkillComposerReply({ callId, call, response, reply }) {
+  const settings = await chrome.storage.sync.get(["autoSend"]);
+  const pending = await rememberPendingHelperDelivery(callId, call, response, reply, settings);
+  return attemptPendingHelperDelivery(pending, settings);
+}
+
 function extractShellCallCandidates(root) {
   let index = 0;
   const candidates = [];
@@ -1843,7 +2134,8 @@ function containsToolLanguageHint(text) {
     /ai-helper-board-[a-z0-9][a-z0-9._-]{0,63}-start/.test(lower) ||
     lower.includes(HELPER_AGENT_MESSAGE_START) ||
     lower.includes(HELPER_AGENT_ROSTER_START) ||
-    lower.includes(HELPER_AGENT_TASK_STATUS_START);
+    lower.includes(HELPER_AGENT_TASK_STATUS_START) ||
+    lower.includes(HELPER_SKILL_START);
 }
 
 function closestMessageContainer(node) {
@@ -1990,6 +2282,15 @@ function parsePlainTextHelperBlocks(text) {
         inferredEndMarker,
         ...parseAgentTaskStatusLines(lines.slice(valueLineIndex, blockEndIndex))
       });
+    } else if (start.kind === "skill") {
+      calls.push({
+        kind: start.kind,
+        helperId,
+        helperIdSource: start.helperId ? "marker" : "payload-hash",
+        helperMarkerError: start.error || "",
+        inferredEndMarker,
+        ...parseSkillHelperLines(lines.slice(valueLineIndex, blockEndIndex))
+      });
     } else {
       calls.push({
         kind: start.kind,
@@ -2120,6 +2421,10 @@ function parseHelperStartMarker(line) {
   if (agentTaskStatus.kind) {
     return agentTaskStatus;
   }
+  const skill = parseSpecificHelperStartMarker(text, HELPER_SKILL_START, "skill");
+  if (skill.kind) {
+    return skill;
+  }
   return { kind: "", helperId: "", error: "" };
 }
 
@@ -2224,6 +2529,9 @@ function expectedHelperEndMarker(kind) {
   if (kind === "agent-task-status") {
     return HELPER_AGENT_TASK_STATUS_END;
   }
+  if (kind === "skill") {
+    return HELPER_SKILL_END;
+  }
   return "";
 }
 
@@ -2302,6 +2610,49 @@ function parseAgentTaskStatusLines(lines) {
   };
 }
 
+function parseSkillHelperLines(lines) {
+  const allowedHeaders = new Set([
+    "cmd",
+    "challenge",
+    "catalog-sha",
+    "memory-entry",
+    "skill-id",
+    "reason"
+  ]);
+  const headers = {};
+  const errors = [];
+  for (const line of Array.from(lines || [])) {
+    const text = String(line || "");
+    if (!text.trim()) {
+      continue;
+    }
+    const match = text.match(/^([a-z][a-z0-9-]*):\s*(.*)$/i);
+    if (!match) {
+      errors.push(`Malformed Skill helper line: ${text}`);
+      continue;
+    }
+    const key = match[1].toLowerCase();
+    if (!allowedHeaders.has(key)) {
+      errors.push(`Unsupported Skill helper field: ${key}`);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(headers, key)) {
+      errors.push(`Duplicate Skill helper field: ${key}`);
+      continue;
+    }
+    headers[key] = match[2].trim();
+  }
+  return {
+    cmd: String(headers.cmd || "").toLowerCase(),
+    challenge: String(headers.challenge || "").toLowerCase(),
+    catalogSha: String(headers["catalog-sha"] || "").toLowerCase(),
+    memoryEntry: String(headers["memory-entry"] || ""),
+    skillId: String(headers["skill-id"] || ""),
+    reason: String(headers.reason || ""),
+    skillHeaderError: errors[0] || ""
+  };
+}
+
 function splitShellCallLines(text) {
   const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   while (lines.length > 0 && lines[lines.length - 1] === "") {
@@ -2350,6 +2701,10 @@ function isAgentTaskStatusHelperCall(call) {
   return call?.kind === "agent-task-status";
 }
 
+function isSkillHelperCall(call) {
+  return call?.kind === "skill";
+}
+
 function isAgentQueryHelperCall(call) {
   return isAgentRosterHelperCall(call) || isAgentTaskStatusHelperCall(call);
 }
@@ -2359,7 +2714,7 @@ function isRepeatableAgentQueryHelperCall(call) {
 }
 
 function isRunnableHelperCall(call) {
-  if (isDrawioHelperCall(call)) {
+  if (isDrawioHelperCall(call) || isSkillHelperCall(call)) {
     return false;
   }
   if (isFileHelperCall(call)) {
@@ -2384,13 +2739,15 @@ function resetChainForNewHumanPrompt() {
   }
 
   lastUserMessageText = text;
-  if (!isStructuredShellOutputText(text)) {
+  if (!isStructuredShellOutputText(text) && !isKnownPluginOwnedSubmittedText(text)) {
     chainCallCount = 0;
   }
 }
 
 function getLastUserMessageText() {
-  const explicit = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const explicit = Array.from(document.querySelectorAll(
+    '[data-message-author-role="user"], [data-author-role="user"], .fai-UserMessage[role="article"]'
+  )).filter(isSubmittedUserMessageNode);
   if (explicit.length > 0) {
     const last = explicit[explicit.length - 1];
     return normalizeCommand(last.innerText || last.textContent || "");
@@ -2413,6 +2770,39 @@ function getLastUserMessageText() {
     .filter(isStructuredShellOutputText);
 
   return toolOutputLike.length > 0 ? toolOutputLike[toolOutputLike.length - 1] : "";
+}
+
+function rememberRecentSubmittedPluginReply(reply) {
+  const text = String(reply || "");
+  if (!text) {
+    return;
+  }
+  const now = Date.now();
+  const pageIdentity = getCurrentPageIdentity();
+  recentSubmittedPluginReplies = recentSubmittedPluginReplies
+    .filter((entry) => now - entry.submittedAt < RECENT_SUBMITTED_PLUGIN_REPLY_MAX_AGE_MS &&
+      entry.pageIdentity === pageIdentity &&
+      entry.reply !== text)
+    .slice(-19);
+  recentSubmittedPluginReplies.push({ reply: text, submittedAt: now, pageIdentity });
+}
+
+function isKnownPluginOwnedSubmittedText(text) {
+  if (location.hostname !== "m365.cloud.microsoft") {
+    return false;
+  }
+  const now = Date.now();
+  const pageIdentity = getCurrentPageIdentity();
+  recentSubmittedPluginReplies = recentSubmittedPluginReplies
+    .filter((entry) => now - Number(entry.submittedAt || 0) < RECENT_SUBMITTED_PLUGIN_REPLY_MAX_AGE_MS &&
+      entry.pageIdentity === pageIdentity);
+  const replies = [
+    ...recentSubmittedPluginReplies.map((entry) => entry.reply),
+    ...Array.from(pendingHelperDeliveries.values())
+      .filter((entry) => entry.pageIdentity === pageIdentity)
+      .map((entry) => entry.reply)
+  ];
+  return replies.some((reply) => m365SubmittedMessageTextMatches(text, reply));
 }
 
 function isStructuredShellOutputText(text) {
@@ -2447,14 +2837,33 @@ function isStructuredShellOutputText(text) {
     "Agent task status query failed:",
     "Agent task status query rejected:"
   ];
-  return candidates.some((candidate) => headings.some((heading) => {
+  const ordinaryStructured = candidates.some((candidate) => headings.some((heading) => {
     if (!candidate.startsWith(heading)) {
       return false;
     }
     const body = candidate.slice(heading.length);
-    return /^\n(?:\n)?(?:```shell-output|shell-output)(?:\n|$)/.test(body) ||
+    return /^\n(?:\n)?(?:(?:`{3,})(?:shell-output|skill-output)|shell-output)(?:\n|$)/.test(body) ||
       (location.hostname === "m365.cloud.microsoft" && body.startsWith("```shell-output"));
   }));
+  if (ordinaryStructured) {
+    return true;
+  }
+  return candidates.some((candidate) => {
+    if ([
+      "Local SKILLS catalog:",
+      "Local SKILLS catalog synchronization response:",
+      "Local Skill load result:"
+    ].some((heading) => candidate.startsWith(heading))) {
+      return hasFencedSkillOutput(candidate);
+    }
+    return candidate.startsWith("Local Skill helper response:\n") &&
+      /\nerror-code: [^\n]+\nerror: [^\n]+(?:\n|$)/.test(candidate);
+  });
+}
+
+function hasFencedSkillOutput(text) {
+  const match = /(?:^|\n)(`{3,})skill-output[^\n]*\n[\s\S]*?\n\1(?:\n|$)/.exec(String(text || ""));
+  return Boolean(match);
 }
 
 function isShellOutputCandidate(candidate) {
@@ -2471,7 +2880,13 @@ function isRenderedShellOutputRoot(root) {
     "pre.language-shell-output",
     'pre[class*="language-shell-output"]',
     '[data-language="shell-output"]',
-    '[data-code-language="shell-output"]'
+    '[data-code-language="shell-output"]',
+    "code.language-skill-output",
+    'code[class*="language-skill-output"]',
+    "pre.language-skill-output",
+    'pre[class*="language-skill-output"]',
+    '[data-language="skill-output"]',
+    '[data-code-language="skill-output"]'
   ].join(",");
   if (root.matches?.(selector) || root.closest?.(selector)) {
     return true;
@@ -2481,7 +2896,7 @@ function isRenderedShellOutputRoot(root) {
     root.getAttribute?.("data-code-language") || "",
     root.getAttribute?.("class") || root.className || ""
   ].join(" ").toLowerCase();
-  return language.includes("shell-output");
+  return language.includes("shell-output") || language.includes("skill-output");
 }
 
 function isHelperLineInsideShellOutput(text, helperStartLine) {
@@ -2494,7 +2909,7 @@ function isHelperLineInsideShellOutput(text, helperStartLine) {
   let shellOutputFence = "";
   for (let index = 0; index <= stopAt && index < lines.length; index += 1) {
     const line = String(lines[index] || "").trim().toLowerCase();
-    const opening = line.match(/^(`{3,})shell-output(?:\s.*)?$/);
+    const opening = line.match(/^(`{3,})(?:shell-output|skill-output)(?:\s.*)?$/);
     if (!inside && opening) {
       inside = true;
       shellOutputFence = opening[1];
@@ -2527,7 +2942,71 @@ function validateHelperCall(call) {
   if (isAgentTaskStatusHelperCall(call)) {
     return validateAgentTaskStatusCall(call);
   }
+  if (isSkillHelperCall(call)) {
+    return validateSkillHelperCall(call);
+  }
   return validateShellCall(call);
+}
+
+function validateSkillHelperCall(call) {
+  if (call?.skillHeaderError) {
+    return { ok: false, reason: call.skillHeaderError };
+  }
+  if (call?.inferredEndMarker) {
+    return { ok: false, reason: "Skill helpers require an explicit ai helper skill end marker." };
+  }
+  const cmd = String(call?.cmd || "").trim().toLowerCase();
+  if (!["list", "load", "list-updated", "list-update-failed"].includes(cmd)) {
+    return { ok: false, reason: "Skill helper cmd must be list, load, list-updated, or list-update-failed." };
+  }
+  const challenge = String(call?.challenge || "");
+  const catalogSha = String(call?.catalogSha || "");
+  if (challenge && !/^[a-f0-9]{32}$/.test(challenge)) {
+    return { ok: false, reason: "Skill helper challenge must be the exact 32-character challenge supplied by the plugin." };
+  }
+  if (catalogSha && !/^[a-f0-9]{64}$/.test(catalogSha)) {
+    return { ok: false, reason: "Skill helper catalog-sha must be the complete 64-character SHA-256 value." };
+  }
+  if (cmd === "list") {
+    if (call.catalogSha || call.memoryEntry || call.skillId || call.reason) {
+      return { ok: false, reason: "Skill list accepts only cmd and an optional challenge." };
+    }
+    return { ok: true };
+  }
+  if (cmd === "load") {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(String(call.skillId || ""))) {
+      return { ok: false, reason: "Skill load requires a valid skill-id from memory." };
+    }
+    if (!/^[a-f0-9]{64}$/.test(catalogSha)) {
+      return { ok: false, reason: "Skill load requires the full catalog-sha stored with the memory catalog." };
+    }
+    if (call.challenge || call.memoryEntry || call.reason) {
+      return { ok: false, reason: "Skill load accepts only cmd, skill-id, and catalog-sha." };
+    }
+    return { ok: true };
+  }
+  if (!/^[a-f0-9]{32}$/.test(challenge)) {
+    return { ok: false, reason: "Skill sync completion requires the current challenge." };
+  }
+  if (!/^[a-f0-9]{64}$/.test(catalogSha)) {
+    return { ok: false, reason: "Skill sync completion requires the full catalog-sha." };
+  }
+  if (cmd === "list-updated") {
+    if (call.memoryEntry !== SKILL_MEMORY_ENTRY) {
+      return { ok: false, reason: `Skill sync completion must name the fixed memory entry ${SKILL_MEMORY_ENTRY}.` };
+    }
+    if (call.skillId || call.reason) {
+      return { ok: false, reason: "Skill list-updated contains unsupported fields." };
+    }
+    return { ok: true };
+  }
+  if (!String(call.reason || "").trim()) {
+    return { ok: false, reason: "Skill list-update-failed requires a short reason." };
+  }
+  if (call.memoryEntry || call.skillId) {
+    return { ok: false, reason: "Skill list-update-failed contains unsupported fields." };
+  }
+  return { ok: true };
 }
 
 function validateFileHelperCall(call) {
@@ -4130,6 +4609,22 @@ function formatInboundAgentPrompt(profile, message) {
 }
 
 function setHelperCompletionStatus(call, response) {
+  if (call?.kind === "skill-sync-prompt") {
+    setStatus("Skill update request sent to the AI", "running");
+    return;
+  }
+  if (call?.kind === "skill-list") {
+    setStatus(response?.ok === false ? "Skill catalog request failed" : "Skill catalog sent to the AI", response?.ok === false ? "error" : "running");
+    return;
+  }
+  if (call?.kind === "skill-load") {
+    setStatus(response?.ok === false ? "Skill load failed" : `Skill ${call.skillId || ""} sent to the AI`, response?.ok === false ? "error" : "ok");
+    return;
+  }
+  if (call?.kind === "skill-error") {
+    setStatus("Skill protocol error sent to the AI", "error");
+    return;
+  }
   if (isAuthoritativeDuplicateResponse(response)) {
     rememberSuppressedCallStatus(`server ${response.reason || "already-executed-on-target"}`);
     setStatus(
@@ -5464,7 +5959,8 @@ function isSubmittedUserMessageNode(node) {
 
 function isM365SubmittedUserMessageNode(node) {
   return location.hostname === "m365.cloud.microsoft" &&
-    node?.matches?.('.fai-UserMessage[role="article"]') === true;
+    (node?.matches?.('.fai-UserMessage[role="article"]') === true ||
+      node?.closest?.('.fai-UserMessage[role="article"]') != null);
 }
 
 function m365SubmittedMessageTextMatches(messageText, expectedText) {
@@ -5504,13 +6000,14 @@ function isM365FlattenableStructuredDelivery(expectedText) {
 
 function extractExpectedRenderedCodeBlock(expectedText) {
   const expected = normalizeCommand(expectedText);
-  const match = /(?:^|\n)```shell-output[^\n]*\n([\s\S]*?)\n```(?:\n|$)/.exec(expected);
+  const match = /(?:^|\n)(`{3,})(shell-output|skill-output)[^\n]*\n([\s\S]*?)\n\1(?:\n|$)/.exec(expected);
   if (!match) {
     return null;
   }
   return {
     prefix: normalizeComposerOwnershipText(expected.slice(0, match.index)),
-    code: normalizeComposerOwnershipText(match[1])
+    language: match[2],
+    code: normalizeComposerOwnershipText(match[3])
   };
 }
 
@@ -5773,6 +6270,29 @@ function injectStatus() {
   statusText.title = "Drag to move";
   statusRow.appendChild(statusText);
 
+  const skillStatusAction = document.createElement("button");
+  skillStatusAction.id = SKILL_STATUS_ACTION_ID;
+  skillStatusAction.type = "button";
+  skillStatusAction.hidden = true;
+  skillStatusAction.disabled = true;
+  skillStatusAction.dataset.shellToolAction = "skill-sync";
+  skillStatusAction.textContent = "Skills";
+  skillStatusAction.style.cssText = [
+    "flex:0 0 auto",
+    "min-height:22px",
+    "max-width:88px",
+    "border:1px solid #4b5563",
+    "border-radius:999px",
+    "padding:2px 7px",
+    "font:600 10px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "background:#1f2937",
+    "color:#cbd5e1",
+    "white-space:nowrap",
+    "overflow:hidden",
+    "text-overflow:ellipsis"
+  ].join(";");
+  statusRow.appendChild(skillStatusAction);
+
   panel.appendChild(statusRow);
 
   const actions = document.createElement("div");
@@ -5920,6 +6440,19 @@ function injectStatus() {
   ], 2, { marginTop: true }));
   advancedControls.appendChild(agentSection.section);
 
+  const skillsSection = createPanelSection("Skills", "skills");
+  const skillDetail = document.createElement("div");
+  skillDetail.id = SKILL_DETAIL_ID;
+  skillDetail.textContent = "Checking local Skills...";
+  skillDetail.style.cssText = "padding:6px;border-radius:6px;background:#1f2937;color:#dbeafe;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.35;white-space:pre-wrap;word-break:break-word;max-height:130px;overflow:auto";
+  skillsSection.body.appendChild(skillDetail);
+  skillsSection.body.appendChild(createPanelButtonGrid([
+    { mode: "skill-view", label: "View Skills", title: "Show the complete local Skill catalog without writing to the AI composer" },
+    { mode: "skill-rescan", label: "Rescan", title: "Rescan configured local Skill roots" },
+    { mode: "skill-force-sync", label: "Force sync", title: "Ask the AI to replace the fixed Skill memory entry even when the SHA is already acknowledged" }
+  ], 3, { marginTop: true }));
+  advancedControls.appendChild(skillsSection.section);
+
   const pendingAgentDeliveryPanel = document.createElement("div");
   pendingAgentDeliveryPanel.id = PENDING_AGENT_DELIVERY_ID;
   pendingAgentDeliveryPanel.hidden = true;
@@ -6010,6 +6543,7 @@ function injectStatus() {
   loadAgentControls().catch(() => {});
   refreshTmuxAiTargetOptions({ quiet: true }).catch(() => {});
   updateDrawioContextAction();
+  updateSkillPanelState();
   updateContextualPanelActions();
   restorePanelPosition(panel);
   installPanelDrag(panel, statusText);
@@ -6053,6 +6587,275 @@ function updateDrawioContextAction() {
   button.title = hasArtifact
     ? "Reopen the latest Draw.io SVG preview"
     : "Open the latest Draw.io render error log";
+}
+
+function startSkillStatePolling() {
+  stopSkillStatePolling();
+  refreshSkillState({ quiet: true }).catch(() => {});
+  skillStatePollTimer = window.setInterval(() => {
+    refreshSkillState({ quiet: true }).catch(() => {});
+  }, SKILL_SYNC_POLL_INTERVAL_MS);
+}
+
+function stopSkillStatePolling() {
+  if (skillStatePollTimer) {
+    window.clearInterval(skillStatePollTimer);
+    skillStatePollTimer = 0;
+  }
+  skillStatePollInFlight = false;
+}
+
+async function refreshSkillState({ quiet = false } = {}) {
+  if (!extensionActive || skillStatePollInFlight) {
+    return skillPanelState;
+  }
+  skillStatePollInFlight = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "skill-state-get" });
+    skillPanelState = response && typeof response === "object" ? response : {
+      ok: false,
+      error: "Skill state response is unavailable."
+    };
+    updateSkillPanelState();
+    if (!quiet && skillPanelState.ok !== true) {
+      setStatus(`Skill catalog unavailable: ${summarizeCommand(skillPanelState.error || firstSkillUiError(skillPanelState) || "unknown error")}`, "error");
+    }
+    return skillPanelState;
+  } finally {
+    skillStatePollInFlight = false;
+  }
+}
+
+function updateSkillPanelState() {
+  const action = document.getElementById(SKILL_STATUS_ACTION_ID);
+  const detail = document.getElementById(SKILL_DETAIL_ID);
+  if (!action && !detail) {
+    return;
+  }
+  const state = skillPanelState;
+  if (!state || state.ok !== true) {
+    if (action) {
+      action.hidden = !state;
+      action.disabled = !state;
+      action.textContent = "Skills !";
+      action.style.cursor = state ? "pointer" : "default";
+      action.style.background = "#4c1d2a";
+      action.style.borderColor = "#be123c";
+      action.style.color = "#fecdd3";
+      action.title = state ? `Skill catalog unavailable: ${state.error || firstSkillUiError(state) || "unknown error"}` : "Checking local Skills";
+    }
+    if (detail) {
+      detail.textContent = state
+        ? `Unavailable: ${state.error || firstSkillUiError(state) || "unknown error"}`
+        : "Checking local Skills...";
+    }
+    return;
+  }
+  const version = Number(state.version || 0);
+  const updateAvailable = state.updateAvailable === true;
+  const syncing = state.syncing === true;
+  if (action) {
+    action.hidden = false;
+    action.textContent = `Skills v${version}${syncing ? " …" : updateAvailable ? " ↑" : ""}`;
+    action.disabled = !updateAvailable || syncing;
+    action.style.cursor = action.disabled ? "default" : "pointer";
+    action.style.background = updateAvailable ? "#065f46" : "#1f2937";
+    action.style.borderColor = updateAvailable ? "#10b981" : "#4b5563";
+    action.style.color = updateAvailable ? "#d1fae5" : "#cbd5e1";
+    action.style.boxShadow = updateAvailable ? "0 0 0 2px rgba(16,185,129,.18)" : "none";
+    action.title = syncing
+      ? state.syncOwnedByCurrentTab
+        ? "Skill synchronization is waiting for this AI tab"
+        : "Skill synchronization is being handled by another tab for this AI memory scope"
+      : updateAvailable
+        ? `Local Skills v${version} changed; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
+        : `Local Skills v${version} are acknowledged for this AI memory scope`;
+  }
+  if (detail) {
+    const catalogSha = String(state.catalogSha || "");
+    const acknowledgedSha = String(state.acknowledgedCatalogSha || "");
+    detail.textContent = [
+      `Local version: v${version}`,
+      `Skills: ${Number(state.skillCount || 0)}`,
+      `Catalog SHA: ${catalogSha || "(none)"}`,
+      `Memory entry: ${SKILL_MEMORY_ENTRY}`,
+      `Acknowledged: ${acknowledgedSha || "(never)"}`,
+      syncing
+        ? state.syncOwnedByCurrentTab
+          ? "Sync: waiting for this tab's AI"
+          : "Sync: owned by another tab"
+        : updateAvailable ? "Sync: update required" : "Sync: current",
+      state.lastSyncError ? `Last sync error: ${state.lastSyncError}` : "",
+      Array.isArray(state.warnings) && state.warnings.length > 0
+        ? `Warning: ${state.warnings[0]?.message || state.warnings[0]}`
+        : ""
+    ].filter(Boolean).join("\n");
+  }
+}
+
+async function startSkillSync({ force = false } = {}) {
+  const response = await chrome.runtime.sendMessage({
+    type: "skill-sync-begin",
+    force
+  });
+  if (response?.ok !== true) {
+    await refreshSkillState({ quiet: true }).catch(() => {});
+    setStatus(response?.error || "Skill synchronization could not start", response?.errorCode === "skills-already-current" ? "ok" : "error");
+    return false;
+  }
+  skillPanelState = {
+    ...(skillPanelState || {}),
+    ...response,
+    ok: true,
+    updateAvailable: true,
+    syncing: true,
+    syncOwnedByCurrentTab: true
+  };
+  updateSkillPanelState();
+  await removeObsoleteSkillSyncPromptDeliveries(response.challenge);
+  const reply = buildSkillSyncPrompt(response);
+  const settings = await chrome.storage.sync.get(["autoSend"]);
+  const call = {
+    kind: "skill-sync-prompt",
+    challenge: response.challenge,
+    catalogSha: response.catalogSha
+  };
+  const pending = await rememberPendingHelperDelivery(
+    `skill-sync-prompt:${response.challenge}`,
+    call,
+    { ok: true },
+    reply,
+    settings
+  );
+  const delivered = await attemptPendingHelperDelivery(pending, settings);
+  if (!delivered) {
+    setStatus("Skill update request is cached; waiting for the chat composer/send control", "running");
+  }
+  return delivered;
+}
+
+async function removeObsoleteSkillSyncPromptDeliveries(activeChallenge) {
+  await loadPendingHelperDeliveriesForCurrentPage();
+  let changed = false;
+  for (const [callId, entry] of pendingHelperDeliveries) {
+    if (entry.kind === "skill-sync-prompt" && entry.call?.challenge !== activeChallenge) {
+      pendingHelperDeliveries.delete(callId);
+      changed = true;
+    }
+  }
+  if (changed) {
+    await persistPendingHelperDeliveries();
+  }
+}
+
+function buildSkillSyncPrompt(sync) {
+  return [
+    "The local SKILLS catalog has changed.",
+    `Local catalog version: ${Number(sync?.version || 0)}`,
+    `Local catalog SHA: ${String(sync?.catalogSha || "")}`,
+    `The catalog must be stored in the single memory entry named ${SKILL_MEMORY_ENTRY}.`,
+    "",
+    "Request the complete latest catalog now by replying with exactly one plain helper block and no prose.",
+    "Use the words ai helper skill start and ai helper skill end as its opening and closing delimiters, replacing spaces with hyphens in the actual delimiters.",
+    "Put these two fields between the delimiters:",
+    "cmd: list",
+    `challenge: ${String(sync?.challenge || "")}`,
+    "",
+    "The next local response will contain the complete catalog, exact memory replacement instructions, and the required success or failure acknowledgement fields."
+  ].join("\n");
+}
+
+async function viewSkillCatalog() {
+  const response = await chrome.runtime.sendMessage({ type: "skill-catalog-list" });
+  showSkillCatalogDialog(response);
+  if (response?.ok !== true) {
+    setStatus(`Skill catalog invalid: ${summarizeCommand(response?.error || firstSkillUiError(response) || "unknown error")}`, "error");
+    return false;
+  }
+  setStatus(`Showing ${Number(response.skillCount || 0)} local Skills from v${Number(response.version || 0)}`, "ok");
+  return true;
+}
+
+async function rescanSkillCatalog() {
+  const response = await chrome.runtime.sendMessage({ type: "skill-catalog-rescan" });
+  await refreshSkillState({ quiet: true });
+  if (response?.ok !== true) {
+    showSkillCatalogDialog(response);
+    setStatus(`Skill rescan found errors: ${summarizeCommand(response?.error || firstSkillUiError(response) || "unknown error")}`, "error");
+    return false;
+  }
+  setStatus(`Rescanned ${Number(response.skillCount || 0)} Skills; local version is v${Number(response.version || 0)}`, "ok");
+  return true;
+}
+
+function showSkillCatalogDialog(response = {}) {
+  document.getElementById(SKILL_CATALOG_DIALOG_ID)?.remove();
+  const overlay = document.createElement("div");
+  overlay.id = SKILL_CATALOG_DIALOG_ID;
+  overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(2,6,23,.68);font:13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#e5e7eb";
+  const dialog = document.createElement("section");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-label", "Local Skills catalog");
+  dialog.style.cssText = "box-sizing:border-box;width:min(760px,calc(100vw - 48px));max-height:calc(100vh - 48px);overflow:auto;border:1px solid #475569;border-radius:12px;padding:16px;background:#111827;box-shadow:0 20px 50px rgba(0,0,0,.45)";
+  const header = document.createElement("div");
+  header.style.cssText = "display:flex;align-items:center;gap:12px;margin-bottom:12px";
+  const title = document.createElement("strong");
+  title.textContent = `Local Skills v${Number(response.version || 0)} · ${Number(response.skillCount || 0)} item(s)`;
+  title.style.cssText = "min-width:0;flex:1;font-size:16px";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "Close";
+  close.style.cssText = "border:1px solid #64748b;border-radius:7px;padding:5px 10px;background:#334155;color:#fff;cursor:pointer";
+  close.addEventListener("click", () => overlay.remove());
+  header.append(title, close);
+  dialog.appendChild(header);
+
+  const summary = document.createElement("div");
+  summary.textContent = [
+    `Catalog SHA: ${String(response.catalogSha || "(none)")}`,
+    `Memory entry: ${SKILL_MEMORY_ENTRY}`,
+    response.ok === true ? "Catalog is valid." : `Catalog is invalid: ${firstSkillUiError(response) || response.error || "unknown error"}`
+  ].join("\n");
+  summary.style.cssText = "margin-bottom:12px;padding:8px;border-radius:7px;background:#1f2937;white-space:pre-wrap;word-break:break-word;font:11px ui-monospace,SFMono-Regular,Menlo,monospace";
+  dialog.appendChild(summary);
+
+  const skills = Array.isArray(response.skills) ? response.skills : [];
+  for (const skill of skills) {
+    const item = document.createElement("article");
+    item.style.cssText = "margin-top:8px;padding:10px;border:1px solid #334155;border-radius:8px;background:#0f172a";
+    const name = document.createElement("strong");
+    name.textContent = String(skill.name || skill.id || "(unnamed)");
+    const sha = document.createElement("code");
+    sha.textContent = String(skill.sha || "");
+    sha.style.cssText = "display:block;margin-top:3px;color:#94a3b8;font-size:10px;word-break:break-all";
+    const description = document.createElement("div");
+    description.textContent = String(skill.description || "");
+    description.style.cssText = "margin-top:7px;white-space:pre-wrap;line-height:1.4";
+    item.append(name, sha, description);
+    dialog.appendChild(item);
+  }
+  const errors = Array.isArray(response.errors) ? response.errors : [];
+  for (const error of errors) {
+    const item = document.createElement("div");
+    item.textContent = `Error: ${error?.message || error}`;
+    item.style.cssText = "margin-top:8px;padding:8px;border-radius:7px;background:#4c1d2a;color:#fecdd3;white-space:pre-wrap;word-break:break-word";
+    dialog.appendChild(item);
+  }
+  overlay.appendChild(dialog);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      overlay.remove();
+    }
+  });
+  document.documentElement.appendChild(overlay);
+  close.focus();
+}
+
+function firstSkillUiError(response) {
+  return Array.isArray(response?.errors) && response.errors.length > 0
+    ? String(response.errors[0]?.message || response.errors[0] || "")
+    : "";
 }
 
 function setPanelForceRunAvailable(available) {
@@ -6581,6 +7384,40 @@ function handlePanelAction(action) {
     if (!globalThis.AiChatDrawioPreview?.reopen?.()) {
       setStatus("No draw.io preview or render log is available yet", "idle");
     }
+    return;
+  }
+
+  if (action === "skill-sync") {
+    if (skillPanelState && skillPanelState.ok !== true) {
+      viewSkillCatalog().catch((error) => {
+        setStatus(`Skill catalog view failed: ${summarizeCommand(error.message || String(error))}`, "error");
+      });
+      return;
+    }
+    startSkillSync({ force: false }).catch((error) => {
+      setStatus(`Skill sync failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "skill-force-sync") {
+    startSkillSync({ force: true }).catch((error) => {
+      setStatus(`Forced Skill sync failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "skill-view") {
+    viewSkillCatalog().catch((error) => {
+      setStatus(`Skill catalog view failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "skill-rescan") {
+    rescanSkillCatalog().catch((error) => {
+      setStatus(`Skill rescan failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
     return;
   }
 

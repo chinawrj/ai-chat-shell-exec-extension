@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
 
-assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.10\.5";/);
+assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.0";/);
 assert.match(source, /width:min\(292px,calc\(100vw - 32px\)\)/);
 assert.match(source, /statusText\.style\.cssText = "[^"]*text-overflow:ellipsis;white-space:nowrap/);
 assert.match(source, /statusIndicator\.id = STATUS_INDICATOR_ID/);
@@ -33,7 +33,10 @@ for (const advancedOnlyAction of [
   "agent-list",
   "agent-check",
   "tmux-ai-refresh",
-  "tmux-ai-register"
+  "tmux-ai-register",
+  "skill-view",
+  "skill-rescan",
+  "skill-force-sync"
 ]) {
   assert.doesNotMatch(commonActions, new RegExp(`mode: "${advancedOnlyAction}"`));
   assert.match(source, new RegExp(`mode: "${advancedOnlyAction}"`));
@@ -51,6 +54,7 @@ for (const [title, group] of [
   ["Setup & recovery", "setup-recovery"],
   ["Page binding", "page-binding"],
   ["Agent & tmux-ai", "agent-tmux-ai"],
+  ["Skills", "skills"],
   ["Tools & diagnostics", "tools-diagnostics"]
 ]) {
   assert.match(source, new RegExp(`createPanelSection\\("${title.replace("&", "&")}", "${group}"\\)`));
@@ -75,5 +79,25 @@ assert.match(awaitingUserControls, /data-shell-tool-action="stop-helper"[^>]*>St
 assert.doesNotMatch(source, /Force terminate/);
 assert.doesNotMatch(source, />Quit<\/button>/);
 assert.doesNotMatch(source, /data-shell-tool-action="terminate-helper"/);
+
+assert.match(source, /skillStatusAction\.id = SKILL_STATUS_ACTION_ID/);
+assert.match(source, /skillStatusAction\.dataset\.shellToolAction = "skill-sync"/);
+assert.match(source, /action\.textContent = `Skills v\$\{version\}\$\{syncing \? " …" : updateAvailable \? " ↑" : ""\}`/);
+assert.match(source, /action\.disabled = !updateAvailable \|\| syncing/);
+assert.match(source, /action\.style\.background = updateAvailable \? "#065f46" : "#1f2937"/);
+const skillsSection = source.match(/const skillsSection = createPanelSection\("Skills", "skills"\);[\s\S]*?advancedControls\.appendChild\(skillsSection\.section\);/)?.[0] || "";
+assert.ok(skillsSection, "The complete Skills controls must live in a labelled advanced group.");
+for (const [mode, label] of [
+  ["skill-view", "View Skills"],
+  ["skill-rescan", "Rescan"],
+  ["skill-force-sync", "Force sync"]
+]) {
+  assert.match(skillsSection, new RegExp(`mode: "${mode}", label: "${label}"`));
+}
+const viewSkillCatalog = source.match(/async function viewSkillCatalog\(\) \{[\s\S]*?\n\}/)?.[0] || "";
+assert.match(viewSkillCatalog, /type: "skill-catalog-list"/);
+assert.doesNotMatch(viewSkillCatalog, /insertReply|rememberPendingHelperDelivery|attemptPendingHelperDelivery/, "View Skills must remain local and never write to the AI composer.");
+assert.match(source, /type: "skill-sync-begin",\s*force/);
+assert.match(source, /type: "skill-catalog-rescan"/);
 
 console.log("content compact panel tests passed");

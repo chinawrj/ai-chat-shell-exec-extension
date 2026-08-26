@@ -18,6 +18,7 @@ const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkp
 const E2E_TIMEOUT_MS = 45000;
 const MIN_CHROMIUM_MAJOR = 116;
 const FORCE_HEADLESS = process.env.AI_SHELL_E2E_HEADLESS === "1";
+const SKILLS_ONLY = process.env.AI_SHELL_E2E_SKILLS_ONLY === "1";
 const STARTUP_SETTLE_MS = 4200;
 const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
 
@@ -62,13 +63,18 @@ async function main() {
     const serverProtocolVersion = serverHealth.serverProtocolVersion ?? serverHealth.protocolVersion;
     assert.equal(
       serverProtocolVersion,
-      10,
+      11,
       `Existing shell server protocol is ${serverProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
     assert.equal(
       serverHealth.helperProtocolVersion,
-      3,
+      4,
       `Existing shell helper protocol is ${serverHealth.helperProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
+    );
+    assert.equal(
+      serverHealth.skillProtocolVersion,
+      1,
+      `Existing Skill protocol is ${serverHealth.skillProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
 
@@ -82,9 +88,17 @@ async function main() {
   const helperFileTestHome = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-file-home-e2e-"));
   const helperFileOverrideDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-file-override-e2e-"));
   const shellStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-state-e2e-"));
+  const skillRootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-skills-e2e-"));
+  const skillDirectory = path.join(skillRootDir, "e2e-skill");
+  const skillPath = path.join(skillDirectory, "SKILL.md");
+  const skillAllowedValue = `skill-allowed-${Date.now()}`;
+  const skillSecretValue = `skill-secret-${Date.now()}`;
+  fs.mkdirSync(skillDirectory, { recursive: true });
+  fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 1 }));
   cleanup.push(() => fs.rmSync(helperFileTestHome, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(helperFileOverrideDir, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(shellStateDir, { recursive: true, force: true }));
+  cleanup.push(() => fs.rmSync(skillRootDir, { recursive: true, force: true }));
 
   let managedShellServer = null;
   const managedShellServerEnv = {
@@ -92,6 +106,10 @@ async function main() {
     AI_CHAT_SHELL_RUNNER: fs.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh",
     AI_CHAT_SHELL_ALLOW_UNTRUSTED_ORIGINS: "1",
     AI_CHAT_SHELL_STATE_DIR: shellStateDir,
+    AI_HELPER_SKILL_PATHS: skillRootDir,
+    AI_HELPER_SKILL_ENV_ALLOWLIST: "E2E_SKILL_ALLOWED",
+    E2E_SKILL_ALLOWED: skillAllowedValue,
+    E2E_SKILL_SECRET: skillSecretValue,
     HOME: helperFileTestHome
   };
   if (!serverHealth?.ok) {
@@ -206,7 +224,8 @@ async function main() {
         "check", "test", "site", "reset-tmux", "role-filter",
         "input", "send", "shell", "clear",
         "agent-register", "agent-list", "agent-check",
-        "tmux-ai-refresh", "tmux-ai-register"
+        "tmux-ai-refresh", "tmux-ai-register",
+        "skill-view", "skill-rescan", "skill-force-sync"
       ].every((action) => Boolean(advanced?.querySelector('[data-shell-tool-action="' + action + '"]'))),
       drawioHidden: panel?.querySelector('#ai-chat-shell-exec-drawio-action')?.hidden === true,
       drawioInAdvanced: Boolean(advanced?.querySelector('[data-shell-tool-action="drawio-reopen"]')),
@@ -228,12 +247,9 @@ async function main() {
     "setup-recovery",
     "page-binding",
     "agent-tmux-ai",
+    "skills",
     "tools-diagnostics"
   ]);
-  if (SCREENSHOT_DIR) {
-    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-idle.png"));
-  }
-
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
@@ -246,6 +262,21 @@ async function main() {
   }
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
+
+  if (managedShellServer) {
+    await runSkillE2E(page, debugPort, {
+      skillPath,
+      expectedHome: helperFileTestHome,
+      allowedValue: skillAllowedValue,
+      secretValue: skillSecretValue
+    });
+  } else {
+    console.log("Deterministic Skill browser E2E skipped because the fixed shell-server port is owned by an existing foreground server.");
+  }
+  if (SKILLS_ONLY) {
+    assert.ok(managedShellServer, "Skills-only Chrome E2E requires the isolated managed shell server.");
+    return;
+  }
 
   // A developer may rerun this E2E against an already-running foreground
   // server after a prior browser process crashed before unregistering. Clear
@@ -1398,6 +1429,423 @@ async function main() {
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
   }
+}
+
+async function runSkillE2E(page, debugPort, {
+  skillPath,
+  expectedHome,
+  allowedValue,
+  secretValue
+}) {
+  const startMarker = "ai-helper-skill-start";
+  const endMarker = "ai-helper-skill-end";
+  const memoryEntry = "AI_CHAT_SHELL_SKILLS_CATALOG";
+
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && !chip.hidden && !chip.disabled && chip.textContent.includes("↑");
+  })()`, "initial local Skill update chip");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-skills-update.png"));
+  }
+  const initialUserCount = await pageUserMessageCount(page);
+  await page.evaluate(`(() => {
+    const composer = document.getElementById("composer");
+    composer.focus();
+    composer.click();
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    document.getElementById("ai-chat-shell-exec-skill-status").click();
+    return true;
+  })()`);
+  const initialPrompt = await waitForNewUserMessage(
+    page,
+    initialUserCount,
+    "The local SKILLS catalog has changed.",
+    "Skill update prompt to be submitted"
+  );
+  assertNoCompleteSkillMarkerLines(initialPrompt, "Skill update prompt");
+  assert.match(initialPrompt, /single memory entry named AI_CHAT_SHELL_SKILLS_CATALOG/);
+  assert.match(initialPrompt, /cmd: list/);
+  const initialChallenge = requireMessageField(initialPrompt, "challenge", /^[a-f0-9]{32}$/);
+  const initialCatalogSha = requireMessageField(initialPrompt, "Local catalog SHA", /^[a-f0-9]{64}$/);
+  await assertUserMessageCountStable(page, initialUserCount + 1, "Skill update prompt must not trigger itself");
+
+  const competingPage = await openChromePage(debugPort, TEST_PAGE_URL);
+  cleanup.push(() => competingPage.close());
+  await competingPage.send("Page.enable");
+  await competingPage.send("Runtime.enable");
+  await waitForEvaluate(competingPage, "document.readyState === 'complete'", "competing Skill tab load");
+  await waitForEvaluate(competingPage, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && !chip.hidden && chip.disabled && /another tab/i.test(chip.title || "");
+  })()`, "competing tab to observe the Skill owner lock");
+  const competingUserCount = await pageUserMessageCount(competingPage);
+  await competingPage.evaluate(`(() => {
+    document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click();
+    return true;
+  })()`);
+  await waitForEvaluate(competingPage, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return /another tab/i.test(panel?.innerText || "");
+  })()`, "competing tab force sync to be rejected by the owner lock");
+  assert.equal(await pageUserMessageCount(competingPage), competingUserCount, "A non-owner tab must not send a competing Skill prompt.");
+
+  const explicitUserBlock = [
+    `${startMarker}:explicit-user-e2e`,
+    "cmd: list",
+    `challenge: ${initialChallenge}`,
+    endMarker
+  ].join("\n");
+  const beforeExplicitUser = await pageUserMessageCount(page);
+  await page.evaluate(`(() => {
+    const article = document.createElement("article");
+    article.className = "message";
+    article.dataset.messageAuthorRole = "user";
+    article.innerHTML = '<div class="role">User</div><pre><code class="language-text"></code></pre>';
+    article.querySelector("code").textContent = ${JSON.stringify(explicitUserBlock)};
+    document.getElementById("thread").appendChild(article);
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return /explicitly identified user message/i.test(panel?.innerText || "");
+  })()`, "explicit user Skill helper to be ignored");
+  await assertUserMessageCountStable(page, beforeExplicitUser + 1, "Explicit user Skill helper must not receive a plugin reply");
+
+  const beforeCatalog = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:list-e2e-v1`,
+    "cmd: list",
+    `challenge: ${initialChallenge}`,
+    endMarker
+  ]);
+  const initialCatalogReply = await waitForNewUserMessage(
+    page,
+    beforeCatalog,
+    "Local SKILLS catalog synchronization response:",
+    "initial Skill catalog response"
+  );
+  assertNoCompleteSkillMarkerLines(initialCatalogReply, "Skill catalog response");
+  assert.match(initialCatalogReply, /Replace that entry entirely; do not append/);
+  assert.match(initialCatalogReply, /Remove entries for Skills that are not in this complete list/);
+  assert.match(initialCatalogReply, /e2e-skill/);
+  assert.match(initialCatalogReply, /E2E Skill browser coverage/);
+  assert.match(initialCatalogReply, new RegExp(`memory-entry: ${memoryEntry}`));
+  assert.equal(requireMessageField(initialCatalogReply, "catalog-sha", /^[a-f0-9]{64}$/), initialCatalogSha);
+  await assertUserMessageCountStable(page, beforeCatalog + 1, "Catalog response must not trigger its own indirect instructions");
+
+  const beforeWrongMemory = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:wrong-memory-e2e`,
+    "cmd: list-updated",
+    `challenge: ${initialChallenge}`,
+    `catalog-sha: ${initialCatalogSha}`,
+    "memory-entry: WRONG_MEMORY_ENTRY",
+    endMarker
+  ]);
+  const wrongMemoryReply = await waitForNewUserMessage(
+    page,
+    beforeWrongMemory,
+    "Local Skill helper response:",
+    "wrong Skill memory entry rejection"
+  );
+  assert.match(wrongMemoryReply, /fixed memory entry/i);
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && chip.textContent.includes("…") && /waiting for this AI tab/i.test(chip.title || "");
+  })()`, "active Skill sync to remain pending after wrong memory ACK");
+
+  fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 2 }));
+  const beforeStaleAck = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:stale-ack-e2e`,
+    "cmd: list-updated",
+    `challenge: ${initialChallenge}`,
+    `catalog-sha: ${initialCatalogSha}`,
+    `memory-entry: ${memoryEntry}`,
+    endMarker
+  ]);
+  const staleReply = await waitForNewUserMessage(
+    page,
+    beforeStaleAck,
+    "stale-skill-sync-ack",
+    "stale Skill ACK rejection"
+  );
+  assert.match(staleReply, /changed after it was listed/i);
+  const changedCatalogSha = requireMessageField(staleReply, "latest catalog-sha", /^[a-f0-9]{64}$/);
+  assert.notEqual(changedCatalogSha, initialCatalogSha);
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && chip.textContent.includes("…") && /waiting for this AI tab/i.test(chip.title || "");
+  })()`, "active Skill sync to remain pending after stale ACK");
+
+  const beforeLatestCatalog = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:list-e2e-v2`,
+    "cmd: list",
+    `challenge: ${initialChallenge}`,
+    endMarker
+  ]);
+  const latestCatalogReply = await waitForNewUserMessage(
+    page,
+    beforeLatestCatalog,
+    "Local SKILLS catalog synchronization response:",
+    "latest accumulated Skill catalog response"
+  );
+  const latestCatalogSha = requireMessageField(latestCatalogReply, "catalog-sha", /^[a-f0-9]{64}$/);
+  assert.equal(latestCatalogSha, changedCatalogSha);
+  assert.match(latestCatalogReply, /revision 2/);
+
+  const beforeValidAck = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:valid-ack-e2e-v2`,
+    "cmd: list-updated",
+    `challenge: ${initialChallenge}`,
+    `catalog-sha: ${latestCatalogSha}`,
+    `memory-entry: ${memoryEntry}`,
+    endMarker
+  ]);
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && !chip.hidden && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+  })()`, "valid Skill ACK to clear the green chip");
+  await assertUserMessageCountStable(page, beforeValidAck, "A successful Skill ACK must not create a composer reply");
+  await waitForEvaluate(competingPage, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+  })()`, "valid Skill ACK to clear other tabs in the same scope");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-idle.png"));
+  }
+
+  const beforeView = await pageUserMessageCount(page);
+  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-view"]')?.click(); true`);
+  await waitForEvaluate(page, `Boolean(document.getElementById("ai-chat-shell-exec-skill-dialog"))`, "local Skill catalog dialog");
+  assert.equal(await pageUserMessageCount(page), beforeView, "View Skills must not write anything to the AI chat.");
+  await page.evaluate(`document.querySelector('#ai-chat-shell-exec-skill-dialog button')?.click(); true`);
+  await waitForEvaluate(page, `!document.getElementById("ai-chat-shell-exec-skill-dialog")`, "local Skill catalog dialog to close");
+  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return /Rescanned 1 Skills/i.test(panel?.innerText || "");
+  })()`, "local Skill rescan");
+  assert.equal(await pageUserMessageCount(page), beforeView, "Rescan Skills must remain local.");
+
+  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click(); true`);
+  const forcedPrompt = await waitForNewUserMessage(
+    page,
+    beforeView,
+    "The local SKILLS catalog has changed.",
+    "forced Skill sync prompt"
+  );
+  const forcedChallenge = requireMessageField(forcedPrompt, "challenge", /^[a-f0-9]{32}$/);
+  assert.notEqual(forcedChallenge, initialChallenge);
+  assert.equal(requireMessageField(forcedPrompt, "Local catalog SHA", /^[a-f0-9]{64}$/), latestCatalogSha);
+  const beforeForcedList = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:force-list-e2e`,
+    "cmd: list",
+    `challenge: ${forcedChallenge}`,
+    endMarker
+  ]);
+  await waitForNewUserMessage(page, beforeForcedList, "Local SKILLS catalog synchronization response:", "forced catalog response");
+  const beforeFailure = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:force-failed-e2e`,
+    "cmd: list-update-failed",
+    `challenge: ${forcedChallenge}`,
+    `catalog-sha: ${latestCatalogSha}`,
+    "reason: memory intentionally unavailable in E2E",
+    endMarker
+  ]);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return /memory intentionally unavailable in E2E/i.test(panel?.innerText || "") &&
+      chip && !chip.disabled && chip.textContent.includes("↑");
+  })()`, "failed forced Skill sync to remain highlighted");
+  await assertUserMessageCountStable(page, beforeFailure, "A handled list-update-failed report must not create another AI reply");
+
+  await page.evaluate(`document.getElementById("ai-chat-shell-exec-skill-status")?.click(); true`);
+  const retryPrompt = await waitForNewUserMessage(
+    page,
+    beforeFailure,
+    "The local SKILLS catalog has changed.",
+    "Skill retry prompt after memory failure"
+  );
+  const retryChallenge = requireMessageField(retryPrompt, "challenge", /^[a-f0-9]{32}$/);
+  assert.notEqual(retryChallenge, forcedChallenge);
+  await waitForSkillPromptLifecycleSettled(page, retryChallenge, "retry Skill prompt lifecycle to settle before the AI reply");
+  const beforeRetryList = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:retry-list-e2e`,
+    "cmd: list",
+    `challenge: ${retryChallenge}`,
+    endMarker
+  ]);
+  let retryCatalog;
+  try {
+    retryCatalog = await waitForNewUserMessage(page, beforeRetryList, "Local SKILLS catalog synchronization response:", "retry Skill catalog response");
+  } catch (error) {
+    const domState = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      panel: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
+      assistants: Array.from(document.querySelectorAll('[data-message-author-role="assistant"]')).slice(-6).map((node) => node.innerText || ""),
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]')).slice(-6).map((node) => node.innerText || "")
+    }))()`);
+    const isolatedState = await page.evaluateAcrossContexts(`(() => {
+      if (typeof skillHelperInFlight === "undefined") {
+        return null;
+      }
+      return {
+        skillHelperInFlight,
+        chainCallCount,
+        lastUserMessageText,
+        skillPanelState,
+        pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+          callId: entry.callId,
+          kind: entry.kind,
+          phase: entry.phase,
+          attempts: entry.attempts,
+          lastError: entry.lastError,
+          challenge: entry.call?.challenge || ""
+        }))
+      };
+    })()`);
+    throw new Error(`${error.message}; retrySkillState=${JSON.stringify({ domState, isolatedState })}`);
+  }
+  const retryCatalogSha = requireMessageField(retryCatalog, "catalog-sha", /^[a-f0-9]{64}$/);
+  const beforeRetryAck = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:retry-ack-e2e`,
+    "cmd: list-updated",
+    `challenge: ${retryChallenge}`,
+    `catalog-sha: ${retryCatalogSha}`,
+    `memory-entry: ${memoryEntry}`,
+    endMarker
+  ]);
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+  })()`, "Skill retry ACK");
+  await assertUserMessageCountStable(page, beforeRetryAck, "Successful retry ACK must remain silent");
+
+  const beforeStaleLoad = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:stale-load-e2e`,
+    "cmd: load",
+    "skill-id: e2e-skill",
+    `catalog-sha: ${initialCatalogSha}`,
+    endMarker
+  ]);
+  const staleLoadReply = await waitForNewUserMessage(page, beforeStaleLoad, "stale-catalog", "stale Skill load rejection");
+  assert.match(staleLoadReply, /latest catalog-sha/i);
+
+  const beforeLoad = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:valid-load-e2e`,
+    "cmd: load",
+    "skill-id: e2e-skill",
+    `catalog-sha: ${retryCatalogSha}`,
+    endMarker
+  ]);
+  const loadReply = await waitForNewUserMessage(page, beforeLoad, "Local Skill load result:", "valid Skill body load");
+  assert.match(loadReply, new RegExp(escapeRegExp(`home=${expectedHome}`)));
+  assert.match(loadReply, new RegExp(escapeRegExp(`allowed=${allowedValue}`)));
+  assert.match(loadReply, /secret=\$\{E2E_SKILL_SECRET\}/);
+  assert.match(loadReply, /arguments=\$ARGUMENTS/);
+  assert.match(loadReply, /ai-helper-skill-start/);
+  assert.match(loadReply, /ai-helper-skill-end/);
+  assert.ok(!loadReply.includes(secretValue), "A non-allowlisted local environment variable must not leak to the AI.");
+  await assertUserMessageCountStable(page, beforeLoad + 1, "Loaded Skill helper examples must stay inert inside skill-output provenance");
+}
+
+function buildE2eSkillSource({ revision }) {
+  return [
+    "---",
+    "name: e2e-skill",
+    `description: E2E Skill browser coverage revision ${revision}`,
+    "---",
+    `revision ${revision}`,
+    "home=$HOME",
+    "allowed=${E2E_SKILL_ALLOWED}",
+    "secret=${E2E_SKILL_SECRET}",
+    "arguments=$ARGUMENTS",
+    "Embedded helper documentation must remain inert:",
+    "ai-helper-skill-start",
+    "cmd: list",
+    "ai-helper-skill-end",
+    ""
+  ].join("\n");
+}
+
+async function appendAssistantSkillHelper(page, lines) {
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(lines.join("\n"))}, "text"); true`);
+}
+
+function pageUserMessageCount(page) {
+  return page.evaluate(`document.querySelectorAll('[data-message-author-role="user"]').length`);
+}
+
+function waitForNewUserMessage(page, previousCount, includedText, description) {
+  return waitForEvaluateValue(page, `(() => {
+    const messages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .slice(${Number(previousCount)});
+    const matched = messages.find((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(includedText)}));
+    return matched ? (matched.innerText || matched.textContent || "") : "";
+  })()`, description);
+}
+
+async function waitForSkillPromptLifecycleSettled(page, challenge, description) {
+  await waitForValue(async () => {
+    const worlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined" || typeof skillHelperInFlight === "undefined") {
+        return null;
+      }
+      const matchingPrompt = Array.from(pendingHelperDeliveries.values()).find((entry) =>
+        entry.kind === "skill-sync-prompt" && entry.call?.challenge === ${JSON.stringify(challenge)}
+      );
+      const composer = document.getElementById("composer");
+      const thread = typeof getConversationRoot === "function" ? getConversationRoot() : null;
+      const currentThreadText = typeof normalizeText === "function"
+        ? normalizeText(thread?.innerText || thread?.textContent || "")
+        : "";
+      const scanQuiet = currentThreadText === lastThreadText && Date.now() - lastThreadTextAt >= 1200;
+      return {
+        contentWorld: true,
+        settled: !matchingPrompt && !skillHelperInFlight && !activeComposerDeliveryToken &&
+          !(composer?.innerText || composer?.textContent || "").trim() && scanQuiet,
+        matchingPhase: matchingPrompt?.phase || "",
+        matchingInFlight: matchingPrompt?.deliveryInFlight === true,
+        skillHelperInFlight,
+        activeDeliveryKind: activeComposerDeliveryToken?.kind || "",
+        composerText: composer?.innerText || composer?.textContent || "",
+        scanQuiet
+      };
+    })()`);
+    const contentState = worlds.find((entry) => entry.value?.contentWorld)?.value;
+    return contentState?.settled ? contentState : undefined;
+  }, description);
+}
+
+async function assertUserMessageCountStable(page, expectedCount, message) {
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2000))");
+  assert.equal(await pageUserMessageCount(page), expectedCount, message);
+}
+
+function assertNoCompleteSkillMarkerLines(text, label) {
+  assert.ok(!String(text || "").includes("ai-helper-skill-start"), `${label} contains the complete Skill start marker substring.`);
+  assert.ok(!String(text || "").includes("ai-helper-skill-end"), `${label} contains the complete Skill end marker substring.`);
+  const lines = String(text || "").split(/\r?\n/);
+  assert.ok(!lines.includes("ai-helper-skill-start"), `${label} contains a complete Skill start marker line.`);
+  assert.ok(!lines.includes("ai-helper-skill-end"), `${label} contains a complete Skill end marker line.`);
+}
+
+function requireMessageField(text, field, pattern) {
+  const expression = new RegExp(`(?:^|\\s)${escapeRegExp(field)}:\\s*(\\S+)`, "i");
+  const value = expression.exec(String(text || ""))?.[1] || "";
+  assert.match(value, pattern, `Missing or invalid ${field} in message:\n${text}`);
+  return value;
 }
 
 function findChrome() {

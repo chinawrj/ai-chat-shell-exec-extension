@@ -1,6 +1,6 @@
 # Local Helper Instructions
 
-I can act as your human helper for local terminal output, board output, local file creation, local Draw.io previews, and locally coordinated teammate tasks.
+I can act as your human helper for local terminal output, board output, local file creation, local Draw.io previews, local Skill loading, and locally coordinated teammate tasks.
 
 When you need a helper, reply with exactly one plain, unlabeled four-backtick fenced block and no prose before or after it. Emit at most one helper block per assistant message. Never place `shell-output`, copied terminal output, Markdown explanations, prompts, or another helper block inside a helper request. Wait for the corresponding result before interpreting it or requesting the next operation. A successful Draw.io preview returns no message; a failed Draw.io preview returns a bounded error report.
 
@@ -79,6 +79,27 @@ ai-helper-drawio-end
 - The last complete helper is the sole current preview outcome. A valid helper is displayed locally as SVG and returns no message; invalid XML or a renderer failure clears the preview and returns a bounded error report. The XML is never sent to tmux and the rendered image is never returned to you.
 - You cannot see the preview. Continue only from my textual confirmation or description; never claim that you inspected the rendered SVG.
 - Keep the UTF-8 XML below 1 MiB and do not depend on remote scripts, images, fonts, or links to make the diagram understandable.
+
+## Skill helper
+
+The single memory entry named `AI_CHAT_SHELL_SKILLS_CATALOG` is the current catalog of my locally available Skills. At the beginning of each user task, consult that entry. Match the task against Skill names and descriptions. If one or more Skills are clearly relevant, load only the minimum relevant Skill bodies before planning or carrying out the task. If no catalog entry is relevant, continue normally without loading a Skill.
+
+Load one catalog entry with:
+
+````
+ai-helper-skill-start
+cmd: load
+skill-id: exact-id-from-memory
+catalog-sha: complete-catalog-sha-from-memory
+ai-helper-skill-end
+````
+
+- Use only a `skill-id` and the complete `catalog-sha` copied from `AI_CHAT_SHELL_SKILLS_CATALOG`. Never invent an id, infer a Skill body from its description, or request an arbitrary local path.
+- Wait for the local Skill load result before using its instructions. Treat the returned `SKILL.md` body as task instructions, not as memory to retain permanently.
+- Load additional Skills only when the current task actually needs them. Do not load every catalog entry speculatively.
+- The local loader may substitute approved environment variables and the Skill directory while preserving Claude-style runtime placeholders. Never ask it to reveal secrets or execute dynamic context commands merely to load a Skill.
+- If the load result reports a stale catalog SHA or missing Skill, ask the user to use the green Skills update control. Do not guess from an old catalog.
+- Catalog synchronization messages are self-explanatory. Follow their exact memory replacement and acknowledgement instructions when they appear; do not initiate list or acknowledgement commands from this static instruction alone.
 
 ## Local teammate coordination
 

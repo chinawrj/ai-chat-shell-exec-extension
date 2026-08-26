@@ -6,6 +6,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { SkillCatalogService } = require(path.join(__dirname, "skill_catalog"));
 
 const HOST = "127.0.0.1";
 const PORT = 17371;
@@ -19,8 +20,9 @@ const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 const COMMAND_ECHO_MAX_CHARS = 8000;
 const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 10;
-const HELPER_PROTOCOL_VERSION = 3;
+const SERVER_PROTOCOL_VERSION = 11;
+const HELPER_PROTOCOL_VERSION = 4;
+const SKILL_PROTOCOL_VERSION = 1;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
@@ -92,6 +94,12 @@ let agentHubState = createAgentHubState();
 const tmuxShellPaneQueues = new Map();
 const tmuxShellPaneQueueDepths = new Map();
 const activeTmuxShellRuns = new Map();
+const skillCatalogService = new SkillCatalogService({
+  stateDir: STATE_DIR,
+  env: process.env,
+  cwd: ROOT_DIR,
+  homeDir: process.env.HOME || os.homedir()
+});
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -372,6 +380,7 @@ function getProtocolMetadata() {
     serverProtocolVersion: SERVER_PROTOCOL_VERSION,
     helperProtocolVersion: HELPER_PROTOCOL_VERSION,
     helperProtocol: "ai-helper-plain-text",
+    skillProtocolVersion: SKILL_PROTOCOL_VERSION,
     visualProtocolVersion: 1,
     visualTmuxApps: getVisionTmuxAppNames(),
     executionBackend: "tmux"
@@ -382,6 +391,7 @@ function buildHealthResponse() {
   const forAiConfig = getForAiTmuxConfigForHealth();
   const state = getStateStatus({ create: true });
   const visionAvailability = getVisionAvailability();
+  const skillCatalog = getSkillCatalogHealth();
   return {
     ok: state.ok,
     error: state.error || "",
@@ -408,11 +418,52 @@ function buildHealthResponse() {
     visionAvailable: visionAvailability.available,
     visionErrorCode: visionAvailability.errorCode || "",
     visionError: visionAvailability.error || "",
+    skillCatalogOk: skillCatalog.ok === true,
+    skillCatalogSha: skillCatalog.catalogSha,
+    skillCatalogVersion: skillCatalog.version,
+    skillCount: skillCatalog.skillCount,
+    skillRootCount: skillCatalog.rootCount,
+    skillCatalogErrors: skillCatalog.errors || [],
+    skillCatalogWarnings: skillCatalog.warnings || [],
     maxShellScriptBytes: MAX_SHELL_SCRIPT_BYTES,
     maxInteractiveCommandChars: MAX_INTERACTIVE_COMMAND_CHARS,
     maxWebSocketMessageBytes: MAX_WEBSOCKET_MESSAGE_BYTES,
     ledgerEntries: Object.keys(serverLedger.calls || {}).length
   };
+}
+
+function getSkillCatalogHealth() {
+  try {
+    return skillCatalogService.status();
+  } catch (error) {
+    console.error(`[skill-catalog] health failed: ${error.message || String(error)}`);
+    return {
+      ok: false,
+      catalogSha: "",
+      version: 0,
+      skillCount: 0,
+      rootCount: 0,
+      errors: [{
+        code: "skill-catalog-unavailable",
+        message: "The local Skill catalog service is unavailable. Check the shell server console."
+      }],
+      warnings: []
+    };
+  }
+}
+
+function handleSkillCatalogOperation(type, operation) {
+  try {
+    return withProtocolMetadata(operation());
+  } catch (error) {
+    console.error(`[skill-catalog] ${type} failed: ${error.message || String(error)}`);
+    return withProtocolMetadata({
+      ok: false,
+      type,
+      errorCode: "skill-catalog-unavailable",
+      error: "The local Skill catalog operation failed. Check the shell server console."
+    });
+  }
 }
 
 function withProtocolMetadata(response) {
@@ -459,6 +510,26 @@ async function handleMessageText(text, context = {}) {
 
   if (message.type === "write-file") {
     return handleWriteFileMessage(message);
+  }
+
+  if (message.type === "skill-catalog-status") {
+    return handleSkillCatalogOperation("skill-catalog-status", () =>
+      skillCatalogService.status({ force: message.fresh === true }));
+  }
+
+  if (message.type === "skill-catalog-list") {
+    return handleSkillCatalogOperation("skill-catalog-list", () => skillCatalogService.list());
+  }
+
+  if (message.type === "skill-catalog-rescan") {
+    return handleSkillCatalogOperation("skill-catalog-rescan", () => skillCatalogService.rescan());
+  }
+
+  if (message.type === "skill-load") {
+    return handleSkillCatalogOperation("skill-load", () => skillCatalogService.load({
+      skillId: message.skillId,
+      catalogSha: message.catalogSha
+    }));
   }
 
   if (message.type === "run-board") {
@@ -6686,6 +6757,7 @@ module.exports = {
   MAX_SHELL_SCRIPT_BYTES,
   MAX_WEBSOCKET_MESSAGE_BYTES,
   SERVER_PROTOCOL_VERSION,
+  SKILL_PROTOCOL_VERSION,
   acquirePersistentTmuxPaneOwner,
   buildBoardHelperExample,
   buildCommandEchoFields,

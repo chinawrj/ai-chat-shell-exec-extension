@@ -7,9 +7,10 @@ const path = require("node:path");
 const root = path.join(__dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const e2eSource = fs.readFileSync(path.join(root, "tests", "chrome_extension_e2e.test.js"), "utf8");
-const assetRoot = "docs/release-assets/v0.10.4";
+const assetRoot = "docs/release-assets/v0.11.0";
 const screenshots = [
   "extension-panel-idle.png",
+  "extension-panel-skills-update.png",
   "extension-panel-force.png",
   "extension-panel-running.png",
   "extension-panel-awaiting-user.png",

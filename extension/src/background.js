@@ -10,8 +10,13 @@ const LEGACY_DEFAULT_TIMEOUT_MS = 30000;
 const SETTINGS_MIGRATION_VERSION_KEY = "settingsMigrationVersion";
 const SETTINGS_MIGRATION_VERSION = 3;
 const TAB_AGENT_PROFILE_PREFIX = "tabAgentProfile:v1:";
-const REQUIRED_SERVER_PROTOCOL_VERSION = 10;
-const REQUIRED_HELPER_PROTOCOL_VERSION = 3;
+const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
+const SKILL_SYNC_PREFIX = "skillCatalogSync:v1:";
+const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
+const SKILL_SYNC_TTL_MS = 10 * 60 * 1000;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 11;
+const REQUIRED_HELPER_PROTOCOL_VERSION = 4;
+const REQUIRED_SKILL_PROTOCOL_VERSION = 1;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
@@ -36,6 +41,18 @@ const BACKGROUND_AGENT_MESSAGE_TYPES = new Set([
   "agent-ack",
   "agent-reply"
 ]);
+const BACKGROUND_SKILL_MESSAGE_TYPES = new Set([
+  "skill-state-get",
+  "skill-sync-begin",
+  "skill-sync-list",
+  "skill-sync-ack",
+  "skill-sync-failed",
+  "skill-catalog-list",
+  "skill-catalog-rescan",
+  "skill-load"
+]);
+const skillScopeTails = new Map();
+const recentlyClosedSkillTabIds = new Set();
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -57,6 +74,10 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.tabs?.onRemoved?.addListener((tabId) => {
   chrome.storage.session.remove([`${TAB_AGENT_PROFILE_PREFIX}${tabId}`]).catch(() => {});
+  recentlyClosedSkillTabIds.add(Number(tabId));
+  const cleanupTimer = setTimeout(() => recentlyClosedSkillTabIds.delete(Number(tabId)), 60_000);
+  cleanupTimer?.unref?.();
+  releaseSkillSyncLocksForTab(tabId).catch(() => {});
 });
 
 ensureDefaultSettings();
@@ -83,6 +104,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "shell-health") {
     checkShellServerHealth()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message || String(error)
+      }));
+    return true;
+  }
+
+  if (String(message.type || "").startsWith("skill-")) {
+    handleSkillMessage(message, sender)
       .then(sendResponse)
       .catch((error) => sendResponse({
         ok: false,
@@ -251,6 +282,435 @@ async function handleAgentMessage(message) {
   }
   await requireShellServerReady();
   return runShellViaWebSocket(message);
+}
+
+async function handleSkillMessage(message, sender = {}) {
+  if (!BACKGROUND_SKILL_MESSAGE_TYPES.has(message.type)) {
+    return {
+      ok: false,
+      errorCode: "unsupported-skill-message",
+      error: `Unsupported background Skill message type: ${message.type || ""}`
+    };
+  }
+  const scope = getSkillMemoryScope(sender);
+  return withSkillScopeLock(scope, async () => {
+    if (message.type === "skill-state-get") {
+      return getSkillState(scope, sender);
+    }
+    if (message.type === "skill-sync-begin") {
+      return beginSkillSync(scope, sender, { force: message.force === true });
+    }
+    if (message.type === "skill-sync-list") {
+      return getSkillListForAi(scope, sender, message);
+    }
+    if (message.type === "skill-sync-ack") {
+      return acknowledgeSkillSync(scope, sender, message);
+    }
+    if (message.type === "skill-sync-failed") {
+      return failSkillSync(scope, sender, message);
+    }
+    await requireShellServerReady();
+    if (message.type === "skill-catalog-list") {
+      return runShellViaWebSocket({ type: "skill-catalog-list", timeoutMs: 5000 });
+    }
+    if (message.type === "skill-catalog-rescan") {
+      return runShellViaWebSocket({ type: "skill-catalog-rescan", timeoutMs: 5000 });
+    }
+    return runShellViaWebSocket({
+      type: "skill-load",
+      skillId: message.skillId,
+      catalogSha: message.catalogSha,
+      timeoutMs: 5000
+    });
+  });
+}
+
+async function getSkillState(scope, sender = {}) {
+  await requireShellServerReady();
+  const status = await runShellViaWebSocket({ type: "skill-catalog-status", timeoutMs: 5000 });
+  const [ackStore, syncStore] = await Promise.all([
+    localGet([skillAckKey(scope)]),
+    chrome.storage.session.get([skillSyncKey(scope)])
+  ]);
+  const ack = normalizeSkillAck(ackStore[skillAckKey(scope)]);
+  let sync = normalizeSkillSync(syncStore[skillSyncKey(scope)]);
+  if (sync && sync.expiresAt <= Date.now()) {
+    await chrome.storage.session.remove([skillSyncKey(scope)]);
+    sync = null;
+  }
+  const updateAvailable = status?.ok === true && (
+    Boolean(ack.lastSyncError) ||
+    (ack.catalogSha
+      ? ack.catalogSha !== status.catalogSha
+      : Number(status.skillCount || 0) > 0)
+  );
+  return {
+    ...status,
+    type: "skill-state",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    acknowledgedCatalogSha: ack.catalogSha,
+    acknowledgedVersion: ack.version,
+    acknowledgedAt: ack.acknowledgedAt,
+    lastSyncError: ack.lastSyncError,
+    updateAvailable,
+    syncing: Boolean(sync),
+    syncOwnerTabId: sync?.ownerTabId ?? null,
+    syncOwnedByCurrentTab: Boolean(sync && Number(sender?.tab?.id) === sync.ownerTabId),
+    syncCatalogSha: sync?.catalogSha || "",
+    syncStartedAt: sync?.startedAt || 0,
+    syncExpiresAt: sync?.expiresAt || 0
+  };
+}
+
+async function beginSkillSync(scope, sender, { force = false } = {}) {
+  const tabId = requireSkillTabId(sender);
+  await requireShellServerReady();
+  const status = await runShellViaWebSocket({ type: "skill-catalog-status", fresh: true, timeoutMs: 5000 });
+  if (status?.ok !== true) {
+    return {
+      ...status,
+      ok: false,
+      errorCode: "skill-catalog-invalid",
+      error: status?.error || firstSkillCatalogError(status) || "The local Skill catalog is invalid."
+    };
+  }
+  const state = await getSkillStateFromStatus(scope, status);
+  if (!force && state.updateAvailable !== true) {
+    return {
+      ...state,
+      ok: false,
+      errorCode: "skills-already-current",
+      error: "The current Skill catalog is already acknowledged for this memory scope."
+    };
+  }
+  const key = skillSyncKey(scope);
+  const stored = await chrome.storage.session.get([key]);
+  const existing = normalizeSkillSync(stored[key]);
+  if (existing && existing.expiresAt > Date.now()) {
+    if (!(force && existing.ownerTabId === tabId)) {
+      return {
+        ok: false,
+        errorCode: existing.ownerTabId === tabId ? "skill-sync-already-active" : "skill-sync-owned-by-another-tab",
+        error: existing.ownerTabId === tabId
+          ? "Skill sync is already active in this tab."
+          : "Skill sync is already active in another tab for this AI memory scope.",
+        memoryScope: scope,
+        memoryEntry: SKILL_MEMORY_ENTRY,
+        syncing: true,
+        syncOwnerTabId: existing.ownerTabId,
+        syncCatalogSha: existing.catalogSha,
+        syncStartedAt: existing.startedAt,
+        syncExpiresAt: existing.expiresAt
+      };
+    }
+  }
+  if (recentlyClosedSkillTabIds.has(tabId)) {
+    return skillSyncRejection("skill-sync-tab-closed", "The tab closed before Skill synchronization could start.");
+  }
+  const now = Date.now();
+  const sync = {
+    version: 1,
+    challenge: createSkillChallenge(),
+    catalogSha: String(status.catalogSha || ""),
+    catalogVersion: Number(status.version || 0),
+    ownerTabId: tabId,
+    startedAt: now,
+    expiresAt: now + SKILL_SYNC_TTL_MS,
+    force
+  };
+  await chrome.storage.session.set({ [key]: sync });
+  if (recentlyClosedSkillTabIds.has(tabId)) {
+    await chrome.storage.session.remove([key]);
+    return skillSyncRejection("skill-sync-tab-closed", "The tab closed before Skill synchronization could start.");
+  }
+  return {
+    ok: true,
+    type: "skill-sync-begin",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    challenge: sync.challenge,
+    catalogSha: sync.catalogSha,
+    version: sync.catalogVersion,
+    skillCount: Number(status.skillCount || 0),
+    forced: force,
+    syncing: true,
+    syncOwnerTabId: tabId,
+    syncStartedAt: sync.startedAt,
+    syncExpiresAt: sync.expiresAt
+  };
+}
+
+async function getSkillListForAi(scope, sender, message) {
+  const tabId = requireSkillTabId(sender);
+  const challenge = normalizeSkillChallenge(message.challenge);
+  let sync = null;
+  const key = skillSyncKey(scope);
+  if (challenge) {
+    const stored = await chrome.storage.session.get([key]);
+    sync = normalizeSkillSync(stored[key]);
+    const validation = validateSkillSyncOwner(sync, { tabId, challenge });
+    if (validation) {
+      return validation;
+    }
+  }
+  await requireShellServerReady();
+  const list = await runShellViaWebSocket({ type: "skill-catalog-list", timeoutMs: 5000 });
+  if (list?.ok !== true) {
+    return {
+      ...list,
+      ok: false,
+      errorCode: "skill-catalog-invalid",
+      error: list?.error || firstSkillCatalogError(list) || "The local Skill catalog is invalid."
+    };
+  }
+  if (sync) {
+    sync.catalogSha = String(list.catalogSha || "");
+    sync.catalogVersion = Number(list.version || 0);
+    sync.expiresAt = Date.now() + SKILL_SYNC_TTL_MS;
+    await chrome.storage.session.set({ [key]: sync });
+  }
+  return {
+    ...list,
+    type: "skill-sync-list",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    challenge,
+    syncRequired: Boolean(sync)
+  };
+}
+
+async function acknowledgeSkillSync(scope, sender, message) {
+  const tabId = requireSkillTabId(sender);
+  const challenge = normalizeSkillChallenge(message.challenge);
+  const catalogSha = String(message.catalogSha || "").trim().toLowerCase();
+  const memoryEntry = String(message.memoryEntry || "").trim();
+  const key = skillSyncKey(scope);
+  const stored = await chrome.storage.session.get([key]);
+  const sync = normalizeSkillSync(stored[key]);
+  const validation = validateSkillSyncOwner(sync, { tabId, challenge });
+  if (validation) {
+    return validation;
+  }
+  if (memoryEntry !== SKILL_MEMORY_ENTRY) {
+    return skillSyncRejection("memory-entry-mismatch", `Skill sync ACK must name the fixed memory entry ${SKILL_MEMORY_ENTRY}.`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(catalogSha) || catalogSha !== sync.catalogSha) {
+    return skillSyncRejection("catalog-sha-mismatch", "Skill sync ACK does not match the catalog delivered for this challenge.");
+  }
+  await requireShellServerReady();
+  const latest = await runShellViaWebSocket({ type: "skill-catalog-status", fresh: true, timeoutMs: 5000 });
+  if (latest?.ok !== true) {
+    return skillSyncRejection("skill-catalog-invalid", firstSkillCatalogError(latest) || "The local Skill catalog is invalid.", latest);
+  }
+  if (catalogSha !== latest.catalogSha) {
+    return skillSyncRejection("stale-skill-sync-ack", "The local Skill catalog changed after it was listed. Request and acknowledge the latest catalog.", {
+      catalogSha: latest.catalogSha,
+      version: latest.version
+    });
+  }
+  const ack = {
+    version: 1,
+    catalogSha,
+    catalogVersion: Number(latest.version || sync.catalogVersion || 0),
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    acknowledgedAt: Date.now(),
+    lastSyncError: ""
+  };
+  await localSet({ [skillAckKey(scope)]: ack });
+  await chrome.storage.session.remove([key]);
+  return {
+    ok: true,
+    type: "skill-sync-ack",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    catalogSha,
+    version: ack.catalogVersion,
+    updateAvailable: false,
+    syncing: false
+  };
+}
+
+async function failSkillSync(scope, sender, message) {
+  const tabId = requireSkillTabId(sender);
+  const challenge = normalizeSkillChallenge(message.challenge);
+  const key = skillSyncKey(scope);
+  const stored = await chrome.storage.session.get([key]);
+  const sync = normalizeSkillSync(stored[key]);
+  const validation = validateSkillSyncOwner(sync, { tabId, challenge });
+  if (validation) {
+    return validation;
+  }
+  const catalogSha = String(message.catalogSha || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(catalogSha) || catalogSha !== sync.catalogSha) {
+    return skillSyncRejection("catalog-sha-mismatch", "Skill sync failure report does not match the catalog delivered for this challenge.");
+  }
+  const ackKey = skillAckKey(scope);
+  const ackStore = await localGet([ackKey]);
+  const ack = normalizeSkillAck(ackStore[ackKey]);
+  ack.lastSyncError = String(message.reason || "AI reported that the fixed Skill memory entry could not be updated.").slice(0, 500);
+  await localSet({ [ackKey]: ack });
+  await chrome.storage.session.remove([key]);
+  return {
+    ok: true,
+    type: "skill-sync-failed",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    catalogSha,
+    version: sync.catalogVersion,
+    lastSyncError: ack.lastSyncError,
+    updateAvailable: true,
+    syncing: false
+  };
+}
+
+async function getSkillStateFromStatus(scope, status) {
+  const [ackStore, syncStore] = await Promise.all([
+    localGet([skillAckKey(scope)]),
+    chrome.storage.session.get([skillSyncKey(scope)])
+  ]);
+  const ack = normalizeSkillAck(ackStore[skillAckKey(scope)]);
+  let sync = normalizeSkillSync(syncStore[skillSyncKey(scope)]);
+  if (sync && sync.expiresAt <= Date.now()) {
+    await chrome.storage.session.remove([skillSyncKey(scope)]);
+    sync = null;
+  }
+  return {
+    ...status,
+    type: "skill-state",
+    memoryScope: scope,
+    memoryEntry: SKILL_MEMORY_ENTRY,
+    acknowledgedCatalogSha: ack.catalogSha,
+    acknowledgedVersion: ack.version,
+    acknowledgedAt: ack.acknowledgedAt,
+    lastSyncError: ack.lastSyncError,
+    updateAvailable: Boolean(ack.lastSyncError) ||
+      (ack.catalogSha ? ack.catalogSha !== status.catalogSha : Number(status.skillCount || 0) > 0),
+    syncing: Boolean(sync),
+    syncOwnerTabId: sync?.ownerTabId ?? null,
+    syncCatalogSha: sync?.catalogSha || ""
+  };
+}
+
+function getSkillMemoryScope(sender = {}) {
+  const value = sender.origin || sender.url || sender.tab?.url || "";
+  try {
+    const origin = new URL(value).origin;
+    if (!origin || origin === "null") {
+      throw new Error("invalid origin");
+    }
+    return origin;
+  } catch (_error) {
+    throw new Error("Skill messages require a valid AI page origin.");
+  }
+}
+
+function requireSkillTabId(sender = {}) {
+  const tabId = Number(sender?.tab?.id);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    throw new Error("Skill sync requires a browser tab context.");
+  }
+  return tabId;
+}
+
+function normalizeSkillAck(value = {}) {
+  return {
+    catalogSha: /^[a-f0-9]{64}$/.test(String(value?.catalogSha || "")) ? String(value.catalogSha) : "",
+    version: Math.max(0, Number(value?.catalogVersion || value?.version || 0)),
+    acknowledgedAt: Math.max(0, Number(value?.acknowledgedAt || 0)),
+    lastSyncError: String(value?.lastSyncError || "")
+  };
+}
+
+function normalizeSkillSync(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const challenge = normalizeSkillChallenge(value.challenge);
+  const ownerTabId = Number(value.ownerTabId);
+  const expiresAt = Number(value.expiresAt || 0);
+  if (!challenge || !Number.isInteger(ownerTabId) || ownerTabId < 0 || !Number.isFinite(expiresAt)) {
+    return null;
+  }
+  return {
+    version: 1,
+    challenge,
+    catalogSha: String(value.catalogSha || "").toLowerCase(),
+    catalogVersion: Math.max(0, Number(value.catalogVersion || 0)),
+    ownerTabId,
+    startedAt: Math.max(0, Number(value.startedAt || 0)),
+    expiresAt,
+    force: value.force === true
+  };
+}
+
+function normalizeSkillChallenge(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{32}$/.test(text) ? text : "";
+}
+
+function validateSkillSyncOwner(sync, { tabId, challenge }) {
+  if (!sync || sync.expiresAt <= Date.now()) {
+    return skillSyncRejection("skill-sync-not-active", "No active Skill sync challenge is available. Start or force a new sync.");
+  }
+  if (!challenge || challenge !== sync.challenge) {
+    return skillSyncRejection("skill-sync-challenge-mismatch", "The Skill sync challenge is missing, stale, or incorrect.");
+  }
+  if (sync.ownerTabId !== tabId) {
+    return skillSyncRejection("skill-sync-owner-mismatch", "This Skill sync belongs to another tab.");
+  }
+  return null;
+}
+
+function skillSyncRejection(errorCode, error, extra = {}) {
+  return { ok: false, type: "skill-sync-rejected", errorCode, error, ...extra };
+}
+
+function firstSkillCatalogError(response) {
+  return Array.isArray(response?.errors) && response.errors.length > 0
+    ? String(response.errors[0]?.message || response.errors[0] || "")
+    : "";
+}
+
+function createSkillChallenge() {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function skillAckKey(scope) {
+  return `${SKILL_ACK_PREFIX}${scope}`;
+}
+
+function skillSyncKey(scope) {
+  return `${SKILL_SYNC_PREFIX}${scope}`;
+}
+
+function withSkillScopeLock(scope, task) {
+  const previous = skillScopeTails.get(scope) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  skillScopeTails.set(scope, current);
+  return current.finally(() => {
+    if (skillScopeTails.get(scope) === current) {
+      skillScopeTails.delete(scope);
+    }
+  });
+}
+
+async function releaseSkillSyncLocksForTab(tabId) {
+  const store = await chrome.storage.session.get(null);
+  const keys = Object.entries(store || {})
+    .filter(([key, value]) => key.startsWith(SKILL_SYNC_PREFIX) && Number(value?.ownerTabId) === Number(tabId))
+    .map(([key]) => key);
+  await Promise.all(keys.map((key) => {
+    const scope = key.slice(SKILL_SYNC_PREFIX.length);
+    return withSkillScopeLock(scope, async () => {
+      const latest = await chrome.storage.session.get([key]);
+      if (Number(latest?.[key]?.ownerTabId) === Number(tabId)) {
+        await chrome.storage.session.remove([key]);
+      }
+    });
+  }));
 }
 
 async function handleWriteFileMessage(message) {
@@ -563,22 +1023,24 @@ async function checkShellServerHealth() {
     const extensionVersion = getExtensionVersionInfo().version;
     const serverProtocolVersion = Number(body?.serverProtocolVersion ?? body?.protocolVersion);
     const helperProtocolVersion = Number(body?.helperProtocolVersion);
+    const skillProtocolVersion = Number(body?.skillProtocolVersion);
     const serverReleaseVersion = String(body?.serverReleaseVersion || body?.releaseVersion || "");
     const originMatches = body?.allowUntrustedOrigins === true || body?.allowedOrigin === extensionOrigin;
     const protocolMatches = serverProtocolVersion === REQUIRED_SERVER_PROTOCOL_VERSION;
     const helperProtocolMatches = helperProtocolVersion === REQUIRED_HELPER_PROTOCOL_VERSION;
+    const skillProtocolMatches = skillProtocolVersion === REQUIRED_SKILL_PROTOCOL_VERSION;
     const releaseMatches = Boolean(serverReleaseVersion) && serverReleaseVersion === extensionVersion;
     const error = !response.ok
       ? `Shell server health returned HTTP ${response.status}.`
       : !originMatches
       ? `Shell server origin policy does not match ${extensionOrigin}.`
-      : !protocolMatches || !helperProtocolMatches
-        ? buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, extensionVersion })
+      : !protocolMatches || !helperProtocolMatches || !skillProtocolMatches
+        ? buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, skillProtocolVersion, extensionVersion })
         : body?.error || "";
 
     return {
       ...body,
-      ok: response.ok && body?.ok === true && originMatches && protocolMatches && helperProtocolMatches,
+      ok: response.ok && body?.ok === true && originMatches && protocolMatches && helperProtocolMatches && skillProtocolMatches,
       status: response.status,
       url: SHELL_SERVER_HEALTH_URL,
       extensionId: chrome.runtime.id,
@@ -588,12 +1050,15 @@ async function checkShellServerHealth() {
       releaseMatches,
       requiredServerProtocolVersion: REQUIRED_SERVER_PROTOCOL_VERSION,
       requiredHelperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION,
+      requiredSkillProtocolVersion: REQUIRED_SKILL_PROTOCOL_VERSION,
       serverProtocolVersion,
       helperProtocolVersion,
+      skillProtocolVersion,
       originMatches,
       protocolMatches,
       helperProtocolMatches,
-      staleServer: !protocolMatches || !helperProtocolMatches,
+      skillProtocolMatches,
+      staleServer: !protocolMatches || !helperProtocolMatches || !skillProtocolMatches,
       error
     };
   } finally {
@@ -601,13 +1066,14 @@ async function checkShellServerHealth() {
   }
 }
 
-function buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, extensionVersion }) {
+function buildProtocolMismatchMessage({ serverProtocolVersion, helperProtocolVersion, skillProtocolVersion, extensionVersion }) {
   const serverProtocolText = Number.isFinite(serverProtocolVersion) ? serverProtocolVersion : "(missing)";
   const helperProtocolText = Number.isFinite(helperProtocolVersion) ? helperProtocolVersion : "(missing)";
+  const skillProtocolText = Number.isFinite(skillProtocolVersion) ? skillProtocolVersion : "(missing)";
   return [
     `Shell server protocol mismatch for extension v${extensionVersion || "(unknown)"}.`,
-    `Expected server protocol ${REQUIRED_SERVER_PROTOCOL_VERSION} and helper protocol ${REQUIRED_HELPER_PROTOCOL_VERSION};`,
-    `found server protocol ${serverProtocolText} and helper protocol ${helperProtocolText}.`,
+    `Expected server protocol ${REQUIRED_SERVER_PROTOCOL_VERSION}, helper protocol ${REQUIRED_HELPER_PROTOCOL_VERSION}, and Skill protocol ${REQUIRED_SKILL_PROTOCOL_VERSION};`,
+    `found server protocol ${serverProtocolText}, helper protocol ${helperProtocolText}, and Skill protocol ${skillProtocolText}.`,
     "Restart the foreground server from this checkout with ./scripts/start_shell_server.sh."
   ].join(" ");
 }
@@ -635,7 +1101,9 @@ function getExtensionVersionInfo() {
     extensionId: chrome.runtime.id,
     requiredServerProtocolVersion: REQUIRED_SERVER_PROTOCOL_VERSION,
     requiredHelperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION,
-    helperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION
+    requiredSkillProtocolVersion: REQUIRED_SKILL_PROTOCOL_VERSION,
+    helperProtocolVersion: REQUIRED_HELPER_PROTOCOL_VERSION,
+    skillProtocolVersion: REQUIRED_SKILL_PROTOCOL_VERSION
   };
 }
 
