@@ -94,7 +94,6 @@ async function main() {
   const skillAllowedValue = `skill-allowed-${Date.now()}`;
   const skillSecretValue = `skill-secret-${Date.now()}`;
   fs.mkdirSync(skillDirectory, { recursive: true });
-  fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 1 }));
   cleanup.push(() => fs.rmSync(helperFileTestHome, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(helperFileOverrideDir, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(shellStateDir, { recursive: true, force: true }));
@@ -264,6 +263,7 @@ async function main() {
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
 
   if (managedShellServer) {
+    await runEmptySkillCatalogE2E(page, { skillPath });
     await runSkillE2E(page, debugPort, {
       skillPath,
       expectedHome: helperFileTestHome,
@@ -1429,6 +1429,80 @@ async function main() {
   if (SCREENSHOT_DIR) {
     await saveScreenshot(page, path.join(SCREENSHOT_DIR, "file-helper-result.png"));
   }
+}
+
+async function runEmptySkillCatalogE2E(page, { skillPath }) {
+  const startMarker = "ai-helper-skill-start";
+  const endMarker = "ai-helper-skill-end";
+  const memoryEntry = "AI_CHAT_SHELL_SKILLS_CATALOG";
+
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
+    return chip && !chip.hidden && !chip.disabled && chip.textContent.includes("↑") &&
+      /not been acknowledged/i.test(chip.title || "") &&
+      /Skills: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Acknowledged: \\(never\\)/.test(detail?.innerText || detail?.textContent || "") &&
+      /Sync: update required/.test(detail?.innerText || detail?.textContent || "");
+  })()`, "never-acknowledged empty Skill catalog to require synchronization");
+
+  const beforePrompt = await pageUserMessageCount(page);
+  await page.evaluate(`document.getElementById("ai-chat-shell-exec-skill-status")?.click(); true`);
+  const prompt = await waitForNewUserMessage(
+    page,
+    beforePrompt,
+    "The local SKILLS catalog has changed.",
+    "empty Skill catalog synchronization prompt"
+  );
+  assertNoCompleteSkillMarkerLines(prompt, "Empty Skill catalog update prompt");
+  const challenge = requireMessageField(prompt, "challenge", /^[a-f0-9]{32}$/);
+  const emptyCatalogSha = requireMessageField(prompt, "Local catalog SHA", /^[a-f0-9]{64}$/);
+
+  const beforeList = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:empty-list-e2e`,
+    "cmd: list",
+    `challenge: ${challenge}`,
+    endMarker
+  ]);
+  const catalogReply = await waitForNewUserMessage(
+    page,
+    beforeList,
+    "Local SKILLS catalog synchronization response:",
+    "empty Skill catalog response"
+  );
+  assert.match(catalogReply, /"skills": \[\]/);
+  assert.match(catalogReply, /Remove entries for Skills that are not in this complete list/);
+  assert.equal(requireMessageField(catalogReply, "catalog-sha", /^[a-f0-9]{64}$/), emptyCatalogSha);
+
+  const beforeAck = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:empty-ack-e2e`,
+    "cmd: list-updated",
+    `challenge: ${challenge}`,
+    `catalog-sha: ${emptyCatalogSha}`,
+    `memory-entry: ${memoryEntry}`,
+    endMarker
+  ]);
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
+    return chip && chip.disabled && !chip.textContent.includes("↑") &&
+      /acknowledged/i.test(chip.title || "") &&
+      /Skills: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Acknowledged: ${emptyCatalogSha}/.test(detail?.innerText || detail?.textContent || "") &&
+      /Sync: current/.test(detail?.innerText || detail?.textContent || "");
+  })()`, "acknowledged empty Skill catalog to become current");
+  await assertUserMessageCountStable(page, beforeAck, "A successful empty-catalog ACK must remain silent");
+
+  fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 1 }));
+  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return /Rescanned 1 Skills/i.test(panel?.innerText || "") &&
+      chip && !chip.disabled && chip.textContent.includes("↑") && /changed/i.test(chip.title || "");
+  })()`, "adding the first Skill after an empty ACK to require synchronization");
 }
 
 async function runSkillE2E(page, debugPort, {

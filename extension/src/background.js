@@ -338,12 +338,7 @@ async function getSkillState(scope, sender = {}) {
     await chrome.storage.session.remove([skillSyncKey(scope)]);
     sync = null;
   }
-  const updateAvailable = status?.ok === true && (
-    Boolean(ack.lastSyncError) ||
-    (ack.catalogSha
-      ? ack.catalogSha !== status.catalogSha
-      : Number(status.skillCount || 0) > 0)
-  );
+  const updateAvailable = skillCatalogNeedsSync(ack, status);
   return {
     ...status,
     type: "skill-state",
@@ -584,12 +579,20 @@ async function getSkillStateFromStatus(scope, status) {
     acknowledgedVersion: ack.version,
     acknowledgedAt: ack.acknowledgedAt,
     lastSyncError: ack.lastSyncError,
-    updateAvailable: Boolean(ack.lastSyncError) ||
-      (ack.catalogSha ? ack.catalogSha !== status.catalogSha : Number(status.skillCount || 0) > 0),
+    updateAvailable: skillCatalogNeedsSync(ack, status),
     syncing: Boolean(sync),
     syncOwnerTabId: sync?.ownerTabId ?? null,
     syncCatalogSha: sync?.catalogSha || ""
   };
+}
+
+function skillCatalogNeedsSync(ack, status) {
+  if (status?.ok !== true) {
+    return false;
+  }
+  return Boolean(ack?.lastSyncError) ||
+    !/^[a-f0-9]{64}$/.test(String(ack?.catalogSha || "")) ||
+    ack.catalogSha !== status.catalogSha;
 }
 
 function getSkillMemoryScope(sender = {}) {

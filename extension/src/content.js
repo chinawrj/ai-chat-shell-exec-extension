@@ -37,7 +37,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.0";
+const CONTENT_SCRIPT_VERSION = "0.11.1";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -6654,6 +6654,7 @@ function updateSkillPanelState() {
   const version = Number(state.version || 0);
   const updateAvailable = state.updateAvailable === true;
   const syncing = state.syncing === true;
+  const acknowledgedSha = String(state.acknowledgedCatalogSha || "");
   if (action) {
     action.hidden = false;
     action.textContent = `Skills v${version}${syncing ? " …" : updateAvailable ? " ↑" : ""}`;
@@ -6668,12 +6669,13 @@ function updateSkillPanelState() {
         ? "Skill synchronization is waiting for this AI tab"
         : "Skill synchronization is being handled by another tab for this AI memory scope"
       : updateAvailable
-        ? `Local Skills v${version} changed; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
+        ? acknowledgedSha
+          ? `Local Skills v${version} changed; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
+          : `Local Skills v${version} have not been acknowledged; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
         : `Local Skills v${version} are acknowledged for this AI memory scope`;
   }
   if (detail) {
     const catalogSha = String(state.catalogSha || "");
-    const acknowledgedSha = String(state.acknowledgedCatalogSha || "");
     detail.textContent = [
       `Local version: v${version}`,
       `Skills: ${Number(state.skillCount || 0)}`,

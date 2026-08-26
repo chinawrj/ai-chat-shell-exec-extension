@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-27
+
+- Fixes a never-acknowledged healthy catalog with zero Skills being incorrectly shown as current. Empty catalogs now request synchronization so the AI can clear a possibly stale `AI_CHAT_SHELL_SKILLS_CATALOG` memory entry.
+- Keeps an empty catalog current after its real aggregate SHA is acknowledged, while failures remain pending, Force sync stays available, origins stay isolated, and removing the final Skill triggers a fresh update.
+- Adds focused background and dynamic panel regressions plus a real-Chrome empty-root synchronization flow covering the green pending state, complete empty list, silent acknowledgement, and transition when the first Skill appears.
+
 ## [0.11.0] - 2026-08-26
 
 - Adds a local Claude-compatible `SKILL.md` catalog backed by bounded server-side discovery, raw per-file SHA-256 hashing, one aggregate catalog SHA, and a persisted monotonic local version.

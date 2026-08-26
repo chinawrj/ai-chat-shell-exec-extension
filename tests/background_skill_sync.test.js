@@ -19,6 +19,9 @@ async function main() {
   const chatgptTab2 = sender(12, "https://chatgpt.com/c/two");
   const m365Tab = sender(21, "https://m365.cloud.microsoft/chat");
 
+  await testEmptyCatalogSynchronization(context);
+  catalog = makeCatalog("a", 1);
+
   const initial = await context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab1);
   assert.equal(initial.ok, true);
   assert.equal(initial.memoryScope, "https://chatgpt.com");
@@ -226,6 +229,134 @@ async function main() {
   assert.equal(localStore["shellCallLedger:v1"], undefined, "Skill traffic must not enter the browser shell ledger.");
 }
 
+async function testEmptyCatalogSynchronization(context) {
+  const firstOriginTab = sender(31, "https://empty-a.example/chat");
+  const sameOriginTab = sender(32, "https://empty-a.example/other");
+  const secondOriginTab = sender(41, "https://empty-b.example/chat");
+
+  catalog = makeEmptyCatalog("0", 1);
+  const firstInitial = await context.handleSkillMessage({ type: "skill-state-get" }, firstOriginTab);
+  const secondInitial = await context.handleSkillMessage({ type: "skill-state-get" }, secondOriginTab);
+  assert.equal(firstInitial.skillCount, 0);
+  assert.equal(firstInitial.acknowledgedCatalogSha, "");
+  assert.equal(firstInitial.updateAvailable, true, "A healthy empty catalog must require its first ACK.");
+  assert.equal(secondInitial.updateAvailable, true, "Empty-catalog ACK state must remain origin-scoped.");
+
+  const firstBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, firstOriginTab);
+  assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
+  assert.equal(firstBegin.skillCount, 0);
+  const firstList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: firstBegin.challenge
+  }, firstOriginTab);
+  assert.equal(firstList.ok, true);
+  assert.deepEqual(Array.from(firstList.skills), []);
+
+  const crossOriginAck = await context.handleSkillMessage(
+    ackMessage(firstList, firstBegin.challenge),
+    secondOriginTab
+  );
+  assert.equal(crossOriginAck.errorCode, "skill-sync-not-active");
+  const firstStillOwned = await context.handleSkillMessage({ type: "skill-state-get" }, sameOriginTab);
+  assert.equal(firstStillOwned.syncing, true, "A cross-origin ACK attempt must not consume the real owner's challenge.");
+
+  const firstFailure = await context.handleSkillMessage({
+    type: "skill-sync-failed",
+    challenge: firstBegin.challenge,
+    catalogSha: firstList.catalogSha,
+    reason: "empty catalog memory update failed"
+  }, firstOriginTab);
+  assert.equal(firstFailure.ok, true);
+  const afterFailure = await context.handleSkillMessage({ type: "skill-state-get" }, firstOriginTab);
+  assert.equal(afterFailure.acknowledgedCatalogSha, "");
+  assert.equal(afterFailure.updateAvailable, true);
+  assert.equal(afterFailure.lastSyncError, "empty catalog memory update failed");
+
+  const retryBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, firstOriginTab);
+  assert.equal(retryBegin.ok, true, "A first empty-catalog failure must be retryable without Force.");
+  assert.notEqual(retryBegin.challenge, firstBegin.challenge);
+  const retryList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: retryBegin.challenge
+  }, firstOriginTab);
+  const firstAck = await context.handleSkillMessage(ackMessage(retryList, retryBegin.challenge), firstOriginTab);
+  assert.equal(firstAck.ok, true);
+  const firstCurrent = await context.handleSkillMessage({ type: "skill-state-get" }, sameOriginTab);
+  assert.equal(firstCurrent.updateAvailable, false, "An acknowledged empty catalog must become current.");
+  assert.equal(firstCurrent.acknowledgedCatalogSha, catalog.catalogSha);
+  assert.equal(firstCurrent.lastSyncError, "");
+  const alreadyCurrent = await context.handleSkillMessage({ type: "skill-sync-begin" }, firstOriginTab);
+  assert.equal(alreadyCurrent.errorCode, "skills-already-current", "An empty catalog must not remain permanently pending.");
+
+  const forced = await context.handleSkillMessage({ type: "skill-sync-begin", force: true }, firstOriginTab);
+  assert.equal(forced.ok, true, "Force sync must remain available for a current empty catalog.");
+  const forcedList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: forced.challenge
+  }, firstOriginTab);
+  const forcedAck = await context.handleSkillMessage(ackMessage(forcedList, forced.challenge), firstOriginTab);
+  assert.equal(forcedAck.ok, true);
+
+  const secondStillPending = await context.handleSkillMessage({ type: "skill-state-get" }, secondOriginTab);
+  assert.equal(secondStillPending.updateAvailable, true, "ACKing one origin must not clear another origin.");
+  const secondBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, secondOriginTab);
+  const secondList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: secondBegin.challenge
+  }, secondOriginTab);
+  const secondAck = await context.handleSkillMessage(ackMessage(secondList, secondBegin.challenge), secondOriginTab);
+  assert.equal(secondAck.ok, true);
+
+  catalog = makeCatalog("d", 2);
+  const nonEmptyChange = await context.handleSkillMessage({ type: "skill-state-get" }, firstOriginTab);
+  assert.equal(nonEmptyChange.updateAvailable, true);
+  const nonEmptyBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, firstOriginTab);
+  const nonEmptyList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: nonEmptyBegin.challenge
+  }, firstOriginTab);
+  const nonEmptyAck = await context.handleSkillMessage(ackMessage(nonEmptyList, nonEmptyBegin.challenge), firstOriginTab);
+  assert.equal(nonEmptyAck.ok, true);
+
+  catalog = makeEmptyCatalog("1", 3);
+  const removedLastSkill = await context.handleSkillMessage({ type: "skill-state-get" }, firstOriginTab);
+  assert.equal(removedLastSkill.skillCount, 0);
+  assert.equal(removedLastSkill.updateAvailable, true, "Removing the last Skill must require clearing the AI memory catalog.");
+  const emptyAgainBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, firstOriginTab);
+  const emptyAgainList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: emptyAgainBegin.challenge
+  }, firstOriginTab);
+  assert.deepEqual(Array.from(emptyAgainList.skills), []);
+  const emptyAgainAck = await context.handleSkillMessage(ackMessage(emptyAgainList, emptyAgainBegin.challenge), firstOriginTab);
+  assert.equal(emptyAgainAck.ok, true);
+  const emptyAgainCurrent = await context.handleSkillMessage({ type: "skill-state-get" }, firstOriginTab);
+  assert.equal(emptyAgainCurrent.updateAvailable, false);
+
+  const malformedAckTab = sender(51, "https://malformed-ack.example/chat");
+  localStore["skillCatalogAck:v1:https://malformed-ack.example"] = {
+    version: 1,
+    catalogSha: "too-short",
+    catalogVersion: 3,
+    acknowledgedAt: Date.now(),
+    lastSyncError: ""
+  };
+  const malformedAckState = await context.handleSkillMessage({ type: "skill-state-get" }, malformedAckTab);
+  assert.equal(malformedAckState.acknowledgedCatalogSha, "");
+  assert.equal(malformedAckState.updateAvailable, true, "A malformed persisted ACK must be treated as never acknowledged.");
+
+  catalog = {
+    ...makeEmptyCatalog("2", 4),
+    ok: false,
+    errors: [{ code: "test-invalid", message: "invalid empty catalog" }]
+  };
+  const invalidState = await context.handleSkillMessage({ type: "skill-state-get" }, malformedAckTab);
+  assert.equal(invalidState.ok, false);
+  assert.equal(invalidState.updateAvailable, false, "An invalid catalog must fail closed instead of requesting synchronization.");
+  const invalidBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, malformedAckTab);
+  assert.equal(invalidBegin.errorCode, "skill-catalog-invalid");
+}
+
 function createBackgroundContext({ healthGate } = {}) {
   const context = {
     AbortController,
@@ -233,7 +364,7 @@ function createBackgroundContext({ healthGate } = {}) {
     chrome: {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-        getManifest: () => ({ version: "0.11.0" }),
+        getManifest: () => ({ version: "0.11.1" }),
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener() {} }
@@ -271,8 +402,8 @@ function createBackgroundContext({ healthGate } = {}) {
         text: async () => JSON.stringify({
           ok: true,
           allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-          releaseVersion: "0.11.0",
-          serverReleaseVersion: "0.11.0",
+          releaseVersion: "0.11.1",
+          serverReleaseVersion: "0.11.1",
           protocolVersion: 11,
           serverProtocolVersion: 11,
           helperProtocolVersion: 4,
@@ -367,6 +498,19 @@ function makeCatalog(seed, version) {
     errors: [],
     warnings: [],
     skills: [{ id: "example", name: "example", description: "Example Skill", sha: skillSha }]
+  };
+}
+
+function makeEmptyCatalog(seed, version) {
+  return {
+    ok: true,
+    catalogSha: seed.repeat(64).slice(0, 64),
+    version,
+    skillCount: 0,
+    rootCount: 1,
+    errors: [],
+    warnings: [],
+    skills: []
   };
 }
 

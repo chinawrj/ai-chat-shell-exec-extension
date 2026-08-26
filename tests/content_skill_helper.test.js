@@ -19,6 +19,7 @@ testInvalidSkillHelpersFailClosed();
 testSkillEnvelopeAndIdentityRules();
 testSelfExplainingPromptsCannotTriggerTheSkillParser();
 testSkillLoadFinalSerializationBoundaries();
+testEmptyCatalogPanelStates();
 awaitTestExplicitUserAndProvenanceRejection()
   .then(() => console.log("content Skill helper tests passed"));
 
@@ -335,6 +336,60 @@ function testSelfExplainingPromptsCannotTriggerTheSkillParser() {
     false,
     "A heading alone must not spoof plugin-owned Skill output provenance."
   );
+}
+
+function testEmptyCatalogPanelStates() {
+  const elements = {
+    "ai-chat-shell-exec-skill-status": { style: {} },
+    "ai-chat-shell-exec-skill-detail": { style: {} }
+  };
+  const originalGetElementById = context.document.getElementById;
+  context.document.getElementById = (id) => elements[id] || null;
+  try {
+    vm.runInContext(`
+      skillPanelState = {
+        ok: true,
+        version: 3,
+        skillCount: 0,
+        catalogSha: ${JSON.stringify(catalogSha)},
+        acknowledgedCatalogSha: "",
+        updateAvailable: true,
+        syncing: false,
+        warnings: []
+      };
+      updateSkillPanelState();
+    `, context);
+    const action = elements["ai-chat-shell-exec-skill-status"];
+    const detail = elements["ai-chat-shell-exec-skill-detail"];
+    assert.equal(action.textContent, "Skills v3 ↑");
+    assert.equal(action.disabled, false);
+    assert.match(action.title, /have not been acknowledged/i);
+    assert.match(detail.textContent, /Skills: 0/);
+    assert.match(detail.textContent, /Acknowledged: \(never\)/);
+    assert.match(detail.textContent, /Sync: update required/);
+
+    vm.runInContext(`
+      skillPanelState = {
+        ok: true,
+        version: 3,
+        skillCount: 0,
+        catalogSha: ${JSON.stringify(catalogSha)},
+        acknowledgedCatalogSha: ${JSON.stringify(catalogSha)},
+        updateAvailable: false,
+        syncing: false,
+        warnings: []
+      };
+      updateSkillPanelState();
+    `, context);
+    assert.equal(action.textContent, "Skills v3");
+    assert.equal(action.disabled, true);
+    assert.match(action.title, /are acknowledged/i);
+    assert.match(detail.textContent, new RegExp(`Acknowledged: ${catalogSha}`));
+    assert.match(detail.textContent, /Sync: current/);
+    assert.doesNotMatch(detail.textContent, /Sync: update required/);
+  } finally {
+    context.document.getElementById = originalGetElementById;
+  }
 }
 
 function testSkillLoadFinalSerializationBoundaries() {
