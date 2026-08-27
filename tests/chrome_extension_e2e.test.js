@@ -436,6 +436,12 @@ async function main() {
       panel?.querySelector("[data-shell-agent-id]")?.value === "slave-a" &&
       badge?.textContent === "Slave" && badge?.dataset.agentRole === "slave";
   })()`, "per-tab role restoration after page session storage was cleared");
+  await waitFor(async () => {
+    const states = await page.evaluateAcrossContexts(`(() =>
+      typeof initialThreadSettled === "boolean" ? initialThreadSettled : null
+    )()`);
+    return states.some((entry) => entry.value === true);
+  }, "content script baseline scan after role refresh");
 
   const refreshedAgentTmuxToken = `agent-tmux-refresh-e2e-${Date.now()}`;
   await page.evaluate(`(() => {
@@ -1153,6 +1159,44 @@ async function main() {
       .some((node) => (node.innerText || "").includes(${JSON.stringify(opaqueCommandToken)}));
     return submitted && !(composer?.innerText || "").trim();
   })()`, "opaque command result to be submitted before Force run coverage");
+  try {
+    await waitFor(async () => {
+      const states = await page.evaluateAcrossContexts(`(() =>
+        typeof pendingHelperDeliveries === "object" ? pendingHelperDeliveries.size : null
+      )()`);
+      return states.some((entry) => entry.value === 0);
+    }, "opaque command result delivery receipt before Force run coverage");
+  } catch (error) {
+    const deliveryState = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") {
+        return null;
+      }
+      return {
+        panel: document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "",
+        composer: document.getElementById("composer")?.innerText || "",
+        pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+          callId: entry.callId,
+          helperId: entry.call?.helperId || "",
+          phase: entry.phase,
+          attempts: entry.attempts,
+          sendAttemptRounds: entry.sendAttemptRounds,
+          deliveryInFlight: entry.deliveryInFlight,
+          lastError: entry.lastError,
+          submittedMessageCountBefore: entry.submittedMessageCountBefore,
+          submittedMessageRootIdsBefore: entry.submittedMessageRootIdsBefore,
+          matchingRoots: typeof getSubmittedMessageRootsMatching === "function"
+            ? getSubmittedMessageRootsMatching(entry.reply).map((node) => ({
+                id: typeof getSubmittedMessageRootIdentity === "function"
+                  ? getSubmittedMessageRootIdentity(node)
+                  : "",
+                text: node.innerText || node.textContent || ""
+              }))
+            : []
+        }))
+      };
+    })()`);
+    throw new Error(`${error.message}; deliveryState=${JSON.stringify(deliveryState)}`);
+  }
 
   const forceOpaqueToken = `ai-chat-shell-force-opaque-${Date.now()}`;
   const forceOpaqueMarkerPath = path.join(shellStateDir, `${forceOpaqueToken}.txt`);

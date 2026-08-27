@@ -98,12 +98,11 @@ assert.doesNotMatch(guardedBoundarySource, /isOriginalSendActuatorEventOwnedByCo
 const retrySource = extractFunctionSource("retryInsertedPendingHelperDelivery");
 assert.match(retrySource, /entry\.sendActuatorGeneration/);
 assert.match(retrySource, /onStarted:/);
-assert.match(retrySource, /waiting for manual send without repeating send actions/);
-assert.match(retrySource, /send ownership guard is not ready; will retry without rewriting the composer/);
-assert.match(
+assert.match(retrySource, /settlePendingHelperAfterUnconfirmedSend/);
+assert.doesNotMatch(
   retrySource,
-  /entry\.lastError = entry\.sendActuatorGeneration === pageLifecycleGeneration/,
-  "A preflight ownership veto must not be reported as a completed v0.8.6\/v0.8.9 actuator run."
+  /waiting for manual send without repeating send actions/,
+  "The outer persistent queue must not permanently give up while it still owns the exact composer text."
 );
 
 const sleepSource = extractFunctionSource("sleep");
@@ -367,6 +366,7 @@ async function verifyPreflightVetoDoesNotConsumeOrMisreportActuatorGeneration() 
   let wrapperCalls = 0;
   let startedCalls = 0;
   let retrySchedules = 0;
+  let finalizeCalls = 0;
   const context = {
     pageLifecycleGeneration: 7,
     findReplyInput: async () => composer,
@@ -379,11 +379,22 @@ async function verifyPreflightVetoDoesNotConsumeOrMisreportActuatorGeneration() 
     },
     inspectCurrentComposerOwnership: async () => ({ state: "owned", composer }),
     getComposerText: (node) => node?.innerText || "",
+    hasPendingHelperSubmissionProof: () => false,
+    isAssistantGenerating: () => false,
+    markPendingHelperDeliverySubmittedUnconfirmed: async () => false,
     persistPendingHelperDeliveries: async () => {},
     setPendingHelperDeliveryStatus: () => {},
     schedulePendingHelperDeliveryRetry: () => { retrySchedules += 1; },
+    settlePendingHelperAfterUnconfirmedSend: async (pending) => {
+      pending.lastError = "send was not confirmed; will retry send-only without rewriting the composer";
+      retrySchedules += 1;
+      return false;
+    },
     cancelPendingHelperDeliveryAfterComposerRemoval: async () => false,
-    finalizePendingHelperDelivery: async () => true
+    finalizePendingHelperDelivery: async () => {
+      finalizeCalls += 1;
+      return true;
+    }
   };
   vm.createContext(context);
   vm.runInContext(extractFunctionSource("retryInsertedPendingHelperDelivery"), context);
@@ -397,7 +408,7 @@ async function verifyPreflightVetoDoesNotConsumeOrMisreportActuatorGeneration() 
   assert.equal(await context.retryInsertedPendingHelperDelivery(entry, { autoSend: true }), false);
   assert.equal(wrapperCalls, 1);
   assert.equal(entry.sendActuatorGeneration, undefined, "A guard veto before onStarted must not consume the lifecycle generation.");
-  assert.equal(entry.lastError, "send ownership guard is not ready; will retry without rewriting the composer");
+  assert.match(entry.lastError, /retry/i);
   assert.equal(retrySchedules, 1);
 
   context.runOriginalSendActuatorForOwnedComposer = async (_composer, _continue, _expected, callbacks) => {
@@ -409,10 +420,26 @@ async function verifyPreflightVetoDoesNotConsumeOrMisreportActuatorGeneration() 
   assert.equal(await context.retryInsertedPendingHelperDelivery(entry, { autoSend: true }), false);
   assert.equal(startedCalls, 1);
   assert.equal(entry.sendActuatorGeneration, 7);
-  assert.equal(
+  assert.match(
     entry.lastError,
-    "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions"
+    /retry/i,
+    "An unconfirmed actuator run should remain eligible for a bounded outer send-only retry."
   );
+
+  context.runOriginalSendActuatorForOwnedComposer = async (_composer, _continue, _expected, callbacks) => {
+    wrapperCalls += 1;
+    startedCalls += 1;
+    await callbacks.onStarted();
+    return true;
+  };
+  assert.equal(
+    await context.retryInsertedPendingHelperDelivery(entry, { autoSend: true }),
+    true,
+    "The same exact composer may recover on a later bounded send-only attempt in the same lifecycle."
+  );
+  assert.equal(wrapperCalls, 3);
+  assert.equal(startedCalls, 2);
+  assert.equal(finalizeCalls, 1);
 }
 
 async function verifyAnotherFormsSendButtonRetainsV089Authority() {

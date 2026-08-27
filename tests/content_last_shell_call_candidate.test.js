@@ -1558,6 +1558,95 @@ async function verifySubmittedMessageMatchingPreservesLineBoundaries() {
   );
 }
 
+async function verifyCompletionStatusSurvivesHandledRescan() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  const panelChild = new FakeElement();
+  panelChild.closest = (selector) => selector === "#ai-chat-shell-exec-status" ? panelChild : null;
+  assert.equal(
+    context.isShellToolPanelMutation({ target: panelChild }),
+    true,
+    "Mutations produced by the extension panel must be filtered before they can schedule a helper rescan."
+  );
+  const pageElement = new FakeElement();
+  pageElement.closest = () => null;
+  assert.equal(
+    context.isShellToolPanelMutation({ target: pageElement }),
+    false,
+    "Ordinary page mutations must remain observable."
+  );
+  const command = "printf terminal-panel-status";
+  const message = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: command })
+  });
+  const root = createRoot([message]);
+  context.document.body = root;
+  context.getConversationRoot = () => root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+
+  const panel = {
+    dataset: {},
+    querySelector: () => null
+  };
+  const statusText = {
+    textContent: "",
+    ariaLabel: "",
+    setAttribute(name, value) {
+      if (name === "aria-label") {
+        this.ariaLabel = value;
+      }
+    }
+  };
+  const statusDetail = { textContent: "" };
+  const indicator = { style: {} };
+  const elements = new Map([
+    ["ai-chat-shell-exec-status", panel],
+    ["ai-chat-shell-exec-status-text", statusText],
+    ["ai-chat-shell-exec-status-detail", statusDetail],
+    ["ai-chat-shell-exec-status-indicator", indicator]
+  ]);
+  context.document.getElementById = (id) => elements.get(id) || null;
+
+  const [candidate] = context.extractShellCallCandidates(root);
+  assert.ok(candidate, "The terminal-status fixture must expose one shell helper.");
+  const semanticCallKey = context.buildSemanticCallKey(candidate.call);
+  const callKey = context.buildCandidateCallKey(candidate, semanticCallKey);
+  context.markCallProcessed(candidate, callKey, semanticCallKey);
+
+  vm.runInContext(
+    `extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`,
+    context
+  );
+  context.setHelperCompletionStatus(candidate.call, {
+    ok: true,
+    executed: true,
+    executionCompleted: true,
+    executionId: "1010101010101010",
+    exitCode: 0,
+    stdout: "terminal-panel-status"
+  });
+  assert.match(statusText.textContent, /Shell helper completed/);
+
+  await context.scanForShellCall();
+
+  assert.match(
+    statusText.textContent,
+    /Shell helper completed/,
+    "A benign observer rescan of the already-handled source helper must preserve terminal completion."
+  );
+  assert.doesNotMatch(statusText.textContent, /Already handled this helper block/);
+  assert.equal(panel.dataset.state, "ok");
+}
+
 async function verifyAutoSendDoesNotHoldExecutionLock() {
   const context = loadContentContext();
   await Promise.resolve();
@@ -1694,8 +1783,15 @@ async function verifyNonPersistentResultRetriesSendOnly() {
   let backendAttempts = 0;
   let insertAttempts = 0;
   let sendAttempts = 0;
+  const submitted = [];
   const composer = { innerText: "", textContent: "", isConnected: true };
-  context.chrome.runtime.sendMessage = async () => {
+  context.document.querySelectorAll = (selector) =>
+    selector.includes('data-message-author-role="user"') ? submitted : [];
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
+    assert.equal(payload.type, "write-file");
     backendAttempts += 1;
     return {
       ok: true,
@@ -1713,6 +1809,15 @@ async function verifyNonPersistentResultRetriesSendOnly() {
   context.findReplyInput = async () => composer;
   context.clickSendWhenReady = async () => {
     sendAttempts += 1;
+    if (sendAttempts >= 2) {
+      submitted.push(new MockNode({
+        text: context.getComposerText(composer),
+        role: "user",
+        order: 2
+      }));
+      composer.innerText = "";
+      composer.textContent = "";
+    }
     return sendAttempts >= 2;
   };
 
@@ -1725,8 +1830,8 @@ async function verifyNonPersistentResultRetriesSendOnly() {
 
   assert.equal(backendAttempts, 1, "Send retry must never execute the file helper again.");
   assert.equal(insertAttempts, 1, "Send retry must never write the file result again.");
-  assert.equal(sendAttempts, 1, "The persistent queue must not restart the v0.8.9 actuator.");
-  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+  assert.equal(sendAttempts, 2, "The queue retries only sending while exact ownership remains.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
 }
 
 async function verifySameRenderedPendingResultRetriesLocallyOnly() {
@@ -1738,12 +1843,19 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   context.clearTimeout = () => {};
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
   const messages = [];
+  const submitted = [];
+  context.document.querySelectorAll = (selector) =>
+    selector.includes('data-message-author-role="user"') ? submitted : [];
   context.chrome.runtime.sendMessage = async (payload) => {
-    messages.push(payload);
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
     if (payload.type === "run-result-presented") {
+      messages.push(payload);
       return { ok: true };
     }
     assert.equal(payload.type, "run-shell");
+    messages.push(payload);
     return {
       ok: true,
       executed: true,
@@ -1765,6 +1877,15 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   let sendAttempts = 0;
   context.clickSendWhenReady = async () => {
     sendAttempts += 1;
+    if (sendAttempts > 1) {
+      submitted.push(new MockNode({
+        text: context.getComposerText(composer),
+        role: "user",
+        order: 2
+      }));
+      composer.innerText = "";
+      composer.textContent = "";
+    }
     return sendAttempts > 1;
   };
   context.setStatus = () => {};
@@ -1779,12 +1900,12 @@ async function verifySameRenderedPendingResultRetriesLocallyOnly() {
   assert.ok(Object.keys(backing).some((key) => key.startsWith("helperPendingDelivery:v1:")));
 
   const second = await context.runAndReply("same-rendered-pending", call);
-  assert.equal(second.pendingDelivery, true);
+  assert.equal(second.pendingDelivery, false);
   assert.equal(messages.filter((payload) => payload.type === "run-shell").length, 1, "Retrying the same rendered helper must remain local.");
   assert.equal(insertAttempts, 1, "Once helper output is in the composer, send retries must not write it again.");
-  assert.equal(sendAttempts, 1, "The same page lifecycle must not restart the v0.8.9 actuator.");
-  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
-  assert.ok(!messages.some((payload) => payload.type === "run-result-presented"));
+  assert.equal(sendAttempts, 2, "The same page lifecycle may make a bounded send-only retry.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.ok(messages.some((payload) => payload.type === "run-result-presented"));
 }
 
 async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
@@ -1865,6 +1986,7 @@ async function verifyDeletedPendingResultCancelsAutomaticComposerDelivery() {
   composer.innerText = "";
   composer.textContent = "";
   const pendingEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  pendingEntry.userCancellationObserved = true;
   await context.attemptPendingHelperDelivery(pendingEntry, { autoSend: true });
   await context.retryPendingHelperDeliveries();
 
@@ -1887,14 +2009,12 @@ async function verifyHostClearedComposerFinalizesDelayedSubmissionBeforeCancella
   context.setTimeout = () => 1;
   context.clearTimeout = () => {};
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
-  let submittedCount = 0;
+  const submitted = [];
   let receiptCount = 0;
-  let delayCount = 0;
-  context.countSubmittedMessagesMatching = () => submittedCount;
+  context.document.querySelectorAll = (selector) =>
+    selector.includes('data-message-author-role="user"') ? submitted : [];
   context.chrome.runtime.sendMessage = async (payload) => {
     if (payload.type === "content-ui-delay") {
-      delayCount += 1;
-      submittedCount = 1;
       return { ok: true };
     }
     if (payload.type === "run-result-presented") {
@@ -1912,7 +2032,9 @@ async function verifyHostClearedComposerFinalizesDelayedSubmissionBeforeCancella
     };
   };
   const composer = { innerText: "", textContent: "", isConnected: true };
+  let insertedReply = "";
   context.insertReply = async (text) => {
+    insertedReply = text;
     composer.innerText = text;
     composer.textContent = text;
     return composer;
@@ -1933,10 +2055,17 @@ async function verifyHostClearedComposerFinalizesDelayedSubmissionBeforeCancella
   composer.innerText = "";
   composer.textContent = "";
   const pendingEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  const stillWaiting = await context.attemptPendingHelperDelivery(pendingEntry, { autoSend: true });
+  assert.equal(stillWaiting, false);
+  assert.equal(pendingEntry.phase, "submitted-unconfirmed");
+  submitted.push(new MockNode({
+    text: insertedReply,
+    role: "user",
+    order: 2
+  }));
   const finalized = await context.attemptPendingHelperDelivery(pendingEntry, { autoSend: true });
 
   assert.equal(finalized, true);
-  assert.ok(delayCount >= 1);
   assert.equal(receiptCount, 1, "A delayed exact submission must produce the canonical presentation receipt.");
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
 }
@@ -2119,8 +2248,8 @@ async function verifyM365ClearedComposerWithoutSubmittedRootStaysUnpresented() {
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
   assert.equal(
     vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context),
-    "inserted",
-    "The canonical result remains pending without rewriting or repeating the actuator."
+    "submitted-unconfirmed",
+    "The canonical result remains pending without rewriting or regaining send authority."
   );
 }
 
@@ -2167,8 +2296,9 @@ async function verifyPendingResultRestoresAcrossSamePageReload() {
   restoredContext.clearTimeout = () => {};
   restoredContext.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: false });
   const restoredMessages = [];
-  let restoredSubmittedCount = 0;
-  restoredContext.countSubmittedMessagesMatching = () => restoredSubmittedCount;
+  const restoredSubmitted = [];
+  restoredContext.document.querySelectorAll = (selector) =>
+    selector.includes('data-message-author-role="user"') ? restoredSubmitted : [];
   restoredContext.chrome.runtime.sendMessage = async (payload) => {
     restoredMessages.push(payload);
     if (payload.type === "run-shell") {
@@ -2195,9 +2325,24 @@ async function verifyPendingResultRestoresAcrossSamePageReload() {
   assert.ok(!restoredMessages.some((payload) => payload.type === "run-result-presented"));
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", restoredContext), 1);
 
-  restoredSubmittedCount = 1;
+  restoredSubmitted.push(new MockNode({
+    text: inserted[0],
+    role: "user",
+    order: 2
+  }));
   await restoredContext.retryPendingHelperDeliveries();
-  assert.ok(restoredMessages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "1122334455667788"));
+  assert.ok(
+    restoredMessages.some((payload) => payload.type === "run-result-presented" && payload.executionId === "1122334455667788"),
+    vm.runInContext(`JSON.stringify({
+      matching: getSubmittedMessageRootsMatching(Array.from(pendingHelperDeliveries.values())[0]?.reply || "").length,
+      pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+        phase: entry.phase,
+        countBefore: entry.submittedMessageCountBefore,
+        rootIdsBefore: entry.submittedMessageRootIdsBefore,
+        hasProof: hasPendingHelperSubmissionProof(entry)
+      }))
+    })`, restoredContext)
+  );
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", restoredContext), 0);
   const retainedKey = Object.keys(backing).find((key) => key.startsWith("helperPendingDelivery:v1:"));
   assert.ok(retainedKey, "A bounded local presentation tombstone remains for stale duplicate responses.");
@@ -2777,10 +2922,17 @@ async function verifyM365LexicalFlatteningKeepsOriginalSendActuator() {
   );
   context.location.hostname = originalHostname;
   const originalGetAttribute = composer.getAttribute;
+  composer.getAttribute = (name) => name === "aria-label" ? "Nachricht an Copilot" : originalGetAttribute(name);
+  assert.equal(
+    context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
+    composer.innerText,
+    "M365 may localize its composer label; exact node shape, sentinel, and full payload remain the ownership proof."
+  );
   composer.getAttribute = (name) => name === "aria-label" ? "Search chats" : originalGetAttribute(name);
   assert.equal(
     context.getValidatedComposerOwnershipText(composer, intended, { allowM365HostNormalization: true }),
-    ""
+    "",
+    "A generic M365 textbox label without Copilot must not acquire flattened composer ownership."
   );
   composer.getAttribute = originalGetAttribute;
   const originalQuerySelector = composer.querySelector;
@@ -3052,6 +3204,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyForceRunPersistsWhileActiveCallRunning())
   .then(() => verifyDebugPanelListsAllCandidates())
   .then(() => verifySubmittedMessageMatchingPreservesLineBoundaries())
+  .then(() => verifyCompletionStatusSurvivesHandledRescan())
   .then(() => verifyAutoSendDoesNotHoldExecutionLock())
   .then(() => verifyBackendResponsesRetryOnlyLocalDelivery())
   .then(() => verifyNonShellComposerWritesNeverReexecuteRenderedHelpers())

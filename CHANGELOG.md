@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-08-27
+
+- Keeps retrying the unchanged v0.8.6/v0.8.9 send actuator when the current visible composer still contains the exact plugin-written result, without repeating the backend helper operation or the one allowed composer write.
+- Adds a persistent `submitted-unconfirmed` delivery phase: a cleared composer waits for a fresh exact submitted-user-message root instead of clicking or writing again, while user deletion, replacement, or a competing draft cancels safely.
+- Captures fresh submission proof immediately from the page mutation that renders it, preventing a fast refresh or SPA transition from erasing the only valid proof before the normal retry timer runs.
+- Preserves submitted-but-unconfirmed ownership across same-tab routes. Exact plugin text resumes send-only delivery; non-exact non-empty user text is never sent and cancels the pending batch.
+- Prevents floating-panel mutations from retriggering the helper scanner and keeps backend completion, send pending, submission confirmation, and receipt-pending status distinct.
+- Adds focused positive and negative regressions with a watchdog-protected 16-case route/delivery suite, plus real unpacked-extension Chrome coverage for refresh, hidden-tab MV3, composer redraw, route handoff, Force run, file delivery, and presentation receipts.
+
 ## [0.11.3] - 2026-08-27
 
 - Keeps the acknowledged gray `Skills vN` chip interactive: clicking it opens the complete local Skills catalog without starting synchronization, creating a challenge, or writing to the AI composer. Update, syncing, and invalid states retain their distinct sync, disabled, and local-error behaviors.

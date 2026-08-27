@@ -4,9 +4,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
+const extensionDir = path.join(__dirname, "..", "extension");
+const source = fs.readFileSync(path.join(extensionDir, "src", "content.js"), "utf8");
+const manifestVersion = JSON.parse(fs.readFileSync(path.join(extensionDir, "manifest.json"), "utf8")).version;
 
-assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.3";/);
+assert.match(source, new RegExp(`const CONTENT_SCRIPT_VERSION = "${manifestVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}";`));
 assert.match(source, /width:min\(292px,calc\(100vw - 32px\)\)/);
 assert.match(source, /statusText\.style\.cssText = "[^"]*text-overflow:ellipsis;white-space:nowrap/);
 assert.match(source, /statusIndicator\.id = STATUS_INDICATOR_ID/);
@@ -80,8 +82,9 @@ assert.match(source, /advancedControls\.hidden = !expanded/);
 
 assert.match(source, /button\.disabled = !panelShellHelperActive;/);
 assert.match(source, /const backendBusy = Boolean\(activeCallId\);/);
+assert.match(source, /const deliveryBusy = pendingHelperDeliveries\.size > 0;/);
 assert.match(source, /const showCheck = !backendBusy && !panelShellHelperActive && panel\.dataset\.state === "error";/);
-assert.match(source, /const showForce = !backendBusy && !panelShellHelperActive && panelForceRunAvailable;/);
+assert.match(source, /const showForce = !backendBusy && !deliveryBusy && !panelShellHelperActive && panelForceRunAvailable;/);
 assert.match(source, /activeCallToken = null;\s*updateContextualPanelActions\(\);/);
 assert.match(source, /stop\.hidden = !panelShellHelperActive \|\| Boolean\(activeShellRunNotice\);/);
 assert.match(source, /setPanelForceRunAvailable\(Boolean\(runnableCandidate\)\)/);

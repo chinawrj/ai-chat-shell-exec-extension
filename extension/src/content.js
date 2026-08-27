@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.3";
+const CONTENT_SCRIPT_VERSION = "0.11.4";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -249,7 +249,12 @@ function observeThread() {
   }
 
   threadObserver = new MutationObserver((records) => {
-    invalidateRenderedHelperTracking(records);
+    const pageRecords = Array.from(records || []).filter((record) => !isShellToolPanelMutation(record));
+    if (pageRecords.length === 0) {
+      return;
+    }
+    invalidateRenderedHelperTracking(pageRecords);
+    observePendingHelperSubmissionProof();
     scheduleScan();
   });
 
@@ -259,6 +264,28 @@ function observeThread() {
     characterData: true,
     characterDataOldValue: true
   });
+}
+
+function isShellToolPanelMutation(record) {
+  const target = record?.target instanceof Element
+    ? record.target
+    : record?.target?.parentElement;
+  return isInsideShellToolPanel(target);
+}
+
+function observePendingHelperSubmissionProof() {
+  for (const entry of pendingHelperDeliveries.values()) {
+    if (!["inserted", "submitted-unconfirmed"].includes(entry.phase) ||
+        entry.finalizationInFlight ||
+        !hasPendingHelperSubmissionProof(entry)) {
+      continue;
+    }
+    // A host may render the submitted user message and immediately navigate
+    // or redraw the thread. Claim the fresh exact root in this MutationObserver
+    // microtask instead of waiting for the two-second delivery retry, otherwise
+    // the only valid presentation proof can disappear before it is recorded.
+    finalizePendingHelperDelivery(entry, "submitted").catch(() => {});
+  }
 }
 
 function invalidateRenderedHelperTracking(records) {
@@ -298,6 +325,7 @@ function installPageEventListeners() {
 
   document.addEventListener("focusin", handleComposerFocus, true);
   document.addEventListener("click", handleComposerClick, true);
+  document.addEventListener("beforeinput", handleComposerBeforeInput, true);
   document.addEventListener("input", handleComposerInput, true);
   document.addEventListener("pointerdown", handleBindingPointerDown, true);
   document.addEventListener("click", handleBindingClick, true);
@@ -316,6 +344,7 @@ function removePageEventListeners() {
 
   document.removeEventListener("focusin", handleComposerFocus, true);
   document.removeEventListener("click", handleComposerClick, true);
+  document.removeEventListener("beforeinput", handleComposerBeforeInput, true);
   document.removeEventListener("input", handleComposerInput, true);
   document.removeEventListener("pointerdown", handleBindingPointerDown, true);
   document.removeEventListener("click", handleBindingClick, true);
@@ -407,9 +436,72 @@ function handleComposerClick(event) {
   }
 }
 
+function handleComposerBeforeInput(event) {
+  if (!extensionActive || event?.isTrusted !== true) {
+    return;
+  }
+  const composer = closestEditable(event.target);
+  if (!composer) {
+    return;
+  }
+  for (const entry of pendingHelperDeliveries.values()) {
+    if (entry.phase !== "inserted" || entry.composerElement !== composer) {
+      continue;
+    }
+    if (!getValidatedComposerOwnershipText(composer, entry.reply, {
+      allowM365HostNormalization: true
+    })) {
+      continue;
+    }
+    entry.pendingTrustedMutation = {
+      type: String(event.type || "beforeinput"),
+      inputType: String(event.inputType || ""),
+      observedAt: Date.now()
+    };
+  }
+}
+
 function handleComposerInput(event) {
   if (extensionActive) {
     rememberComposer(event.target);
+    recordTrustedPendingHelperComposerMutation(event);
+  }
+}
+
+function recordTrustedPendingHelperComposerMutation(event) {
+  if (event?.isTrusted !== true) {
+    return;
+  }
+  const composer = closestEditable(event.target);
+  if (!composer) {
+    return;
+  }
+  for (const entry of pendingHelperDeliveries.values()) {
+    if (entry.phase !== "inserted" || entry.composerElement !== composer || !entry.pendingTrustedMutation) {
+      continue;
+    }
+    const mutation = entry.pendingTrustedMutation;
+    entry.pendingTrustedMutation = null;
+    const stillOwned = getValidatedComposerOwnershipText(composer, entry.reply, {
+      allowM365HostNormalization: true
+    });
+    if (stillOwned) {
+      continue;
+    }
+    const currentText = getComposerText(composer);
+    const inputType = String(event.inputType || mutation.inputType || "");
+    // A trusted Enter-like edit may be the user's own submit action. An empty
+    // composer therefore becomes submitted-unconfirmed and is never rewritten
+    // or clicked again while the matching user-message root catches up.
+    if (!currentText && /^(insertParagraph|insertLineBreak)$/.test(inputType)) {
+      markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+        reason: "composer was cleared after a trusted submit-like edit"
+      }).catch(() => {});
+      continue;
+    }
+    entry.userCancellationObserved = true;
+    entry.updatedAt = Date.now();
+    cancelPendingHelperDeliveryAfterComposerRemoval(entry).catch(() => {});
   }
 }
 
@@ -661,7 +753,7 @@ async function scanForShellCall(options = {}) {
       );
       if (pendingDelivery) {
         setPendingHelperDeliveryStatus(pendingDelivery);
-      } else {
+      } else if (!isPanelStatusOwnedByHelperDelivery(call)) {
         setStatus(`Already handled this helper block: ${summarizeCommand(helperPreviewText(call))}`, "ok");
       }
       return;
@@ -899,7 +991,7 @@ function refreshPageLifecycle() {
       pendingHelperDeliveryStorageKey(previousPageIdentity);
     const routeHandoffEntries = Array.from(pendingHelperDeliveries.values())
       .filter((entry) =>
-        ["queued", "inserted", "submitted", "presented"].includes(entry?.phase) &&
+        ["queued", "inserted", "submitted-unconfirmed", "submitted", "presented"].includes(entry?.phase) &&
         entry?.pageIdentity === previousPageIdentity
       );
     const routeHandoffPresentedExecutions = Array.from(
@@ -1143,6 +1235,7 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
       return existing;
     }
   }
+  const submittedMessageRootsBefore = getSubmittedMessageRootsMatching(reply);
   const entry = {
     callId,
     executionId,
@@ -1153,7 +1246,11 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     autoSend: settings?.autoSend !== false,
     pageIdentity: getCurrentPageIdentity(),
     phase: "queued",
-    submittedMessageCountBefore: countSubmittedMessagesMatching(reply),
+    submittedMessageCountBefore: submittedMessageRootsBefore.length,
+    submittedMessageRootIdsBefore: submittedMessageRootsBefore
+      .map(getSubmittedMessageRootIdentity)
+      .filter(Boolean),
+    submittedMessageRootsBefore: new Set(submittedMessageRootsBefore),
     createdAt: now,
     updatedAt: now,
     attempts: 0,
@@ -1176,6 +1273,10 @@ function persistPendingHelperDeliveries(
       restored: _restored,
       deliveryInFlight: _deliveryInFlight,
       sendActuatorGeneration: _sendActuatorGeneration,
+      composerElement: _composerElement,
+      pendingTrustedMutation: _pendingTrustedMutation,
+      submittedMessageRootsBefore: _submittedMessageRootsBefore,
+      finalizationInFlight: _finalizationInFlight,
       ...entry
     }) => entry);
   const presentedExecutions = pruneLocallyPresentedHelperExecutions(
@@ -1209,10 +1310,7 @@ async function cancelPendingHelperDeliveryAfterComposerRemoval(entry) {
   if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
     return true;
   }
-  if (await waitForOriginalSendActuatorSubmissionProof(
-    entry.reply,
-    Number(entry.submittedMessageCountBefore || 0)
-  )) {
+  if (await waitForPendingHelperSubmissionProof(entry)) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
   // Emptying or replacing the current text is an explicit user cancellation.
@@ -1242,30 +1340,171 @@ async function acknowledgePendingHelperResultPresented(entry) {
 }
 
 async function finalizePendingHelperDelivery(entry, phase) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return true;
+  }
+  if (entry.finalizationInFlight) {
+    return entry.finalizationInFlight;
+  }
+  const finalization = performPendingHelperDeliveryFinalization(entry, phase);
+  entry.finalizationInFlight = finalization;
+  try {
+    return await finalization;
+  } finally {
+    if (entry.finalizationInFlight === finalization) {
+      entry.finalizationInFlight = null;
+    }
+  }
+}
+
+async function performPendingHelperDeliveryFinalization(entry, phase) {
   entry.phase = phase;
   entry.updatedAt = Date.now();
   rememberRecentSubmittedPluginReply(entry.reply);
+  // Presentation proof is the user-visible completion boundary. Surface it
+  // before best-effort storage and receipt I/O so a slow extension channel
+  // cannot leave a successfully submitted result looking unfinished.
+  setHelperCompletionStatus(entry.call, entry.response);
   await persistPendingHelperDeliveries();
   await rememberLocallyPresentedHelperExecution(entry);
   const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
   if (receiptAcknowledged) {
     await clearPendingHelperDelivery(entry);
+    setHelperCompletionStatus(entry.call, entry.response);
   } else {
     entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
     await persistPendingHelperDeliveries();
+    setPendingHelperDeliveryStatus(entry);
     schedulePendingHelperDeliveryRetry();
   }
-  setHelperCompletionStatus(entry.call, entry.response);
   return true;
 }
 
 function setPendingHelperDeliveryStatus(entry) {
   const label = pendingHelperDeliveryLabel(entry);
+  const completedLabel = entry.response?.ok === false
+    ? `${label} execution failed`
+    : `${label} completed`;
   const lastError = entry.lastError ? ` Last send state: ${summarizeCommand(entry.lastError)}.` : "";
-  setStatus(`${label} result cached locally; waiting for chat composer/send readiness. The backend operation and composer write will not be repeated.${lastError}`, "running");
+  const message = entry.phase === "inserted"
+    ? `${completedLabel}; output remains in the chat composer and safe send-only attempts will continue. The backend operation and composer write will not be repeated.${lastError}`
+    : entry.phase === "submitted-unconfirmed"
+      ? `${completedLabel}; the composer was cleared or the page began accepting the message. Waiting for the matching submitted chat message without another click or composer write.${lastError}`
+      : entry.phase === "submitted" || entry.phase === "presented"
+        ? `${completedLabel}; the result was submitted and only the server presentation receipt is pending.${lastError}`
+        : `${completedLabel}; result cached locally and waiting for the chat composer. The backend operation has ended and will not be repeated.${lastError}`;
+  setStatus(message, "running", {
+    owner: "helper-delivery",
+    ownerKey: buildSemanticCallKey(entry.call)
+  });
+}
+
+async function markPendingHelperDeliverySubmittedUnconfirmed(entry, options = {}) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return false;
+  }
+  entry.phase = "submitted-unconfirmed";
+  entry.composerElement = null;
+  entry.pendingTrustedMutation = null;
+  entry.lastError = String(options.reason || "waiting for exact submitted-message proof");
+  entry.updatedAt = Date.now();
+  persistPendingHelperDeliveries().catch(() => {});
+  setPendingHelperDeliveryStatus(entry);
+  schedulePendingHelperDeliveryRetry();
+  return false;
+}
+
+async function retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings) {
+  if (hasPendingHelperSubmissionProof(entry)) {
+    return finalizePendingHelperDelivery(entry, "submitted");
+  }
+  let composer = null;
+  try {
+    composer = await findReplyInput({ fresh: true });
+  } catch (_unused) {
+    composer = null;
+  }
+  if (composer && !entry.userCancellationObserved && getValidatedComposerOwnershipText(
+    composer,
+    entry.reply,
+    { allowM365HostNormalization: true }
+  )) {
+    if (isAssistantGenerating()) {
+      setPendingHelperDeliveryStatus(entry);
+      schedulePendingHelperDeliveryRetry();
+      return false;
+    }
+    entry.phase = "inserted";
+    entry.composerElement = composer;
+    entry.lastError = "the exact plugin-owned text is still present; resuming safe send-only attempts";
+    entry.updatedAt = Date.now();
+    persistPendingHelperDeliveries().catch(() => {});
+    return retryInsertedPendingHelperDelivery(entry, deliverySettings);
+  }
+  if (composer && getComposerText(composer)) {
+    entry.userCancellationObserved = true;
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  setPendingHelperDeliveryStatus(entry);
+  schedulePendingHelperDeliveryRetry();
+  return false;
+}
+
+function isExplicitUserComposerCancellation(details, composerText) {
+  if (composerText) {
+    return true;
+  }
+  const type = String(details?.type || "");
+  const inputType = String(details?.inputType || "");
+  return type === "cut" || type === "paste" || /^(delete|insertText|insertFrom)/.test(inputType);
+}
+
+async function settlePendingHelperAfterUnconfirmedSend(entry, callToken) {
+  if (entry.phase !== "inserted") {
+    entry.lastError = "chat composer insertion has not completed; waiting to perform the single allowed composer write";
+    entry.updatedAt = Date.now();
+    persistPendingHelperDeliveries().catch(() => {});
+    setPendingHelperDeliveryStatus(entry);
+    schedulePendingHelperDeliveryRetry();
+    return false;
+  }
+  const ownership = await inspectCurrentComposerOwnership(entry.composerElement, entry.reply);
+  if (hasPendingHelperSubmissionProof(entry)) {
+    return finalizePendingHelperDelivery(entry, "submitted");
+  }
+  const currentText = getComposerText(ownership.composer);
+  if (callToken?.composerCancelled && isExplicitUserComposerCancellation(
+    callToken.composerCancellation,
+    currentText
+  )) {
+    entry.userCancellationObserved = true;
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  if (ownership.state === "changed" && currentText) {
+    entry.userCancellationObserved = true;
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
+  if (ownership.state === "changed" && !currentText) {
+    return markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+      reason: callToken?.composerCancelled
+        ? "composer was cleared after a trusted submit-like action; waiting for exact submission proof"
+        : "composer was cleared after a send attempt; waiting for exact submission proof"
+    });
+  }
+  entry.lastError = ownership.state === "owned"
+    ? "the last send round produced no submission proof; exact plugin-owned text remains, so send-only retries will continue"
+    : "the current composer is temporarily unavailable; waiting without rewriting or rerunning the helper";
+  entry.updatedAt = Date.now();
+  persistPendingHelperDeliveries().catch(() => {});
+  setPendingHelperDeliveryStatus(entry);
+  schedulePendingHelperDeliveryRetry();
+  return false;
 }
 
 async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
+  if (hasPendingHelperSubmissionProof(entry)) {
+    return finalizePendingHelperDelivery(entry, "submitted");
+  }
   let composer;
   try {
     composer = await findReplyInput();
@@ -1275,18 +1514,31 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   if (!composer) {
     entry.lastError = "composer unavailable after the result was inserted; waiting without reinserting";
     entry.updatedAt = Date.now();
-    await persistPendingHelperDeliveries();
+    persistPendingHelperDeliveries().catch(() => {});
     setPendingHelperDeliveryStatus(entry);
     schedulePendingHelperDeliveryRetry();
     return false;
   }
 
+  if (entry.userCancellationObserved) {
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+  }
   const expectedComposerText = getValidatedComposerOwnershipText(composer, entry.reply, {
     allowM365HostNormalization: true
   });
   if (!expectedComposerText) {
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    if (hasPendingHelperSubmissionProof(entry)) {
+      return finalizePendingHelperDelivery(entry, "submitted");
+    }
+    if (getComposerText(composer)) {
+      entry.userCancellationObserved = true;
+      return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    }
+    return markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+      reason: "composer is empty after a prior send attempt; waiting for exact submission proof"
+    });
   }
+  entry.composerElement = composer;
   if (deliverySettings.autoSend === false) {
     entry.lastError = "auto-send is disabled; waiting for exact manual submission proof";
     entry.updatedAt = Date.now();
@@ -1295,13 +1547,10 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     schedulePendingHelperDeliveryRetry();
     return false;
   }
-  if (entry.sendActuatorGeneration === pageLifecycleGeneration) {
-    entry.lastError = "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions";
-    entry.updatedAt = Date.now();
-    await persistPendingHelperDeliveries();
-    setPendingHelperDeliveryStatus(entry);
-    schedulePendingHelperDeliveryRetry();
-    return false;
+  if (isAssistantGenerating()) {
+    return markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+      reason: "the page is generating after a send attempt; waiting for exact submission proof"
+    });
   }
 
   const callToken = {
@@ -1327,11 +1576,13 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
       {
         onStarted: async () => {
           entry.sendActuatorGeneration = pageLifecycleGeneration;
+          entry.sendAttemptRounds = Number(entry.sendAttemptRounds || 0) + 1;
           entry.updatedAt = Date.now();
-          await persistPendingHelperDeliveries();
+          persistPendingHelperDeliveries().catch(() => {});
         },
-        onUserCancellation: () => {
+        onUserCancellation: (details) => {
           callToken.composerCancelled = true;
+          callToken.composerCancellation = details || null;
         }
       }
     );
@@ -1339,21 +1590,7 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   if (sent) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
-  if (callToken.composerCancelled) {
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
-  }
-  const currentOwnership = await inspectCurrentComposerOwnership(composer, entry.reply);
-  if (currentOwnership.state === "changed" && getComposerText(currentOwnership.composer)) {
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
-  }
-  entry.lastError = entry.sendActuatorGeneration === pageLifecycleGeneration
-    ? "the original v0.8.9 send attempt finished; waiting for manual send without repeating send actions"
-    : "send ownership guard is not ready; will retry without rewriting the composer";
-  entry.updatedAt = Date.now();
-  await persistPendingHelperDeliveries();
-  setPendingHelperDeliveryStatus(entry);
-  schedulePendingHelperDeliveryRetry();
-  return false;
+  return settlePendingHelperAfterUnconfirmedSend(entry, callToken);
 }
 
 async function attemptPendingHelperDelivery(entry, settings = null) {
@@ -1365,12 +1602,15 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
   }
   entry.deliveryInFlight = true;
   try {
-    if (entry.phase === "submitted" || entry.phase === "presented" ||
-        countSubmittedMessagesMatching(entry.reply) > Number(entry.submittedMessageCountBefore || 0)) {
+    if (entry.phase === "submitted" || entry.phase === "presented") {
       return finalizePendingHelperDelivery(
         entry,
         entry.phase === "presented" ? "presented" : "submitted"
       );
+    }
+    if (entry.phase === "submitted-unconfirmed") {
+      const deliverySettings = settings || await chrome.storage.sync.get(["autoSend"]);
+      return retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings);
     }
     if (entry.restored === true && entry.phase === "inserted" && !initialThreadSettled) {
       setPendingHelperDeliveryStatus(entry);
@@ -1391,18 +1631,21 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
     entry.attempts = Number(entry.attempts || 0) + 1;
     entry.updatedAt = Date.now();
     const delivered = await deliverHelperReply(callToken, entry.reply, deliverySettings, async () => {
-      setHelperCompletionStatus(entry.call, entry.response);
-    }, async () => {
+      setPendingHelperDeliveryStatus(entry);
+    }, async (composer) => {
       entry.phase = "inserted";
+      entry.composerElement = composer || entry.composerElement;
       entry.updatedAt = Date.now();
       entry.lastError = "";
-      await persistPendingHelperDeliveries();
+      persistPendingHelperDeliveries().catch(() => {});
     }, async () => {
       entry.sendActuatorGeneration = pageLifecycleGeneration;
+      entry.sendAttemptRounds = Number(entry.sendAttemptRounds || 0) + 1;
       entry.updatedAt = Date.now();
-      await persistPendingHelperDeliveries();
-    }, () => {
+      persistPendingHelperDeliveries().catch(() => {});
+    }, (details) => {
       callToken.composerCancelled = true;
+      callToken.composerCancellation = details || null;
     });
     if (delivered) {
       if (deliverySettings.autoSend === false) {
@@ -1415,15 +1658,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       }
       return finalizePendingHelperDelivery(entry, "submitted");
     }
-    if (callToken.composerCancelled) {
-      return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
-    }
-    entry.lastError = "chat composer insertion or send is not complete";
-    entry.updatedAt = Date.now();
-    await persistPendingHelperDeliveries();
-    setPendingHelperDeliveryStatus(entry);
-    schedulePendingHelperDeliveryRetry();
-    return false;
+    return settlePendingHelperAfterUnconfirmedSend(entry, callToken);
   } finally {
     entry.deliveryInFlight = false;
   }
@@ -3318,6 +3553,7 @@ async function runAndReply(callId, call, options = {}) {
       formatShellOutput(call, effectiveResponse, startedAt);
     if (isPersistentResultHelperCall(call)) {
       const pending = await rememberPendingHelperDelivery(callId, call, effectiveResponse, reply, settings);
+      setPendingHelperDeliveryStatus(pending);
       releaseActiveCall(callToken);
       if (!isCallLifecycleCurrent(callToken)) {
         return { retryable: false, abandoned: true, pendingDelivery: true, response };
@@ -3485,7 +3721,12 @@ async function deliverHelperReply(
     }
     callToken.composerWriteAttempted = true;
     callToken.phase = "reply-write-attempted";
-    await onWriteAttempted(composer);
+    try {
+      Promise.resolve(onWriteAttempted(composer)).catch(() => {});
+    } catch (_unused) {
+      // The queued result already exists durably. Best-effort inserted-phase
+      // persistence must never create a post-write/pre-send blocking gap.
+    }
     if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
       return false;
     }
@@ -4611,6 +4852,10 @@ function formatInboundAgentPrompt(profile, message) {
 }
 
 function setHelperCompletionStatus(call, response) {
+  const helperStatusOptions = {
+    owner: "helper-delivery",
+    ownerKey: buildSemanticCallKey(call)
+  };
   if (call?.kind === "skill-sync-prompt") {
     setStatus("Skill update request sent to the AI", "running");
     return;
@@ -4633,7 +4878,8 @@ function setHelperCompletionStatus(call, response) {
       isBoardHelperCall(call)
         ? `Server confirmed duplicate board command on ${response.targetName || response.target || "the resolved tmux pane"}`
         : `Server confirmed duplicate shell command on ${response.targetName || response.target || "the resolved tmux pane"}`,
-      "ok"
+      "ok",
+      helperStatusOptions
     );
     return;
   }
@@ -4687,12 +4933,17 @@ function setHelperCompletionStatus(call, response) {
         : response.interruptSignal
           ? `Shell helper interrupted by SIG${response.interruptSignal}`
           : "Shell helper interrupted",
-      "ok"
+      "ok",
+      helperStatusOptions
     );
     return;
   }
 
-  setStatus(response?.ok === false ? "Shell helper failed" : "Shell helper completed", response?.ok === false ? "error" : "ok");
+  setStatus(
+    response?.ok === false ? "Shell helper failed" : "Shell helper completed",
+    response?.ok === false ? "error" : "ok",
+    helperStatusOptions
+  );
 }
 
 function isExpectedSelfTestCall(call) {
@@ -5516,6 +5767,10 @@ async function runOriginalSendActuatorForOwnedComposer(
       hasCompetingVisibleUserDraft(guard, mutatedComposer)
     )) {
       guard.sawTrustedComposerMutation = true;
+      guard.trustedComposerMutation = {
+        type: String(event.type || ""),
+        inputType: String(event.inputType || "")
+      };
     }
   };
   const captureTargets = new Set();
@@ -5571,7 +5826,7 @@ async function runOriginalSendActuatorForOwnedComposer(
         )) {
           return true;
         }
-        callbacks.onUserCancellation?.();
+        callbacks.onUserCancellation?.(guard.trustedComposerMutation || null);
         return false;
       }
       if (typeof guard.shouldContinue === "function" && guard.shouldContinue() !== true) {
@@ -5653,7 +5908,7 @@ function isM365FlattenedLexicalComposerOwnership(composer, actualText, intendedT
   }
   if (String(composer.getAttribute?.("role") || "").toLowerCase() !== "textbox" ||
       String(composer.getAttribute?.("contenteditable") || "").toLowerCase() !== "true" ||
-      String(composer.getAttribute?.("aria-label") || "") !== "Message Copilot") {
+      !/copilot/i.test(String(composer.getAttribute?.("aria-label") || ""))) {
     return false;
   }
   const sentinel = composer.querySelector?.('[aria-hidden="true"][data-lexical-text="true"]');
@@ -5896,9 +6151,13 @@ async function waitForSubmitted(composer, originalText) {
 }
 
 function countSubmittedMessagesMatching(text) {
+  return getSubmittedMessageRootsMatching(text).length;
+}
+
+function getSubmittedMessageRootsMatching(text) {
   const expected = normalizeCommand(text);
   if (!expected || typeof document.querySelectorAll !== "function") {
-    return 0;
+    return [];
   }
   const comparableExpected = normalizeComposerOwnershipText(expected);
   const expectedRenderedCodeBlock = extractExpectedRenderedCodeBlock(expected);
@@ -5943,8 +6202,66 @@ function countSubmittedMessagesMatching(text) {
         }
         return normalizeComposerOwnershipText(lines.join("\n")) === comparableExpected;
       });
-    })
-    .length;
+    });
+}
+
+function getSubmittedMessageRootIdentity(node) {
+  if (!node || typeof node.getAttribute !== "function") {
+    return "";
+  }
+  for (const attribute of ["data-message-id", "data-testid", "id"]) {
+    const value = String(node.getAttribute(attribute) || "");
+    if (value) {
+      return `${attribute}:${value}`;
+    }
+  }
+  return "";
+}
+
+function hasPendingHelperSubmissionProof(entry) {
+  const observedCount = countSubmittedMessagesMatching(entry?.reply || "");
+  const baselineCount = Number(entry?.submittedMessageCountBefore || 0);
+  const roots = getSubmittedMessageRootsMatching(entry?.reply || "");
+  if (roots.length === 0) {
+    // Standalone harnesses and compatible host adapters may provide only the
+    // count contract. Production content uses the root identities below.
+    return observedCount > baselineCount;
+  }
+  const baselineIds = new Set(Array.from(entry?.submittedMessageRootIdsBefore || []));
+  const baselineRoots = entry?.submittedMessageRootsBefore instanceof Set
+    ? entry.submittedMessageRootsBefore
+    : null;
+  for (const root of roots) {
+    const identity = getSubmittedMessageRootIdentity(root);
+    if (identity) {
+      if (!baselineIds.has(identity)) {
+        return true;
+      }
+      continue;
+    }
+    if (baselineRoots && !baselineRoots.has(root) && (baselineCount === 0 || roots.length > baselineCount)) {
+      return true;
+    }
+  }
+  if (!baselineRoots && baselineIds.size === 0) {
+    return observedCount > baselineCount;
+  }
+  return false;
+}
+
+async function waitForPendingHelperSubmissionProof(
+  entry,
+  attempts = COMPOSER_HANDOFF_SETTLE_ATTEMPTS
+) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (hasPendingHelperSubmissionProof(entry)) {
+      return true;
+    }
+    if (attempt + 1 < attempts) {
+      await contentUiDelay(COMPOSER_HANDOFF_SETTLE_DELAY_MS);
+    }
+  }
+  return false;
 }
 
 function isSubmittedUserMessageNode(node) {
@@ -6945,8 +7262,9 @@ function updateContextualPanelActions() {
   const stop = actions.querySelector('[data-shell-tool-action="stop-helper"]');
   const more = actions.querySelector('[data-shell-tool-action="more"]');
   const backendBusy = Boolean(activeCallId);
+  const deliveryBusy = pendingHelperDeliveries.size > 0;
   const showCheck = !backendBusy && !panelShellHelperActive && panel.dataset.state === "error";
-  const showForce = !backendBusy && !panelShellHelperActive && panelForceRunAvailable;
+  const showForce = !backendBusy && !deliveryBusy && !panelShellHelperActive && panelForceRunAvailable;
   if (check) {
     check.hidden = !showCheck;
   }
@@ -6962,7 +7280,13 @@ function updateContextualPanelActions() {
     .join(" ");
 }
 
-function setStatus(text, state = "idle") {
+function isPanelStatusOwnedByHelperDelivery(call) {
+  const panel = document.getElementById(STATUS_ID);
+  return panel?.dataset?.statusOwner === "helper-delivery" &&
+    panel.dataset.statusOwnerKey === buildSemanticCallKey(call);
+}
+
+function setStatus(text, state = "idle", options = {}) {
   const panel = document.getElementById(STATUS_ID);
   const statusText = document.getElementById(STATUS_TEXT_ID);
   if (!panel || !statusText) {
@@ -6979,13 +7303,18 @@ function setStatus(text, state = "idle") {
     lastSuppressedCallStatus = "";
     setForceButtonHighlight(false);
   }
-  statusText.textContent = lastSuppressedCallStatus ? `${effectiveText} (${FORCE_RUN_STATUS_HINT})` : effectiveText;
+  const nextStatusText = lastSuppressedCallStatus ? `${effectiveText} (${FORCE_RUN_STATUS_HINT})` : effectiveText;
+  if (statusText.textContent !== nextStatusText) {
+    statusText.textContent = nextStatusText;
+  }
   statusText.setAttribute("aria-label", statusText.textContent);
   const statusDetail = document.getElementById(STATUS_DETAIL_ID);
-  if (statusDetail) {
+  if (statusDetail && statusDetail.textContent !== statusText.textContent) {
     statusDetail.textContent = statusText.textContent;
   }
   panel.dataset.state = effectiveState;
+  panel.dataset.statusOwner = String(options.owner || "");
+  panel.dataset.statusOwnerKey = String(options.ownerKey || "");
   updateContextualPanelActions();
   const colors = {
     idle: { dot: "#64748b", ring: "rgba(100,116,139,.16)" },
