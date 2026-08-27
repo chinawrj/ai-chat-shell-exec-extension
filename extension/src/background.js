@@ -16,7 +16,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_SYNC_TTL_MS = 10 * 60 * 1000;
 const REQUIRED_SERVER_PROTOCOL_VERSION = 11;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 4;
-const REQUIRED_SKILL_PROTOCOL_VERSION = 2;
+const REQUIRED_SKILL_PROTOCOL_VERSION = 3;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
@@ -48,7 +48,9 @@ const BACKGROUND_SKILL_MESSAGE_TYPES = new Set([
   "skill-sync-ack",
   "skill-sync-failed",
   "skill-catalog-list",
+  "skill-management-list",
   "skill-catalog-rescan",
+  "skill-install",
   "skill-load"
 ]);
 const skillScopeTails = new Map();
@@ -293,6 +295,17 @@ async function handleSkillMessage(message, sender = {}) {
     };
   }
   const scope = getSkillMemoryScope(sender);
+  if (message.type === "skill-install") {
+    await requireShellServerReady();
+    return runShellViaWebSocket({
+      type: "skill-install",
+      skillId: message.skillId,
+      skillSha: message.skillSha,
+      installSha: message.installSha,
+      catalogSha: message.catalogSha,
+      timeoutMs: 125000
+    });
+  }
   return withSkillScopeLock(scope, async () => {
     if (message.type === "skill-state-get") {
       return getSkillState(scope, sender);
@@ -312,6 +325,9 @@ async function handleSkillMessage(message, sender = {}) {
     await requireShellServerReady();
     if (message.type === "skill-catalog-list") {
       return runShellViaWebSocket({ type: "skill-catalog-list", timeoutMs: 5000 });
+    }
+    if (message.type === "skill-management-list") {
+      return runShellViaWebSocket({ type: "skill-management-list", timeoutMs: 5000 });
     }
     if (message.type === "skill-catalog-rescan") {
       return runShellViaWebSocket({ type: "skill-catalog-rescan", timeoutMs: 5000 });
@@ -479,6 +495,7 @@ async function acknowledgeSkillSync(scope, sender, message) {
   const tabId = requireSkillTabId(sender);
   const challenge = normalizeSkillChallenge(message.challenge);
   const catalogSha = String(message.catalogSha || "").trim().toLowerCase();
+  const catalogVersion = Number(message.catalogVersion);
   const memoryEntry = String(message.memoryEntry || "").trim();
   const key = skillSyncKey(scope);
   const stored = await chrome.storage.session.get([key]);
@@ -493,12 +510,15 @@ async function acknowledgeSkillSync(scope, sender, message) {
   if (!/^[a-f0-9]{64}$/.test(catalogSha) || catalogSha !== sync.catalogSha) {
     return skillSyncRejection("catalog-sha-mismatch", "Skill sync ACK does not match the catalog delivered for this challenge.");
   }
+  if (!Number.isSafeInteger(catalogVersion) || catalogVersion < 1 || catalogVersion !== Number(sync.catalogVersion || 0)) {
+    return skillSyncRejection("catalog-version-mismatch", "Skill sync ACK does not match the catalog version delivered for this challenge.");
+  }
   await requireShellServerReady();
   const latest = await runShellViaWebSocket({ type: "skill-catalog-status", fresh: true, timeoutMs: 5000 });
   if (latest?.ok !== true) {
     return skillSyncRejection("skill-catalog-invalid", firstSkillCatalogError(latest) || "The local Skill catalog is invalid.", latest);
   }
-  if (catalogSha !== latest.catalogSha) {
+  if (catalogSha !== latest.catalogSha || Number(latest.version || 0) !== catalogVersion) {
     return skillSyncRejection("stale-skill-sync-ack", "The local Skill catalog changed after it was listed. Request and acknowledge the latest catalog.", {
       catalogSha: latest.catalogSha,
       version: latest.version
@@ -507,7 +527,7 @@ async function acknowledgeSkillSync(scope, sender, message) {
   const ack = {
     version: 1,
     catalogSha,
-    catalogVersion: Number(latest.version || sync.catalogVersion || 0),
+    catalogVersion,
     memoryEntry: SKILL_MEMORY_ENTRY,
     acknowledgedAt: Date.now(),
     lastSyncError: ""
@@ -539,6 +559,10 @@ async function failSkillSync(scope, sender, message) {
   const catalogSha = String(message.catalogSha || "").trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(catalogSha) || catalogSha !== sync.catalogSha) {
     return skillSyncRejection("catalog-sha-mismatch", "Skill sync failure report does not match the catalog delivered for this challenge.");
+  }
+  const catalogVersion = Number(message.catalogVersion);
+  if (!Number.isSafeInteger(catalogVersion) || catalogVersion < 1 || catalogVersion !== Number(sync.catalogVersion || 0)) {
+    return skillSyncRejection("catalog-version-mismatch", "Skill sync failure report does not match the catalog version delivered for this challenge.");
   }
   const ackKey = skillAckKey(scope);
   const ackStore = await localGet([ackKey]);
@@ -592,7 +616,8 @@ function skillCatalogNeedsSync(ack, status) {
   }
   return Boolean(ack?.lastSyncError) ||
     !/^[a-f0-9]{64}$/.test(String(ack?.catalogSha || "")) ||
-    ack.catalogSha !== status.catalogSha;
+    ack.catalogSha !== status.catalogSha ||
+    Number(ack?.version || 0) !== Number(status?.version || 0);
 }
 
 function getSkillMemoryScope(sender = {}) {

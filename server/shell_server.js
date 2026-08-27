@@ -22,7 +22,7 @@ const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
 const SERVER_PROTOCOL_VERSION = 11;
 const HELPER_PROTOCOL_VERSION = 4;
-const SKILL_PROTOCOL_VERSION = 2;
+const SKILL_PROTOCOL_VERSION = 3;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
@@ -422,6 +422,8 @@ function buildHealthResponse() {
     skillCatalogSha: skillCatalog.catalogSha,
     skillCatalogVersion: skillCatalog.version,
     skillCount: skillCatalog.skillCount,
+    discoveredSkillCount: skillCatalog.discoveredSkillCount,
+    installableSkillCount: skillCatalog.installableSkillCount,
     skillRootCount: skillCatalog.rootCount,
     skillCatalogErrors: skillCatalog.errors || [],
     skillCatalogWarnings: skillCatalog.warnings || [],
@@ -452,9 +454,9 @@ function getSkillCatalogHealth() {
   }
 }
 
-function handleSkillCatalogOperation(type, operation) {
+async function handleSkillCatalogOperation(type, operation) {
   try {
-    return withProtocolMetadata(operation());
+    return withProtocolMetadata(await operation());
   } catch (error) {
     console.error(`[skill-catalog] ${type} failed: ${error.message || String(error)}`);
     return withProtocolMetadata({
@@ -521,6 +523,10 @@ async function handleMessageText(text, context = {}) {
     return handleSkillCatalogOperation("skill-catalog-list", () => skillCatalogService.list());
   }
 
+  if (message.type === "skill-management-list") {
+    return handleSkillCatalogOperation("skill-management-list", () => skillCatalogService.manage());
+  }
+
   if (message.type === "skill-catalog-rescan") {
     return handleSkillCatalogOperation("skill-catalog-rescan", () => skillCatalogService.rescan());
   }
@@ -528,6 +534,15 @@ async function handleMessageText(text, context = {}) {
   if (message.type === "skill-load") {
     return handleSkillCatalogOperation("skill-load", () => skillCatalogService.load({
       skillId: message.skillId,
+      catalogSha: message.catalogSha
+    }));
+  }
+
+  if (message.type === "skill-install") {
+    return handleSkillCatalogOperation("skill-install", () => skillCatalogService.install({
+      skillId: message.skillId,
+      skillSha: message.skillSha,
+      installSha: message.installSha,
       catalogSha: message.catalogSha
     }));
   }

@@ -30,7 +30,13 @@ const {
 
 const temporaryPaths = [];
 
-try {
+main().finally(() => {
+  for (const target of temporaryPaths.reverse()) {
+    fs.rmSync(target, { recursive: true, force: true });
+  }
+});
+
+async function main() {
   testAggregateShaUsesOnlySortedRawFileShasAndKeepsDuplicates();
   testConfiguredRootsAndFrontmatter();
   testCatalogScanningRawShaVersionAndPersistence();
@@ -40,16 +46,12 @@ try {
   testFileSizeEncodingDepthAndCountBoundaries();
   testScanWorkAndDiagnosticBoundaries();
   testTotalSizeAndSerializedMetadataBoundaries();
-  testDescriptionAndExpandedLoadBoundaries();
-  testFormattedSkillLoadReplyBoundaries();
+  await testDescriptionAndExpandedLoadBoundaries();
+  await testFormattedSkillLoadReplyBoundaries();
   testEnvironmentExpansionIsAllowlistedAndSinglePass();
-  testSkillLoadRequiresCurrentCatalog();
+  await testSkillLoadRequiresCurrentCatalog();
   testCorruptStateIsRebuilt();
   console.log("server Skill catalog tests passed");
-} finally {
-  for (const target of temporaryPaths.reverse()) {
-    fs.rmSync(target, { recursive: true, force: true });
-  }
 }
 
 function testAggregateShaUsesOnlySortedRawFileShasAndKeepsDuplicates() {
@@ -131,7 +133,7 @@ function testCatalogScanningRawShaVersionAndPersistence() {
   const env = { AI_HELPER_SKILL_PATHS: root };
   const service = new SkillCatalogService({ stateDir, env, cwd: root, homeDir: root });
 
-  const first = service.list();
+  const first = service.manage();
   assert.equal(first.ok, true, JSON.stringify(first.errors));
   assert.equal(first.version, 1);
   assert.deepEqual(first.skills.map((skill) => skill.id), ["alpha", "beta"]);
@@ -142,7 +144,7 @@ function testCatalogScanningRawShaVersionAndPersistence() {
   const same = service.rescan();
   assert.equal(same.catalogSha, first.catalogSha);
   assert.equal(same.version, first.version, "An unchanged scan must not create a catalog version.");
-  const restarted = new SkillCatalogService({ stateDir, env, cwd: root, homeDir: root }).list();
+  const restarted = new SkillCatalogService({ stateDir, env, cwd: root, homeDir: root }).manage();
   assert.equal(restarted.catalogSha, first.catalogSha);
   assert.equal(restarted.version, first.version, "Catalog version must survive a shell-server restart.");
 
@@ -189,7 +191,7 @@ function testCatalogCacheAndFreshOperations() {
   const freshStatus = service.status({ force: true });
   assert.notEqual(freshStatus.catalogSha, initialStatus.catalogSha, "A fresh status call must bypass the scan cache.");
   fs.appendFileSync(skillPath, "\nrevision three");
-  const freshList = service.list();
+  const freshList = service.manage();
   assert.notEqual(freshList.catalogSha, freshStatus.catalogSha, "Catalog list must always scan fresh.");
 
   fs.appendFileSync(skillPath, "\nrevision four");
@@ -219,7 +221,7 @@ function testInvalidCatalogsFailClosed() {
     cwd: root,
     homeDir: root
   });
-  const list = service.list();
+  const list = service.manage();
   assert.equal(list.ok, false);
   assert.deepEqual(list.skills.map((skill) => skill.id), ["valid"]);
   assert.ok(list.errors.some((error) => error.code === "duplicate-skill-id"));
@@ -236,7 +238,7 @@ function testInvalidCatalogsFailClosed() {
     env: { AI_HELPER_SKILL_PATHS: path.join(root, "does-not-exist") },
     cwd: root,
     homeDir: root
-  }).list();
+  }).manage();
   assert.equal(explicitMissing.ok, false);
   assert.ok(explicitMissing.errors.some((error) => error.code === "skill-root-missing"));
   assertNoLocalPathLeak(explicitMissing, [root], "Missing-root diagnostics");
@@ -247,9 +249,9 @@ function testInvalidCatalogsFailClosed() {
     env: {},
     cwd: root,
     homeDir: implicitMissingHome
-  }).list();
+  }).manage();
   assert.equal(implicitMissing.ok, true);
-  assert.equal(implicitMissing.skillCount, 0);
+  assert.equal(implicitMissing.discoveredSkillCount, 0);
   assert.ok(implicitMissing.warnings.some((warning) => warning.code === "skill-root-missing"));
 
   const emptyExplicit = new SkillCatalogService({
@@ -257,7 +259,7 @@ function testInvalidCatalogsFailClosed() {
     env: { AI_HELPER_SKILL_PATHS: "" },
     cwd: root,
     homeDir: root
-  }).list();
+  }).manage();
   assert.equal(emptyExplicit.ok, false);
   assert.ok(emptyExplicit.errors.some((error) => error.code === "empty-skill-paths"));
 }
@@ -280,9 +282,9 @@ function testSymlinkAndRootContainmentProtection() {
     env: { AI_HELPER_SKILL_PATHS: root },
     cwd: root,
     homeDir: root
-  }).list();
+  }).manage();
   assert.equal(list.ok, false);
-  assert.equal(list.skillCount, 0);
+  assert.equal(list.discoveredSkillCount, 0);
   assert.ok(list.errors.filter((error) => error.code === "skill-symlink-rejected").length >= 2);
   assertNoLocalPathLeak(list, [root, outside], "Symlink catalog diagnostics");
 
@@ -293,7 +295,7 @@ function testSymlinkAndRootContainmentProtection() {
     env: { AI_HELPER_SKILL_PATHS: symlinkRoot },
     cwd: root,
     homeDir: root
-  }).list();
+  }).manage();
   assert.equal(linkedRootList.ok, false);
   assert.ok(linkedRootList.errors.some((error) => error.code === "invalid-skill-root"));
   assertNoLocalPathLeak(linkedRootList, [symlinkRoot, outside], "Symlink-root diagnostics");
@@ -303,15 +305,15 @@ function testFileSizeEncodingDepthAndCountBoundaries() {
   const maxSkillBytes = MAX_SKILL_FILE_BYTES;
   const exactRoot = makeTempDir("skill-size-exact-root-");
   writeSkillWithExactBytes(exactRoot, "exact-size", "exact-size", maxSkillBytes);
-  const exact = createService(exactRoot, "skill-size-exact-state-").list();
+  const exact = createService(exactRoot, "skill-size-exact-state-").manage();
   assert.equal(exact.ok, true, JSON.stringify(exact.errors));
-  assert.equal(exact.skillCount, 1, "A SKILL.md exactly at the byte limit must remain valid.");
+  assert.equal(exact.discoveredSkillCount, 1, "A SKILL.md exactly at the byte limit must remain valid.");
 
   const oversizedRoot = makeTempDir("skill-size-over-root-");
   writeSkillWithExactBytes(oversizedRoot, "over-size", "over-size", maxSkillBytes + 1);
-  const oversized = createService(oversizedRoot, "skill-size-over-state-").list();
+  const oversized = createService(oversizedRoot, "skill-size-over-state-").manage();
   assert.equal(oversized.ok, false);
-  assert.equal(oversized.skillCount, 0);
+  assert.equal(oversized.discoveredSkillCount, 0);
   assert.ok(oversized.errors.some((error) => error.code === "skill-too-large"));
 
   const invalidUtf8Root = makeTempDir("skill-utf8-root-");
@@ -321,7 +323,7 @@ function testFileSizeEncodingDepthAndCountBoundaries() {
     Buffer.from("---\nname: invalid-utf8\ndescription: Invalid UTF-8 bytes\n---\n", "utf8"),
     Buffer.from([0xc3, 0x28])
   ]));
-  const invalidUtf8 = createService(invalidUtf8Root, "skill-utf8-state-").list();
+  const invalidUtf8 = createService(invalidUtf8Root, "skill-utf8-state-").manage();
   assert.equal(invalidUtf8.ok, false);
   assert.ok(invalidUtf8.errors.some((error) => error.code === "invalid-skill-encoding"));
 
@@ -331,9 +333,9 @@ function testFileSizeEncodingDepthAndCountBoundaries() {
     description: "Allowed maximum depth",
     body: "depth 12"
   });
-  const depth12 = createService(depth12Root, "skill-depth12-state-").list();
+  const depth12 = createService(depth12Root, "skill-depth12-state-").manage();
   assert.equal(depth12.ok, true, JSON.stringify(depth12.errors));
-  assert.equal(depth12.skillCount, 1);
+  assert.equal(depth12.discoveredSkillCount, 1);
 
   const depth13Root = makeTempDir("skill-depth13-root-");
   writeSkill(depth13Root, Array.from({ length: 13 }, (_, index) => `d${index + 1}`).join("/"), {
@@ -341,22 +343,22 @@ function testFileSizeEncodingDepthAndCountBoundaries() {
     description: "Rejected over maximum depth",
     body: "depth 13"
   });
-  const depth13 = createService(depth13Root, "skill-depth13-state-").list();
+  const depth13 = createService(depth13Root, "skill-depth13-state-").manage();
   assert.equal(depth13.ok, false);
-  assert.equal(depth13.skillCount, 0);
+  assert.equal(depth13.discoveredSkillCount, 0);
   assert.ok(depth13.errors.some((error) => error.code === "skill-depth-exceeded"));
 
   const count500Root = makeTempDir("skill-count500-root-");
   writeManySkills(count500Root, 500);
-  const count500 = createService(count500Root, "skill-count500-state-").list();
+  const count500 = createService(count500Root, "skill-count500-state-").manage();
   assert.equal(count500.ok, true, JSON.stringify(count500.errors.slice(0, 3)));
-  assert.equal(count500.skillCount, 500, "Exactly the maximum number of Skills must remain valid.");
+  assert.equal(count500.discoveredSkillCount, 500, "Exactly the maximum number of Skills must remain valid.");
 
   const count501Root = makeTempDir("skill-count501-root-");
   writeManySkills(count501Root, 501);
-  const count501 = createService(count501Root, "skill-count501-state-").list();
+  const count501 = createService(count501Root, "skill-count501-state-").manage();
   assert.equal(count501.ok, false, "An extra SKILL.md must never be silently truncated into a healthy catalog.");
-  assert.equal(count501.skillCount, 500);
+  assert.equal(count501.discoveredSkillCount, 500);
   assert.ok(
     count501.errors.some((error) => error.code === "skill-count-exceeded"),
     "A catalog over the file-count limit must report skill-count-exceeded."
@@ -375,7 +377,7 @@ function testScanWorkAndDiagnosticBoundaries() {
     env: { AI_HELPER_SKILL_PATHS: exactConfiguredRoots.join(path.delimiter) },
     cwd: exactRootListBase,
     homeDir: exactRootListBase
-  }).list();
+  }).manage();
   assert.equal(exactRootCountList.ok, true, JSON.stringify(exactRootCountList.errors));
   assert.equal(exactRootCountList.rootCount, MAX_SKILL_ROOTS);
 
@@ -390,7 +392,7 @@ function testScanWorkAndDiagnosticBoundaries() {
     cwd: rootListBase,
     homeDir: rootListBase
   });
-  const rootCountList = rootCountService.list();
+  const rootCountList = rootCountService.manage();
   assert.equal(rootCountList.ok, false);
   assert.equal(rootCountList.rootCount, MAX_SKILL_ROOTS + 1);
   assert.deepEqual(rootCountList.skills, []);
@@ -423,7 +425,7 @@ function testScanWorkAndDiagnosticBoundaries() {
     };
     try {
       return {
-        list: createService(entryRoot, statePrefix).list(),
+        list: createService(entryRoot, statePrefix).manage(),
         readCount: () => fakeReadCount
       };
     } finally {
@@ -476,7 +478,7 @@ function testScanWorkAndDiagnosticBoundaries() {
   };
   let nestedEntryList;
   try {
-    nestedEntryList = createService(nestedEntryRoot, "skill-entry-nested-limit-state-").list();
+    nestedEntryList = createService(nestedEntryRoot, "skill-entry-nested-limit-state-").manage();
   } finally {
     fs.opendirSync = originalNestedOpendirSync;
   }
@@ -490,7 +492,7 @@ function testScanWorkAndDiagnosticBoundaries() {
   for (let index = 0; index < MAX_SKILL_TRAVERSAL_ISSUES + 1; index += 1) {
     fs.symlinkSync(traversalTarget, path.join(traversalRoot, `linked-${String(index).padStart(3, "0")}`), "dir");
   }
-  const traversalList = createService(traversalRoot, "skill-traversal-issues-state-").list();
+  const traversalList = createService(traversalRoot, "skill-traversal-issues-state-").manage();
   assert.equal(traversalList.ok, false);
   assert.equal(traversalList.errors.length, MAX_SKILL_TRAVERSAL_ISSUES);
   assert.ok(traversalList.errors.some((error) => error.code === "skill-traversal-issue-limit-exceeded"));
@@ -502,14 +504,14 @@ function testScanWorkAndDiagnosticBoundaries() {
     fs.writeFileSync(path.join(directory, "SKILL.md"), "missing frontmatter\n");
   }
   const diagnosticService = createService(diagnosticRoot, "skill-public-issues-state-");
-  const exactDiagnosticList = diagnosticService.list();
+  const exactDiagnosticList = diagnosticService.manage();
   assert.equal(exactDiagnosticList.ok, false);
   assert.equal(exactDiagnosticList.errors.length, MAX_SKILL_PUBLIC_ISSUES);
   assert.ok(!exactDiagnosticList.errors.some((error) => error.code === "skill-public-issue-limit-exceeded"));
   const overDiagnosticDirectory = path.join(diagnosticRoot, `invalid-${MAX_SKILL_PUBLIC_ISSUES}`);
   fs.mkdirSync(overDiagnosticDirectory, { recursive: true });
   fs.writeFileSync(path.join(overDiagnosticDirectory, "SKILL.md"), "missing frontmatter\n");
-  const diagnosticList = diagnosticService.list();
+  const diagnosticList = diagnosticService.manage();
   assert.equal(diagnosticList.ok, false);
   assert.equal(diagnosticList.errors.length, MAX_SKILL_PUBLIC_ISSUES);
   assert.equal(
@@ -522,15 +524,15 @@ function testScanWorkAndDiagnosticBoundaries() {
 function testTotalSizeAndSerializedMetadataBoundaries() {
   const exactTotalRoot = makeTempDir("skill-total-exact-root-");
   writeSkillsWithExactTotalBytes(exactTotalRoot, MAX_SKILL_TOTAL_BYTES);
-  const exactTotal = createService(exactTotalRoot, "skill-total-exact-state-").list();
+  const exactTotal = createService(exactTotalRoot, "skill-total-exact-state-").manage();
   assert.equal(exactTotal.ok, true, JSON.stringify(exactTotal.errors));
-  assert.ok(exactTotal.skillCount > 1);
+  assert.ok(exactTotal.discoveredSkillCount > 1);
 
   const oversizedTotalRoot = makeTempDir("skill-total-over-root-");
   writeSkillsWithExactTotalBytes(oversizedTotalRoot, MAX_SKILL_TOTAL_BYTES + 1);
-  const oversizedTotal = createService(oversizedTotalRoot, "skill-total-over-state-").list();
+  const oversizedTotal = createService(oversizedTotalRoot, "skill-total-over-state-").manage();
   assert.equal(oversizedTotal.ok, false, "A catalog one byte over the aggregate limit must fail closed.");
-  assert.equal(oversizedTotal.skillCount, 0);
+  assert.equal(oversizedTotal.discoveredSkillCount, 0);
   assert.ok(oversizedTotal.errors.some((error) => error.code === "skill-total-size-exceeded"));
 
   const plainMetadataRoot = makeTempDir("skill-metadata-plain-root-");
@@ -540,7 +542,7 @@ function testTotalSizeAndSerializedMetadataBoundaries() {
   const plainActualChars = serializedPublicCatalogChars(plainInternal);
   assert.equal(plainInternal.catalogMetadataChars, plainActualChars, "The bound must measure the actual JSON sent to the extension.");
   assert.ok(plainActualChars <= MAX_SKILL_CATALOG_JSON_CHARS, `Expected ${plainActualChars} <= ${MAX_SKILL_CATALOG_JSON_CHARS}.`);
-  const plainList = plainService.list();
+  const plainList = plainService.manage();
   assert.equal(plainList.ok, true, JSON.stringify(plainList.errors));
   assert.equal(plainList.skills.length, 500, "A near-limit catalog must be returned completely.");
 
@@ -551,13 +553,13 @@ function testTotalSizeAndSerializedMetadataBoundaries() {
   const escapedActualChars = serializedPublicCatalogChars(escapedInternal);
   assert.equal(escapedInternal.catalogMetadataChars, escapedActualChars);
   assert.ok(escapedActualChars > MAX_SKILL_CATALOG_JSON_CHARS, "JSON escaping must count toward the serialized catalog limit.");
-  const escapedList = escapedService.list();
+  const escapedList = escapedService.manage();
   assert.equal(escapedList.ok, false);
   assert.deepEqual(escapedList.skills, [], "An oversized metadata catalog must never expose a partial list.");
   assert.ok(escapedList.errors.some((error) => error.code === "skill-catalog-metadata-too-large"));
 }
 
-function testDescriptionAndExpandedLoadBoundaries() {
+async function testDescriptionAndExpandedLoadBoundaries() {
   const exactDescription = "d".repeat(MAX_SKILL_DESCRIPTION_CHARS);
   assert.equal(
     parseSkillFrontmatter(`---\nname: exact-description\ndescription: ${exactDescription}\n---\nbody`).description.length,
@@ -571,7 +573,7 @@ function testDescriptionAndExpandedLoadBoundaries() {
   );
 
   const exactExpanded = createExpansionBoundaryService(MAX_LOADED_SKILL_CHARS);
-  const exactList = exactExpanded.service.list();
+  const exactList = await installSkillForTest(exactExpanded.service, "expanded-boundary");
   assert.equal(exactList.ok, true, JSON.stringify(exactList.errors));
   const exactLoad = exactExpanded.service.load({
     skillId: "expanded-boundary",
@@ -585,7 +587,7 @@ function testDescriptionAndExpandedLoadBoundaries() {
   );
 
   const oversizedExpanded = createExpansionBoundaryService(MAX_LOADED_SKILL_CHARS + 1);
-  const oversizedList = oversizedExpanded.service.list();
+  const oversizedList = await installSkillForTest(oversizedExpanded.service, "expanded-boundary");
   assert.equal(oversizedList.ok, true, JSON.stringify(oversizedList.errors));
   const oversizedLoad = oversizedExpanded.service.load({
     skillId: "expanded-boundary",
@@ -599,7 +601,7 @@ function testDescriptionAndExpandedLoadBoundaries() {
   );
 }
 
-function testFormattedSkillLoadReplyBoundaries() {
+async function testFormattedSkillLoadReplyBoundaries() {
   const root = makeTempDir("skill-formatted-reply-root-");
   const stateDir = makeTempDir("skill-formatted-reply-state-");
   const skillId = "formatted-fence";
@@ -637,7 +639,7 @@ function testFormattedSkillLoadReplyBoundaries() {
     FENCE_VALUE: "`".repeat(exactFenceRunChars) + "x".repeat(valueChars - exactFenceRunChars)
   };
   const service = new SkillCatalogService({ stateDir, env, cwd: root, homeDir: root });
-  const list = service.list();
+  const list = await installSkillForTest(service, skillId);
   assert.equal(list.ok, true, JSON.stringify(list.errors));
   const exactLoad = service.load({ skillId, catalogSha: list.catalogSha });
   assert.equal(exactLoad.ok, true, JSON.stringify(exactLoad));
@@ -735,7 +737,7 @@ function testEnvironmentExpansionIsAllowlistedAndSinglePass() {
   assert.equal(boundedRuntimeExpansion.content, "", "An oversized expansion must not retain a large partial body.");
 }
 
-function testSkillLoadRequiresCurrentCatalog() {
+async function testSkillLoadRequiresCurrentCatalog() {
   const root = makeTempDir("skill-load-root-");
   const stateDir = makeTempDir("skill-load-state-");
   const skillPath = writeSkill(root, "loader", {
@@ -761,7 +763,7 @@ function testSkillLoadRequiresCurrentCatalog() {
     cwd: root,
     homeDir: root
   });
-  const list = service.list();
+  const list = await installSkillForTest(service, "loader");
   const loaded = service.load({ skillId: "loader", catalogSha: list.catalogSha });
   assert.equal(loaded.ok, true, JSON.stringify(loaded));
   assert.ok(loaded.content.includes("home=/safe/home"));
@@ -809,7 +811,7 @@ function testSkillLoadRequiresCurrentCatalog() {
     cwd: missingRoot,
     homeDir: missingRoot
   });
-  const missingList = missingService.list();
+  const missingList = await installSkillForTest(missingService, "missing-env");
   const missingLoad = missingService.load({ skillId: "missing-env", catalogSha: missingList.catalogSha });
   assert.equal(missingLoad.ok, false);
   assert.equal(missingLoad.errorCode, "missing-skill-environment");
@@ -835,11 +837,11 @@ function testCorruptStateIsRebuilt() {
       env: { AI_HELPER_SKILL_PATHS: root },
       cwd: root,
       homeDir: root
-    }).list();
+    }).manage();
     assert.equal(list.ok, true);
     assert.equal(list.version, 1);
     const repaired = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    assert.equal(repaired.stateVersion, 1);
+    assert.equal(repaired.stateVersion, 2);
     assert.equal(repaired.catalogSha, list.catalogSha);
     assert.equal(repaired.version, list.version);
     assert.ok(Number.isFinite(Date.parse(repaired.updatedAt)));
@@ -916,6 +918,26 @@ function serializedPublicCatalogChars(catalog) {
     version: catalog.version,
     skills: catalog.skills.map(({ id, name, description, sha }) => ({ id, name, description, sha }))
   }, null, 2).length;
+}
+
+async function installSkillForTest(service, skillId) {
+  const discovered = service.scan({ force: true }).skills.find((skill) => skill.id === skillId);
+  assert.ok(discovered, `Expected discovered Skill ${skillId}.`);
+  const installerPath = path.join(path.dirname(discovered.filePath), "install.sh");
+  if (!fs.existsSync(installerPath)) {
+    fs.writeFileSync(installerPath, "#!/bin/sh\nset -eu\ntest -f \"${PWD}/SKILL.md\"\n", { mode: 0o700 });
+  }
+  service.current = null;
+  const management = service.manage();
+  const record = management.skills.find((skill) => skill.id === skillId);
+  const installed = await service.install({
+    skillId,
+    skillSha: record.sha,
+    installSha: record.installSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(installed.ok, true, JSON.stringify(installed));
+  return service.list();
 }
 
 function assertNoLocalPathLeak(value, localPaths, label) {

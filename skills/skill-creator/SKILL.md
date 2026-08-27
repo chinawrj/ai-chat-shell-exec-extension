@@ -21,7 +21,7 @@ Use only those resolved roots. They already reflect `AI_HELPER_SKILL_PATHS`, the
 3. If exactly one root is available, use it.
 4. If multiple roots are available, update the unique existing Skill when exactly one matching Skill is found inside them; otherwise ask the user which resolved root should receive the new Skill.
 
-Create or update `<resolved-root>/<skill-name>/SKILL.md`. Keep the folder name equal to the frontmatter `name`. Reject traversal, symlinked roots or files, and destinations outside the resolved root.
+Create or update `<resolved-root>/<skill-name>/SKILL.md` and `<resolved-root>/<skill-name>/install.sh`. Keep the folder name equal to the frontmatter `name`. Reject traversal, symlinked roots or files, and destinations outside the resolved root.
 
 ## Design the Skill
 
@@ -38,8 +38,9 @@ Create or update `<resolved-root>/<skill-name>/SKILL.md`. Keep the folder name e
 1. Inspect an existing Skill with the same name before writing. Across multiple configured roots, fail on duplicate names instead of choosing one arbitrarily.
 2. For an update, preserve useful instructions and unrelated supported metadata. Change only what the request requires.
 3. For a new Skill, start with YAML frontmatter containing `name` and `description`, followed by the focused Markdown instructions.
-4. Use the available file-editing mechanism; do not construct an unsafe shell command from an unvalidated name or path.
-5. If the Skill includes scripts, run them in an isolated or reversible test case. If it includes references, verify that every referenced path exists and is discoverable from `SKILL.md`.
+4. Ensure the Skill directory has a real, non-symlinked `install.sh`. It must be non-interactive, use a shebang plus `set -eu`, return zero only after all required setup succeeds, and return nonzero on failure. The shell server guarantees that the installer's working directory is the Skill directory but executes an immutable snapshot elsewhere, so resolve Skill-relative files through `$PWD` or cwd-relative paths; never derive the Skill directory from `$0` or `dirname "$0"`. When the Skill needs no setup, use `test -f "$PWD/SKILL.md"` and then exit successfully. Do not hide network access, privilege escalation, destructive changes, or credential requirements in the installer.
+5. Use the available file-editing mechanism; do not construct an unsafe shell command from an unvalidated name or path.
+6. Run the installer in an isolated or reversible test case. If the Skill includes other scripts, test them too. If it includes references, verify that every referenced path exists and is discoverable from `SKILL.md`.
 
 ## Validate
 
@@ -48,7 +49,8 @@ Before reporting completion:
 - Confirm the file is UTF-8, begins with valid YAML frontmatter, and its `name` matches both the requested name and folder.
 - Confirm the description is sufficiently discriminating for discovery and the body contains no unfinished scaffold text.
 - Confirm the final file is a real file contained by a real configured root, not a symlink.
-- Request a fresh catalog list with the standard Skill helper after writing:
+- Tell the user that a new or changed Skill remains unavailable to the AI until they open `View Skills` in the extension and click `Install`. Do not try to trigger installation through an AI helper.
+- After the user confirms installation, request a fresh installed catalog list with the standard Skill helper:
 
   ```text
   ai-helper-skill-start

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-08-28
+
+- Adds an explicit local Skill installation lifecycle: every discovered Skill starts uninstalled, the expanded Skills list exposes `Install`, `Installed`, retry, and missing-installer states, and only a trusted user click plus native confirmation can run an installer.
+- Stores server-authenticated schema-v2 installation records in the fixed `skill-install-state.json` file under `AI_CHAT_SHELL_STATE_DIR`, reconciles add/delete/SKILL.md/installer changes, repairs invalid or forged records, and advances the monotonic local Skills version for meaningful changes while ignoring metadata-only JSON rewrites.
+- Sends only installed and loadable Skills to AI, including every full bounded description, and explicitly tells the AI to preserve names and descriptions as routing metadata in the single `AI_CHAT_SHELL_SKILLS_CATALOG` memory entry.
+- Keeps installation local to the extension/server management path: AI Skill helpers cannot execute installers, installer output stays out of the composer, and installs never touch tmux, command deduplication, Force run, or shell ledgers.
+- Hardens installer execution with exact current id/Skill SHA/installer SHA/catalog validation, no-follow inode-safe reads, private immutable snapshots, a fixed `/bin/sh` invocation, minimal environment, per-service serialization, timeout/process-group termination, post-run revalidation, atomic `0600` state writes, and local-only diagnostics.
+- Requires AI synchronization acknowledgement to echo the exact catalog version as well as SHA, preventing version-only installation-state changes from being falsely acknowledged.
+- Bumps the Skill protocol to 3 and adds focused positive, negative, stale-state, failure, timeout, mutation, concurrency, panel, sync-prompt, packaging, and real-Chrome E2E regressions.
+
 ## [0.11.4] - 2026-08-27
 
 - Keeps retrying the unchanged v0.8.6/v0.8.9 send actuator when the current visible composer still contains the exact plugin-written result, without repeating the backend helper operation or the one allowed composer write.

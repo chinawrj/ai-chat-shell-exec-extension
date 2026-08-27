@@ -78,7 +78,9 @@ const sourceEntries = new Set(sourceListResult.stdout.trim().split(/\r?\n/));
 const sourcePrefix = `ai-chat-shell-exec-extension-v${manifest.version}/`;
 for (const entry of [
   "skills/skill-creator/SKILL.md",
+  "skills/skill-creator/install.sh",
   "tests/skill_creator_skill.test.js",
+  "tests/server_skill_install.test.js",
 ]) {
   assert.ok(sourceEntries.has(`${sourcePrefix}${entry}`), `source release archive must contain ${entry}`);
 }

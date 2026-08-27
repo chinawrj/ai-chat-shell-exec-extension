@@ -12,6 +12,7 @@ const websocketPayloads = [];
 const tabRemovedListeners = [];
 let challengeSequence = 1;
 let catalog = makeCatalog("a", 1);
+let installResponseGate = null;
 
 async function main() {
   let context = createBackgroundContext();
@@ -91,6 +92,11 @@ async function main() {
     memoryEntry: "SOME_OTHER_ENTRY"
   }, chatgptTab1);
   assert.equal(wrongMemoryAck.errorCode, "memory-entry-mismatch");
+  const wrongVersionAck = await context.handleSkillMessage({
+    ...ackMessage(list, begun.challenge),
+    catalogVersion: list.version + 1
+  }, chatgptTab1);
+  assert.equal(wrongVersionAck.errorCode, "catalog-version-mismatch");
 
   catalog = makeCatalog("b", 2);
   const staleAck = await context.handleSkillMessage(ackMessage(list, begun.challenge), chatgptTab1);
@@ -129,13 +135,23 @@ async function main() {
     type: "skill-sync-failed",
     challenge: forced.challenge,
     catalogSha: "0".repeat(64),
+    catalogVersion: forceList.version,
     reason: "wrong sha"
   }, chatgptTab1);
   assert.equal(wrongFailureSha.errorCode, "catalog-sha-mismatch");
+  const wrongFailureVersion = await context.handleSkillMessage({
+    type: "skill-sync-failed",
+    challenge: forced.challenge,
+    catalogSha: forceList.catalogSha,
+    catalogVersion: forceList.version + 1,
+    reason: "wrong version"
+  }, chatgptTab1);
+  assert.equal(wrongFailureVersion.errorCode, "catalog-version-mismatch");
   const failed = await context.handleSkillMessage({
     type: "skill-sync-failed",
     challenge: forced.challenge,
     catalogSha: forceList.catalogSha,
+    catalogVersion: forceList.version,
     reason: "memory unavailable"
   }, chatgptTab1);
   assert.equal(failed.ok, true);
@@ -161,6 +177,29 @@ async function main() {
   const afterRetry = await context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab1);
   assert.equal(afterRetry.updateAvailable, false);
   assert.equal(afterRetry.lastSyncError, "");
+
+  catalog = { ...catalog, version: catalog.version + 1 };
+  const jsonStateChange = await context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab1);
+  assert.equal(
+    jsonStateChange.updateAvailable,
+    true,
+    "A meaningful installation-JSON change must require sync even when the raw catalog SHA is unchanged."
+  );
+  const jsonChangeBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, chatgptTab1);
+  const jsonChangeList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: jsonChangeBegin.challenge
+  }, chatgptTab1);
+  catalog = { ...catalog, version: catalog.version + 1 };
+  const staleSameShaAck = await context.handleSkillMessage(ackMessage(jsonChangeList, jsonChangeBegin.challenge), chatgptTab1);
+  assert.equal(staleSameShaAck.errorCode, "stale-skill-sync-ack", "A same-SHA installation-state race must reject the old list by version.");
+  const latestJsonChangeList = await context.handleSkillMessage({
+    type: "skill-sync-list",
+    challenge: jsonChangeBegin.challenge
+  }, chatgptTab1);
+  const jsonChangeAck = await context.handleSkillMessage(ackMessage(latestJsonChangeList, jsonChangeBegin.challenge), chatgptTab1);
+  assert.equal(jsonChangeAck.ok, true);
+  assert.equal((await context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab1)).updateAvailable, false);
 
   catalog = makeCatalog("c", 3);
   const persistedBegin = await context.handleSkillMessage({ type: "skill-sync-begin" }, chatgptTab1);
@@ -218,6 +257,32 @@ async function main() {
 
   const catalogList = await context.handleSkillMessage({ type: "skill-catalog-list" }, chatgptTab1);
   assert.equal(catalogList.ok, true);
+  const managementList = await context.handleSkillMessage({ type: "skill-management-list" }, chatgptTab1);
+  assert.equal(managementList.ok, true);
+  assert.ok(websocketPayloads.some((payload) => payload.type === "skill-management-list"));
+  const installSha = "d".repeat(64);
+  installResponseGate = deferred();
+  const installPending = context.handleSkillMessage({
+    type: "skill-install",
+    skillId: "example",
+    skillSha: catalog.skills[0].sha,
+    installSha,
+    catalogSha: catalog.catalogSha
+  }, chatgptTab1);
+  const stateWhileInstalling = await Promise.race([
+    context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab1),
+    new Promise((resolve) => setTimeout(() => resolve(null), 500))
+  ]);
+  installResponseGate.resolve();
+  installResponseGate = null;
+  const install = await installPending;
+  assert.equal(stateWhileInstalling?.ok, true, "A long installer must not hold the origin-scoped sync/status lock.");
+  assert.equal(install.ok, true);
+  const installPayload = websocketPayloads.findLast((payload) => payload.type === "skill-install");
+  assert.equal(installPayload.skillId, "example");
+  assert.equal(installPayload.skillSha, catalog.skills[0].sha);
+  assert.equal(installPayload.installSha, installSha);
+  assert.equal(installPayload.catalogSha, catalog.catalogSha);
   const load = await context.handleSkillMessage({
     type: "skill-load",
     skillId: "example",
@@ -264,6 +329,7 @@ async function testEmptyCatalogSynchronization(context) {
     type: "skill-sync-failed",
     challenge: firstBegin.challenge,
     catalogSha: firstList.catalogSha,
+    catalogVersion: firstList.version,
     reason: "empty catalog memory update failed"
   }, firstOriginTab);
   assert.equal(firstFailure.ok, true);
@@ -407,7 +473,7 @@ function createBackgroundContext({ healthGate } = {}) {
           protocolVersion: 11,
           serverProtocolVersion: 11,
           helperProtocolVersion: 4,
-          skillProtocolVersion: 2
+          skillProtocolVersion: 3
         })
       };
     },
@@ -446,7 +512,10 @@ class FakeWebSocket {
   send(text) {
     const payload = JSON.parse(text);
     websocketPayloads.push(payload);
-    setTimeout(() => {
+    setTimeout(async () => {
+      if (payload.type === "skill-install" && installResponseGate) {
+        await installResponseGate.promise;
+      }
       const response = skillServerResponse(payload);
       this.emit("message", { data: JSON.stringify(response) });
     }, 0);
@@ -469,6 +538,23 @@ function skillServerResponse(payload) {
   }
   if (payload.type === "skill-catalog-list") {
     return { ...catalog, type: "skill-catalog-status", skills: catalog.skills };
+  }
+  if (payload.type === "skill-management-list") {
+    return {
+      ...catalog,
+      type: "skill-management-list",
+      discoveredSkillCount: catalog.skills.length,
+      skills: catalog.skills.map((skill) => ({ ...skill, installed: true, installAvailable: true }))
+    };
+  }
+  if (payload.type === "skill-install") {
+    return {
+      ...catalog,
+      ok: true,
+      type: "skill-install",
+      exitCode: 0,
+      skill: { ...catalog.skills[0], installed: true, installAvailable: true }
+    };
   }
   if (payload.type === "skill-load") {
     if (payload.catalogSha !== catalog.catalogSha) {
@@ -519,6 +605,7 @@ function ackMessage(list, challenge) {
     type: "skill-sync-ack",
     challenge,
     catalogSha: list.catalogSha,
+    catalogVersion: list.version,
     memoryEntry: "AI_CHAT_SHELL_SKILLS_CATALOG"
   };
 }

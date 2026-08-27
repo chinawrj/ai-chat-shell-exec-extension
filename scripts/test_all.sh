@@ -30,6 +30,7 @@ SHELL_SCRIPTS=(
   scripts/build_macos_vision_helper.sh
   scripts/run_terminal_vision_self_test.sh
   scripts/test_all.sh
+  skills/skill-creator/install.sh
 )
 
 for shell_script in "${SHELL_SCRIPTS[@]}"; do

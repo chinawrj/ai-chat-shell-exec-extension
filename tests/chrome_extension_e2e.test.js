@@ -73,7 +73,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.skillProtocolVersion,
-      2,
+      3,
       `Existing Skill protocol is ${serverHealth.skillProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -91,6 +91,8 @@ async function main() {
   const skillRootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-shell-skills-e2e-"));
   const skillDirectory = path.join(skillRootDir, "e2e-skill");
   const skillPath = path.join(skillDirectory, "SKILL.md");
+  const skillInstallPath = path.join(skillDirectory, "install.sh");
+  const skillInstallRunPath = path.join(skillDirectory, "install-runs.txt");
   const skillAllowedValue = `skill-allowed-${Date.now()}`;
   const skillSecretValue = `skill-secret-${Date.now()}`;
   fs.mkdirSync(skillDirectory, { recursive: true });
@@ -304,9 +306,10 @@ async function main() {
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
 
   if (managedShellServer) {
-    await runEmptySkillCatalogE2E(page, { skillPath });
+    await runEmptySkillCatalogE2E(page, { skillPath, skillInstallPath, skillInstallRunPath, shellStateDir });
     await runSkillE2E(page, debugPort, {
       skillPath,
+      skillInstallRunPath,
       expectedHome: helperFileTestHome,
       allowedValue: skillAllowedValue,
       secretValue: skillSecretValue
@@ -1536,7 +1539,7 @@ async function main() {
   }
 }
 
-async function runEmptySkillCatalogE2E(page, { skillPath }) {
+async function runEmptySkillCatalogE2E(page, { skillPath, skillInstallPath, skillInstallRunPath, shellStateDir }) {
   const startMarker = "ai-helper-skill-start";
   const endMarker = "ai-helper-skill-end";
   const memoryEntry = "AI_CHAT_SHELL_SKILLS_CATALOG";
@@ -1546,7 +1549,8 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
     const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
     return chip && !chip.hidden && !chip.disabled && chip.textContent.includes("↑") &&
       /not been acknowledged/i.test(chip.title || "") &&
-      /Skills: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Installed: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Discovered: 0/.test(detail?.innerText || detail?.textContent || "") &&
       /Acknowledged: \\(never\\)/.test(detail?.innerText || detail?.textContent || "") &&
       /Sync: update required/.test(detail?.innerText || detail?.textContent || "");
   })()`, "never-acknowledged empty Skill catalog to require synchronization");
@@ -1579,6 +1583,7 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
   assert.match(catalogReply, /"skills": \[\]/);
   assert.match(catalogReply, /Remove entries for Skills that are not in this complete list/);
   assert.equal(requireMessageField(catalogReply, "catalog-sha", /^[a-f0-9]{64}$/), emptyCatalogSha);
+  const emptyCatalogVersion = requireMessageField(catalogReply, "catalog-version", /^[1-9][0-9]*$/);
 
   const beforeAck = await pageUserMessageCount(page);
   await appendAssistantSkillHelper(page, [
@@ -1586,6 +1591,7 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
     "cmd: list-updated",
     `challenge: ${challenge}`,
     `catalog-sha: ${emptyCatalogSha}`,
+    `catalog-version: ${emptyCatalogVersion}`,
     `memory-entry: ${memoryEntry}`,
     endMarker
   ]);
@@ -1594,7 +1600,8 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
     const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
     return chip && !chip.disabled && !chip.textContent.includes("↑") &&
       /View local Skills v[0-9]+ catalog/i.test(chip.title || "") &&
-      /Skills: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Installed: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Discovered: 0/.test(detail?.innerText || detail?.textContent || "") &&
       /Acknowledged: ${emptyCatalogSha}/.test(detail?.innerText || detail?.textContent || "") &&
       /Sync: current/.test(detail?.innerText || detail?.textContent || "");
   })()`, "acknowledged empty Skill catalog to become current");
@@ -1602,23 +1609,39 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
   await page.evaluate(`document.getElementById("ai-chat-shell-exec-skill-status")?.click(); true`);
   await waitForEvaluate(page, `(() => {
     const dialog = document.getElementById("ai-chat-shell-exec-skill-dialog");
-    return dialog && /Local Skills v[0-9]+ · 0 item\\(s\\)/.test(dialog.innerText || "");
+    return dialog && /Installed 0 \\/ Discovered 0/.test(dialog.innerText || "");
   })()`, "current empty Skill chip to open the zero-item local catalog");
   await assertUserMessageCountStable(page, beforeAck, "Viewing an acknowledged empty catalog must not write to the AI chat");
   await page.evaluate(`document.querySelector('#ai-chat-shell-exec-skill-dialog button')?.click(); true`);
 
   fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 1 }));
+  fs.writeFileSync(skillInstallPath, [
+    "#!/bin/sh",
+    "set -eu",
+    "printf 'run\\n' >> install-runs.txt",
+    "test -f \"$PWD/SKILL.md\"",
+    ""
+  ].join("\n"), { mode: 0o700 });
   await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
   await waitForEvaluate(page, `(() => {
-    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
-    return /Rescanned 1 Skills/i.test(panel?.innerText || "") &&
-      chip && !chip.disabled && chip.textContent.includes("↑") && /changed/i.test(chip.title || "");
+    const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
+    return chip && !chip.disabled && chip.textContent.includes("↑") && /changed/i.test(chip.title || "") &&
+      /Installed: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Discovered: 1/.test(detail?.innerText || detail?.textContent || "");
   })()`, "adding the first Skill after an empty ACK to require synchronization");
+  const statePath = path.join(shellStateDir, "skill-install-state.json");
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, false);
+  const beforeInstall = await pageUserMessageCount(page);
+  await installSkillThroughDialog(page, "e2e-skill");
+  await assertUserMessageCountStable(page, beforeInstall, "Installing a local Skill must not write or auto-sync the AI composer");
+  assert.equal(fs.readFileSync(skillInstallRunPath, "utf8"), "run\n", "A double-click must execute install.sh exactly once.");
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, true);
 }
 
 async function runSkillE2E(page, debugPort, {
   skillPath,
+  skillInstallRunPath,
   expectedHome,
   allowedValue,
   secretValue
@@ -1718,6 +1741,7 @@ async function runSkillE2E(page, debugPort, {
   assert.match(initialCatalogReply, /E2E Skill browser coverage/);
   assert.match(initialCatalogReply, new RegExp(`memory-entry: ${memoryEntry}`));
   assert.equal(requireMessageField(initialCatalogReply, "catalog-sha", /^[a-f0-9]{64}$/), initialCatalogSha);
+  const initialCatalogVersion = requireMessageField(initialCatalogReply, "catalog-version", /^[1-9][0-9]*$/);
   await assertUserMessageCountStable(page, beforeCatalog + 1, "Catalog response must not trigger its own indirect instructions");
 
   const beforeWrongMemory = await pageUserMessageCount(page);
@@ -1726,6 +1750,7 @@ async function runSkillE2E(page, debugPort, {
     "cmd: list-updated",
     `challenge: ${initialChallenge}`,
     `catalog-sha: ${initialCatalogSha}`,
+    `catalog-version: ${initialCatalogVersion}`,
     "memory-entry: WRONG_MEMORY_ENTRY",
     endMarker
   ]);
@@ -1742,12 +1767,17 @@ async function runSkillE2E(page, debugPort, {
   })()`, "active Skill sync to remain pending after wrong memory ACK");
 
   fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 2 }));
+  const beforeReinstall = await pageUserMessageCount(page);
+  await installSkillThroughDialog(page, "e2e-skill");
+  await assertUserMessageCountStable(page, beforeReinstall, "Reinstalling a changed Skill must remain local while sync is active");
+  assert.equal(fs.readFileSync(skillInstallRunPath, "utf8"), "run\nrun\n", "A changed Skill must require one fresh successful install.");
   const beforeStaleAck = await pageUserMessageCount(page);
   await appendAssistantSkillHelper(page, [
     `${startMarker}:stale-ack-e2e`,
     "cmd: list-updated",
     `challenge: ${initialChallenge}`,
     `catalog-sha: ${initialCatalogSha}`,
+    `catalog-version: ${initialCatalogVersion}`,
     `memory-entry: ${memoryEntry}`,
     endMarker
   ]);
@@ -1779,6 +1809,7 @@ async function runSkillE2E(page, debugPort, {
     "latest accumulated Skill catalog response"
   );
   const latestCatalogSha = requireMessageField(latestCatalogReply, "catalog-sha", /^[a-f0-9]{64}$/);
+  const latestCatalogVersion = requireMessageField(latestCatalogReply, "catalog-version", /^[1-9][0-9]*$/);
   assert.equal(latestCatalogSha, changedCatalogSha);
   assert.match(latestCatalogReply, /revision 2/);
 
@@ -1788,6 +1819,7 @@ async function runSkillE2E(page, debugPort, {
     "cmd: list-updated",
     `challenge: ${initialChallenge}`,
     `catalog-sha: ${latestCatalogSha}`,
+    `catalog-version: ${latestCatalogVersion}`,
     `memory-entry: ${memoryEntry}`,
     endMarker
   ]);
@@ -1834,13 +1866,15 @@ async function runSkillE2E(page, debugPort, {
     `challenge: ${forcedChallenge}`,
     endMarker
   ]);
-  await waitForNewUserMessage(page, beforeForcedList, "Local SKILLS catalog synchronization response:", "forced catalog response");
+  const forcedCatalogReply = await waitForNewUserMessage(page, beforeForcedList, "Local SKILLS catalog synchronization response:", "forced catalog response");
+  const forcedCatalogVersion = requireMessageField(forcedCatalogReply, "catalog-version", /^[1-9][0-9]*$/);
   const beforeFailure = await pageUserMessageCount(page);
   await appendAssistantSkillHelper(page, [
     `${startMarker}:force-failed-e2e`,
     "cmd: list-update-failed",
     `challenge: ${forcedChallenge}`,
     `catalog-sha: ${latestCatalogSha}`,
+    `catalog-version: ${forcedCatalogVersion}`,
     "reason: memory intentionally unavailable in E2E",
     endMarker
   ]);
@@ -1901,12 +1935,14 @@ async function runSkillE2E(page, debugPort, {
     throw new Error(`${error.message}; retrySkillState=${JSON.stringify({ domState, isolatedState })}`);
   }
   const retryCatalogSha = requireMessageField(retryCatalog, "catalog-sha", /^[a-f0-9]{64}$/);
+  const retryCatalogVersion = requireMessageField(retryCatalog, "catalog-version", /^[1-9][0-9]*$/);
   const beforeRetryAck = await pageUserMessageCount(page);
   await appendAssistantSkillHelper(page, [
     `${startMarker}:retry-ack-e2e`,
     "cmd: list-updated",
     `challenge: ${retryChallenge}`,
     `catalog-sha: ${retryCatalogSha}`,
+    `catalog-version: ${retryCatalogVersion}`,
     `memory-entry: ${memoryEntry}`,
     endMarker
   ]);
@@ -1944,6 +1980,45 @@ async function runSkillE2E(page, debugPort, {
   assert.match(loadReply, /ai-helper-skill-end/);
   assert.ok(!loadReply.includes(secretValue), "A non-allowlisted local environment variable must not leak to the AI.");
   await assertUserMessageCountStable(page, beforeLoad + 1, "Loaded Skill helper examples must stay inert inside skill-output provenance");
+}
+
+async function installSkillThroughDialog(page, skillId) {
+  await page.evaluate(`(() => {
+    document.getElementById("ai-chat-shell-exec-skill-dialog")?.remove();
+    document.querySelector('[data-shell-tool-action="skill-view"]')?.click();
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const row = document.querySelector(${JSON.stringify(`#ai-chat-shell-exec-skill-dialog [data-skill-id="${skillId}"]`)});
+    const button = row?.querySelector('[data-skill-install]');
+    return button && !button.disabled && /^(Install|Retry)$/.test(button.textContent || "");
+  })()`, `Skill ${skillId} Install action`);
+  await trustedDoubleClick(page, `#ai-chat-shell-exec-skill-dialog [data-skill-id="${skillId}"] [data-skill-install]`);
+  await waitForEvaluate(page, `(() => {
+    const row = document.querySelector(${JSON.stringify(`#ai-chat-shell-exec-skill-dialog [data-skill-id="${skillId}"]`)});
+    return row && /Installed/.test(row.querySelector('[role="status"]')?.textContent || "");
+  })()`, `Skill ${skillId} installation success`);
+  await page.evaluate(`document.querySelector('#ai-chat-shell-exec-skill-dialog > section > div:first-child button')?.click(); true`);
+  await waitForEvaluate(page, `!document.getElementById("ai-chat-shell-exec-skill-dialog")`, `Skill ${skillId} dialog to close after installation`);
+}
+
+async function trustedDoubleClick(page, selector) {
+  const point = await page.evaluate(`(() => {
+    const target = document.querySelector(${JSON.stringify(selector)});
+    if (!target) return null;
+    const rect = target.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`);
+  assert.ok(point && Number.isFinite(point.x) && Number.isFinite(point.y), `Missing click target: ${selector}`);
+  page.acceptNextDialog = true;
+  try {
+    for (let clickCount = 1; clickCount <= 2; clickCount += 1) {
+      await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount });
+      await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount });
+    }
+  } finally {
+    page.acceptNextDialog = false;
+  }
 }
 
 function buildE2eSkillSource({ revision }) {

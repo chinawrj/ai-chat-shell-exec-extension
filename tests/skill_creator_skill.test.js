@@ -14,11 +14,21 @@ const {
 const rootDir = path.join(__dirname, "..");
 const bundledSkillsRoot = path.join(rootDir, "skills");
 const skillPath = path.join(bundledSkillsRoot, "skill-creator", "SKILL.md");
+const installPath = path.join(bundledSkillsRoot, "skill-creator", "install.sh");
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "skill-creator-test-"));
 
-try {
+main().finally(() => {
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+async function main() {
   assert.equal(fs.lstatSync(skillPath).isFile(), true);
   assert.equal(fs.lstatSync(skillPath).isSymbolicLink(), false);
+  assert.equal(fs.lstatSync(installPath).isFile(), true);
+  assert.equal(fs.lstatSync(installPath).isSymbolicLink(), false);
+  const bundledInstallSource = fs.readFileSync(installPath, "utf8");
+  assert.match(bundledInstallSource, /\$\{PWD\}\/SKILL\.md/);
+  assert.doesNotMatch(bundledInstallSource, /dirname\s+["']?\$0|\$\{?0\}?/);
 
   const plural = getConfiguredSkillRoots({
     env: { AI_HELPER_SKILL_PATHS: bundledSkillsRoot },
@@ -39,7 +49,10 @@ try {
     stateDir: path.join(tempRoot, "plural-state"),
     cacheMs: 0
   });
-  const pluralList = pluralService.list();
+  const pluralManagement = pluralService.manage();
+  assert.equal(pluralManagement.skills[0].installed, false);
+  assert.equal(pluralManagement.skills[0].installAvailable, true);
+  const pluralList = await installSkillForTest(pluralService, "skill-creator");
   assert.equal(pluralList.ok, true, JSON.stringify(pluralList.errors));
   assert.equal(pluralList.skillCount, 1);
   assert.equal(pluralList.skills[0].id, "skill-creator");
@@ -59,6 +72,14 @@ try {
   assert.match(loaded.content, /If the roots JSON is empty, stop/);
   assert.match(loaded.content, /A path outside the resolved roots belongs to a different workflow/);
   assert.match(loaded.content, /Reject traversal, symlinked roots or files/);
+  assert.match(loaded.content, /<skill-name>\/install\.sh/);
+  assert.match(loaded.content, /return zero only after all required setup succeeds/i);
+  assert.match(loaded.content, /immutable snapshot/i);
+  assert.match(loaded.content, /working directory is the Skill directory/i);
+  assert.match(loaded.content, /never derive the Skill directory from `\$0`/i);
+  assert.match(loaded.content, /test -f "\$PWD\/SKILL\.md"/);
+  assert.match(loaded.content, /remains unavailable to the AI until they open `View Skills`/i);
+  assert.match(loaded.content, /Do not try to trigger installation through an AI helper/i);
   assert.match(loaded.content, /cmd: list/);
   assert.match(loaded.content, /Do not invent `cmd: rescan`/);
   assert.doesNotMatch(loaded.content, /\.claude\/skills/);
@@ -73,7 +94,7 @@ try {
     stateDir: path.join(tempRoot, "singular-state"),
     cacheMs: 0
   });
-  const singularList = singularService.list();
+  const singularList = await installSkillForTest(singularService, "skill-creator");
   assert.equal(singularList.ok, true, JSON.stringify(singularList.errors));
   assert.equal(singularList.skillCount, 1);
   assert.equal(singularList.skills[0].id, "skill-creator");
@@ -111,7 +132,7 @@ try {
     stateDir: path.join(tempRoot, "multi-state"),
     cacheMs: 0
   });
-  const multipleList = multipleService.list();
+  const multipleList = await installSkillForTest(multipleService, "skill-creator");
   assert.equal(multipleList.ok, true, JSON.stringify(multipleList.errors));
   assert.equal(multipleList.skillCount, 1);
   const multipleLoad = multipleService.load({
@@ -167,6 +188,7 @@ try {
   const defaultSkillDirectory = path.join(defaultSkillsRoot, "skill-creator");
   fs.mkdirSync(defaultSkillDirectory, { recursive: true });
   fs.copyFileSync(skillPath, path.join(defaultSkillDirectory, "SKILL.md"));
+  fs.copyFileSync(installPath, path.join(defaultSkillDirectory, "install.sh"));
   const defaultService = new SkillCatalogService({
     env: { HOME: fallbackHome },
     cwd: rootDir,
@@ -174,7 +196,7 @@ try {
     stateDir: path.join(tempRoot, "default-state"),
     cacheMs: 0
   });
-  const defaultList = defaultService.list();
+  const defaultList = await installSkillForTest(defaultService, "skill-creator");
   assert.equal(defaultList.ok, true, JSON.stringify(defaultList.errors));
   assert.equal(defaultList.skillCount, 1);
   const defaultLoad = defaultService.load({
@@ -187,8 +209,6 @@ try {
   assert.equal(defaultRuntime.AI_HELPER_SKILL_ROOT_SOURCE, "default");
 
   console.log("skill-creator Skill tests passed");
-} finally {
-  fs.rmSync(tempRoot, { recursive: true, force: true });
 }
 
 function escapeRegExp(value) {
@@ -200,4 +220,18 @@ function assertLoadedRoots(load, roots, source) {
   assert.match(load.content, new RegExp(escapeRegExp(JSON.stringify(roots))));
   assert.match(load.content, new RegExp(escapeRegExp(`Configuration source: \`${source}\``)));
   assert.doesNotMatch(load.content, /\$AI_HELPER_SKILL_(?:ROOTS_JSON|ROOT_SOURCE)/);
+}
+
+async function installSkillForTest(service, skillId) {
+  const management = service.manage();
+  const record = management.skills.find((skill) => skill.id === skillId);
+  assert.ok(record, `Expected discovered Skill ${skillId}.`);
+  const installed = await service.install({
+    skillId,
+    skillSha: record.sha,
+    installSha: record.installSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(installed.ok, true, JSON.stringify(installed));
+  return service.list();
 }

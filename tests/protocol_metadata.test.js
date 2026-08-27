@@ -25,7 +25,7 @@ async function main() {
 
     assert.equal(server.SERVER_PROTOCOL_VERSION, 11);
     assert.equal(server.HELPER_PROTOCOL_VERSION, 4);
-    assert.equal(server.SKILL_PROTOCOL_VERSION, 2);
+    assert.equal(server.SKILL_PROTOCOL_VERSION, 3);
     assert.match(doctorSource, new RegExp(`EXPECTED_SERVER_PROTOCOL_VERSION=${server.SERVER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_HELPER_PROTOCOL_VERSION=${server.HELPER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_SKILL_PROTOCOL_VERSION=${server.SKILL_PROTOCOL_VERSION}(?:\\n|$)`));
@@ -42,7 +42,7 @@ async function main() {
     assert.equal(metadata.protocolVersion, 11);
     assert.equal(metadata.serverProtocolVersion, 11);
     assert.equal(metadata.helperProtocolVersion, 4);
-    assert.equal(metadata.skillProtocolVersion, 2);
+    assert.equal(metadata.skillProtocolVersion, 3);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
     assert.equal(metadata.visualProtocolVersion, 1);
     assert.deepEqual(metadata.visualTmuxApps, ["Terminal", "Ghostty"]);
@@ -53,7 +53,7 @@ async function main() {
     assert.equal(health.serverReleaseVersion, manifest.version);
     assert.equal(health.serverProtocolVersion, 11);
     assert.equal(health.helperProtocolVersion, 4);
-    assert.equal(health.skillProtocolVersion, 2);
+    assert.equal(health.skillProtocolVersion, 3);
     assert.equal(health.visualProtocolVersion, 1);
     assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
     assert.equal(health.executionBackend, "tmux");
@@ -72,7 +72,7 @@ async function main() {
         protocolVersion: 11,
         serverProtocolVersion: 11,
         helperProtocolVersion: 4,
-        skillProtocolVersion: 2
+        skillProtocolVersion: 3
       },
       assertHealth: (result) => {
         assert.equal(result.ok, true);
@@ -82,7 +82,7 @@ async function main() {
         assert.equal(result.releaseMatches, true);
         assert.equal(result.requiredServerProtocolVersion, 11);
         assert.equal(result.requiredHelperProtocolVersion, 4);
-        assert.equal(result.requiredSkillProtocolVersion, 2);
+        assert.equal(result.requiredSkillProtocolVersion, 3);
       }
     });
 
@@ -98,7 +98,7 @@ async function main() {
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 11, helper protocol 4, and Skill protocol 2/);
+        assert.match(result.error, /Expected server protocol 11, helper protocol 4, and Skill protocol 3/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -113,7 +113,7 @@ async function main() {
         protocolVersion: 11,
         serverProtocolVersion: 11,
         helperProtocolVersion: 0,
-        skillProtocolVersion: 2
+        skillProtocolVersion: 3
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);
@@ -132,7 +132,7 @@ async function main() {
         serverReleaseVersion: manifest.version,
         protocolVersion: 11,
         serverProtocolVersion: 11,
-        skillProtocolVersion: 2
+        skillProtocolVersion: 3
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);

@@ -118,8 +118,29 @@ for (const [mode, label] of [
   assert.match(skillsSection, new RegExp(`mode: "${mode}", label: "${label}"`));
 }
 const viewSkillCatalog = source.match(/async function viewSkillCatalog\(\) \{[\s\S]*?\n\}/)?.[0] || "";
-assert.match(viewSkillCatalog, /type: "skill-catalog-list"/);
+assert.match(viewSkillCatalog, /type: "skill-management-list"/);
 assert.doesNotMatch(viewSkillCatalog, /insertReply|rememberPendingHelperDelivery|attemptPendingHelperDelivery/, "View Skills must remain local and never write to the AI composer.");
+assert.match(source, /action\.textContent = "✓ Installed"/);
+assert.match(source, /const retrying = skillInstallErrors\.has\(skillId\)/);
+assert.match(source, /action\.textContent = retrying \? "Retry" : "Install"/);
+assert.match(source, /action\.textContent = "No installer"/);
+assert.match(source, /action\.textContent = "Installing…"/);
+assert.match(source, /event\?\.isTrusted !== true/);
+assert.match(source, /window\.confirm\(`Install local Skill "\$\{skillName\}" \(id: \$\{skillId\}\)/);
+assert.match(source, /action\.disabled = response\.ok !== true/, "An invalid catalog must never expose an enabled installer action.");
+assert.match(source, /aria-describedby/);
+assert.match(source, /Installation unavailable: add a real, safe install\.sh/);
+assert.match(source, /dialogContext\?\.pageGeneration === pageLifecycleGeneration/);
+assert.match(source, /dialogContext\?\.overlay\?\.isConnected/);
+assert.match(source, /updateSkillInstallRowLocally/);
+assert.match(source, /type: "skill-install"/);
+assert.match(source, /installSha: String\(skill\?\.installSha \|\| ""\)/);
+assert.match(source, /skillInstallInFlight\.has\(skillId\)/, "Double-clicks must be rejected before the install message is sent.");
+assert.doesNotMatch(
+  source.match(/async function installSkillFromPanel[\s\S]*?\n\}/)?.[0] || "",
+  /rememberPendingHelperDelivery|attemptPendingHelperDelivery|startSkillSync/,
+  "A local Install click must not write or auto-sync the AI composer."
+);
 assert.match(source, /type: "skill-sync-begin",\s*force/);
 assert.match(source, /type: "skill-catalog-rescan"/);
 
