@@ -31,13 +31,14 @@ const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
 const SHELL_RUN_CONTROL_ID = "ai-chat-shell-exec-run-control";
 const SKILL_STATUS_ACTION_ID = "ai-chat-shell-exec-skill-status";
+const AGENT_ROLE_BADGE_ID = "ai-chat-shell-exec-agent-role-badge";
 const SKILL_DETAIL_ID = "ai-chat-shell-exec-skill-detail";
 const SKILL_CATALOG_DIALOG_ID = "ai-chat-shell-exec-skill-dialog";
 const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.2";
+const CONTENT_SCRIPT_VERSION = "0.11.3";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -3955,6 +3956,7 @@ async function setCurrentAgentProfile(role, agentId) {
   }
   activeAgentProfile = profile;
   writeSessionAgentProfile(profile);
+  updateAgentRoleBadge(profile);
   await chrome.storage.local.set({
     [agentProfileKey()]: profile
   });
@@ -6225,6 +6227,31 @@ function createPanelSection(title, group) {
   return { section, body };
 }
 
+function createCollapsedPanelSection(title, group) {
+  const section = document.createElement("details");
+  section.dataset.shellPanelGroup = group;
+  section.open = false;
+  section.style.cssText = "margin-top:10px;border-top:1px solid #2f3a4d";
+
+  const heading = document.createElement("summary");
+  heading.textContent = title;
+  heading.style.cssText = [
+    "min-height:28px",
+    "box-sizing:border-box",
+    "padding:8px 0",
+    "cursor:pointer",
+    "color:#b8c1d1",
+    "font:600 10px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "letter-spacing:.04em",
+    "text-transform:uppercase"
+  ].join(";");
+
+  const body = document.createElement("div");
+  body.style.marginTop = "4px";
+  section.append(heading, body);
+  return { section, body };
+}
+
 function injectStatus() {
   if (document.getElementById(STATUS_ID)) {
     return;
@@ -6254,13 +6281,42 @@ function injectStatus() {
   ].join(";");
 
   const statusRow = document.createElement("div");
-  statusRow.style.cssText = "display:flex;align-items:center;gap:7px;min-height:24px;margin-bottom:8px";
+  statusRow.style.cssText = "display:flex;align-items:center;gap:6px;min-height:24px;margin-bottom:8px";
 
   const statusIndicator = document.createElement("span");
   statusIndicator.id = STATUS_INDICATOR_ID;
   statusIndicator.setAttribute("aria-hidden", "true");
   statusIndicator.style.cssText = "flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#64748b;box-shadow:0 0 0 3px rgba(100,116,139,.16)";
   statusRow.appendChild(statusIndicator);
+
+  const agentRoleBadge = document.createElement("span");
+  agentRoleBadge.id = AGENT_ROLE_BADGE_ID;
+  agentRoleBadge.dataset.agentRole = "none";
+  agentRoleBadge.textContent = "None";
+  agentRoleBadge.setAttribute("role", "status");
+  agentRoleBadge.setAttribute("aria-live", "polite");
+  agentRoleBadge.setAttribute("aria-label", "Page role: None; shell target ForAI:host");
+  agentRoleBadge.title = "Page role: None; shell target ForAI:host";
+  agentRoleBadge.style.cssText = [
+    "box-sizing:border-box",
+    "flex:0 0 auto",
+    "min-height:20px",
+    "max-width:52px",
+    "display:inline-flex",
+    "align-items:center",
+    "justify-content:center",
+    "border:1px solid #4b5563",
+    "border-radius:999px",
+    "padding:2px 6px",
+    "background:#273244",
+    "color:#cbd5e1",
+    "font:600 10px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    "line-height:1",
+    "white-space:nowrap",
+    "overflow:hidden",
+    "text-overflow:ellipsis"
+  ].join(";");
+  statusRow.appendChild(agentRoleBadge);
 
   const statusText = document.createElement("div");
   statusText.id = STATUS_TEXT_ID;
@@ -6275,7 +6331,7 @@ function injectStatus() {
   skillStatusAction.type = "button";
   skillStatusAction.hidden = true;
   skillStatusAction.disabled = true;
-  skillStatusAction.dataset.shellToolAction = "skill-sync";
+  skillStatusAction.dataset.shellToolAction = "skill-status";
   skillStatusAction.textContent = "Skills";
   skillStatusAction.style.cssText = [
     "flex:0 0 auto",
@@ -6295,6 +6351,13 @@ function injectStatus() {
 
   panel.appendChild(statusRow);
 
+  const panelInteractionStyle = document.createElement("style");
+  panelInteractionStyle.textContent = [
+    `#${SKILL_STATUS_ACTION_ID}:not(:disabled):hover{filter:brightness(1.18)}`,
+    `#${SKILL_STATUS_ACTION_ID}:focus-visible{outline:2px solid #93c5fd;outline-offset:2px}`
+  ].join("");
+  panel.appendChild(panelInteractionStyle);
+
   const actions = document.createElement("div");
   actions.dataset.shellPanelGroup = "common";
   actions.style.cssText = "display:grid;grid-template-columns:32px;justify-content:end;gap:4px";
@@ -6313,7 +6376,7 @@ function injectStatus() {
     {
       mode: "more",
       label: "•••",
-      title: "Show setup, binding, agent, and diagnostic controls"
+      title: "Show setup, agent, Skills, diagnostic, and page-binding controls"
     }
   ]) {
     const button = createPanelActionButton(action);
@@ -6396,15 +6459,6 @@ function injectStatus() {
     }
   ], 2));
   advancedControls.appendChild(setupSection.section);
-
-  const bindingSection = createPanelSection("Page binding", "page-binding");
-  bindingSection.body.appendChild(createPanelButtonGrid([
-    { mode: "input", label: "Bind input" },
-    { mode: "send", label: "Bind send" },
-    { mode: "shell", label: "Bind shell" },
-    { mode: "clear", label: "Clear" }
-  ], 2));
-  advancedControls.appendChild(bindingSection.section);
 
   const agentSection = createPanelSection("Agent & tmux-ai", "agent-tmux-ai");
 
@@ -6492,6 +6546,15 @@ function injectStatus() {
   debugPanel.append(debugSummary, debugBody);
   diagnosticSection.body.appendChild(debugPanel);
   advancedControls.appendChild(diagnosticSection.section);
+
+  const bindingSection = createCollapsedPanelSection("Page binding", "page-binding");
+  bindingSection.body.appendChild(createPanelButtonGrid([
+    { mode: "input", label: "Bind input" },
+    { mode: "send", label: "Bind send" },
+    { mode: "shell", label: "Bind shell" },
+    { mode: "clear", label: "Clear" }
+  ], 2));
+  advancedControls.appendChild(bindingSection.section);
   panel.appendChild(advancedControls);
 
   chrome.storage.local.get([debugProfileKey()]).then((stored) => {
@@ -6564,8 +6627,8 @@ function setAdvancedPanelOpen(open) {
   button.setAttribute("aria-expanded", expanded ? "true" : "false");
   button.setAttribute("aria-label", expanded ? "Hide more controls" : "More controls");
   button.title = expanded
-    ? "Hide setup, binding, agent, and diagnostic controls"
-    : "Show setup, binding, agent, and diagnostic controls";
+    ? "Hide setup, agent, Skills, diagnostic, and page-binding controls"
+    : "Show setup, agent, Skills, diagnostic, and page-binding controls";
   panel.dataset.advancedOpen = expanded ? "true" : "false";
 }
 
@@ -6643,6 +6706,7 @@ function updateSkillPanelState() {
       action.style.borderColor = "#be123c";
       action.style.color = "#fecdd3";
       action.title = state ? `Skill catalog unavailable: ${state.error || firstSkillUiError(state) || "unknown error"}` : "Checking local Skills";
+      action.ariaLabel = state ? "View local Skills catalog error" : "Checking local Skills";
     }
     if (detail) {
       detail.textContent = state
@@ -6658,7 +6722,7 @@ function updateSkillPanelState() {
   if (action) {
     action.hidden = false;
     action.textContent = `Skills v${version}${syncing ? " …" : updateAvailable ? " ↑" : ""}`;
-    action.disabled = !updateAvailable || syncing;
+    action.disabled = syncing;
     action.style.cursor = action.disabled ? "default" : "pointer";
     action.style.background = updateAvailable ? "#065f46" : "#1f2937";
     action.style.borderColor = updateAvailable ? "#10b981" : "#4b5563";
@@ -6672,7 +6736,12 @@ function updateSkillPanelState() {
         ? acknowledgedSha
           ? `Local Skills v${version} changed; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
           : `Local Skills v${version} have not been acknowledged; ask the AI to replace ${SKILL_MEMORY_ENTRY}`
-        : `Local Skills v${version} are acknowledged for this AI memory scope`;
+        : `View local Skills v${version} catalog; this version is acknowledged for this AI memory scope`;
+    action.ariaLabel = syncing
+      ? `Skills v${version} synchronization in progress`
+      : updateAvailable
+        ? `Synchronize local Skills v${version}`
+        : `View local Skills v${version} catalog`;
   }
   if (detail) {
     const catalogSha = String(state.catalogSha || "");
@@ -7389,8 +7458,11 @@ function handlePanelAction(action) {
     return;
   }
 
-  if (action === "skill-sync") {
-    if (skillPanelState && skillPanelState.ok !== true) {
+  if (action === "skill-status") {
+    if (!skillPanelState || skillPanelState.syncing === true) {
+      return;
+    }
+    if (skillPanelState.ok !== true || skillPanelState.updateAvailable !== true) {
       viewSkillCatalog().catch((error) => {
         setStatus(`Skill catalog view failed: ${summarizeCommand(error.message || String(error))}`, "error");
       });
@@ -7529,6 +7601,7 @@ function handlePanelAction(action) {
 
 async function loadAgentControls() {
   const profile = await getCurrentAgentProfile();
+  updateAgentRoleBadge(profile);
   const role = document.querySelector(`#${STATUS_ID} [data-shell-agent-role]`);
   const agentId = document.querySelector(`#${STATUS_ID} [data-shell-agent-id]`);
   if (role) {
@@ -7537,6 +7610,46 @@ async function loadAgentControls() {
   if (agentId) {
     agentId.value = profile.agentId || "";
   }
+}
+
+function updateAgentRoleBadge(profile = activeAgentProfile) {
+  const badge = document.getElementById(AGENT_ROLE_BADGE_ID);
+  if (!badge) {
+    return;
+  }
+  const normalized = normalizeAgentProfile(profile);
+  const role = ["master", "slave"].includes(normalized.role) ? normalized.role : "none";
+  const presentation = {
+    none: {
+      label: "None",
+      background: "#273244",
+      border: "#4b5563",
+      color: "#cbd5e1"
+    },
+    master: {
+      label: "Master",
+      background: "#1e3a5f",
+      border: "#60a5fa",
+      color: "#dbeafe"
+    },
+    slave: {
+      label: "Slave",
+      background: "#3b245f",
+      border: "#a78bfa",
+      color: "#ede9fe"
+    }
+  }[role];
+  const target = role === "none" ? "ForAI:host" : `ForAI-${normalized.agentId}:host`;
+  const description = role === "none"
+    ? `Page role: ${presentation.label}; shell target ${target}`
+    : `Page role: ${presentation.label}; agent ${normalized.agentId}; shell target ${target}`;
+  badge.dataset.agentRole = role;
+  badge.textContent = presentation.label;
+  badge.style.background = presentation.background;
+  badge.style.borderColor = presentation.border;
+  badge.style.color = presentation.color;
+  badge.setAttribute("aria-label", description);
+  badge.title = description;
 }
 
 function applyAgentRoleSuggestion(role) {

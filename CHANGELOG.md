@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-08-27
+
+- Keeps the acknowledged gray `Skills vN` chip interactive: clicking it opens the complete local Skills catalog without starting synchronization, creating a challenge, or writing to the AI composer. Update, syncing, and invalid states retain their distinct sync, disabled, and local-error behaviors.
+- Adds a compact saved-role badge to the panel's existing top row. `None`, `Master`, and `Slave` remain text-visible as well as color-distinct, and unsaved advanced-form edits cannot misrepresent the active tmux routing role.
+- Moves Page binding to the bottom of the advanced panel in a default-closed native details group while preserving all four binding actions.
+- Adds focused source/state regressions and real-Chrome coverage for current/zero-Skill catalog viewing, sync-state separation, role badge save/restore/reset behavior and routing, compact non-overlap, advanced ordering, and Page binding collapse/expansion.
+- Regenerates the README panel gallery from the real unpacked-extension Chrome E2E path, including the new role badge and bottom collapsed Page binding state.
+
 ## [0.11.2] - 2026-08-27
 
 - Adds a bundled `skill-creator` for authoring focused Claude-compatible Skills in the AI Chat Shell Exec local catalog, with scoped discovery and explicit validation guidance.

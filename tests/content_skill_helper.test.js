@@ -20,6 +20,7 @@ testSkillEnvelopeAndIdentityRules();
 testSelfExplainingPromptsCannotTriggerTheSkillParser();
 testSkillLoadFinalSerializationBoundaries();
 testEmptyCatalogPanelStates();
+testSkillStatusActionRouting();
 awaitTestExplicitUserAndProvenanceRejection()
   .then(() => console.log("content Skill helper tests passed"));
 
@@ -382,14 +383,55 @@ function testEmptyCatalogPanelStates() {
       updateSkillPanelState();
     `, context);
     assert.equal(action.textContent, "Skills v3");
-    assert.equal(action.disabled, true);
-    assert.match(action.title, /are acknowledged/i);
+    assert.equal(action.disabled, false);
+    assert.equal(action.style.cursor, "pointer");
+    assert.match(action.title, /View local Skills v3 catalog/i);
+    assert.equal(action.ariaLabel, "View local Skills v3 catalog");
     assert.match(detail.textContent, new RegExp(`Acknowledged: ${catalogSha}`));
     assert.match(detail.textContent, /Sync: current/);
     assert.doesNotMatch(detail.textContent, /Sync: update required/);
   } finally {
     context.document.getElementById = originalGetElementById;
   }
+}
+
+function testSkillStatusActionRouting() {
+  vm.runInContext(`
+    (() => {
+      const originalViewSkillCatalog = viewSkillCatalog;
+      const originalStartSkillSync = startSkillSync;
+      let viewCount = 0;
+      const syncForces = [];
+      viewSkillCatalog = () => {
+        viewCount += 1;
+        return Promise.resolve(true);
+      };
+      startSkillSync = ({ force }) => {
+        syncForces.push(force);
+        return Promise.resolve(true);
+      };
+
+      skillPanelState = { ok: true, updateAvailable: false, syncing: false };
+      handlePanelAction("skill-status");
+      skillPanelState = { ok: false, updateAvailable: true, syncing: false };
+      handlePanelAction("skill-status");
+      skillPanelState = { ok: true, updateAvailable: true, syncing: false };
+      handlePanelAction("skill-status");
+      skillPanelState = { ok: true, updateAvailable: true, syncing: true };
+      handlePanelAction("skill-status");
+      skillPanelState = null;
+      handlePanelAction("skill-status");
+
+      globalThis.__skillStatusRouting = { viewCount, syncForces };
+      viewSkillCatalog = originalViewSkillCatalog;
+      startSkillSync = originalStartSkillSync;
+    })();
+  `, context);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.__skillStatusRouting)),
+    { viewCount: 2, syncForces: [false] },
+    "Current and invalid status chips must view locally, update must sync once, and syncing/checking must no-op."
+  );
 }
 
 function testSkillLoadFinalSerializationBoundaries() {

@@ -7,7 +7,7 @@ const path = require("node:path");
 const root = path.join(__dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const e2eSource = fs.readFileSync(path.join(root, "tests", "chrome_extension_e2e.test.js"), "utf8");
-const assetRoot = "docs/release-assets/v0.11.0";
+const assetRoot = "docs/release-assets/v0.11.3";
 const screenshots = [
   "extension-panel-idle.png",
   "extension-panel-skills-update.png",
@@ -15,7 +15,8 @@ const screenshots = [
   "extension-panel-running.png",
   "extension-panel-awaiting-user.png",
   "extension-panel-drawio.png",
-  "extension-panel-advanced.png"
+  "extension-panel-advanced.png",
+  "extension-panel-page-binding.png"
 ];
 
 assert.match(readme, /## Latest Extension Panel Screenshots/);

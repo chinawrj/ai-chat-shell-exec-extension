@@ -73,7 +73,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.skillProtocolVersion,
-      1,
+      2,
       `Existing Skill protocol is ${serverHealth.skillProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -162,6 +162,9 @@ async function main() {
       `--load-extension=${EXTENSION_DIR}`
     );
   }
+  if (SCREENSHOT_DIR) {
+    chromeArgs.push("--force-device-scale-factor=2");
+  }
   chromeArgs.push("about:blank");
   if (browserEnv.headless) {
     chromeArgs.unshift("--headless=new");
@@ -209,6 +212,9 @@ async function main() {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const common = panel?.querySelector('[data-shell-panel-group="common"]');
     const advanced = panel?.querySelector('#ai-chat-shell-exec-advanced-controls');
+    const binding = advanced?.querySelector('[data-shell-panel-group="page-binding"]');
+    const roleBadge = panel?.querySelector('#ai-chat-shell-exec-agent-role-badge');
+    const skillChip = panel?.querySelector('#ai-chat-shell-exec-skill-status');
     const visibleCommonActions = Array.from(common?.querySelectorAll('[data-shell-tool-action]') || [])
       .filter((button) => getComputedStyle(button).display !== "none")
       .map((button) => button.dataset.shellToolAction);
@@ -228,6 +234,14 @@ async function main() {
       ].every((action) => Boolean(advanced?.querySelector('[data-shell-tool-action="' + action + '"]'))),
       drawioHidden: panel?.querySelector('#ai-chat-shell-exec-drawio-action')?.hidden === true,
       drawioInAdvanced: Boolean(advanced?.querySelector('[data-shell-tool-action="drawio-reopen"]')),
+      bindingTag: binding?.tagName || "",
+      bindingOpen: binding?.open === true,
+      roleText: roleBadge?.textContent || "",
+      roleState: roleBadge?.dataset.agentRole || "",
+      roleAria: roleBadge?.getAttribute("aria-label") || "",
+      roleOverlapsSkill: !skillChip?.hidden && roleBadge && skillChip
+        ? roleBadge.getBoundingClientRect().right > skillChip.getBoundingClientRect().left
+        : false,
       groups: Array.from(panel?.querySelectorAll('[data-shell-panel-group]') || [])
         .map((element) => element.dataset.shellPanelGroup)
     };
@@ -241,13 +255,19 @@ async function main() {
   assert.equal(compactPanelState.advancedActionsPresent, true, JSON.stringify(compactPanelState));
   assert.equal(compactPanelState.drawioHidden, true, JSON.stringify(compactPanelState));
   assert.equal(compactPanelState.drawioInAdvanced, false, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.bindingTag, "DETAILS", JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.bindingOpen, false, JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.roleText, "None", JSON.stringify(compactPanelState));
+  assert.equal(compactPanelState.roleState, "none", JSON.stringify(compactPanelState));
+  assert.match(compactPanelState.roleAria, /Page role: None; shell target ForAI:host/);
+  assert.equal(compactPanelState.roleOverlapsSkill, false, JSON.stringify(compactPanelState));
   assert.deepEqual(compactPanelState.groups, [
     "common",
     "setup-recovery",
-    "page-binding",
     "agent-tmux-ai",
     "skills",
-    "tools-diagnostics"
+    "tools-diagnostics",
+    "page-binding"
   ]);
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `(() => {
@@ -256,9 +276,30 @@ async function main() {
     const more = panel?.querySelector('[data-shell-tool-action="more"]');
     return advanced?.hidden === false && more?.getAttribute("aria-expanded") === "true";
   })()`, "compact panel advanced controls to expand");
+  const unsavedRoleBadge = await page.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const select = panel?.querySelector('[data-shell-agent-role]');
+    select.value = "master";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    const result = panel?.querySelector('#ai-chat-shell-exec-agent-role-badge')?.textContent || "";
+    select.value = "none";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return result;
+  })()`);
+  assert.equal(unsavedRoleBadge, "None", "An unsaved role draft must not change the active role badge.");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-advanced.png"));
+    await page.evaluate(`(() => {
+      const advanced = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls');
+      advanced.scrollTop = advanced.scrollHeight;
+      return true;
+    })()`);
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-page-binding.png"));
   }
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="page-binding"] > summary')?.click(); true`);
+  await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="page-binding"]')?.open === true`, "Page binding native details expansion");
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="page-binding"] > summary')?.click(); true`);
+  await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-panel-group="page-binding"]')?.open === false`, "Page binding to collapse again");
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
 
@@ -297,6 +338,12 @@ async function main() {
     return true;
   })()`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered slave slave-a")`, "panel agent slave registration");
+  await waitForEvaluate(page, `(() => {
+    const badge = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-agent-role-badge');
+    return badge?.textContent === "Slave" && badge?.dataset.agentRole === "slave" &&
+      /agent slave-a; shell target ForAI-slave-a:host/.test(badge?.getAttribute("aria-label") || "") &&
+      getComputedStyle(badge).borderColor === "rgb(167, 139, 250)";
+  })()`, "saved Slave role badge");
 
   let agentResponse = await sendLocalAgentRequest(page, {
     type: "agent-list"
@@ -384,8 +431,10 @@ async function main() {
   await waitForEvaluate(page, "document.readyState === 'complete'", "role refresh page load");
   await waitForEvaluate(page, `(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const badge = panel?.querySelector("#ai-chat-shell-exec-agent-role-badge");
     return panel?.querySelector("[data-shell-agent-role]")?.value === "slave" &&
-      panel?.querySelector("[data-shell-agent-id]")?.value === "slave-a";
+      panel?.querySelector("[data-shell-agent-id]")?.value === "slave-a" &&
+      badge?.textContent === "Slave" && badge?.dataset.agentRole === "slave";
   })()`, "per-tab role restoration after page session storage was cleared");
 
   const refreshedAgentTmuxToken = `agent-tmux-refresh-e2e-${Date.now()}`;
@@ -452,6 +501,12 @@ async function main() {
     return true;
   })()`);
   await waitForEvaluate(masterPage, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Registered master master")`, "master panel agent registration");
+  await waitForEvaluate(masterPage, `(() => {
+    const badge = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-agent-role-badge');
+    return badge?.textContent === "Master" && badge?.dataset.agentRole === "master" &&
+      /agent master; shell target ForAI-master:host/.test(badge?.getAttribute("aria-label") || "") &&
+      getComputedStyle(badge).borderColor === "rgb(96, 165, 250)";
+  })()`, "saved Master role badge");
   await masterPage.evaluate(`(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     panel.querySelector('[data-shell-tool-action="agent-check"]').click();
@@ -672,6 +727,12 @@ async function main() {
     return true;
   })()`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}).innerText.includes("Agent mode disabled")`, "page agent mode to disable before non-agent refresh tests");
+  await waitForEvaluate(page, `(() => {
+    const badge = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-agent-role-badge');
+    return badge?.textContent === "None" && badge?.dataset.agentRole === "none" &&
+      /shell target ForAI:host/.test(badge?.getAttribute("aria-label") || "") &&
+      getComputedStyle(badge).borderColor === "rgb(75, 85, 99)";
+  })()`, "disabled agent None role badge");
 
   const deletedComposerMarkerPath = path.join(os.tmpdir(), `ai-chat-shell-deleted-composer-e2e-${process.pid}-${Date.now()}.txt`);
   const deletedComposerToken = `ai-chat-shell-deleted-composer-${Date.now()}`;
@@ -1487,13 +1548,20 @@ async function runEmptySkillCatalogE2E(page, { skillPath }) {
   await waitForEvaluate(page, `(() => {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
     const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
-    return chip && chip.disabled && !chip.textContent.includes("↑") &&
-      /acknowledged/i.test(chip.title || "") &&
+    return chip && !chip.disabled && !chip.textContent.includes("↑") &&
+      /View local Skills v[0-9]+ catalog/i.test(chip.title || "") &&
       /Skills: 0/.test(detail?.innerText || detail?.textContent || "") &&
       /Acknowledged: ${emptyCatalogSha}/.test(detail?.innerText || detail?.textContent || "") &&
       /Sync: current/.test(detail?.innerText || detail?.textContent || "");
   })()`, "acknowledged empty Skill catalog to become current");
   await assertUserMessageCountStable(page, beforeAck, "A successful empty-catalog ACK must remain silent");
+  await page.evaluate(`document.getElementById("ai-chat-shell-exec-skill-status")?.click(); true`);
+  await waitForEvaluate(page, `(() => {
+    const dialog = document.getElementById("ai-chat-shell-exec-skill-dialog");
+    return dialog && /Local Skills v[0-9]+ · 0 item\\(s\\)/.test(dialog.innerText || "");
+  })()`, "current empty Skill chip to open the zero-item local catalog");
+  await assertUserMessageCountStable(page, beforeAck, "Viewing an acknowledged empty catalog must not write to the AI chat");
+  await page.evaluate(`document.querySelector('#ai-chat-shell-exec-skill-dialog button')?.click(); true`);
 
   fs.writeFileSync(skillPath, buildE2eSkillSource({ revision: 1 }));
   await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
@@ -1681,21 +1749,21 @@ async function runSkillE2E(page, debugPort, {
   ]);
   await waitForEvaluate(page, `(() => {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
-    return chip && !chip.hidden && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+    return chip && !chip.hidden && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
   })()`, "valid Skill ACK to clear the green chip");
   await assertUserMessageCountStable(page, beforeValidAck, "A successful Skill ACK must not create a composer reply");
   await waitForEvaluate(competingPage, `(() => {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
-    return chip && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+    return chip && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
   })()`, "valid Skill ACK to clear other tabs in the same scope");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-idle.png"));
   }
 
   const beforeView = await pageUserMessageCount(page);
-  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-view"]')?.click(); true`);
+  await page.evaluate(`document.getElementById("ai-chat-shell-exec-skill-status")?.click(); true`);
   await waitForEvaluate(page, `Boolean(document.getElementById("ai-chat-shell-exec-skill-dialog"))`, "local Skill catalog dialog");
-  assert.equal(await pageUserMessageCount(page), beforeView, "View Skills must not write anything to the AI chat.");
+  await assertUserMessageCountStable(page, beforeView, "The acknowledged Skills chip must open the local catalog without creating a sync challenge or AI message.");
   await page.evaluate(`document.querySelector('#ai-chat-shell-exec-skill-dialog button')?.click(); true`);
   await waitForEvaluate(page, `!document.getElementById("ai-chat-shell-exec-skill-dialog")`, "local Skill catalog dialog to close");
   await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
@@ -1800,7 +1868,7 @@ async function runSkillE2E(page, debugPort, {
   ]);
   await waitForEvaluate(page, `(() => {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
-    return chip && chip.disabled && !chip.textContent.includes("↑") && /acknowledged/i.test(chip.title || "");
+    return chip && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
   })()`, "Skill retry ACK");
   await assertUserMessageCountStable(page, beforeRetryAck, "Successful retry ACK must remain silent");
 
@@ -2337,6 +2405,11 @@ async function savePanelScreenshot(page, filePath) {
     clone.style.transform = "none";
     stage.appendChild(clone);
     document.documentElement.appendChild(stage);
+    const sourceAdvanced = panel.querySelector("#ai-chat-shell-exec-advanced-controls");
+    const cloneAdvanced = clone.querySelector("#ai-chat-shell-exec-advanced-controls");
+    if (sourceAdvanced && cloneAdvanced) {
+      cloneAdvanced.scrollTop = sourceAdvanced.scrollTop;
+    }
     const rect = stage.getBoundingClientRect();
     return {
       x: window.scrollX,

@@ -6,11 +6,19 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
 
-assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.2";/);
+assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.3";/);
 assert.match(source, /width:min\(292px,calc\(100vw - 32px\)\)/);
 assert.match(source, /statusText\.style\.cssText = "[^"]*text-overflow:ellipsis;white-space:nowrap/);
 assert.match(source, /statusIndicator\.id = STATUS_INDICATOR_ID/);
 assert.match(source, /statusDetail\.id = STATUS_DETAIL_ID/);
+assert.match(source, /agentRoleBadge\.id = AGENT_ROLE_BADGE_ID/);
+assert.match(source, /agentRoleBadge\.textContent = "None"/);
+assert.match(source, /max-width:52px/);
+assert.match(source, /master: \{[\s\S]*?label: "Master"[\s\S]*?border: "#60a5fa"/);
+assert.match(source, /slave: \{[\s\S]*?label: "Slave"[\s\S]*?border: "#a78bfa"/);
+assert.match(source, /function updateAgentRoleBadge\(profile = activeAgentProfile\)/);
+assert.match(source, /loadAgentControls\(\)[\s\S]*?updateAgentRoleBadge\(profile\)/);
+assert.match(source, /activeAgentProfile = profile;[\s\S]*?updateAgentRoleBadge\(profile\);[\s\S]*?chrome\.storage\.local\.set/);
 
 const commonActions = source.match(/actions\.dataset\.shellPanelGroup = "common";[\s\S]*?panel\.appendChild\(actions\);/)?.[0] || "";
 assert.ok(commonActions, "Compact common action group must exist.");
@@ -52,13 +60,21 @@ assert.doesNotMatch(diagnosticSection, /drawio-reopen/, "Draw.io must be context
 assert.match(source, /advancedControls\.id = ADVANCED_CONTROLS_ID;\s*advancedControls\.hidden = true;/);
 for (const [title, group] of [
   ["Setup & recovery", "setup-recovery"],
-  ["Page binding", "page-binding"],
   ["Agent & tmux-ai", "agent-tmux-ai"],
   ["Skills", "skills"],
   ["Tools & diagnostics", "tools-diagnostics"]
 ]) {
   assert.match(source, new RegExp(`createPanelSection\\("${title.replace("&", "&")}", "${group}"\\)`));
 }
+assert.match(source, /createCollapsedPanelSection\("Page binding", "page-binding"\)/);
+assert.match(source, /section\.open = false/);
+assert.match(source, /const section = document\.createElement\("details"\)/);
+assert.match(source, /min-height:28px/);
+assert.ok(
+  source.indexOf('advancedControls.appendChild(diagnosticSection.section);') <
+    source.indexOf('advancedControls.appendChild(bindingSection.section);'),
+  "Default-collapsed Page binding must be the last advanced group."
+);
 assert.match(source, /button\.setAttribute\("aria-expanded", expanded \? "true" : "false"\)/);
 assert.match(source, /advancedControls\.hidden = !expanded/);
 
@@ -81,10 +97,14 @@ assert.doesNotMatch(source, />Quit<\/button>/);
 assert.doesNotMatch(source, /data-shell-tool-action="terminate-helper"/);
 
 assert.match(source, /skillStatusAction\.id = SKILL_STATUS_ACTION_ID/);
-assert.match(source, /skillStatusAction\.dataset\.shellToolAction = "skill-sync"/);
+assert.match(source, /skillStatusAction\.dataset\.shellToolAction = "skill-status"/);
 assert.match(source, /action\.textContent = `Skills v\$\{version\}\$\{syncing \? " …" : updateAvailable \? " ↑" : ""\}`/);
-assert.match(source, /action\.disabled = !updateAvailable \|\| syncing/);
+assert.match(source, /action\.disabled = syncing/);
 assert.match(source, /action\.style\.background = updateAvailable \? "#065f46" : "#1f2937"/);
+assert.match(source, /action === "skill-status"/);
+assert.match(source, /skillPanelState\.syncing === true/);
+assert.match(source, /skillPanelState\.ok !== true \|\| skillPanelState\.updateAvailable !== true/);
+assert.match(source, /viewSkillCatalog\(\)\.catch/);
 const skillsSection = source.match(/const skillsSection = createPanelSection\("Skills", "skills"\);[\s\S]*?advancedControls\.appendChild\(skillsSection\.section\);/)?.[0] || "";
 assert.ok(skillsSection, "The complete Skills controls must live in a labelled advanced group.");
 for (const [mode, label] of [

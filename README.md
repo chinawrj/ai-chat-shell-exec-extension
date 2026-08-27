@@ -114,29 +114,31 @@ The panel is state-driven: it keeps the healthy idle view minimal and reveals an
 
 | Healthy idle | Skills update available |
 | --- | --- |
-| <img src="docs/release-assets/v0.11.0/extension-panel-idle.png" width="328" alt="Healthy idle extension panel showing the acknowledged Skills version and More"> | <img src="docs/release-assets/v0.11.0/extension-panel-skills-update.png" width="328" alt="Extension panel showing the green Skills update action"> |
-| The acknowledged `Skills vN` chip stays neutral beside the concise health status and `More`. | A changed local catalog turns the version chip into the green synchronization action. |
+| <img src="docs/release-assets/v0.11.3/extension-panel-idle.png" width="328" alt="Healthy idle extension panel showing the saved role, acknowledged Skills version, and More"> | <img src="docs/release-assets/v0.11.3/extension-panel-skills-update.png" width="328" alt="Extension panel showing the saved role and green Skills update action"> |
+| The acknowledged `Skills vN` chip stays neutral but remains clickable to open the local catalog; the compact role badge shows the saved `None`, `Master`, or `Slave` routing state. | A changed local catalog turns the version chip into the green synchronization action. |
 
 | Force run available |
 | --- |
-| <img src="docs/release-assets/v0.11.0/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run and More controls"> |
+| <img src="docs/release-assets/v0.11.3/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run and More controls"> |
 | `Force run` appears when a rendered executable helper is available for an explicit forced attempt. Skill helpers never make it appear. |
 
 | Shell helper running | Waiting for user decision |
 | --- | --- |
-| <img src="docs/release-assets/v0.11.0/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.11.0/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
+| <img src="docs/release-assets/v0.11.3/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.11.3/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
 | During execution, `Stop helper` replaces `Force run`. | After the output-idle interval, `Continue waiting` and `Stop helper` appear together in the decision card. |
 
 | Draw.io available |
 | --- |
-| <img src="docs/release-assets/v0.11.0/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
+| <img src="docs/release-assets/v0.11.3/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
 | `Draw.io preview` appears only after a preview artifact or render error exists and remains available after closing the preview. |
 
 ### Expanded advanced controls
 
-`More` reveals the complete setup/recovery, page-binding, Agent/tmux-ai, Skills, full-status, and debug controls without making them occupy the normal chat view.
+`More` reveals the complete setup/recovery, Agent/tmux-ai, Skills, full-status, debug, and page-binding controls without making them occupy the normal chat view. Page binding is the last group and stays folded until its native summary is opened.
 
-<img src="docs/release-assets/v0.11.0/extension-panel-advanced.png" width="328" alt="Expanded extension panel with categorized advanced controls including Skills">
+| Advanced controls | Page binding at the bottom |
+| --- | --- |
+| <img src="docs/release-assets/v0.11.3/extension-panel-advanced.png" width="328" alt="Expanded extension panel with categorized advanced controls including Skills"> | <img src="docs/release-assets/v0.11.3/extension-panel-page-binding.png" width="328" alt="Bottom of the expanded extension panel showing Page binding folded by default"> |
 
 ## Basic Helper Screenshots
 
