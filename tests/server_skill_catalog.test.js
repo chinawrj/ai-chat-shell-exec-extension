@@ -12,6 +12,10 @@ const {
   MAX_SKILL_DESCRIPTION_CHARS,
   MAX_SKILL_FILE_BYTES,
   MAX_SKILL_LOAD_REPLY_CHARS,
+  MAX_SKILL_PUBLIC_ISSUES,
+  MAX_SKILL_ROOTS,
+  MAX_SKILL_SCAN_ENTRIES,
+  MAX_SKILL_TRAVERSAL_ISSUES,
   MAX_SKILL_TOTAL_BYTES,
   SKILL_CATALOG_CACHE_MS,
   SkillCatalogService,
@@ -20,6 +24,7 @@ const {
   formatSkillLoadReplyForSizing,
   getConfiguredSkillRoots,
   getSkillEnvironmentAllowlist,
+  getSkillRuntimeVariables,
   parseSkillFrontmatter
 } = require("../server/skill_catalog");
 
@@ -33,6 +38,7 @@ try {
   testInvalidCatalogsFailClosed();
   testSymlinkAndRootContainmentProtection();
   testFileSizeEncodingDepthAndCountBoundaries();
+  testScanWorkAndDiagnosticBoundaries();
   testTotalSizeAndSerializedMetadataBoundaries();
   testDescriptionAndExpandedLoadBoundaries();
   testFormattedSkillLoadReplyBoundaries();
@@ -357,6 +363,162 @@ function testFileSizeEncodingDepthAndCountBoundaries() {
   );
 }
 
+function testScanWorkAndDiagnosticBoundaries() {
+  const exactRootListBase = makeTempDir("skill-root-count-exact-base-");
+  const exactConfiguredRoots = Array.from({ length: MAX_SKILL_ROOTS }, (_, index) => {
+    const root = path.join(exactRootListBase, `root-${index}`);
+    fs.mkdirSync(root, { recursive: true });
+    return root;
+  });
+  const exactRootCountList = new SkillCatalogService({
+    stateDir: makeTempDir("skill-root-count-exact-state-"),
+    env: { AI_HELPER_SKILL_PATHS: exactConfiguredRoots.join(path.delimiter) },
+    cwd: exactRootListBase,
+    homeDir: exactRootListBase
+  }).list();
+  assert.equal(exactRootCountList.ok, true, JSON.stringify(exactRootCountList.errors));
+  assert.equal(exactRootCountList.rootCount, MAX_SKILL_ROOTS);
+
+  const rootListBase = makeTempDir("skill-root-count-base-");
+  const configuredRoots = Array.from(
+    { length: MAX_SKILL_ROOTS + 1 },
+    (_, index) => path.join(rootListBase, `root-${index}`)
+  );
+  const rootCountService = new SkillCatalogService({
+    stateDir: makeTempDir("skill-root-count-state-"),
+    env: { AI_HELPER_SKILL_PATHS: configuredRoots.join(path.delimiter) },
+    cwd: rootListBase,
+    homeDir: rootListBase
+  });
+  const rootCountList = rootCountService.list();
+  assert.equal(rootCountList.ok, false);
+  assert.equal(rootCountList.rootCount, MAX_SKILL_ROOTS + 1);
+  assert.deepEqual(rootCountList.skills, []);
+  assert.ok(rootCountList.errors.some((error) => error.code === "skill-root-count-exceeded"));
+
+  const entryRoot = makeTempDir("skill-entry-limit-root-");
+  const runSyntheticEntryScan = (entryCount, statePrefix) => {
+    const originalOpendirSync = fs.opendirSync;
+    let fakeReadCount = 0;
+    fs.opendirSync = function boundedEntryFixture(target, options) {
+      if (path.resolve(String(target)) === entryRoot) {
+        return {
+          readSync() {
+            if (fakeReadCount >= entryCount) {
+              return null;
+            }
+            const index = fakeReadCount;
+            fakeReadCount += 1;
+            return {
+              name: `resource-${String(index).padStart(5, "0")}`,
+              isSymbolicLink: () => false,
+              isDirectory: () => false,
+              isFile: () => false
+            };
+          },
+          closeSync() {}
+        };
+      }
+      return originalOpendirSync.call(fs, target, options);
+    };
+    try {
+      return {
+        list: createService(entryRoot, statePrefix).list(),
+        readCount: () => fakeReadCount
+      };
+    } finally {
+      fs.opendirSync = originalOpendirSync;
+    }
+  };
+  const exactEntryScan = runSyntheticEntryScan(MAX_SKILL_SCAN_ENTRIES, "skill-entry-exact-state-");
+  assert.equal(exactEntryScan.list.ok, true, JSON.stringify(exactEntryScan.list.errors));
+  assert.equal(exactEntryScan.readCount(), MAX_SKILL_SCAN_ENTRIES);
+  const overEntryScan = runSyntheticEntryScan(MAX_SKILL_SCAN_ENTRIES + 1, "skill-entry-limit-state-");
+  assert.equal(overEntryScan.list.ok, false);
+  assert.equal(overEntryScan.readCount(), MAX_SKILL_SCAN_ENTRIES + 1, "The scanner must stop reading at the first over-limit entry.");
+  assert.ok(overEntryScan.list.errors.some((error) => error.code === "skill-scan-entry-limit-exceeded"));
+
+  const nestedEntryRoot = makeTempDir("skill-entry-nested-limit-root-");
+  const firstNestedDirectory = path.join(nestedEntryRoot, "directory-00000");
+  const originalNestedOpendirSync = fs.opendirSync;
+  let rootReadCount = 0;
+  let childReadCount = 0;
+  let closedDirectoryCount = 0;
+  fs.opendirSync = function nestedBoundedEntryFixture(target, options) {
+    const resolved = path.resolve(String(target));
+    if (resolved === nestedEntryRoot || resolved === firstNestedDirectory) {
+      const isRoot = resolved === nestedEntryRoot;
+      const available = isRoot ? 6_000 : MAX_SKILL_SCAN_ENTRIES - 6_000 + 1;
+      return {
+        readSync() {
+          const index = isRoot ? rootReadCount : childReadCount;
+          if (index >= available) {
+            return null;
+          }
+          if (isRoot) {
+            rootReadCount += 1;
+          } else {
+            childReadCount += 1;
+          }
+          return {
+            name: `${isRoot ? "directory" : "resource"}-${String(index).padStart(5, "0")}`,
+            isSymbolicLink: () => false,
+            isDirectory: () => isRoot,
+            isFile: () => false
+          };
+        },
+        closeSync() {
+          closedDirectoryCount += 1;
+        }
+      };
+    }
+    return originalNestedOpendirSync.call(fs, target, options);
+  };
+  let nestedEntryList;
+  try {
+    nestedEntryList = createService(nestedEntryRoot, "skill-entry-nested-limit-state-").list();
+  } finally {
+    fs.opendirSync = originalNestedOpendirSync;
+  }
+  assert.equal(nestedEntryList.ok, false);
+  assert.equal(rootReadCount + childReadCount, MAX_SKILL_SCAN_ENTRIES + 1);
+  assert.equal(closedDirectoryCount, 2, "Every streamed directory handle must be closed on the over-limit path.");
+  assert.ok(nestedEntryList.errors.some((error) => error.code === "skill-scan-entry-limit-exceeded"));
+
+  const traversalRoot = makeTempDir("skill-traversal-issues-root-");
+  const traversalTarget = makeTempDir("skill-traversal-issues-target-");
+  for (let index = 0; index < MAX_SKILL_TRAVERSAL_ISSUES + 1; index += 1) {
+    fs.symlinkSync(traversalTarget, path.join(traversalRoot, `linked-${String(index).padStart(3, "0")}`), "dir");
+  }
+  const traversalList = createService(traversalRoot, "skill-traversal-issues-state-").list();
+  assert.equal(traversalList.ok, false);
+  assert.equal(traversalList.errors.length, MAX_SKILL_TRAVERSAL_ISSUES);
+  assert.ok(traversalList.errors.some((error) => error.code === "skill-traversal-issue-limit-exceeded"));
+
+  const diagnosticRoot = makeTempDir("skill-public-issues-root-");
+  for (let index = 0; index < MAX_SKILL_PUBLIC_ISSUES; index += 1) {
+    const directory = path.join(diagnosticRoot, `invalid-${String(index).padStart(3, "0")}`);
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "SKILL.md"), "missing frontmatter\n");
+  }
+  const diagnosticService = createService(diagnosticRoot, "skill-public-issues-state-");
+  const exactDiagnosticList = diagnosticService.list();
+  assert.equal(exactDiagnosticList.ok, false);
+  assert.equal(exactDiagnosticList.errors.length, MAX_SKILL_PUBLIC_ISSUES);
+  assert.ok(!exactDiagnosticList.errors.some((error) => error.code === "skill-public-issue-limit-exceeded"));
+  const overDiagnosticDirectory = path.join(diagnosticRoot, `invalid-${MAX_SKILL_PUBLIC_ISSUES}`);
+  fs.mkdirSync(overDiagnosticDirectory, { recursive: true });
+  fs.writeFileSync(path.join(overDiagnosticDirectory, "SKILL.md"), "missing frontmatter\n");
+  const diagnosticList = diagnosticService.list();
+  assert.equal(diagnosticList.ok, false);
+  assert.equal(diagnosticList.errors.length, MAX_SKILL_PUBLIC_ISSUES);
+  assert.equal(
+    diagnosticList.errors.at(-1).code,
+    "skill-public-issue-limit-exceeded",
+    "Public diagnostics must use one bounded omission sentinel instead of returning an unbounded list."
+  );
+}
+
 function testTotalSizeAndSerializedMetadataBoundaries() {
   const exactTotalRoot = makeTempDir("skill-total-exact-root-");
   writeSkillsWithExactTotalBytes(exactTotalRoot, MAX_SKILL_TOTAL_BYTES);
@@ -529,6 +691,48 @@ function testEnvironmentExpansionIsAllowlistedAndSinglePass() {
   assert.ok(result.content.includes("\\$HOME $(printf unsafe) `printf unsafe`"), "Expansion must never execute shell-like text.");
   assert.ok(result.content.includes("${MISSING_ALLOWED}"));
   assert.ok(!result.content.includes("must-not-leak"));
+
+  const runtimeRoot = makeTempDir("skill-runtime-root-");
+  const runtimeVariables = getSkillRuntimeVariables({
+    env: {
+      AI_HELPER_SKILL_PATHS: runtimeRoot,
+      AI_HELPER_SKILL_ROOTS_JSON: "attacker-controlled",
+      AI_HELPER_SKILL_ROOT_SOURCE: "attacker-controlled"
+    },
+    cwd: runtimeRoot,
+    homeDir: runtimeRoot
+  });
+  assert.deepEqual(JSON.parse(runtimeVariables.AI_HELPER_SKILL_ROOTS_JSON), [runtimeRoot]);
+  assert.equal(runtimeVariables.AI_HELPER_SKILL_ROOT_SOURCE, "AI_HELPER_SKILL_PATHS");
+  const runtimeExpanded = expandSkillEnvironment(
+    "$AI_HELPER_SKILL_ROOTS_JSON\n$AI_HELPER_SKILL_ROOT_SOURCE",
+    {
+      env: {
+        AI_HELPER_SKILL_ROOTS_JSON: "attacker-controlled",
+        AI_HELPER_SKILL_ROOT_SOURCE: "attacker-controlled"
+      },
+      allowlist: ["AI_HELPER_SKILL_ROOTS_JSON", "AI_HELPER_SKILL_ROOT_SOURCE"],
+      runtimeVariables
+    }
+  );
+  assert.equal(runtimeExpanded.ok, true);
+  assert.equal(runtimeExpanded.content, `${JSON.stringify([runtimeRoot])}\nAI_HELPER_SKILL_PATHS`);
+  assert.deepEqual(runtimeExpanded.replacedVariables, [
+    "AI_HELPER_SKILL_ROOTS_JSON",
+    "AI_HELPER_SKILL_ROOT_SOURCE"
+  ]);
+  assert.ok(!runtimeExpanded.content.includes("attacker-controlled"));
+
+  const repeatedRuntimePlaceholder = "$AI_HELPER_SKILL_ROOTS_JSON".repeat(14_000);
+  assert.ok(repeatedRuntimePlaceholder.length < MAX_SKILL_FILE_BYTES);
+  const boundedRuntimeExpansion = expandSkillEnvironment(repeatedRuntimePlaceholder, {
+    runtimeVariables: {
+      AI_HELPER_SKILL_ROOTS_JSON: JSON.stringify(["/configured/root/with/a/longer/path"])
+    }
+  });
+  assert.equal(boundedRuntimeExpansion.ok, false);
+  assert.equal(boundedRuntimeExpansion.tooLarge, true);
+  assert.equal(boundedRuntimeExpansion.content, "", "An oversized expansion must not retain a large partial body.");
 }
 
 function testSkillLoadRequiresCurrentCatalog() {

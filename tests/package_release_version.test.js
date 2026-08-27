@@ -50,6 +50,14 @@ const extensionZip = path.join(
   `ai-chat-shell-exec-extension-v${manifest.version}-chrome-extension.zip`,
 );
 assert.ok(fs.existsSync(extensionZip), "extension release archive must be created");
+const sourceZip = path.join(
+  root,
+  "dist",
+  "release",
+  `v${manifest.version}`,
+  `ai-chat-shell-exec-extension-v${manifest.version}-source.zip`,
+);
+assert.ok(fs.existsSync(sourceZip), "source release archive must be created");
 
 const listResult = spawnSync("unzip", ["-Z1", extensionZip], { encoding: "utf8" });
 assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
@@ -62,6 +70,17 @@ for (const entry of [
   "vendor/drawio/ATTRIBUTION.md",
 ]) {
   assert.ok(archiveEntries.has(entry), `extension release archive must contain ${entry}`);
+}
+
+const sourceListResult = spawnSync("unzip", ["-Z1", sourceZip], { encoding: "utf8" });
+assert.equal(sourceListResult.status, 0, sourceListResult.stderr || sourceListResult.stdout);
+const sourceEntries = new Set(sourceListResult.stdout.trim().split(/\r?\n/));
+const sourcePrefix = `ai-chat-shell-exec-extension-v${manifest.version}/`;
+for (const entry of [
+  "skills/skill-creator/SKILL.md",
+  "tests/skill_creator_skill.test.js",
+]) {
+  assert.ok(sourceEntries.has(`${sourcePrefix}${entry}`), `source release archive must contain ${entry}`);
 }
 
 console.log("package release version tests passed");

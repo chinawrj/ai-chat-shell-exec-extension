@@ -364,7 +364,7 @@ function createBackgroundContext({ healthGate } = {}) {
     chrome: {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
-        getManifest: () => ({ version: "0.11.1" }),
+        getManifest: () => ({ version: "0.11.2" }),
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener() {} }
@@ -402,12 +402,12 @@ function createBackgroundContext({ healthGate } = {}) {
         text: async () => JSON.stringify({
           ok: true,
           allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
-          releaseVersion: "0.11.1",
-          serverReleaseVersion: "0.11.1",
+          releaseVersion: "0.11.2",
+          serverReleaseVersion: "0.11.2",
           protocolVersion: 11,
           serverProtocolVersion: 11,
           helperProtocolVersion: 4,
-          skillProtocolVersion: 1
+          skillProtocolVersion: 2
         })
       };
     },

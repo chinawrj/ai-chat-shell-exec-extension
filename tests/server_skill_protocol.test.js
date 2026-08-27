@@ -39,7 +39,7 @@ main()
 
 async function main() {
   const health = buildHealthResponse();
-  assert.equal(health.skillProtocolVersion, 1);
+  assert.equal(health.skillProtocolVersion, 2);
   assert.equal(health.skillCatalogOk, true, JSON.stringify(health.skillCatalogErrors));
   assert.equal(health.skillCount, 1);
   assert.match(health.skillCatalogSha, /^[a-f0-9]{64}$/);
@@ -48,7 +48,7 @@ async function main() {
   const status = await request({ type: "skill-catalog-status" });
   assert.equal(status.ok, true, JSON.stringify(status));
   assert.equal(status.type, "skill-catalog-status");
-  assert.equal(status.skillProtocolVersion, 1);
+  assert.equal(status.skillProtocolVersion, 2);
   assert.equal(status.skillCount, 1);
   assert.equal(status.skills, undefined, "Status should not unnecessarily disclose the catalog list.");
   assertNoPrivateSkillPaths(status, "Skill status response");

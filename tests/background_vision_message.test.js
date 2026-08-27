@@ -201,6 +201,6 @@ function currentHealthBody() {
     protocolVersion: 11,
     serverProtocolVersion: 11,
     helperProtocolVersion: 4,
-    skillProtocolVersion: 1
+    skillProtocolVersion: 2
   };
 }

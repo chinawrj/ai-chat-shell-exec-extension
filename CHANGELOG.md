@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-27
+
+- Adds a bundled `skill-creator` for authoring focused Claude-compatible Skills in the AI Chat Shell Exec local catalog, with scoped discovery and explicit validation guidance.
+- Keeps Skill destinations runtime-configurable through `AI_HELPER_SKILL_PATHS` or `AI_HELPER_SKILL_PATH`; the new Skill never assumes a fixed directory and requires user selection when multiple roots are ambiguous.
+- Injects authoritative resolved roots JSON and configuration source into explicitly loaded Skill bodies through server-owned, non-spoofable runtime placeholders. The Skill uses a fresh challenge-free list request to validate new files without inventing a rescan command.
+- Bumps Skill protocol to 2 so the extension rejects older foreground servers that cannot provide authoritative root metadata.
+- Bounds runtime expansion before allocating the final body, configured root count, visited directory entries, traversal diagnostics, and public diagnostics so malicious local catalogs fail closed without blocking or amplifying server responses.
+- Adds catalog-level, environment precedence/spoofing, scan-boundary, packaging, positive/negative, and independent forward-behavior coverage for single-root creation and ambiguous multi-root no-write behavior.
+
 ## [0.11.1] - 2026-08-27
 
 - Fixes a never-acknowledged healthy catalog with zero Skills being incorrectly shown as current. Empty catalogs now request synchronization so the AI can clear a possibly stale `AI_CHAT_SHELL_SKILLS_CATALOG` memory entry.

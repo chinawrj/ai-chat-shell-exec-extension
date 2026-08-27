@@ -8,6 +8,8 @@ const SKILL_FILE_NAME = "SKILL.md";
 const SKILL_CATALOG_STATE_VERSION = 1;
 const SKILL_CATALOG_STATE_FILE = "skill-catalog-state.json";
 const DEFAULT_SKILL_ENV_ALLOWLIST = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"];
+const SKILL_ROOTS_RUNTIME_VARIABLE = "AI_HELPER_SKILL_ROOTS_JSON";
+const SKILL_ROOT_SOURCE_RUNTIME_VARIABLE = "AI_HELPER_SKILL_ROOT_SOURCE";
 const PRESERVED_CLAUDE_VARIABLES = new Set([
   "ARGUMENTS",
   "CLAUDE_SESSION_ID",
@@ -22,6 +24,10 @@ const MAX_SKILL_DEPTH = 12;
 // silently truncated after a successful server response.
 const MAX_SKILL_FILE_BYTES = 384 * 1024;
 const MAX_SKILL_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_SKILL_ROOTS = 64;
+const MAX_SKILL_SCAN_ENTRIES = 10_000;
+const MAX_SKILL_TRAVERSAL_ISSUES = 100;
+const MAX_SKILL_PUBLIC_ISSUES = 100;
 const MAX_LOADED_SKILL_CHARS = 450 * 1024;
 const MAX_SKILL_LOAD_REPLY_CHARS = 500_000;
 const MAX_SKILL_DESCRIPTION_CHARS = 512;
@@ -105,8 +111,16 @@ class SkillCatalogService {
     const expanded = expandSkillEnvironment(source, {
       env: this.env,
       allowlist: getSkillEnvironmentAllowlist(this.env),
-      skillDir: path.dirname(skill.filePath)
+      skillDir: path.dirname(skill.filePath),
+      runtimeVariables: getSkillRuntimeVariables({
+        env: this.env,
+        cwd: this.cwd,
+        homeDir: this.homeDir
+      })
     });
+    if (expanded.tooLarge) {
+      return skillError(catalog, "expanded-skill-too-large", `Expanded Skill content exceeds ${MAX_LOADED_SKILL_CHARS} characters.`);
+    }
     if (!expanded.ok) {
       return skillError(
         catalog,
@@ -235,26 +249,45 @@ function scanSkillRoots(config) {
   if (config.emptyConfiguration) {
     errors.push({ code: "empty-skill-paths", message: `${config.source} is configured but empty.` });
   }
+  if (config.roots.length > MAX_SKILL_ROOTS) {
+    errors.push({
+      code: "skill-root-count-exceeded",
+      message: `Skill scan exceeds ${MAX_SKILL_ROOTS} configured roots.`
+    });
+    return { skills: [], observedShas: [], errors, warnings };
+  }
 
-  config.roots.forEach((rootPath, rootIndex) => {
+  const scanState = {
+    stop: false,
+    countErrorAdded: false,
+    entriesVisited: 0,
+    entryLimitAdded: false,
+    traversalIssueCount: 0,
+    traversalIssueLimitAdded: false
+  };
+  for (let rootIndex = 0; rootIndex < config.roots.length; rootIndex += 1) {
+    if (scanState.stop) {
+      break;
+    }
+    const rootPath = config.roots[rootIndex];
     if (!fs.existsSync(rootPath)) {
       const issue = { code: "skill-root-missing", rootIndex, message: `Skill root does not exist: ${rootPath}` };
       (config.explicitlyConfigured ? errors : warnings).push(issue);
-      return;
+      continue;
     }
     let rootStat;
     try {
       rootStat = fs.lstatSync(rootPath);
     } catch (error) {
       errors.push({ code: "skill-root-unreadable", rootIndex, message: error.message || String(error) });
-      return;
+      continue;
     }
     if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
       errors.push({ code: "invalid-skill-root", rootIndex, message: `Skill root must be a real directory, not a symlink: ${rootPath}` });
-      return;
+      continue;
     }
-    walkSkillRoot(rootPath, rootPath, rootIndex, candidates, errors, 0, { stop: false, countErrorAdded: false });
-  });
+    walkSkillRoot(rootPath, rootPath, rootIndex, candidates, errors, 0, scanState);
+  }
 
   const observedShas = [];
   const parsed = [];
@@ -345,14 +378,11 @@ function walkSkillRoot(rootPath, currentPath, rootIndex, candidates, errors, dep
     return;
   }
   if (depth > MAX_SKILL_DEPTH) {
-    errors.push({ code: "skill-depth-exceeded", message: `Skill scan exceeded depth ${MAX_SKILL_DEPTH} under ${rootPath}.` });
+    addTraversalIssue(errors, { code: "skill-depth-exceeded", message: `Skill scan exceeded depth ${MAX_SKILL_DEPTH} under ${rootPath}.` }, scanState);
     return;
   }
-  let entries;
-  try {
-    entries = fs.readdirSync(currentPath, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-  } catch (error) {
-    errors.push({ code: "skill-directory-unreadable", message: error.message || String(error) });
+  const entries = readSkillDirectoryEntriesBounded(currentPath, errors, scanState);
+  if (!entries) {
     return;
   }
   for (const entry of entries) {
@@ -365,7 +395,10 @@ function walkSkillRoot(rootPath, currentPath, rootIndex, candidates, errors, dep
         // A broken non-SKILL.md resource symlink is outside the catalog.
       }
       if (entry.name === SKILL_FILE_NAME || pointsToDirectory) {
-        errors.push({ code: "skill-symlink-rejected", message: `Symlinked Skill files and directories are not allowed: ${entryPath}` });
+        addTraversalIssue(errors, { code: "skill-symlink-rejected", message: `Symlinked Skill files and directories are not allowed: ${entryPath}` }, scanState);
+        if (scanState.stop) {
+          return;
+        }
       }
       continue;
     }
@@ -393,6 +426,61 @@ function walkSkillRoot(rootPath, currentPath, rootIndex, candidates, errors, dep
       });
     }
   }
+}
+
+function readSkillDirectoryEntriesBounded(currentPath, errors, scanState) {
+  const entries = [];
+  let directory;
+  try {
+    directory = fs.opendirSync(currentPath);
+    while (true) {
+      const entry = directory.readSync();
+      if (!entry) {
+        break;
+      }
+      if (Number(scanState.entriesVisited || 0) >= MAX_SKILL_SCAN_ENTRIES) {
+        if (!scanState.entryLimitAdded) {
+          errors.push({
+            code: "skill-scan-entry-limit-exceeded",
+            message: `Skill scan exceeds ${MAX_SKILL_SCAN_ENTRIES} directory entries.`
+          });
+          scanState.entryLimitAdded = true;
+        }
+        scanState.stop = true;
+        return null;
+      }
+      entries.push(entry);
+      scanState.entriesVisited = Number(scanState.entriesVisited || 0) + 1;
+    }
+  } catch (error) {
+    addTraversalIssue(errors, { code: "skill-directory-unreadable", message: error.message || String(error) }, scanState);
+    return null;
+  } finally {
+    try {
+      directory?.closeSync();
+    } catch (_error) {
+      // The scan already has all entries it will use; close is best-effort.
+    }
+  }
+  return entries.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function addTraversalIssue(errors, issue, scanState) {
+  scanState.traversalIssueCount = Number(scanState.traversalIssueCount || 0);
+  if (scanState.traversalIssueCount < MAX_SKILL_TRAVERSAL_ISSUES - 1) {
+    errors.push(issue);
+    scanState.traversalIssueCount += 1;
+    return;
+  }
+  if (!scanState.traversalIssueLimitAdded) {
+    errors.push({
+      code: "skill-traversal-issue-limit-exceeded",
+      message: `Skill scan stopped after ${MAX_SKILL_TRAVERSAL_ISSUES} traversal diagnostics.`
+    });
+    scanState.traversalIssueLimitAdded = true;
+    scanState.traversalIssueCount += 1;
+  }
+  scanState.stop = true;
 }
 
 function readSafeSkillFile(filePath, rootPath) {
@@ -489,37 +577,92 @@ function dedentYamlBlock(lines) {
   return lines.map((line) => String(line).slice(indent)).join("\n");
 }
 
-function expandSkillEnvironment(source, { env = process.env, allowlist = [], skillDir = "" } = {}) {
+function expandSkillEnvironment(source, {
+  env = process.env,
+  allowlist = [],
+  skillDir = "",
+  runtimeVariables = {},
+  maxChars = MAX_LOADED_SKILL_CHARS
+} = {}) {
   const allowed = new Set(Array.from(allowlist || []).map((value) => String(value || "").trim()).filter(Boolean));
   const missing = new Set();
   const replaced = new Set();
   const preserved = new Set();
-  const content = String(source || "").replace(/\\?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (match, braced, bare) => {
+  const input = String(source || "");
+  const limit = Math.max(0, Number.isFinite(Number(maxChars)) ? Math.floor(Number(maxChars)) : MAX_LOADED_SKILL_CHARS);
+  if (input.length > limit) {
+    return {
+      ok: false,
+      tooLarge: true,
+      content: "",
+      missingVariables: [],
+      replacedVariables: [],
+      preservedVariables: []
+    };
+  }
+
+  const chunks = [];
+  let outputChars = 0;
+  let cursor = 0;
+  let tooLarge = false;
+  const placeholderPattern = /\\?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
+  let placeholder;
+  while ((placeholder = placeholderPattern.exec(input)) !== null) {
+    const [match, braced, bare] = placeholder;
+    const literal = input.slice(cursor, placeholder.index);
+    let replacement;
     if (match.startsWith("\\$")) {
-      return match;
+      replacement = match;
+    } else {
+      const name = braced || bare;
+      if (name === "CLAUDE_SKILL_DIR") {
+        replaced.add(name);
+        replacement = String(skillDir);
+      } else if (Object.prototype.hasOwnProperty.call(runtimeVariables, name)) {
+        replaced.add(name);
+        replacement = String(runtimeVariables[name]);
+      } else if (PRESERVED_CLAUDE_VARIABLES.has(name) || !allowed.has(name)) {
+        preserved.add(name);
+        replacement = match;
+      } else if (!Object.prototype.hasOwnProperty.call(env, name) || env[name] === undefined) {
+        missing.add(name);
+        replacement = match;
+      } else {
+        replaced.add(name);
+        replacement = String(env[name]);
+      }
     }
-    const name = braced || bare;
-    if (name === "CLAUDE_SKILL_DIR") {
-      replaced.add(name);
-      return skillDir;
+    if (outputChars + literal.length + replacement.length > limit) {
+      tooLarge = true;
+      break;
     }
-    if (PRESERVED_CLAUDE_VARIABLES.has(name) || !allowed.has(name)) {
-      preserved.add(name);
-      return match;
+    chunks.push(literal, replacement);
+    outputChars += literal.length + replacement.length;
+    cursor = placeholderPattern.lastIndex;
+  }
+  if (!tooLarge) {
+    const trailing = input.slice(cursor);
+    if (outputChars + trailing.length > limit) {
+      tooLarge = true;
+    } else {
+      chunks.push(trailing);
     }
-    if (!Object.prototype.hasOwnProperty.call(env, name) || env[name] === undefined) {
-      missing.add(name);
-      return match;
-    }
-    replaced.add(name);
-    return String(env[name]);
-  });
+  }
   return {
-    ok: missing.size === 0,
-    content,
+    ok: missing.size === 0 && !tooLarge,
+    tooLarge,
+    content: tooLarge ? "" : chunks.join(""),
     missingVariables: Array.from(missing).sort(),
     replacedVariables: Array.from(replaced).sort(),
     preservedVariables: Array.from(preserved).sort()
+  };
+}
+
+function getSkillRuntimeVariables({ env = process.env, cwd = process.cwd(), homeDir = os.homedir() } = {}) {
+  const config = getConfiguredSkillRoots({ env, cwd, homeDir });
+  return {
+    [SKILL_ROOTS_RUNTIME_VARIABLE]: JSON.stringify(config.roots),
+    [SKILL_ROOT_SOURCE_RUNTIME_VARIABLE]: config.source
   };
 }
 
@@ -623,9 +766,21 @@ function catalogPublicStatus(catalog) {
     rootCount: catalog.rootCount,
     configuredBy: catalog.configuredBy,
     catalogMetadataChars: catalog.catalogMetadataChars,
-    errors: catalog.errors.map(publicCatalogIssue),
-    warnings: catalog.warnings.map(publicCatalogIssue)
+    errors: boundedPublicCatalogIssues(catalog.errors),
+    warnings: boundedPublicCatalogIssues(catalog.warnings)
   };
+}
+
+function boundedPublicCatalogIssues(issues) {
+  const input = Array.isArray(issues) ? issues : [];
+  if (input.length <= MAX_SKILL_PUBLIC_ISSUES) {
+    return input.map(publicCatalogIssue);
+  }
+  const visible = input.slice(0, MAX_SKILL_PUBLIC_ISSUES - 1).map(publicCatalogIssue);
+  if (input.length > MAX_SKILL_PUBLIC_ISSUES) {
+    visible.push(publicCatalogIssue({ code: "skill-public-issue-limit-exceeded" }));
+  }
+  return visible;
 }
 
 function publicCatalogIssue(issue = {}) {
@@ -655,6 +810,10 @@ function publicCatalogIssue(issue = {}) {
     "duplicate-skill-id": `Skill name ${safeDetails.skillId || "(invalid)"} is duplicated.`,
     "skill-depth-exceeded": `Skill scan exceeded directory depth ${MAX_SKILL_DEPTH}.`,
     "skill-count-exceeded": `Skill scan exceeded ${MAX_SKILL_FILES} SKILL.md files.`,
+    "skill-root-count-exceeded": `Skill scan exceeded ${MAX_SKILL_ROOTS} configured roots.`,
+    "skill-scan-entry-limit-exceeded": `Skill scan exceeded ${MAX_SKILL_SCAN_ENTRIES} directory entries.`,
+    "skill-traversal-issue-limit-exceeded": `Skill scan stopped after ${MAX_SKILL_TRAVERSAL_ISSUES} traversal diagnostics.`,
+    "skill-public-issue-limit-exceeded": "Additional Skill catalog diagnostics were omitted.",
     "skill-total-size-exceeded": `Skill scan exceeded ${MAX_SKILL_TOTAL_BYTES} total bytes.`,
     "skill-catalog-metadata-too-large": `Serialized Skill catalog metadata exceeds ${MAX_SKILL_CATALOG_JSON_CHARS} characters.`
   };
@@ -709,15 +868,22 @@ module.exports = {
   MAX_SKILL_DEPTH,
   MAX_SKILL_FILE_BYTES,
   MAX_SKILL_FILES,
+  MAX_SKILL_PUBLIC_ISSUES,
+  MAX_SKILL_ROOTS,
+  MAX_SKILL_SCAN_ENTRIES,
+  MAX_SKILL_TRAVERSAL_ISSUES,
   MAX_SKILL_TOTAL_BYTES,
   SKILL_CATALOG_CACHE_MS,
   SKILL_ID_PATTERN,
+  SKILL_ROOTS_RUNTIME_VARIABLE,
+  SKILL_ROOT_SOURCE_RUNTIME_VARIABLE,
   SkillCatalogService,
   aggregateSkillShas,
   expandSkillEnvironment,
   formatSkillLoadReplyForSizing,
   getConfiguredSkillRoots,
   getSkillEnvironmentAllowlist,
+  getSkillRuntimeVariables,
   parseSkillFrontmatter,
   scanSkillRoots
 };

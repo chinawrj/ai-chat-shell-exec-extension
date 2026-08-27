@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "content.js"), "utf8");
 
-assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.1";/);
+assert.match(source, /const CONTENT_SCRIPT_VERSION = "0\.11\.2";/);
 assert.match(source, /width:min\(292px,calc\(100vw - 32px\)\)/);
 assert.match(source, /statusText\.style\.cssText = "[^"]*text-overflow:ellipsis;white-space:nowrap/);
 assert.match(source, /statusIndicator\.id = STATUS_INDICATOR_ID/);
