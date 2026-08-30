@@ -3,7 +3,9 @@
 
   const DRAWIO_PREVIEW_HOST_ID = "ai-chat-shell-exec-drawio-preview";
   const DRAWIO_XML_MAX_BYTES = 1024 * 1024;
-  const DRAWIO_RENDER_TIMEOUT_MS = 7000;
+  const DRAWIO_VIEWER_STARTUP_TIMEOUT_MS = 7000;
+  const DRAWIO_RENDER_ACCEPT_TIMEOUT_MS = 7000;
+  const DRAWIO_VIEWER_STARTUP_ATTEMPTS = 2;
   const DRAWIO_INVALID_LOG_KEYS_LIMIT = 64;
 
   let previewHost = null;
@@ -120,14 +122,41 @@
       });
       return Promise.resolve(result);
     }
-    if (currentArtifact?.artifactId === artifactId || pendingArtifactId === artifactId) {
+    if (pendingArtifactId === artifactId) {
+      updateHostDiagnostics();
+      return Promise.resolve({ ok: true, unchanged: true, artifactId });
+    }
+    if (currentArtifact?.artifactId === artifactId) {
+      if (cancelSupersededStage(artifactId, "superseded by the latest already-rendered helper")) {
+        renderGeneration += 1;
+        pendingArtifactId = "";
+        ensurePreview();
+        previewHost.hidden = false;
+        clearErrorLog();
+        setPreviewState("ready");
+        setPreviewStatus("SVG ready. Only the latest complete helper is displayed.");
+      }
       updateHostDiagnostics();
       return Promise.resolve({ ok: true, unchanged: true, artifactId });
     }
     if (failedRenderResults.has(candidateKey)) {
+      const cached = failedRenderResults.get(candidateKey);
+      const outcomeAlreadyVisible = !activeStage && !currentArtifact && pendingArtifactId === "" &&
+        previewHost?.dataset?.state === "error" && errorLog.at(-1)?.artifactId === artifactId;
+      if (!outcomeAlreadyVisible) {
+        cancelSupersededStage(artifactId, "superseded by the latest cached renderer failure");
+        renderGeneration += 1;
+        pendingArtifactId = "";
+        ensurePreview();
+        previewHost.hidden = false;
+        clearCurrentArtifact("No render is available for the latest helper.");
+        replaceErrorLog(cached.error, artifactId, { count: false, console: false });
+        setPreviewState("error");
+        setPreviewStatus("The latest helper failed to render. Open the error log for details.");
+      }
       updateHostDiagnostics();
       return Promise.resolve({
-        ...failedRenderResults.get(candidateKey),
+        ...cached,
         unchanged: true,
         newError: false
       });
@@ -144,9 +173,7 @@
       ? "Rendering the latest valid helper in staging; the current SVG remains visible."
       : "Rendering the latest valid draw.io helper…");
 
-    if (activeStage) {
-      activeStage.cancel("superseded by a newer valid helper", { log: false });
-    }
+    cancelSupersededStage(artifactId, "superseded by a newer valid helper");
     activeStage = createRenderStage({
       generation,
       artifactId,
@@ -159,32 +186,32 @@
     return activeStage.promise;
   }
 
-  function createRenderStage(artifact) {
-    const layer = document.createElement("div");
-    layer.className = "drawio-frame-layer drawio-frame-staging";
-    layer.dataset.artifactId = artifact.artifactId;
-    const iframe = document.createElement("iframe");
-    iframe.title = `Rendering ${artifact.title || "draw.io preview"}`;
-    iframe.setAttribute("sandbox", "allow-scripts");
-    iframe.setAttribute("aria-hidden", "true");
-    const channel = buildChannelToken(artifact.artifactId, artifact.generation);
-    iframe.src = `${chrome.runtime.getURL("drawio/viewer.html")}#channel=${encodeURIComponent(channel)}`;
-    layer.appendChild(iframe);
-    previewElements.viewport.appendChild(layer);
+  function cancelSupersededStage(nextArtifactId, reason) {
+    if (!activeStage || activeStage.artifactId === String(nextArtifactId || "")) {
+      return false;
+    }
+    activeStage.cancel(reason, { log: false });
+    activeStage = null;
+    return true;
+  }
 
+  function createRenderStage(artifact) {
     let settled = false;
     let resolvePromise;
+    let layer = null;
+    let iframe = null;
+    let channel = "";
+    let renderRequested = false;
+    let renderAccepted = false;
     const promise = new Promise((resolve) => {
       resolvePromise = resolve;
     });
-    const timeout = setTimeout(() => {
-      fail(`Draw.io renderer timed out after ${DRAWIO_RENDER_TIMEOUT_MS}ms.`);
-    }, DRAWIO_RENDER_TIMEOUT_MS);
 
     function cleanup() {
-      clearTimeout(timeout);
+      attemptPolicy.cancel();
       window.removeEventListener("message", onMessage, true);
-      iframe.removeEventListener("error", onFrameError);
+      iframe?.removeEventListener("error", onFrameError);
+      iframe?.removeEventListener("load", onFrameLoad);
     }
 
     function cancel(reason, options = {}) {
@@ -193,7 +220,7 @@
       }
       settled = true;
       cleanup();
-      layer.remove();
+      layer?.remove();
       if (pendingArtifactId === artifact.artifactId) {
         pendingArtifactId = "";
       }
@@ -209,7 +236,7 @@
       }
       settled = true;
       cleanup();
-      layer.remove();
+      layer?.remove();
       if (pendingArtifactId === artifact.artifactId) {
         pendingArtifactId = "";
       }
@@ -229,6 +256,48 @@
       setPreviewState("error");
       setPreviewStatus("The latest helper failed to render. Open the error log for details.");
       resolvePromise(result);
+    }
+
+    function mountViewerAttempt() {
+      if (settled) {
+        return;
+      }
+      iframe?.removeEventListener("error", onFrameError);
+      iframe?.removeEventListener("load", onFrameLoad);
+      layer?.remove();
+
+      const startupAttempt = attemptPolicy.beginAttempt();
+      renderRequested = false;
+      renderAccepted = false;
+      channel = buildChannelToken(artifact.artifactId, `${artifact.generation}-${startupAttempt}`);
+      layer = document.createElement("div");
+      layer.className = "drawio-frame-layer drawio-frame-staging";
+      layer.dataset.artifactId = artifact.artifactId;
+      layer.dataset.startupAttempt = String(startupAttempt);
+      iframe = document.createElement("iframe");
+      iframe.title = `Rendering ${artifact.title || "draw.io preview"}`;
+      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.addEventListener("error", onFrameError);
+      iframe.addEventListener("load", onFrameLoad);
+      iframe.src = `${chrome.runtime.getURL("drawio/viewer.html")}#channel=${encodeURIComponent(channel)}`;
+      layer.appendChild(iframe);
+      previewElements.viewport.appendChild(layer);
+      updateHostDiagnostics();
+    }
+
+    function requestRender() {
+      if (settled || renderRequested || !iframe?.contentWindow) {
+        return;
+      }
+      renderRequested = true;
+      iframe.contentWindow.postMessage({
+        type: "ai-chat-drawio-render",
+        channel,
+        artifactId: artifact.artifactId,
+        xml: artifact.xml
+      }, "*");
+      attemptPolicy.awaitAcceptance();
     }
 
     function succeed(message) {
@@ -269,77 +338,263 @@
     }
 
     function onFrameError() {
-      fail("The isolated draw.io viewer iframe could not be loaded.");
+      attemptPolicy.failOrRetry("startup", "The isolated draw.io viewer iframe could not be loaded.");
+    }
+
+    function onFrameLoad() {
+      // A load event is a safe fallback if the one-shot viewer-ready message was
+      // lost during a fast cached iframe startup. viewer.js installs its message
+      // listener before the document load event and ignores duplicate renders.
+      requestRender();
     }
 
     function onMessage(event) {
-      if (event.source !== iframe.contentWindow) {
-        return;
-      }
       const message = event.data;
-      if (!message || message.channel !== channel) {
+      const action = classifyDrawioViewerMessage({
+        source: event.source,
+        expectedSource: iframe.contentWindow,
+        message,
+        channel,
+        artifactId: artifact.artifactId,
+        renderRequested,
+        renderAccepted
+      });
+      if (action === "ready") {
+        requestRender();
         return;
       }
-      if (message.type === "ai-chat-drawio-viewer-ready") {
-        iframe.contentWindow.postMessage({
-          type: "ai-chat-drawio-render",
-          channel,
-          artifactId: artifact.artifactId,
-          xml: artifact.xml
-        }, "*");
+      if (action === "started") {
+        renderAccepted = true;
+        attemptPolicy.accept();
+        setPreviewStatus("The isolated draw.io viewer accepted the helper and is rendering it locally…");
         return;
       }
-      if (message.type === "ai-chat-drawio-rendered") {
+      if (action === "rendered") {
         succeed(message);
         return;
       }
-      if (message.type === "ai-chat-drawio-render-error") {
+      if (action === "error") {
         fail(message.error || "The draw.io viewer returned an unknown render error.");
       }
     }
 
-    iframe.addEventListener("error", onFrameError);
+    const attemptPolicy = createRenderAttemptWatchdog({
+      maxAttempts: DRAWIO_VIEWER_STARTUP_ATTEMPTS,
+      startupTimeoutMs: DRAWIO_VIEWER_STARTUP_TIMEOUT_MS,
+      acceptTimeoutMs: DRAWIO_RENDER_ACCEPT_TIMEOUT_MS,
+      createWatchdog: createVisibleTimeWatchdog,
+      onRetry({ phase, nextAttempt }) {
+        setPreviewStatus(phase === "startup"
+          ? `The draw.io viewer did not start in time; retrying locally (${nextAttempt}/${DRAWIO_VIEWER_STARTUP_ATTEMPTS})…`
+          : `The draw.io viewer did not accept the render request; retrying locally (${nextAttempt}/${DRAWIO_VIEWER_STARTUP_ATTEMPTS})…`);
+        mountViewerAttempt();
+      },
+      onFailure: fail
+    });
+
+    // Register the parent listener before the iframe is navigated or inserted.
     window.addEventListener("message", onMessage, true);
+    mountViewerAttempt();
     return {
       artifactId: artifact.artifactId,
       generation: artifact.generation,
-      layer,
+      get layer() { return layer; },
       promise,
       cancel
     };
   }
 
+  function classifyDrawioViewerMessage(options) {
+    const message = options.message;
+    if (options.source !== options.expectedSource || !message || message.channel !== options.channel) {
+      return "";
+    }
+    if (message.type === "ai-chat-drawio-viewer-ready") {
+      return "ready";
+    }
+    if (options.renderRequested !== true || String(message.artifactId || "") !== String(options.artifactId || "")) {
+      return "";
+    }
+    if (message.type === "ai-chat-drawio-render-started") {
+      return "started";
+    }
+    if (message.type === "ai-chat-drawio-render-error") {
+      return "error";
+    }
+    if (options.renderAccepted === true && message.type === "ai-chat-drawio-rendered") {
+      return "rendered";
+    }
+    return "";
+  }
+
+  function createRenderAttemptWatchdog(options) {
+    const maxAttempts = Math.max(1, Number(options.maxAttempts || 1));
+    let attempt = 0;
+    let phase = "idle";
+    let watchdog = null;
+    let stopped = false;
+
+    function cancelWatchdog() {
+      watchdog?.cancel?.();
+      watchdog = null;
+    }
+
+    function timeoutMessage(timeoutPhase) {
+      return timeoutPhase === "startup"
+        ? `Draw.io viewer startup timed out after ${options.startupTimeoutMs}ms on ${maxAttempts} attempts.`
+        : `Draw.io viewer did not accept the render request after ${options.acceptTimeoutMs}ms on ${maxAttempts} attempts.`;
+    }
+
+    function failOrRetry(timeoutPhase, message = timeoutMessage(timeoutPhase)) {
+      if (stopped) {
+        return false;
+      }
+      cancelWatchdog();
+      if (attempt < maxAttempts) {
+        phase = "retrying";
+        options.onRetry?.({ phase: timeoutPhase, attempt, nextAttempt: attempt + 1 });
+        return true;
+      }
+      if (timeoutPhase === "accept") {
+        phase = "awaiting-accept";
+        return false;
+      }
+      stopped = true;
+      phase = "failed";
+      options.onFailure?.(message);
+      return false;
+    }
+
+    function startPhase(timeoutPhase, timeoutMs) {
+      if (stopped) {
+        return;
+      }
+      cancelWatchdog();
+      phase = timeoutPhase;
+      watchdog = options.createWatchdog(timeoutMs, () => failOrRetry(timeoutPhase));
+    }
+
+    return {
+      beginAttempt() {
+        if (stopped) {
+          return attempt;
+        }
+        attempt += 1;
+        startPhase("startup", options.startupTimeoutMs);
+        return attempt;
+      },
+      awaitAcceptance() {
+        startPhase("accept", options.acceptTimeoutMs);
+      },
+      accept() {
+        if (stopped || (phase !== "accept" && phase !== "awaiting-accept")) {
+          return false;
+        }
+        cancelWatchdog();
+        phase = "rendering";
+        return true;
+      },
+      failOrRetry,
+      cancel() {
+        stopped = true;
+        phase = "cancelled";
+        cancelWatchdog();
+      },
+      getState: () => ({ attempt, phase, stopped })
+    };
+  }
+
+  function createVisibleTimeWatchdog(timeoutMs, onTimeout) {
+    const fullBudget = Math.max(1, Number(timeoutMs || 0));
+    let remainingMs = fullBudget;
+    let visibleStartedAt = 0;
+    let timer = 0;
+    let stopped = false;
+
+    function pageIsHidden() {
+      return document.visibilityState === "hidden" || document.hidden === true;
+    }
+
+    function stopTimer() {
+      if (!timer) {
+        return;
+      }
+      clearTimeout(timer);
+      timer = 0;
+      if (visibleStartedAt > 0) {
+        remainingMs = Math.max(0, remainingMs - (Date.now() - visibleStartedAt));
+        visibleStartedAt = 0;
+      }
+    }
+
+    function schedule() {
+      if (stopped || timer || pageIsHidden()) {
+        return;
+      }
+      if (remainingMs <= 0) {
+        stopped = true;
+        document.removeEventListener?.("visibilitychange", onVisibilityChange);
+        onTimeout();
+        return;
+      }
+      visibleStartedAt = Date.now();
+      timer = setTimeout(() => {
+        timer = 0;
+        remainingMs = Math.max(0, remainingMs - (Date.now() - visibleStartedAt));
+        visibleStartedAt = 0;
+        schedule();
+      }, remainingMs);
+    }
+
+    function onVisibilityChange() {
+      if (pageIsHidden()) {
+        stopTimer();
+      } else {
+        schedule();
+      }
+    }
+
+    document.addEventListener?.("visibilitychange", onVisibilityChange);
+    schedule();
+    return {
+      cancel() {
+        if (stopped) {
+          return;
+        }
+        stopped = true;
+        stopTimer();
+        document.removeEventListener?.("visibilitychange", onVisibilityChange);
+      }
+    };
+  }
+
   function reportInvalid({ key, artifactId, error }) {
     const logKey = String(key || `${artifactId || "invalid"}:${error || "unknown"}`);
-    if (invalidLogKeys.has(logKey)) {
-      return {
-        ok: false,
-        validationError: true,
-        unchanged: true,
-        newError: false,
-        artifactId: String(artifactId || ""),
-        error: `Draw.io helper rejected: ${compactText(error || "invalid XML", 500)}`
-      };
-    }
-    invalidLogKeys.add(logKey);
-    if (invalidLogKeys.size > DRAWIO_INVALID_LOG_KEYS_LIMIT) {
-      invalidLogKeys.delete(invalidLogKeys.values().next().value);
+    const alreadyReported = invalidLogKeys.has(logKey);
+    if (!alreadyReported) {
+      invalidLogKeys.add(logKey);
+      if (invalidLogKeys.size > DRAWIO_INVALID_LOG_KEYS_LIMIT) {
+        invalidLogKeys.delete(invalidLogKeys.values().next().value);
+      }
     }
     ensurePreview();
     previewHost.hidden = false;
     renderGeneration += 1;
     pendingArtifactId = "";
-    activeStage?.cancel("superseded by the latest invalid helper", { log: false });
-    activeStage = null;
+    cancelSupersededStage("", "superseded by the latest invalid helper");
     const message = `Draw.io helper rejected: ${compactText(error || "invalid XML", 500)}`;
     clearCurrentArtifact("No render is available for the latest helper.");
-    replaceErrorLog(message, artifactId || "invalid");
+    replaceErrorLog(message, artifactId || "invalid", {
+      count: !alreadyReported,
+      console: !alreadyReported
+    });
     setPreviewState("error");
     setPreviewStatus("The latest complete draw.io helper is invalid.");
     return {
       ok: false,
       validationError: true,
-      newError: true,
+      unchanged: alreadyReported,
+      newError: !alreadyReported,
       artifactId: String(artifactId || ""),
       error: message
     };
@@ -381,8 +636,10 @@
     updateHostDiagnostics();
   }
 
-  function replaceErrorLog(message, artifactId) {
-    renderErrorCount += 1;
+  function replaceErrorLog(message, artifactId, options = {}) {
+    if (options.count !== false) {
+      renderErrorCount += 1;
+    }
     const entry = {
       at: new Date().toISOString(),
       artifactId: String(artifactId || ""),
@@ -393,10 +650,12 @@
     previewElements.logDetails.hidden = false;
     previewElements.logDetails.open = true;
     previewElements.log.textContent = `[${entry.at}] ${entry.artifactId ? `${entry.artifactId.slice(0, 12)} ` : ""}${entry.message}`;
-    console.error(`[AI Chat Draw.io] ${entry.message}`, {
-      artifactId: entry.artifactId,
-      renderGeneration
-    });
+    if (options.console !== false) {
+      console.error(`[AI Chat Draw.io] ${entry.message}`, {
+        artifactId: entry.artifactId,
+        renderGeneration
+      });
+    }
     updateHostDiagnostics(entry.message);
   }
 
@@ -643,6 +902,9 @@
   globalThis.AiChatDrawioPreview = Object.freeze({
     DRAWIO_PREVIEW_HOST_ID,
     DRAWIO_XML_MAX_BYTES,
+    DRAWIO_VIEWER_STARTUP_TIMEOUT_MS,
+    DRAWIO_RENDER_ACCEPT_TIMEOUT_MS,
+    DRAWIO_VIEWER_STARTUP_ATTEMPTS,
     consider,
     reportInvalid,
     close,
@@ -651,6 +913,9 @@
     getDiagnostics,
     validateDrawioXml,
     isLikelyCompleteDrawioXml,
-    hashDrawioXml
+    hashDrawioXml,
+    createVisibleTimeWatchdog,
+    createRenderAttemptWatchdog,
+    classifyDrawioViewerMessage
   });
 })();

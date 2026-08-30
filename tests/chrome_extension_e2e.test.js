@@ -19,6 +19,7 @@ const E2E_TIMEOUT_MS = 45000;
 const MIN_CHROMIUM_MAJOR = 116;
 const FORCE_HEADLESS = process.env.AI_SHELL_E2E_HEADLESS === "1";
 const SKILLS_ONLY = process.env.AI_SHELL_E2E_SKILLS_ONLY === "1";
+const DRAWIO_ONLY = process.env.AI_SHELL_E2E_DRAWIO_ONLY === "1";
 const STARTUP_SETTLE_MS = 4200;
 const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
 
@@ -305,6 +306,11 @@ async function main() {
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]')?.click()`);
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
 
+  if (DRAWIO_ONLY) {
+    await runDrawioPreviewE2E(page);
+    return;
+  }
+
   if (managedShellServer) {
     await runEmptySkillCatalogE2E(page, { skillPath, skillInstallPath, skillInstallRunPath, shellStateDir });
     await runSkillE2E(page, debugPort, {
@@ -354,6 +360,11 @@ async function main() {
   assert.equal(agentResponse.ok, true);
   assert.ok(agentResponse.agents.some((agent) => agent.agentId === "slave-a" && agent.role === "slave"));
 
+  // The multi-page agent setup leaves this page backgrounded. Draw.io timeout
+  // budgets intentionally pause while hidden, so make the preview page visible
+  // before asserting bounded renderer-failure recovery.
+  await page.send("Page.bringToFront");
+  await waitForEvaluate(page, "document.visibilityState === 'visible'", "Draw.io preview page to become visible");
   await runDrawioPreviewE2E(page);
 
   const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
@@ -1814,15 +1825,37 @@ async function runSkillE2E(page, debugPort, {
   assert.match(latestCatalogReply, /revision 2/);
 
   const beforeValidAck = await pageUserMessageCount(page);
-  await appendAssistantSkillHelper(page, [
+  const canonicalSplitAck = [
     `${startMarker}:valid-ack-e2e-v2`,
     "cmd: list-updated",
-    `challenge: ${initialChallenge}`,
-    `catalog-sha: ${latestCatalogSha}`,
-    `catalog-version: ${latestCatalogVersion}`,
-    `memory-entry: ${memoryEntry}`,
+    `challenge:${initialChallenge}`,
+    `catalog-sha:${latestCatalogSha}`,
+    `catalog-version:${latestCatalogVersion}`,
+    `memory-entry:${memoryEntry}`,
     endMarker
-  ]);
+  ].join("\n");
+  const splitAckDom = await page.evaluate(`(() => {
+    const canonical = ${JSON.stringify(canonicalSplitAck)};
+    const version = ${JSON.stringify(latestCatalogVersion)};
+    const token = "catalog-version:" + version;
+    const index = canonical.indexOf(token);
+    const article = document.createElement("article");
+    article.className = "message";
+    article.dataset.messageAuthorRole = "assistant";
+    article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+    const code = article.querySelector("code");
+    code.appendChild(document.createTextNode(canonical.slice(0, index) + "catalog-version:"));
+    const splitValue = document.createElement("span");
+    splitValue.style.display = "block";
+    splitValue.textContent = version;
+    code.appendChild(splitValue);
+    code.appendChild(document.createTextNode(canonical.slice(index + token.length)));
+    document.getElementById("thread").appendChild(article);
+    return { innerText: code.innerText, textContent: code.textContent };
+  })()`);
+  assert.equal(splitAckDom.textContent, canonicalSplitAck, "The simulated host code DOM must preserve the canonical Skill ACK in textContent.");
+  assert.match(splitAckDom.innerText, new RegExp(`catalog-version:\\s*\\n\\s*${escapeRegExp(latestCatalogVersion)}`),
+    "The simulated host layout must split catalog-version from its numeric value in innerText.");
   await waitForEvaluate(page, `(() => {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
     return chip && !chip.hidden && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
@@ -1832,6 +1865,89 @@ async function runSkillE2E(page, debugPort, {
     const chip = document.getElementById("ai-chat-shell-exec-skill-status");
     return chip && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
   })()`, "valid Skill ACK to clear other tabs in the same scope");
+
+  const beforeMalformedRecovery = await pageUserMessageCount(page);
+  await page.evaluate(`(() => {
+    const form = document.getElementById("composerForm");
+    window.__heldSkillComposerForm = form;
+    form.remove();
+    const weakInput = document.getElementById("command");
+    weakInput.value = "";
+    weakInput.focus();
+    weakInput.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    weakInput.dispatchEvent(new Event("input", { bubbles: true }));
+    appendAssistantToolCall(${JSON.stringify([
+      `${startMarker}:true-malformed-numeric-e2e`,
+      "cmd: list",
+      "2",
+      endMarker
+    ].join("\n"))}, "text");
+    return true;
+  })()`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return /Skill protocol response is cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
+  })()`, "malformed Skill response to remain queued while the composer is absent");
+  assert.equal(await pageUserMessageCount(page), beforeMalformedRecovery,
+    "A queued malformed Skill response must not fabricate submission proof while no composer exists.");
+  assert.equal(await page.evaluate("document.activeElement?.id"), "command",
+    "The recovery case must keep a weak tool input focused so it can compete with the restored strong composer.");
+  await page.evaluate(`(() => {
+    const main = document.querySelector("main");
+    main.appendChild(window.__heldSkillComposerForm);
+    delete window.__heldSkillComposerForm;
+    return true;
+  })()`);
+  let malformedRecoveryReply;
+  try {
+    malformedRecoveryReply = await waitForNewUserMessage(
+      page,
+      beforeMalformedRecovery,
+      "Malformed Skill helper line: 2",
+      "queued malformed Skill response to recover after the composer returns"
+    );
+  } catch (error) {
+    const diagnostics = await page.evaluateAcrossContexts(`(() => {
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      const composer = document.getElementById("composer");
+      const freshComposer = typeof findCurrentReplyInputSynchronously === "function"
+        ? findCurrentReplyInputSynchronously()
+        : null;
+      return {
+        hasPendingState: typeof pendingHelperDeliveries !== "undefined",
+        pending: typeof pendingHelperDeliveries === "undefined" ? [] : Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+          callId: entry.callId,
+          kind: entry.kind,
+          phase: entry.phase,
+          attempts: entry.attempts,
+          lastError: entry.lastError,
+          inFlight: entry.deliveryInFlight === true,
+          sendRounds: entry.sendAttemptRounds || 0
+        })),
+        panelText: panel?.innerText || "",
+        composerConnected: composer?.isConnected === true,
+        composerText: composer?.innerText || composer?.textContent || "",
+        composerVisible: composer ? Boolean(composer.getClientRects().length) : false,
+        composerEditable: typeof isEditableElement === "function" ? isEditableElement(composer) : null,
+        composerLikely: typeof isLikelyReplyComposerCandidate === "function" ? isLikelyReplyComposerCandidate(composer) : null,
+        composerInsidePanel: typeof isInsideShellToolPanel === "function" ? isInsideShellToolPanel(composer) : null,
+        freshComposerId: freshComposer?.id || "",
+        lastComposerId: typeof lastComposerElement === "undefined" ? "" : lastComposerElement?.id || "",
+        lastComposerConnected: typeof lastComposerElement === "undefined" ? null : lastComposerElement?.isConnected === true,
+        activeDeliveryKind: typeof activeComposerDeliveryToken === "undefined" ? "" : activeComposerDeliveryToken?.kind || "",
+        pageGeneration: typeof pageLifecycleGeneration === "undefined" ? null : pageLifecycleGeneration,
+        userCount: document.querySelectorAll('[data-message-author-role="user"]').length
+      };
+    })()`);
+    throw new Error(`${error.message}; skillRecovery=${JSON.stringify(diagnostics)}`);
+  }
+  assert.match(malformedRecoveryReply, /Local Skill helper response:/);
+  await assertUserMessageCountStable(page, beforeMalformedRecovery + 1,
+    "Malformed Skill recovery must write and submit exactly once.");
+  await waitForEvaluate(page, `(() => {
+    const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+    return chip && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
+  })()`, "malformed Skill helper to leave the acknowledged catalog unchanged");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-idle.png"));
   }
@@ -2730,7 +2846,8 @@ async function runDrawioPreviewE2E(page) {
   assert.equal(state.renderCount, 2);
 
   const rapidV3 = drawioHelper(drawioXml("Draw.io E2E v3"), "drawio-e2e-v3");
-  const rapidV4 = drawioHelper(drawioXml("Draw.io E2E v4", "Only this rapid helper should render"), "drawio-e2e-v4");
+  const rapidV4Xml = drawioXml("Draw.io E2E v4", "Only this rapid helper should render");
+  const rapidV4 = drawioHelper(rapidV4Xml, "drawio-e2e-v4");
   await page.evaluate(`(() => {
     appendAssistantToolCall(${JSON.stringify(rapidV3)}, "text");
     appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text");
@@ -2812,6 +2929,8 @@ async function runDrawioPreviewE2E(page) {
   assert.equal(state.renderCount, 4, "A redrawn helper with the same XML artifact must not remount or flicker.");
   assert.equal(state.userCount, baseline.userCount + 2, "A successful redraw must not send any reply.");
 
+  await runDrawioSupersedeE2E(page, rapidV4Xml, v4ArtifactId);
+
   const finalPageState = await page.evaluate(`(() => ({
     composer: document.getElementById("composer")?.innerText || "",
     userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
@@ -2823,6 +2942,93 @@ async function runDrawioPreviewE2E(page) {
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-drawio.png"));
   }
+}
+
+async function runDrawioSupersedeE2E(page, currentXml, currentArtifactId) {
+  const validB = drawioXml("Draw.io superseded B", "This staging result must never become current");
+  const invalidXml = '<mxfile><diagram name="Cached invalid"><mxGraphModel></diagram></mxfile>';
+  const results = await page.evaluateAcrossContexts(`(async () => {
+    if (!globalThis.AiChatDrawioPreview?.consider) {
+      return null;
+    }
+    const currentXml = ${JSON.stringify(currentXml)};
+    const currentArtifactId = ${JSON.stringify(currentArtifactId)};
+    const validB = ${JSON.stringify(validB)};
+    const invalidXml = ${JSON.stringify(invalidXml)};
+    const preview = globalThis.AiChatDrawioPreview;
+
+    const stagingB = preview.consider({
+      xml: validB,
+      candidateKey: "drawio-supersede-current-b"
+    });
+    const pendingBeforeCurrentRestore = preview.getDiagnostics().pendingArtifactId;
+    const currentRestore = await preview.consider({
+      xml: currentXml,
+      candidateKey: "drawio-supersede-current-a"
+    });
+    const cancelledB = await stagingB;
+    const afterCurrentRestore = preview.getDiagnostics();
+
+    const firstInvalid = await preview.consider({
+      xml: invalidXml,
+      candidateKey: "drawio-supersede-cached-invalid"
+    });
+    const firstInvalidState = preview.getDiagnostics();
+    await preview.consider({
+      xml: currentXml,
+      candidateKey: "drawio-supersede-current-after-invalid"
+    });
+
+    const stagingAfterCachedInvalid = preview.consider({
+      xml: validB,
+      candidateKey: "drawio-supersede-cached-invalid-b"
+    });
+    const cachedInvalid = await preview.consider({
+      xml: invalidXml,
+      candidateKey: "drawio-supersede-cached-invalid"
+    });
+    const cancelledAfterCachedInvalid = await stagingAfterCachedInvalid;
+    const afterCachedInvalid = preview.getDiagnostics();
+
+    await preview.consider({
+      xml: currentXml,
+      candidateKey: "drawio-supersede-final-current"
+    });
+    return {
+      currentArtifactId,
+      pendingBeforeCurrentRestore,
+      currentRestore,
+      cancelledB,
+      afterCurrentRestore,
+      firstInvalid,
+      firstInvalidState,
+      cachedInvalid,
+      cancelledAfterCachedInvalid,
+      afterCachedInvalid,
+      finalState: preview.getDiagnostics()
+    };
+  })()`);
+  const outcome = results.find((entry) => entry.value?.currentArtifactId)?.value;
+  assert.ok(outcome, `Draw.io supersede test did not run in the extension context: ${JSON.stringify(results)}`);
+  assert.ok(outcome.pendingBeforeCurrentRestore && outcome.pendingBeforeCurrentRestore !== currentArtifactId,
+    "The regression must first prove that a different artifact is staging.");
+  assert.equal(outcome.currentRestore.unchanged, true);
+  assert.equal(outcome.cancelledB.cancelled, true,
+    "Re-selecting the already-rendered latest artifact must cancel a different staging renderer.");
+  assert.equal(outcome.afterCurrentRestore.currentArtifactId, currentArtifactId);
+  assert.equal(outcome.afterCurrentRestore.pendingArtifactId, "");
+  assert.equal(outcome.firstInvalid.newError, true);
+  assert.equal(outcome.cachedInvalid.newError, false,
+    "A repeated invalid candidate must restore its cached local outcome without generating another AI error.");
+  assert.equal(outcome.cancelledAfterCachedInvalid.cancelled, true,
+    "A cached invalid outcome must still supersede a newer staging renderer.");
+  assert.equal(outcome.afterCachedInvalid.state, "error");
+  assert.equal(outcome.afterCachedInvalid.currentArtifactId, "");
+  assert.equal(outcome.afterCachedInvalid.pendingArtifactId, "");
+  assert.equal(outcome.afterCachedInvalid.renderErrorCount, outcome.firstInvalidState.renderErrorCount,
+    "Restoring a cached invalid outcome must not count or report the same error again.");
+  assert.equal(outcome.finalState.state, "ready");
+  assert.equal(outcome.finalState.currentArtifactId, currentArtifactId);
 }
 
 async function sendLocalAgentRequest(page, payload) {

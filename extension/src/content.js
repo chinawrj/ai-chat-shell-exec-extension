@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.5";
+const CONTENT_SCRIPT_VERSION = "0.11.6";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -96,6 +96,9 @@ let lastUserMessageText = "";
 let lastDisabledStatusAt = 0;
 let lastComposerElement = null;
 let lastComposerSelector = "";
+let lastComposerBindingExplicit = false;
+let savedComposerSelector = "";
+let savedComposerBindingExplicit = false;
 let bindingMode = "";
 let lastPointerTarget = null;
 let savedSendSelector = "";
@@ -239,9 +242,23 @@ function deactivateExtension() {
 
 async function loadLocalProfiles() {
   const profiles = await chrome.storage.local.get([
+    composerProfileKey(),
     sendProfileKey(),
     shellProfileKey()
   ]);
+  const composerProfile = profiles[composerProfileKey()] || {};
+  savedComposerSelector = String(composerProfile.selector || "");
+  savedComposerBindingExplicit = composerProfile.explicit === true;
+  lastComposerSelector = savedComposerSelector;
+  lastComposerBindingExplicit = false;
+  lastComposerElement = null;
+  if (savedComposerSelector) {
+    const saved = document.querySelector(savedComposerSelector);
+    if (saved && isEditableElement(saved) && isVisibleElement(saved) && !isInsideShellToolPanel(saved)) {
+      lastComposerElement = saved;
+      lastComposerBindingExplicit = savedComposerBindingExplicit;
+    }
+  }
   savedSendSelector = profiles[sendProfileKey()]?.selector || "";
   savedShellSelector = profiles[shellProfileKey()]?.selector || "";
 }
@@ -541,16 +558,34 @@ function rememberComposer(target, options) {
     return;
   }
 
-  lastComposerElement = editable;
   const selector = buildStableSelector(editable);
-  if (!selector || selector === lastComposerSelector) {
+  if (!selector) {
+    return;
+  }
+  if (options.explicit !== true && savedComposerBindingExplicit &&
+      savedComposerSelector && selector !== savedComposerSelector) {
+    return;
+  }
+  const selectorChanged = selector !== lastComposerSelector;
+  lastComposerElement = editable;
+  lastComposerSelector = selector;
+  if (options.explicit === true) {
+    lastComposerBindingExplicit = true;
+    savedComposerSelector = selector;
+    savedComposerBindingExplicit = true;
+  } else if (selectorChanged) {
+    lastComposerBindingExplicit = false;
+    savedComposerSelector = selector;
+    savedComposerBindingExplicit = false;
+  }
+  if (!selectorChanged && options.explicit !== true) {
     return;
   }
 
-  lastComposerSelector = selector;
   chrome.storage.local.set({
     [composerProfileKey()]: {
       selector,
+      explicit: lastComposerBindingExplicit,
       host: location.host,
       savedAt: new Date().toISOString()
     }
@@ -569,7 +604,7 @@ function bindElement(mode, target) {
       setStatus("Binding failed: selected element is not editable", "error");
       return;
     }
-    rememberComposer(editable, { force: true });
+    rememberComposer(editable, { force: true, explicit: true });
     setStatus("Bound chat input for this origin", "ok");
     return;
   }
@@ -842,6 +877,7 @@ function buildSemanticCallKey(call) {
     normalizeCommand(call.body || ""),
     normalizeCommand(call.challenge || ""),
     normalizeCommand(call.catalogSha || ""),
+    normalizeCommand(call.catalogVersion || ""),
     normalizeCommand(call.memoryEntry || ""),
     normalizeCommand(call.skillId || ""),
     normalizeCommand(call.reason || ""),
@@ -1032,7 +1068,12 @@ async function loadPendingHelperDeliveriesForCurrentPage() {
       return;
     }
     const entries = prunePendingHelperDeliveryEntries(snapshot.entries)
-      .map((entry) => ({ ...entry, restored: true }));
+      .filter((entry) => !(entry.removeWhenQueuedAfterSkillSync === true && entry.phase === "queued"))
+      .map((entry) => {
+        const restored = { ...entry, restored: true };
+        delete restored.removeWhenQueuedAfterSkillSync;
+        return restored;
+      });
     for (const entry of entries) {
       pendingHelperDeliveries.set(entry.callId, entry);
     }
@@ -1046,6 +1087,7 @@ async function loadPendingHelperDeliveriesForCurrentPage() {
       }
     }
     if (entries.length !== snapshot.entries.length ||
+        snapshot.entries.some((entry) => entry?.removeWhenQueuedAfterSkillSync === true) ||
         presentedExecutions.length !== (Array.isArray(snapshot.presentedExecutions) ? snapshot.presentedExecutions.length : 0)) {
       await persistPendingHelperDeliveries(storageKey);
     }
@@ -1168,7 +1210,10 @@ function snapshotPendingHelperCall(call) {
     surface: String(call?.surface || ""),
     skillId: String(call?.skillId || ""),
     catalogSha: String(call?.catalogSha || ""),
-    challenge: String(call?.challenge || "")
+    catalogVersion: String(call?.catalogVersion || ""),
+    memoryEntry: String(call?.memoryEntry || ""),
+    challenge: String(call?.challenge || ""),
+    reason: String(call?.reason || "")
   };
 }
 
@@ -1386,6 +1431,19 @@ async function performPendingHelperDeliveryFinalization(entry, phase) {
 
 function setPendingHelperDeliveryStatus(entry) {
   const label = pendingHelperDeliveryLabel(entry);
+  if (entry.kind === "skill-error") {
+    const lastError = entry.lastError ? ` Last send state: ${summarizeCommand(entry.lastError)}.` : "";
+    const message = entry.phase === "inserted"
+      ? `Skill protocol response remains in the chat composer and safe send-only attempts will continue; it will not be written twice.${lastError}`
+      : entry.phase === "submitted-unconfirmed"
+        ? `Skill protocol response was submitted locally and is waiting for a matching chat-message proof; it will not be written or submitted again.${lastError}`
+        : `Skill protocol response is cached locally and waiting for the chat composer.${lastError}`;
+    setStatus(message, "running", {
+      owner: "helper-delivery",
+      ownerKey: buildSemanticCallKey(entry.call)
+    });
+    return;
+  }
   const completedLabel = entry.response?.ok === false
     ? `${label} execution failed`
     : `${label} completed`;
@@ -1664,7 +1722,23 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
     }
     return settlePendingHelperAfterUnconfirmedSend(entry, callToken);
   } finally {
-    entry.deliveryInFlight = false;
+    await finishPendingHelperDeliveryAttempt(entry);
+  }
+}
+
+async function finishPendingHelperDeliveryAttempt(entry) {
+  entry.deliveryInFlight = false;
+  const removeAfterSkillSync = entry.removeWhenQueuedAfterSkillSync === true;
+  if (removeAfterSkillSync && entry.phase === "queued" &&
+      pendingHelperDeliveries.get(entry.callId) === entry) {
+    pendingHelperDeliveries.delete(entry.callId);
+    delete entry.removeWhenQueuedAfterSkillSync;
+    await persistPendingHelperDeliveries();
+    return;
+  }
+  delete entry.removeWhenQueuedAfterSkillSync;
+  if (removeAfterSkillSync && pendingHelperDeliveries.get(entry.callId) === entry) {
+    await persistPendingHelperDeliveries();
   }
 }
 
@@ -2430,14 +2504,51 @@ function compareNodeOrder(a, b) {
 }
 
 function extractPlainTextShellCallBlocks(root) {
-  const text = root.innerText || root.textContent || "";
-  const blocks = parsePlainTextHelperBlocks(text);
+  const renderedText = root.innerText || root.textContent || "";
+  const renderedBlocks = parsePlainTextHelperBlocks(renderedText);
+  const extraction = selectCanonicalSkillTextFallback(root, renderedText, renderedBlocks);
+  const text = extraction.text;
+  const blocks = extraction.blocks;
   return blocks.map((call, blockIndex) => ({
     call,
     node: closestMessageContainer(root),
     blockIndex,
     insideShellOutput: isRenderedShellOutputRoot(root) || isHelperLineInsideShellOutput(text, call.sourceStartLine)
   }));
+}
+
+function selectCanonicalSkillTextFallback(root, renderedText, renderedBlocks) {
+  const rendered = String(renderedText || "");
+  const raw = String(root?.textContent || "");
+  const unchanged = { text: rendered, blocks: renderedBlocks };
+  if (!raw || raw === rendered || stripOnlyLineBreaks(rendered) !== stripOnlyLineBreaks(raw)) {
+    return unchanged;
+  }
+
+  // Some syntax-highlighting layouts split a field value into a separate
+  // visual line (for example `catalog-version:\n2`) even though the code
+  // node's canonical textContent remains `catalog-version:2`. Keep the Skill
+  // protocol strict: use textContent only when the two DOM representations
+  // differ by line breaks alone, each is exactly one complete Skill envelope,
+  // rendered parsing fails, and canonical parsing fully validates.
+  const renderedCall = parsePlainTextHelperPayload(rendered);
+  const rawCall = parsePlainTextHelperPayload(raw);
+  if (!isSkillHelperCall(renderedCall) || !isSkillHelperCall(rawCall) ||
+      renderedBlocks.length !== 1 || parsePlainTextHelperBlocks(raw).length !== 1 ||
+      validateSkillHelperCall(renderedCall).ok || !validateSkillHelperCall(rawCall).ok) {
+    return unchanged;
+  }
+  const renderedHasExplicitIdentity = renderedCall.helperIdSource === "marker";
+  const rawHasExplicitIdentity = rawCall.helperIdSource === "marker";
+  if (renderedHasExplicitIdentity !== rawHasExplicitIdentity ||
+      (renderedHasExplicitIdentity && renderedCall.helperId !== rawCall.helperId)) {
+    return unchanged;
+  }
+  return { text: raw, blocks: [rawCall] };
+}
+
+function stripOnlyLineBreaks(value) {
+  return String(value || "").replace(/[\r\n]/g, "");
 }
 
 function parsePlainTextHelperBlocks(text) {
@@ -5507,24 +5618,46 @@ async function findReplyInput(options = {}) {
       isEditableElement(lastComposerElement) &&
       isVisibleElement(lastComposerElement) &&
       !isInsideShellToolPanel(lastComposerElement)) {
-    return lastComposerElement;
+    const preferred = preferCurrentStrongComposerOverWeakRemembered(lastComposerElement, {
+      explicitlyBound: lastComposerBindingExplicit
+    });
+    if (preferred !== lastComposerElement) {
+      lastComposerElement = preferred;
+      lastComposerSelector = buildStableSelector(preferred);
+      lastComposerBindingExplicit = false;
+    }
+    return preferred;
   }
 
   if (options.fresh !== true) {
     const profile = await chrome.storage.local.get(composerProfileKey());
-    const selector = profile[composerProfileKey()]?.selector;
+    const composerProfile = profile[composerProfileKey()] || {};
+    const selector = composerProfile.selector;
+    savedComposerSelector = String(selector || "");
+    savedComposerBindingExplicit = composerProfile.explicit === true;
     if (selector) {
       const saved = document.querySelector(selector);
       if (saved &&
           isEditableElement(saved) &&
           isVisibleElement(saved) &&
           !isInsideShellToolPanel(saved)) {
-        lastComposerElement = saved;
-        return saved;
+        lastComposerBindingExplicit = savedComposerBindingExplicit;
+        const preferred = preferCurrentStrongComposerOverWeakRemembered(saved, {
+          explicitlyBound: lastComposerBindingExplicit
+        });
+        lastComposerElement = preferred;
+        lastComposerSelector = buildStableSelector(preferred);
+        if (preferred !== saved) {
+          lastComposerBindingExplicit = false;
+        }
+        return preferred;
       }
       if (saved && isInsideShellToolPanel(saved)) {
         lastComposerElement = null;
         lastComposerSelector = "";
+        lastComposerBindingExplicit = false;
+        savedComposerSelector = "";
+        savedComposerBindingExplicit = false;
         chrome.storage.local.remove([composerProfileKey()]).catch(() => {});
       }
     }
@@ -5533,8 +5666,23 @@ async function findReplyInput(options = {}) {
   const candidate = findCurrentReplyInputSynchronously();
   if (candidate) {
     lastComposerElement = candidate;
+    lastComposerSelector = buildStableSelector(candidate);
+    lastComposerBindingExplicit = false;
   }
   return candidate;
+}
+
+function preferCurrentStrongComposerOverWeakRemembered(remembered, options = {}) {
+  if (!(remembered instanceof Element) || options.explicitlyBound === true ||
+      isStrongReplyComposerCandidate(remembered)) {
+    return remembered;
+  }
+  const current = getVisibleReplyInputCandidates().find((candidate) =>
+    candidate !== remembered && isStrongReplyComposerCandidate(candidate)
+  );
+  return current instanceof Element && current !== remembered && isStrongReplyComposerCandidate(current)
+    ? current
+    : remembered;
 }
 
 function getVisibleReplyInputCandidates() {
@@ -7147,9 +7295,16 @@ async function removeObsoleteSkillSyncPromptDeliveries(activeChallenge) {
   await loadPendingHelperDeliveriesForCurrentPage();
   let changed = false;
   for (const [callId, entry] of pendingHelperDeliveries) {
-    if (entry.kind === "skill-sync-prompt" && entry.call?.challenge !== activeChallenge) {
-      pendingHelperDeliveries.delete(callId);
-      changed = true;
+    const staleChallenge = String(entry.call?.challenge || "");
+    const staleSyncKind = ["skill-sync-prompt", "skill-list", "skill-error"].includes(entry.kind);
+    if (entry.phase === "queued" && staleSyncKind && staleChallenge && staleChallenge !== activeChallenge) {
+      if (entry.deliveryInFlight === true) {
+        entry.removeWhenQueuedAfterSkillSync = true;
+        changed = true;
+      } else {
+        pendingHelperDeliveries.delete(callId);
+        changed = true;
+      }
     }
   }
   if (changed) {
@@ -8164,7 +8319,11 @@ function handlePanelAction(action) {
   if (action === "clear") {
     savedSendSelector = "";
     savedShellSelector = "";
+    lastComposerElement = null;
     lastComposerSelector = "";
+    lastComposerBindingExplicit = false;
+    savedComposerSelector = "";
+    savedComposerBindingExplicit = false;
     chrome.storage.local.remove([composerProfileKey(), sendProfileKey(), shellProfileKey()]);
     setStatus("Cleared bindings for this origin", "ok");
     return;

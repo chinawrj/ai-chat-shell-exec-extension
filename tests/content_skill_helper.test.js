@@ -21,7 +21,11 @@ testSelfExplainingPromptsCannotTriggerTheSkillParser();
 testSkillLoadFinalSerializationBoundaries();
 testEmptyCatalogPanelStates();
 testSkillStatusActionRouting();
-awaitTestExplicitUserAndProvenanceRejection()
+testComposerRecoveryPreference();
+awaitTestCanonicalSkillDomFallback()
+  .then(() => awaitTestExplicitComposerBindingPersistence())
+  .then(() => awaitTestDurableForceSyncCleanup())
+  .then(() => awaitTestExplicitUserAndProvenanceRejection())
   .then(() => testSkillInstallActionIsExplicitAndSingleFlight())
   .then(() => console.log("content Skill helper tests passed"));
 
@@ -190,6 +194,97 @@ function testSkillEnvelopeAndIdentityRules() {
     "A mismatched helper end marker must not complete a Skill helper."
   );
   assert.equal(context.parsePlainTextHelperBlocks("ai-helper-skill-start\ncmd: list").length, 0);
+}
+
+async function awaitTestCanonicalSkillDomFallback() {
+  const rawAck = [
+    "ai-helper-skill-start:dom-split-ack",
+    "cmd: list-updated",
+    `challenge:${challenge}`,
+    `catalog-sha:${catalogSha}`,
+    "catalog-version:2",
+    `memory-entry:${memoryEntry}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const renderedAck = rawAck.replace("catalog-version:2", "catalog-version:\n2");
+  const node = new context.Element();
+  node.innerText = renderedAck;
+  node.textContent = rawAck;
+  node.closest = (selector) => String(selector).includes("data-message-author-role") ? node : null;
+  const [candidate] = context.extractPlainTextShellCallBlocks(node);
+  assert.ok(candidate, "A canonical Skill helper should still be extracted from a host-split code node.");
+  assert.equal(candidate.call.kind, "skill");
+  assert.equal(candidate.call.catalogVersion, "2");
+  assert.equal(context.validateHelperCall(candidate.call).ok, true);
+
+  const originalSendMessage = context.chrome.runtime.sendMessage;
+  const originalRefreshSkillState = context.refreshSkillState;
+  const originalQueueSkillComposerReply = context.queueSkillComposerReply;
+  const originalGetConversationRoot = context.getConversationRoot;
+  const originalIsVisibleElement = context.isVisibleElement;
+  const originalGetMessageAuthorRole = context.getMessageAuthorRole;
+  const originalSetStatus = context.setStatus;
+  let backendCalls = 0;
+  let lastStatus = "";
+  try {
+    context.getConversationRoot = () => new context.Element();
+    context.isVisibleElement = () => true;
+    context.getMessageAuthorRole = () => "assistant";
+    context.setStatus = (value) => { lastStatus = String(value); };
+    context.refreshSkillState = async () => ({ ok: true });
+    context.queueSkillComposerReply = async () => {
+      throw new Error("A valid recovered ACK must remain silent.");
+    };
+    context.chrome.runtime.sendMessage = async (message) => {
+      backendCalls += 1;
+      assert.equal(message.type, "skill-sync-ack");
+      assert.equal(message.challenge, challenge);
+      assert.equal(message.catalogSha, catalogSha);
+      assert.equal(message.catalogVersion, 2);
+      assert.equal(message.memoryEntry, memoryEntry);
+      return { ok: true, version: 2 };
+    };
+    vm.runInContext("chainCallCount = 0; skillHelperInFlight = false;", context);
+    assert.equal(await context.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true, lastStatus);
+    assert.equal(backendCalls, 1, "The canonical recovered ACK must reach background exactly once.");
+
+    const trueMalformed = new context.Element();
+    trueMalformed.innerText = renderedAck.replace("dom-split-ack", "true-malformed");
+    trueMalformed.textContent = trueMalformed.innerText;
+    trueMalformed.closest = (selector) => String(selector).includes("data-message-author-role") ? trueMalformed : null;
+    const [malformedCandidate] = context.extractPlainTextShellCallBlocks(trueMalformed);
+    assert.match(context.validateHelperCall(malformedCandidate.call).reason, /Malformed Skill helper line: 2/);
+    let queuedError = null;
+    context.queueSkillComposerReply = async (payload) => {
+      queuedError = payload;
+      return false;
+    };
+    assert.equal(await context.processLatestSkillCandidate([malformedCandidate], { maxChainCalls: 100 }), false);
+    assert.equal(backendCalls, 1, "A real naked numeric payload line must still fail before background/server.");
+    assert.equal(queuedError?.call?.kind, "skill-error");
+    assert.match(queuedError?.reply || "", /Malformed Skill helper line: 2/);
+
+    const hiddenExtra = new context.Element();
+    hiddenExtra.innerText = renderedAck.replace("dom-split-ack", "hidden-extra");
+    hiddenExtra.textContent = rawAck
+      .replace("dom-split-ack", "hidden-extra")
+      .replace("catalog-version:2", "catalog-version:2\nreason:hidden");
+    hiddenExtra.closest = (selector) => String(selector).includes("data-message-author-role") ? hiddenExtra : null;
+    const [hiddenExtraCandidate] = context.extractPlainTextShellCallBlocks(hiddenExtra);
+    assert.match(
+      context.validateHelperCall(hiddenExtraCandidate.call).reason,
+      /Malformed Skill helper line: 2/,
+      "Raw hidden content that differs by more than layout line breaks must never repair the visible protocol."
+    );
+  } finally {
+    context.chrome.runtime.sendMessage = originalSendMessage;
+    context.refreshSkillState = originalRefreshSkillState;
+    context.queueSkillComposerReply = originalQueueSkillComposerReply;
+    context.getConversationRoot = originalGetConversationRoot;
+    context.isVisibleElement = originalIsVisibleElement;
+    context.getMessageAuthorRole = originalGetMessageAuthorRole;
+    context.setStatus = originalSetStatus;
+  }
 }
 
 function testSelfExplainingPromptsCannotTriggerTheSkillParser() {
@@ -680,6 +775,230 @@ function testSkillStatusActionRouting() {
   );
 }
 
+function testComposerRecoveryPreference() {
+  const rememberedWeakInput = new context.Element();
+  rememberedWeakInput.tagName = "INPUT";
+  rememberedWeakInput.getAttribute = () => "";
+  rememberedWeakInput.closest = () => null;
+  const currentStrongComposer = new context.Element();
+  currentStrongComposer.tagName = "DIV";
+  currentStrongComposer.getAttribute = (name) => ({
+    role: "textbox",
+    contenteditable: "true",
+    "aria-label": "Chat composer"
+  })[name] || "";
+  currentStrongComposer.closest = () => null;
+  const originalGetVisible = context.getVisibleReplyInputCandidates;
+  try {
+    context.document.activeElement = rememberedWeakInput;
+    context.getVisibleReplyInputCandidates = () => [rememberedWeakInput, currentStrongComposer];
+    assert.equal(
+      context.preferCurrentStrongComposerOverWeakRemembered(rememberedWeakInput, { explicitlyBound: false }),
+      currentStrongComposer,
+      "A stale weak input must not block a newly available strong chat composer."
+    );
+    assert.equal(
+      context.preferCurrentStrongComposerOverWeakRemembered(rememberedWeakInput, { explicitlyBound: true }),
+      rememberedWeakInput,
+      "An explicit Bind input selection must retain final authority."
+    );
+    assert.equal(
+      context.preferCurrentStrongComposerOverWeakRemembered(currentStrongComposer, { explicitlyBound: false }),
+      currentStrongComposer,
+      "A remembered strong composer must remain stable."
+    );
+  } finally {
+    context.document.activeElement = null;
+    context.getVisibleReplyInputCandidates = originalGetVisible;
+  }
+}
+
+async function awaitTestExplicitComposerBindingPersistence() {
+  const explicitlyBound = new context.Element();
+  explicitlyBound.id = "explicit-composer";
+  const competingInput = new context.Element();
+  competingInput.id = "competing-input";
+  const nodes = new Map([
+    ["#explicit-composer", explicitlyBound],
+    ["#competing-input", competingInput]
+  ]);
+  const originalClosestEditable = context.closestEditable;
+  const originalIsVisible = context.isVisibleElement;
+  const originalIsEditable = context.isEditableElement;
+  const originalInsidePanel = context.isInsideShellToolPanel;
+  const originalLikely = context.isLikelyReplyComposerCandidate;
+  const originalBuildSelector = context.buildStableSelector;
+  const originalQuerySelector = context.document.querySelector;
+  const originalStorageGet = context.chrome.storage.local.get;
+  const originalStorageSet = context.chrome.storage.local.set;
+  const originalStorageRemove = context.chrome.storage.local.remove;
+  const originalSetStatus = context.setStatus;
+  let storedProfile = null;
+  let writes = 0;
+  let removals = 0;
+  try {
+    context.closestEditable = (target) => target;
+    context.isVisibleElement = () => true;
+    context.isEditableElement = () => true;
+    context.isInsideShellToolPanel = () => false;
+    context.isLikelyReplyComposerCandidate = () => true;
+    context.buildStableSelector = (node) => `#${node.id}`;
+    context.document.querySelector = (selector) => nodes.get(selector) || null;
+    context.chrome.storage.local.get = async () => storedProfile ? { [context.composerProfileKey()]: storedProfile } : {};
+    context.chrome.storage.local.set = async (snapshot) => {
+      writes += 1;
+      storedProfile = snapshot[context.composerProfileKey()];
+    };
+    context.chrome.storage.local.remove = async () => { removals += 1; storedProfile = null; };
+    context.setStatus = () => {};
+
+    vm.runInContext("lastComposerElement = null; lastComposerSelector = ''; lastComposerBindingExplicit = false; savedComposerSelector = ''; savedComposerBindingExplicit = false;", context);
+    context.rememberComposer(explicitlyBound, { force: true, explicit: true });
+    await Promise.resolve();
+    context.rememberComposer(competingInput);
+    await Promise.resolve();
+    assert.equal(writes, 1, "An automatic input event must not overwrite an explicit composer binding.");
+    assert.equal(vm.runInContext("lastComposerElement", context), explicitlyBound);
+    assert.equal(vm.runInContext("savedComposerBindingExplicit", context), true);
+
+    vm.runInContext("lastComposerElement = null; lastComposerSelector = ''; lastComposerBindingExplicit = false; savedComposerSelector = ''; savedComposerBindingExplicit = false;", context);
+    await context.loadLocalProfiles();
+    context.rememberComposer(competingInput);
+    await Promise.resolve();
+    assert.equal(writes, 1, "Activation must hydrate an explicit binding before automatic composer events can race it.");
+    assert.equal(vm.runInContext("lastComposerElement", context), explicitlyBound);
+    assert.equal(vm.runInContext("lastComposerBindingExplicit", context), true);
+
+    context.handlePanelAction("clear");
+    await Promise.resolve();
+    context.rememberComposer(competingInput);
+    await Promise.resolve();
+    assert.equal(removals, 1);
+    assert.equal(writes, 2, "Clear bindings must allow automatic composer learning again.");
+    assert.equal(vm.runInContext("lastComposerElement", context), competingInput);
+    assert.equal(vm.runInContext("savedComposerBindingExplicit", context), false);
+  } finally {
+    context.closestEditable = originalClosestEditable;
+    context.isVisibleElement = originalIsVisible;
+    context.isEditableElement = originalIsEditable;
+    context.isInsideShellToolPanel = originalInsidePanel;
+    context.isLikelyReplyComposerCandidate = originalLikely;
+    context.buildStableSelector = originalBuildSelector;
+    context.document.querySelector = originalQuerySelector;
+    context.chrome.storage.local.get = originalStorageGet;
+    context.chrome.storage.local.set = originalStorageSet;
+    context.chrome.storage.local.remove = originalStorageRemove;
+    context.setStatus = originalSetStatus;
+  }
+}
+
+async function awaitTestDurableForceSyncCleanup() {
+  const originalStorageGet = context.chrome.storage.local.get;
+  const originalStorageSet = context.chrome.storage.local.set;
+  const originalStorageRemove = context.chrome.storage.local.remove;
+  const now = Date.now();
+  const oldChallenge = "3".repeat(32);
+  const activeChallenge = "4".repeat(32);
+  const pageIdentity = context.getCurrentPageIdentity();
+  const storageKey = context.pendingHelperDeliveryStorageKey();
+  let storage = {};
+  try {
+    context.chrome.storage.local.get = async (keys) => {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(requested.filter((key) => Object.hasOwn(storage, key)).map((key) => [key, storage[key]]));
+    };
+    context.chrome.storage.local.set = async (snapshot) => {
+      storage = { ...storage, ...JSON.parse(JSON.stringify(snapshot)) };
+    };
+    context.chrome.storage.local.remove = async (keys) => {
+      for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key];
+    };
+
+    const oldEntry = {
+      callId: `skill-error:${oldChallenge}`,
+      kind: "skill-error",
+      phase: "queued",
+      deliveryInFlight: true,
+      call: { kind: "skill-error", challenge: oldChallenge },
+      reply: "obsolete Skill protocol response",
+      response: { ok: false },
+      pageIdentity,
+      createdAt: now,
+      updatedAt: now
+    };
+    const activeEntry = {
+      callId: `skill-sync-prompt:${activeChallenge}`,
+      kind: "skill-sync-prompt",
+      phase: "queued",
+      call: { kind: "skill-sync-prompt", challenge: activeChallenge },
+      reply: "fresh Skill synchronization prompt",
+      response: { ok: true },
+      pageIdentity,
+      createdAt: now + 1,
+      updatedAt: now + 1
+    };
+    vm.runInContext("pendingHelperDeliveryStorageTail = Promise.resolve();", context);
+    context.__durableStorageKey = storageKey;
+    context.__durableOldEntry = oldEntry;
+    context.__durableActiveEntry = activeEntry;
+    vm.runInContext(`
+      pendingHelperDeliveriesLoadedKey = __durableStorageKey;
+      pendingHelperDeliveries = new Map([
+        [__durableOldEntry.callId, __durableOldEntry],
+        [__durableActiveEntry.callId, __durableActiveEntry]
+      ]);
+    `, context);
+    await context.removeObsoleteSkillSyncPromptDeliveries(activeChallenge);
+    await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+    assert.equal(storage[storageKey].entries.find((entry) => entry.callId === oldEntry.callId)?.removeWhenQueuedAfterSkillSync, true,
+      "Force Sync must durably persist its intent to discard an obsolete in-flight queued response.");
+
+    // Simulate the page/content lifecycle ending before the old attempt reaches
+    // its finally block, after the fresh prompt has already been persisted.
+    vm.runInContext("pendingHelperDeliveriesLoadedKey = ''; pendingHelperDeliveries = new Map(); pendingHelperDeliveryStorageTail = Promise.resolve();", context);
+    await context.loadPendingHelperDeliveriesForCurrentPage();
+    await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+    assert.equal(vm.runInContext(`pendingHelperDeliveries.has(${JSON.stringify(oldEntry.callId)})`, context), false,
+      "A reload must not resurrect a stale queued Skill response whose durable discard marker survived the crash window.");
+    assert.equal(vm.runInContext(`pendingHelperDeliveries.has(${JSON.stringify(activeEntry.callId)})`, context), true,
+      "The current challenge must remain queued across the same recovery.");
+    assert.equal(storage[storageKey].entries.some((entry) => entry.callId === oldEntry.callId), false,
+      "Recovery must compact the stale response out of persistent FIFO state.");
+    assert.equal(storage[storageKey].entries.some((entry) => entry.removeWhenQueuedAfterSkillSync === true), false,
+      "Consumed discard markers must not remain in the recovered snapshot.");
+
+    const insertedEntry = {
+      ...oldEntry,
+      callId: "skill-error:already-inserted",
+      phase: "inserted",
+      deliveryInFlight: undefined,
+      removeWhenQueuedAfterSkillSync: true,
+      reply: "already inserted Skill protocol response"
+    };
+    storage[storageKey] = {
+      version: 1,
+      pageIdentity,
+      updatedAt: now,
+      entries: [insertedEntry],
+      presentedExecutions: []
+    };
+    vm.runInContext("pendingHelperDeliveriesLoadedKey = ''; pendingHelperDeliveries = new Map(); pendingHelperDeliveryStorageTail = Promise.resolve();", context);
+    await context.loadPendingHelperDeliveriesForCurrentPage();
+    await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+    assert.equal(vm.runInContext(`pendingHelperDeliveries.has(${JSON.stringify(insertedEntry.callId)})`, context), true,
+      "A response that reached the composer before reload must not be discarded by the queued-only tombstone.");
+    assert.equal(vm.runInContext(`pendingHelperDeliveries.get(${JSON.stringify(insertedEntry.callId)}).removeWhenQueuedAfterSkillSync`, context), undefined);
+  } finally {
+    context.chrome.storage.local.get = originalStorageGet;
+    context.chrome.storage.local.set = originalStorageSet;
+    context.chrome.storage.local.remove = originalStorageRemove;
+    delete context.__durableStorageKey;
+    delete context.__durableOldEntry;
+    delete context.__durableActiveEntry;
+    vm.runInContext("pendingHelperDeliveryStorageTail = Promise.resolve(); pendingHelperDeliveriesLoadedKey = ''; pendingHelperDeliveries = new Map();", context);
+  }
+}
+
 function testSkillLoadFinalSerializationBoundaries() {
   const replyLimit = vm.runInContext("PENDING_HELPER_DELIVERY_MAX_REPLY_CHARS", context);
   const response = {
@@ -871,18 +1190,58 @@ async function awaitTestExplicitUserAndProvenanceRejection() {
   vm.runInContext(`(() => {
     pendingHelperDeliveriesLoadedKey = pendingHelperDeliveryStorageKey();
     pendingHelperDeliveries = new Map([
-      ["skill-sync-prompt:${oldChallenge}", { kind: "skill-sync-prompt", call: { challenge: "${oldChallenge}" } }],
-      ["skill-sync-prompt:${activeChallenge}", { kind: "skill-sync-prompt", call: { challenge: "${activeChallenge}" } }],
-      ["skill-load:keep", { kind: "skill-load", call: { challenge: "" } }]
+      ["skill-sync-prompt:${oldChallenge}", { kind: "skill-sync-prompt", phase: "queued", call: { challenge: "${oldChallenge}" } }],
+      ["skill-error:${oldChallenge}", { kind: "skill-error", phase: "queued", call: { challenge: "${oldChallenge}" } }],
+      ["skill-list:${oldChallenge}", { kind: "skill-list", phase: "queued", call: { challenge: "${oldChallenge}" } }],
+      ["skill-error:inserted", { kind: "skill-error", phase: "inserted", call: { challenge: "${oldChallenge}" } }],
+      ["skill-error:inflight", { callId: "skill-error:inflight", kind: "skill-error", phase: "queued", deliveryInFlight: true, call: { challenge: "${oldChallenge}" } }],
+      ["skill-list:inflight-inserted", { callId: "skill-list:inflight-inserted", kind: "skill-list", phase: "queued", deliveryInFlight: true, call: { challenge: "${oldChallenge}" } }],
+      ["skill-sync-prompt:${activeChallenge}", { kind: "skill-sync-prompt", phase: "queued", call: { challenge: "${activeChallenge}" } }],
+      ["skill-load:keep", { kind: "skill-load", phase: "queued", call: { challenge: "" } }],
+      ["drawio-error:keep", { kind: "drawio-error", phase: "queued", call: { challenge: "${oldChallenge}" } }]
     ]);
   })()`, context);
   await context.removeObsoleteSkillSyncPromptDeliveries(activeChallenge);
   const remainingPendingIds = vm.runInContext("Array.from(pendingHelperDeliveries.keys())", context);
   assert.deepEqual(
     Array.from(remainingPendingIds),
-    [`skill-sync-prompt:${activeChallenge}`, "skill-load:keep"],
-    "A replacement challenge must delete only obsolete pending sync prompts while preserving the active prompt and unrelated deliveries."
+    ["skill-error:inserted", "skill-error:inflight", "skill-list:inflight-inserted", `skill-sync-prompt:${activeChallenge}`, "skill-load:keep", "drawio-error:keep"],
+    "A replacement challenge must delete only obsolete, never-written Skill sync responses while preserving inserted and unrelated deliveries."
   );
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('skill-error:inflight').removeWhenQueuedAfterSkillSync", context),
+    true,
+    "An obsolete in-flight queued response must be marked for removal after its current attempt settles."
+  );
+  const inflightQueued = vm.runInContext("pendingHelperDeliveries.get('skill-error:inflight')", context);
+  await context.finishPendingHelperDeliveryAttempt(inflightQueued);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.has('skill-error:inflight')", context), false);
+  const inflightInserted = vm.runInContext("pendingHelperDeliveries.get('skill-list:inflight-inserted')", context);
+  inflightInserted.phase = "inserted";
+  await context.finishPendingHelperDeliveryAttempt(inflightInserted);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.has('skill-list:inflight-inserted')", context),
+    true,
+    "A response that actually reached the composer during the race must be preserved and never rewritten."
+  );
+
+  assert.notEqual(
+    context.buildSemanticCallKey({ kind: "skill-error", challenge, catalogSha, catalogVersion: "7" }),
+    context.buildSemanticCallKey({ kind: "skill-error", challenge, catalogSha, catalogVersion: "8" }),
+    "Skill deliveries that differ only by catalog version require distinct semantic ownership keys."
+  );
+
+  const snapshottedAck = context.snapshotPendingHelperCall({
+    kind: "skill-error",
+    challenge,
+    catalogSha,
+    catalogVersion: "7",
+    memoryEntry,
+    reason: "memory unavailable"
+  });
+  assert.equal(snapshottedAck.catalogVersion, "7");
+  assert.equal(snapshottedAck.memoryEntry, memoryEntry);
+  assert.equal(snapshottedAck.reason, "memory unavailable");
 }
 
 function assertSafePrompt(text, label) {

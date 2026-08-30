@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-08-30
+
+- Splits Draw.io sandbox startup from render acceptance, pauses visible-time budgets while the page is hidden, retries one fresh local iframe when the first attempt does not accept the request, and uses iframe load as a fallback for a lost ready message.
+- Removes the old combined 7-second parent render deadline: a slow final synchronous render may finish without being destroyed, while the isolated viewer uses immediate SVG detection, a mutation observer, and a separate 15-second visible-time output check after the packaged renderer returns.
+- Enforces latest-only Draw.io outcomes across staging races: reselecting an already-rendered or cached invalid/failed candidate cancels any different in-flight renderer before restoring that local outcome.
+- Recovers strict Skill helpers when a syntax-highlighting host inserts layout-only line breaks such as `catalog-version:\n2`; canonical `textContent` is accepted only when it differs by line breaks alone and passes the complete fail-closed protocol.
+- Keeps truly malformed numeric lines, hidden extra content, duplicate/unknown fields, and mismatched envelopes rejected before background/server work.
+- Lets a restored strong chat composer replace a stale weak remembered page input, while preserving an explicit **Bind input** choice as authoritative; queued Skill protocol replies then resume exactly one write/send without rerunning the backend operation.
+- Makes Force Sync cleanup crash-safe by persisting a queued-only discard marker for obsolete in-flight Skill responses; reload consumes the marker without deleting a response that already reached the composer.
+- Adds focused watchdog/policy/message-classifier, canonical-DOM, explicit-binding, stale-input, force-sync race, queued-composer recovery, negative protocol, and repeated real-Chromium Draw.io/Skill regressions.
+
 ## [0.11.5] - 2026-08-28
 
 - Adds an explicit local Skill installation lifecycle: every discovered Skill starts uninstalled, the expanded Skills list exposes `Install`, `Installed`, retry, and missing-installer states, and only a trusted user click plus native confirmation can run an installer.

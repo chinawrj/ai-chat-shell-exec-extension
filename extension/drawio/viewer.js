@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const RENDER_TIMEOUT_MS = 5500;
+  const RENDER_OUTPUT_TIMEOUT_MS = 15000;
   const channel = new URLSearchParams(location.hash.replace(/^#/, "")).get("channel") || "";
   const viewer = document.getElementById("viewer");
   let renderStarted = false;
@@ -52,27 +52,63 @@
   }
 
   function waitForRenderedSvg(container, artifactId, metadata) {
-    const startedAt = Date.now();
-    const timer = setInterval(() => {
+    let visibleElapsedMs = 0;
+    let visibleStartedAt = document.hidden ? 0 : Date.now();
+    let timer = 0;
+    let observer = null;
+    function activeVisibleElapsedMs() {
+      return visibleElapsedMs + (visibleStartedAt > 0 ? Date.now() - visibleStartedAt : 0);
+    }
+    function onVisibilityChange() {
+      if (document.hidden) {
+        if (visibleStartedAt > 0) {
+          visibleElapsedMs += Date.now() - visibleStartedAt;
+          visibleStartedAt = 0;
+        }
+      } else if (visibleStartedAt === 0) {
+        visibleStartedAt = Date.now();
+      }
+    }
+    function cleanupTimer() {
+      clearInterval(timer);
+      observer?.disconnect();
+      observer = null;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+    function settleRenderedSvg() {
       if (renderSettled) {
-        clearInterval(timer);
-        return;
+        cleanupTimer();
+        return true;
       }
       const svg = container.querySelector("svg");
-      if (svg) {
-        clearInterval(timer);
-        renderSettled = true;
-        svg.setAttribute("role", "img");
-        svg.setAttribute("aria-label", metadata.title);
-        post("ai-chat-drawio-rendered", {
-          artifactId,
-          title: metadata.title,
-          pageCount: metadata.pageCount
-        });
+      if (!svg) {
+        return false;
+      }
+      cleanupTimer();
+      renderSettled = true;
+      svg.setAttribute("role", "img");
+      svg.setAttribute("aria-label", metadata.title);
+      post("ai-chat-drawio-rendered", {
+        artifactId,
+        title: metadata.title,
+        pageCount: metadata.pageCount
+      });
+      return true;
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    if (settleRenderedSvg()) {
+      return;
+    }
+    observer = new MutationObserver(() => {
+      settleRenderedSvg();
+    });
+    observer.observe(container, { childList: true, subtree: true });
+    timer = setInterval(() => {
+      if (settleRenderedSvg()) {
         return;
       }
-      if (Date.now() - startedAt >= RENDER_TIMEOUT_MS) {
-        clearInterval(timer);
+      if (activeVisibleElapsedMs() >= RENDER_OUTPUT_TIMEOUT_MS) {
+        cleanupTimer();
         const rendererDetail = String(container.textContent || "").replace(/\s+/g, " ").trim();
         fail(
           rendererDetail
@@ -112,6 +148,7 @@
       }));
       viewer.replaceChildren(container);
       globalThis.GraphViewer.processElements();
+      post("ai-chat-drawio-render-started", { artifactId });
       waitForRenderedSvg(container, artifactId, metadata);
     } catch (error) {
       fail(error, artifactId);
