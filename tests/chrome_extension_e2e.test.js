@@ -315,7 +315,7 @@ async function main() {
 
   if (managedShellServer) {
     await runEmptySkillCatalogE2E(page, { skillPath, skillInstallPath, skillInstallRunPath, shellStateDir });
-    await runSkillE2E(page, debugPort, {
+    const skillE2eState = await runSkillE2E(page, debugPort, {
       skillPath,
       skillInstallRunPath,
       shellStateDir,
@@ -323,6 +323,7 @@ async function main() {
       allowedValue: skillAllowedValue,
       secretValue: skillSecretValue
     });
+    await runIsolatedSkillLoadDispatchE2E(debugPort, skillE2eState.catalogSha);
   } else {
     console.log("Deterministic Skill browser E2E skipped because the fixed shell-server port is owned by an existing foreground server.");
   }
@@ -2164,6 +2165,287 @@ async function runSkillE2E(page, debugPort, {
   await assertUserMessageCountStable(page, beforeFailedInstall,
     "A failed Skill installer and its local result window must not write to the AI chat");
   await failurePage.evaluate(`document.getElementById("close")?.click(); true`).catch(() => null);
+  const skillWorlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof skillPanelState === "undefined") return null;
+    return { contentWorld: true, catalogSha: String(skillPanelState?.catalogSha || "") };
+  })()`);
+  const currentCatalogSha = skillWorlds.find((entry) => entry.value?.contentWorld)?.value?.catalogSha || "";
+  assert.match(currentCatalogSha, /^[a-f0-9]{64}$/, "The isolated Skill dispatch pages require the current catalog SHA.");
+  return { catalogSha: currentCatalogSha };
+}
+
+async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
+  const startMarker = "ai-helper-skill-start";
+  const endMarker = "ai-helper-skill-end";
+  const makeLoad = (id) => [
+    `${startMarker}:${id}`,
+    "cmd: load",
+    "skill-id: e2e-skill",
+    `catalog-sha: ${catalogSha}`,
+    endMarker
+  ].join("\n");
+
+  await withFreshSkillCasePage(debugPort, "new-chat-live-load", async (page, nonce) => {
+    const helper = makeLoad(`new-chat-live-${nonce}`);
+    await page.evaluate(`(async () => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=new-chat-live&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill in this newly created chat.");
+      const stop = document.createElement("button");
+      stop.id = "skill-case-stop-generating";
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      stop.remove();
+      return true;
+    })()`);
+    const reply = await waitForEvaluateValue(page, `(() => {
+      const messages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+      const matches = messages.filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "new-chat live Skill load response on its isolated page");
+    assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "route-completion-live-load", async (page, nonce) => {
+    const helper = makeLoad(`route-completion-${nonce}`);
+    await page.evaluate(`(async () => {
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill while this new chat receives its permanent URL.");
+      const article = document.createElement("article");
+      article.className = "message";
+      article.dataset.messageAuthorRole = "assistant";
+      article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      article.querySelector("code").textContent = "ai-helper-skill-start:route-completion-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(article);
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=route-completion&route=${nonce}");
+      article.querySelector("code").textContent = ${JSON.stringify(helper)};
+      stop.remove();
+      return true;
+    })()`);
+    const reply = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "route-assigned Skill completion response on its isolated page");
+    assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "pending-load-route-recovery", async (page, nonce) => {
+    const helper = makeLoad(`pending-route-${nonce}`);
+    await page.evaluate(`(async () => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      const form = document.getElementById("composerForm");
+      window.__heldPendingSkillForm = form;
+      form.remove();
+      const stop = document.createElement("button");
+      stop.id = "pending-route-stop-generating";
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      stop.remove();
+      return true;
+    })()`);
+    await waitForEvaluate(page, `(() => {
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      return /result cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
+    })()`, "Skill load result to remain queued without a composer");
+    assert.equal(await countSkillLoadReplies(page), 0);
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load-restored&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Continue this new chat with the already completed local Skill load result.");
+      document.querySelector("main").appendChild(window.__heldPendingSkillForm);
+      delete window.__heldPendingSkillForm;
+      return true;
+    })()`);
+    const reply = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "queued Skill load result to recover exactly once after a new-chat route");
+    assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "history-load-manual-recovery", async (page, nonce) => {
+    const helper = makeLoad(`history-recovery-${nonce}`);
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=history-recovery&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      return true;
+    })()`);
+    await waitForEvaluate(page, `(() => {
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      const recovery = panel?.querySelector('[data-shell-tool-action="skill-recovery"]');
+      const debug = document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || "";
+      return recovery && !recovery.hidden && /validated Skill protocol/i.test(recovery.title || "") &&
+        debug.includes("kind=skill") && debug.includes("baseline=settled");
+    })()`, "ignored history Skill to expose validated manual recovery");
+    assert.equal(await countSkillLoadReplies(page), 0, "History rendered without live generation proof must not auto-load.");
+    await page.evaluate(`(() => {
+      const unrelated = document.createElement("div");
+      unrelated.id = "unrelated-history-mutation-${nonce}";
+      unrelated.textContent = "unrelated sidebar redraw";
+      document.querySelector("aside")?.appendChild(unrelated);
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "An unrelated post-baseline mutation must not auto-dispatch an ignored historical Skill.");
+    await page.evaluate(`(() => {
+      const code = document.querySelector('#thread [data-message-author-role="assistant"] code');
+      const unchanged = code?.textContent || "";
+      if (code) {
+        code.textContent = "";
+        code.textContent = unchanged;
+      }
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "A same-root React redraw without generation proof must preserve the cold-history baseline.");
+    await page.evaluate(`(async () => {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const code = document.querySelector('#thread [data-message-author-role="assistant"] code');
+      const unchanged = code?.textContent || "";
+      if (code) {
+        code.textContent = "";
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        code.textContent = unchanged;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      stop.remove();
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "A known historical Skill cleared and restored across observer batches during unrelated generation must not become live.");
+    await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.click(); true`);
+    await waitForEvaluate(page, `(${countSkillLoadRepliesExpression()})() === 1`, "manual Skill recovery response");
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "old-route-stop-negative", async (page, nonce) => {
+    const helper = makeLoad(`old-route-stop-${nonce}`);
+    await page.evaluate(`(async () => {
+      const stop = document.createElement("button");
+      stop.id = "old-route-stop-generating";
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=old-route-stop&route=${nonce}");
+      stop.remove();
+      document.getElementById("thread").innerHTML = "";
+      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      return true;
+    })()`);
+    await waitForEvaluate(page, `(() => {
+      const recovery = document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]');
+      const debug = document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || "";
+      return recovery && !recovery.hidden && debug.includes("skillLive=no") && debug.includes("kind=skill");
+    })()`, "old-route Stop removal not to prove generation in the new lifecycle");
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "A Stop control removed from the previous route must not auto-dispatch new-route history.");
+  });
+
+  await withFreshSkillCasePage(debugPort, "user-skill-load-negative", async (page, nonce) => {
+    const helper = makeLoad(`user-negative-${nonce}`);
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=user-negative&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      const message = document.querySelector('#thread [data-message-author-role="assistant"]:last-child');
+      message.dataset.messageAuthorRole = "user";
+      const role = message.querySelector(".role");
+      if (role) role.textContent = "User";
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3500))");
+    const state = await page.evaluate(`(() => ({
+      replies: (${countSkillLoadRepliesExpression()})(),
+      forceHidden: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="force"]')?.hidden === true,
+      recoveryHidden: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.hidden === true,
+      debug: document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || ""
+    }))()`);
+    assert.equal(state.replies, 0, JSON.stringify(state));
+    assert.equal(state.forceHidden, true, JSON.stringify(state));
+    assert.equal(state.recoveryHidden, true, JSON.stringify(state));
+    assert.match(state.debug, /kind=skill/);
+  });
+}
+
+async function withFreshSkillCasePage(debugPort, caseName, task) {
+  const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const url = `${TEST_PAGE_URL}?isolated-skill-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
+  const page = await openChromePage(debugPort, url);
+  try {
+    await page.send("Page.enable");
+    await page.send("Runtime.enable");
+    await waitForEvaluate(page, "document.readyState === 'complete'", `${caseName} page load`);
+    await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`, `${caseName} extension panel`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2600))");
+    await task(page, nonce.replace(/[^a-z0-9]/gi, "").slice(-24));
+  } finally {
+    await page.send("Page.close").catch(() => null);
+    page.close();
+  }
+}
+
+function countSkillLoadRepliesExpression() {
+  return `() => Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+    .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length`;
+}
+
+function countSkillLoadReplies(page) {
+  return page.evaluate(`(${countSkillLoadRepliesExpression()})()`);
+}
+
+async function assertIsolatedSkillDispatchState(page, { expectedLoadReplies, expectForce }) {
+  await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2200))");
+  const state = await page.evaluateAcrossContexts(`(() => {
+    if (typeof pendingHelperDeliveries === "undefined") return null;
+    return {
+      contentWorld: true,
+      pending: Array.from(pendingHelperDeliveries.values()).filter((entry) => entry.kind === "skill-load").length,
+      skillHelperInFlight,
+      forceVisible: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="force"]')?.hidden === false,
+      recoveryVisible: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.hidden === false
+    };
+  })()`);
+  const content = state.find((entry) => entry.value?.contentWorld)?.value;
+  assert.ok(content, "Missing isolated content-world Skill state.");
+  assert.equal(await countSkillLoadReplies(page), expectedLoadReplies);
+  assert.equal(content.pending, 0, JSON.stringify(content));
+  assert.equal(content.skillHelperInFlight, false, JSON.stringify(content));
+  assert.equal(content.forceVisible, expectForce, JSON.stringify(content));
+  assert.equal(content.recoveryVisible, false, JSON.stringify(content));
 }
 
 async function installSkillThroughDialog(page, skillId) {

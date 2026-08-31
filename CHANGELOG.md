@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-08-31
+
+- Fixes a new-chat SPA lifecycle race that parsed a live Skill `load` helper into Debug but then misclassified its first stable scan as existing history, leaving no backend request or AI-visible load result.
+- Preserves cold-start safety by requiring candidate-bound live assistant-generation evidence before bypassing the initial-history gate; an unhandled assistant Skill helper without that evidence remains inert until the user explicitly invokes the separate contextual **Process Skill** recovery action, which uses the strict Skill protocol and never enters Force run.
+- Prevents a second Skill helper from losing its final wake-up while the previous Skill helper is in flight, prevents stale backend results from crossing into another chat, preserves exactly-once claims across same-root route redraws, defers Skill work while an agent prompt owns the composer, and exposes baseline, generation, in-flight, and recovery state in Debug.
+- Makes Force run and Process Skill single-flight and hides both while the AI is generating, Skill/backend or result-delivery work is active, an agent prompt owns the composer, or incompatible manual work is pending; explicit user messages and plugin-owned Skill output never become recovery candidates.
+- Binds Force run to the exact page lifecycle and DOM-latest executable candidate through every awaited preflight, cancels if the helper or route changes, and rejects stale clicks while any backend helper is active instead of silently queuing hidden work.
+- Adds focused positive/negative dispatch regressions plus real unpacked-Chrome cases in separate tabs for live new-chat auto-load, queued-result route recovery, cold-history redraw/manual recovery, stale Stop-control rejection, and user-message rejection while retaining the existing full-page E2E suite.
+
 ## [0.11.7] - 2026-08-31
 
 - Replaces the Skill installer's absolute 120-second deadline with a 600-second stdout/stderr idle deadline. Either stream resets the clock even after bounded output capture is full, while the browser keeps long installation WebSockets alive without a shorter absolute watchdog.

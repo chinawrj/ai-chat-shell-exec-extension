@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.7";
+const CONTENT_SCRIPT_VERSION = "0.11.8";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -76,6 +76,10 @@ let helperRenderRootSequence = 0;
 const helperRenderRootIds = new WeakMap();
 const helperRenderRootGenerations = new WeakMap();
 const processedRenderedHelpers = new WeakMap();
+const baselineIgnoredRenderedHelpers = new WeakMap();
+const liveGeneratedRenderedHelpers = new WeakMap();
+const knownRenderedHelperSemantics = new WeakMap();
+let assistantGenerationEpoch = null;
 // Keep per-helper scan metadata in memory only. This prevents the same rendered
 // helper block from being submitted repeatedly, but it is not command dedup:
 // only the shell server can decide whether a command already ran on a tmux pane.
@@ -105,6 +109,8 @@ let savedSendSelector = "";
 let savedShellSelector = "";
 let pendingSelfTest = null;
 let initialThreadSettled = false;
+let assistantGenerationObservedForLifecycle = false;
+let assistantGenerationEvidenceUntil = 0;
 let extensionActive = false;
 let threadObserver = null;
 let pageEventListenersInstalled = false;
@@ -113,6 +119,8 @@ let lastExecutedSemanticKey = "";
 let forceCallSequence = 0;
 let pendingForceRunRequested = false;
 let pendingForceRunTimer = 0;
+let pendingForceRunCandidateSnapshot = null;
+let forceRunInFlight = false;
 let extensionVersionWarning = "";
 let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
@@ -142,11 +150,14 @@ let shellRunMonitorTimer = 0;
 let shellRunControlBusy = false;
 let shellRunStatusPollInFlight = false;
 let panelForceRunAvailable = false;
+let panelSkillHelperActionable = false;
+let panelLatestManualActionKind = "";
 let panelShellHelperActive = false;
 let skillPanelState = null;
 let skillStatePollTimer = 0;
 let skillStatePollInFlight = false;
 let skillHelperInFlight = false;
+let skillRecoveryInFlight = false;
 const skillInstallInFlight = new Set();
 const skillInstallErrors = new Map();
 
@@ -224,6 +235,8 @@ function deactivateExtension() {
   pendingSelfTest = null;
   lastPointerTarget = null;
   panelForceRunAvailable = false;
+  panelSkillHelperActionable = false;
+  panelLatestManualActionKind = "";
   panelShellHelperActive = false;
   clearTimeout(scanTimer);
   clearPendingForceRun();
@@ -268,12 +281,29 @@ function observeThread() {
     return;
   }
 
+  rememberKnownRenderedHelperSemantics();
+
   threadObserver = new MutationObserver((records) => {
     const pageRecords = Array.from(records || []).filter((record) => !isShellToolPanelMutation(record));
     if (pageRecords.length === 0) {
       return;
     }
+    // A SPA navigation and the first live assistant mutations can share one
+    // observer batch. Start the new lifecycle here so the scan does not erase
+    // the only evidence that a completed helper came from a response generated
+    // in this page lifecycle rather than from pre-existing conversation history.
+    const routeChanged = refreshPageLifecycle();
+    const generationEvidenceActive = observeAssistantGenerationEvidence(pageRecords, {
+      allowRemovedControls: !routeChanged
+    });
     invalidateRenderedHelperTracking(pageRecords);
+    if (generationEvidenceActive) {
+      if (!routeChanged || assistantGenerationEpoch?.routeCarryOnly !== true) {
+        trackAssistantGenerationHelperRoots(pageRecords);
+      }
+      markLiveGeneratedHelperCandidates(pageRecords);
+    }
+    refreshKnownRenderedHelperSemantics(pageRecords);
     observePendingHelperSubmissionProof();
     scheduleScan();
   });
@@ -657,6 +687,7 @@ function scheduleScan() {
 
 async function scanForShellCall(options = {}) {
   const force = options.force === true;
+  const expectedForceCandidate = options.forceCandidateSnapshot || null;
   if (!extensionActive) {
     return;
   }
@@ -679,9 +710,18 @@ async function scanForShellCall(options = {}) {
   try {
     const conversationRoot = getConversationRoot();
     const allCandidates = extractShellCallCandidates(conversationRoot);
-    const runnableCandidate = getLastRunnableHelperCandidate(allCandidates, conversationRoot);
-    updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
+    const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, conversationRoot);
+    const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, conversationRoot);
+    const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, conversationRoot);
+    panelLatestManualActionKind = getLatestManualActionKind(
+      allCandidates,
+      runnableCandidate,
+      actionableSkillCandidate,
+      skillBoundaryCandidate
+    );
     setPanelForceRunAvailable(Boolean(runnableCandidate));
+    setPanelSkillHelperActionable(Boolean(actionableSkillCandidate));
+    updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
   } catch (_unused) {
     // Detection runs on a partially-rendered DOM during streaming; never
     // let a transient scan failure block the rest of the scanner.
@@ -690,6 +730,7 @@ async function scanForShellCall(options = {}) {
   if (activeCallId) {
     if (force) {
       pendingForceRunRequested = true;
+      pendingForceRunCandidateSnapshot = expectedForceCandidate;
       setStatus("Waiting for current helper call, then running latest", "running");
       schedulePendingForceRunScan();
       return;
@@ -700,6 +741,7 @@ async function scanForShellCall(options = {}) {
   }
 
   if (!force && isAssistantGenerating()) {
+    assistantGenerationObservedForLifecycle = true;
     scheduleScan();
     return;
   }
@@ -716,7 +758,24 @@ async function scanForShellCall(options = {}) {
   const now = Date.now();
 
   const allCandidates = extractShellCallCandidates(thread);
-  const candidate = getLastRunnableHelperCandidate(allCandidates, thread);
+  const candidate = force
+    ? getLastForceEligibleRunnableCandidate(allCandidates, thread)
+    : getLastRunnableHelperCandidate(allCandidates, thread);
+  if (force) {
+    const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
+    const latestActionKind = getLatestManualActionKind(
+      allCandidates,
+      candidate,
+      getLastActionableSkillCandidate(allCandidates, thread),
+      skillBoundaryCandidate
+    );
+    if (latestActionKind !== "force" ||
+        (expectedForceCandidate && !isRenderedHelperCandidateSnapshotCurrent(expectedForceCandidate, candidate))) {
+      clearPendingForceRun();
+      setStatus("Force run cancelled because the latest helper changed", "idle");
+      return;
+    }
+  }
   const hasDrawioCandidate = allCandidates.some((entry) => isDrawioHelperCall(entry.call));
   const hasSkillCandidate = allCandidates.some((entry) => isSkillHelperCall(entry.call));
 
@@ -734,6 +793,17 @@ async function scanForShellCall(options = {}) {
 
   resetChainForNewHumanPrompt();
 
+  if (!force && (candidate || hasDrawioCandidate || hasSkillCandidate) &&
+      hasPendingAgentComposerDelivery()) {
+    // An inbound agent prompt owns the composer first. Do not mark, consume,
+    // or dispatch a newly detected helper while that prompt is pending; the
+    // scheduled rescan will adjudicate the unchanged rendered helper after
+    // the agent delivery leaves the composer.
+    setStatus("Helper detected; waiting for the pending agent message to leave the composer", "running");
+    scheduleScan();
+    return;
+  }
+
   if (!candidate && !hasDrawioCandidate && !hasSkillCandidate) {
     initialThreadSettled = true;
     expirePendingSelfTest();
@@ -746,8 +816,13 @@ async function scanForShellCall(options = {}) {
 
   if (!force && !initialThreadSettled) {
     initialThreadSettled = true;
-    setStatus("Shell tool ready; existing history ignored", "idle");
-    return;
+    const hasLiveGeneratedHelper = allCandidates.some(isLiveGeneratedHelperCandidate);
+    markBaselineIgnoredCandidates(allCandidates);
+    if (!hasLiveGeneratedHelper) {
+      setStatus("Shell tool ready; existing history ignored", "idle");
+      updateDetectedHelperDebug(getLastShellCallCandidate(thread), allCandidates);
+      return;
+    }
   }
 
   if (!force && hasDrawioCandidate) {
@@ -760,14 +835,9 @@ async function scanForShellCall(options = {}) {
 
   if (!candidate) {
     expirePendingSelfTest();
-    return;
-  }
-
-  if (!force && pendingAgentDelivery &&
-      pendingAgentDelivery.sent !== true &&
-      pendingAgentDelivery.cancelled !== true) {
-    setStatus("Helper detected; waiting for the pending agent message to leave the composer", "running");
-    scheduleScan();
+    if (force) {
+      clearPendingForceRun();
+    }
     return;
   }
 
@@ -832,7 +902,13 @@ async function scanForShellCall(options = {}) {
       markCallProcessed(candidate, callKey, semanticCallKey);
     }
   }
-  const outcome = await runAndReply(executionCallKey, call, { force });
+  const forceDispatchSnapshot = force
+    ? (expectedForceCandidate || createRenderedHelperCandidateSnapshot(candidate))
+    : null;
+  const outcome = await runAndReply(executionCallKey, call, {
+    force,
+    forceCandidateSnapshot: forceDispatchSnapshot
+  });
   if (!force && outcome?.retryable === true) {
     unmarkCallProcessed(candidate, semanticCallKey);
   }
@@ -845,15 +921,30 @@ function schedulePendingForceRunScan() {
     if (!pendingForceRunRequested || !extensionActive) {
       return;
     }
-    scanForShellCall({ force: true }).catch((error) => {
-      setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
-      clearPendingForceRun();
-    });
+    if (forceRunInFlight) {
+      schedulePendingForceRunScan();
+      return;
+    }
+    forceRunInFlight = true;
+    updateContextualPanelActions();
+    scanForShellCall({
+      force: true,
+      forceCandidateSnapshot: pendingForceRunCandidateSnapshot
+    })
+      .catch((error) => {
+        setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
+        clearPendingForceRun();
+      })
+      .finally(() => {
+        forceRunInFlight = false;
+        updateContextualPanelActions();
+      });
   }, 500);
 }
 
 function clearPendingForceRun() {
   pendingForceRunRequested = false;
+  pendingForceRunCandidateSnapshot = null;
   clearTimeout(pendingForceRunTimer);
   pendingForceRunTimer = 0;
 }
@@ -909,6 +1000,9 @@ function getHandledHelperReason(candidate, _callKey, semanticCallKey, call) {
     return "";
   }
   const renderedHelperKey = buildRenderedHelperKey(candidate, semanticCallKey);
+  if (isBaselineIgnoredHelperCandidate(candidate, semanticCallKey)) {
+    return "initial-history baseline";
+  }
   if (processedRenderedHelpers.get(renderRoot)?.has(renderedHelperKey)) {
     return "processed rendered helper";
   }
@@ -960,7 +1054,7 @@ function beginPageLifecycle(options = {}) {
     ? options.routeHandoffPresentedExecutions
     : [];
   const previousStorageKey = String(options.previousStorageKey || "");
-  routeHandoffPreviousPageIdentity = options.routeTransition === true && routeHandoffEntries.length > 0
+  routeHandoffPreviousPageIdentity = options.routeTransition === true
     ? String(options.previousPageIdentity || "")
     : "";
   cancelPendingHelperDeliveryRetry();
@@ -973,6 +1067,14 @@ function beginPageLifecycle(options = {}) {
   activeCallId = "";
   activeCallToken = null;
   initialThreadSettled = false;
+  if (options.routeTransition === true && assistantGenerationEpoch) {
+    assistantGenerationEpoch.routeCarryOnly = true;
+    assistantGenerationObservedForLifecycle = true;
+  } else {
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  }
   lastThreadText = "";
   lastThreadTextAt = Date.now();
   chainCallCount = 0;
@@ -983,6 +1085,10 @@ function beginPageLifecycle(options = {}) {
     preserveInsertedOwnership: options.routeTransition === true
   });
   clearPendingForceRun();
+  panelForceRunAvailable = false;
+  panelSkillHelperActionable = false;
+  panelLatestManualActionKind = "";
+  updateContextualPanelActions();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
 
@@ -1023,7 +1129,7 @@ function refreshPageLifecycle() {
   const pageIdentity = getCurrentPageIdentity();
   if (!observedPageIdentity) {
     observedPageIdentity = pageIdentity;
-    return;
+    return false;
   }
   if (pageIdentity !== observedPageIdentity) {
     const previousPageIdentity = observedPageIdentity;
@@ -1045,7 +1151,9 @@ function refreshPageLifecycle() {
       routeHandoffEntries,
       routeHandoffPresentedExecutions
     });
+    return true;
   }
+  return false;
 }
 
 function pendingHelperDeliveryStorageKey(pageIdentity = getCurrentPageIdentity()) {
@@ -1271,8 +1379,11 @@ function snapshotPendingHelperResponse(response) {
   };
 }
 
-async function rememberPendingHelperDelivery(callId, call, response, reply, settings) {
+async function rememberPendingHelperDelivery(callId, call, response, reply, settings, options = {}) {
   await loadPendingHelperDeliveriesForCurrentPage();
+  if (typeof options.lifecycleGuard === "function" && options.lifecycleGuard() !== true) {
+    return null;
+  }
   const now = Date.now();
   const executionId = String(response?.executionId || response?.receipt?.executionId || "");
   if (isCanonicalExecutionId(executionId)) {
@@ -1869,6 +1980,78 @@ function migratePendingAgentDeliveryToCurrentPage(options = {}) {
   persistPendingAgentDelivery();
 }
 
+function createSkillDispatchContext(candidate) {
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    renderRoot: getCandidateRenderRoot(candidate),
+    semanticCallKey: buildSemanticCallKey(candidate?.call),
+    source: candidate?.source || "",
+    blockIndex: candidate?.blockIndex ?? candidate?.index ?? ""
+  };
+}
+
+function isSkillDispatchContextCurrent(context) {
+  if (!context) {
+    return true;
+  }
+  // A history.pushState route change does not itself emit a DOM mutation.
+  // Reconcile it synchronously before deciding where a completed backend
+  // response may be delivered.
+  refreshPageLifecycle();
+  const currentPageIdentity = getCurrentPageIdentity();
+  const retainedCandidate = findRetainedSkillDispatchCandidate(context);
+  if (!retainedCandidate) {
+    return false;
+  }
+  if (context.pageIdentity === currentPageIdentity &&
+      context.generation === pageLifecycleGeneration) {
+    return true;
+  }
+  // Chat hosts commonly assign the permanent conversation URL while keeping
+  // the response DOM intact. Permit that one route handoff only when the exact
+  // originating render root is still connected inside the current transcript.
+  // A result from a removed/older chat therefore cannot enter the new chat.
+  if (routeHandoffPreviousPageIdentity !== context.pageIdentity) {
+    return false;
+  }
+  // A route assignment can share a batch with a React redraw, which invalidates
+  // the old rendered-key claim. Reparse and atomically claim the exact same
+  // semantic helper in the retained root before accepting the backend result,
+  // otherwise the final wake-up scan could dispatch it a second time.
+  markCallProcessed(retainedCandidate, "skill-route-handoff", context.semanticCallKey);
+  context.pageIdentity = currentPageIdentity;
+  context.generation = pageLifecycleGeneration;
+  return true;
+}
+
+function findRetainedSkillDispatchCandidate(context) {
+  const renderRoot = context?.renderRoot;
+  const conversationRoot = getConversationRoot();
+  if (!(renderRoot instanceof Element) ||
+      renderRoot.isConnected !== true ||
+      !(conversationRoot instanceof Element) ||
+      (renderRoot !== conversationRoot && !conversationRoot.contains(renderRoot))) {
+    return null;
+  }
+  try {
+    return extractShellCallCandidates(conversationRoot).find((candidate) =>
+      getCandidateRenderRoot(candidate) === renderRoot &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey &&
+      (candidate.source || "") === context.source &&
+      (candidate.blockIndex ?? candidate.index ?? "") === context.blockIndex
+    ) || null;
+  } catch (_unused) {
+    return null;
+  }
+}
+
+function reportStaleSkillDispatch() {
+  console.warn("[AI Chat Skills] Ignored a backend response after the originating chat changed.");
+  setStatus("Skill result ignored because the originating chat changed; process the helper again in the current chat", "idle");
+  return false;
+}
+
 function buildRenderedHelperKey(candidate, semanticCallKey, pageIdentity = getCurrentPageIdentity()) {
   return [
     pageIdentity,
@@ -1904,6 +2087,57 @@ function markCallProcessed(candidate, callKey, semanticCallKey) {
     handled.add(buildRenderedHelperKey(candidate, semanticCallKey));
     processedRenderedHelpers.set(renderRoot, handled);
   }
+}
+
+function markCallBaselineIgnored(candidate, semanticCallKey) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return;
+  }
+  markCallProcessed(candidate, "baseline", semanticCallKey);
+  const keys = baselineIgnoredRenderedHelpers.get(renderRoot) || new Set();
+  keys.add(buildBaselineIgnoredHelperKey(candidate, semanticCallKey));
+  baselineIgnoredRenderedHelpers.set(renderRoot, keys);
+}
+
+function markBaselineIgnoredCandidates(candidates = []) {
+  for (const candidate of Array.from(candidates || [])) {
+    if (!isLiveGeneratedHelperCandidate(candidate)) {
+      markCallBaselineIgnored(candidate, buildSemanticCallKey(candidate.call));
+    }
+  }
+}
+
+function isBaselineIgnoredHelperCandidate(candidate, semanticCallKey = "") {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return false;
+  }
+  const key = semanticCallKey || buildSemanticCallKey(candidate.call);
+  return baselineIgnoredRenderedHelpers.get(renderRoot)?.has(
+    buildBaselineIgnoredHelperKey(candidate, key)
+  ) === true;
+}
+
+function clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey = "") {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return;
+  }
+  const key = semanticCallKey || buildSemanticCallKey(candidate.call);
+  const ignored = baselineIgnoredRenderedHelpers.get(renderRoot);
+  ignored?.delete(buildBaselineIgnoredHelperKey(candidate, key));
+  if (ignored?.size === 0) {
+    baselineIgnoredRenderedHelpers.delete(renderRoot);
+  }
+}
+
+function buildBaselineIgnoredHelperKey(candidate, semanticCallKey) {
+  return [
+    candidate?.source || "",
+    candidate?.blockIndex ?? candidate?.index ?? "",
+    semanticCallKey
+  ].join("\n");
 }
 
 function unmarkCallProcessed(candidate, semanticCallKey) {
@@ -1985,14 +2219,263 @@ function getCurrentChatFeed() {
 function isAssistantGenerating() {
   const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
     .filter(isVisibleElement);
-  return candidates.some((button) => {
-    const label = `${button.getAttribute("aria-label") || ""} ${button.textContent || ""}`.trim().toLowerCase();
-    return label.includes("stop streaming") ||
-      label.includes("stop generating") ||
-      label.includes("stop response") ||
-      label.includes("stop answering") ||
-      label === "stop";
-  });
+  return candidates.some(isAssistantGenerationControl);
+}
+
+function isAssistantGenerationControl(button) {
+  const label = `${button?.getAttribute?.("aria-label") || ""} ${button?.textContent || ""}`.trim().toLowerCase();
+  return label.includes("stop streaming") ||
+    label.includes("stop generating") ||
+    label.includes("stop response") ||
+    label.includes("stop answering") ||
+    label === "stop";
+}
+
+function observeAssistantGenerationEvidence(records = [], options = {}) {
+  const visibleControl = isAssistantGenerating();
+  const addedControl = Array.from(records || []).some((record) =>
+    Array.from(record?.addedNodes || []).some(nodeContainsAssistantGenerationControl)
+  );
+  const removedControl = options.allowRemovedControls !== false && Array.from(records || []).some((record) =>
+    Array.from(record?.removedNodes || []).some(nodeContainsAssistantGenerationControl)
+  );
+  const changedControls = addedControl || removedControl;
+  if (visibleControl || changedControls) {
+    let createdEpoch = false;
+    if (!assistantGenerationEpoch || Date.now() > assistantGenerationEvidenceUntil) {
+      assistantGenerationEpoch = {
+        trackedRoots: new WeakSet(),
+        historicalSemantics: new WeakMap(),
+        routeCarryOnly: false
+      };
+      createdEpoch = true;
+    } else if (visibleControl || addedControl) {
+      // A still-visible or newly added Stop control proves generation in the
+      // current lifecycle, so new helper roots may be attributed here. A route
+      // carried only by a removed old Stop remains restricted to pre-route roots.
+      assistantGenerationEpoch.routeCarryOnly = false;
+    }
+    if (createdEpoch || addedControl) {
+      captureAssistantGenerationHistoricalSemantics(records);
+    }
+    assistantGenerationObservedForLifecycle = true;
+    assistantGenerationEvidenceUntil = Date.now() + 3000;
+  }
+  const active = visibleControl || changedControls || Date.now() <= assistantGenerationEvidenceUntil;
+  if (!active) {
+    assistantGenerationEpoch = null;
+  }
+  return active;
+}
+
+function nodeContainsAssistantGenerationControl(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+  if (node.matches?.("button, [role='button']") && isAssistantGenerationControl(node)) {
+    return true;
+  }
+  return Array.from(node.querySelectorAll?.("button, [role='button']") || [])
+    .some(isAssistantGenerationControl);
+}
+
+function captureAssistantGenerationHistoricalSemantics(records = []) {
+  const epoch = assistantGenerationEpoch;
+  if (!epoch) {
+    return;
+  }
+  if (!(epoch.historicalSemantics instanceof WeakMap)) {
+    epoch.historicalSemantics = new WeakMap();
+  }
+  const captureElement = (element) => {
+    if (!(element instanceof Element)) {
+      return;
+    }
+    const known = knownRenderedHelperSemantics.get(element);
+    if (!known || known.size === 0) {
+      return;
+    }
+    const captured = epoch.historicalSemantics.get(element) || new Set();
+    for (const semanticCallKey of known) {
+      captured.add(semanticCallKey);
+    }
+    epoch.historicalSemantics.set(element, captured);
+  };
+  const captureNode = (node, includeDescendants = false) => {
+    let element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof Element)) {
+      return;
+    }
+    if (includeDescendants) {
+      for (const descendant of [element, ...Array.from(element.querySelectorAll?.("*") || [])]) {
+        captureElement(descendant);
+      }
+    }
+    while (element instanceof Element) {
+      captureElement(element);
+      element = element.parentElement;
+    }
+  };
+
+  // Only copy semantics that were already known before this observer batch.
+  // A helper newly added in the same batch has no entry yet and therefore
+  // remains eligible for live-generation attribution.
+  try {
+    for (const candidate of extractShellCallCandidates(getConversationRoot())) {
+      captureElement(getCandidateRenderRoot(candidate));
+    }
+  } catch (_unused) {
+    // A partially rendered host DOM is expected while generation begins.
+  }
+  for (const record of Array.from(records || [])) {
+    captureNode(record?.target);
+    for (const node of [
+      ...Array.from(record?.addedNodes || []),
+      ...Array.from(record?.removedNodes || [])
+    ]) {
+      captureNode(node, true);
+    }
+  }
+}
+
+function markLiveGeneratedHelperCandidates(records = []) {
+  let candidates = [];
+  try {
+    candidates = extractShellCallCandidates(getConversationRoot());
+  } catch (_unused) {
+    return;
+  }
+  for (const candidate of candidates) {
+    const renderRoot = getCandidateRenderRoot(candidate);
+    if (!(renderRoot instanceof Element) ||
+        !Array.from(records || []).some((record) => mutationRecordTouchesElement(record, renderRoot))) {
+      continue;
+    }
+    const semanticCallKey = buildSemanticCallKey(candidate.call);
+    if (assistantGenerationEpoch?.routeCarryOnly === true &&
+        assistantGenerationEpoch.trackedRoots.has(renderRoot) !== true) {
+      continue;
+    }
+    if (assistantGenerationEpoch?.historicalSemantics?.get(renderRoot)?.has(semanticCallKey) ||
+        knownRenderedHelperSemantics.get(renderRoot)?.has(semanticCallKey)) {
+      // The same complete helper already existed before this generation batch.
+      // Its epoch-start ownership survives a temporary empty redraw across
+      // observer batches; an unrelated response cannot revive historical Skill.
+      continue;
+    }
+    const keys = liveGeneratedRenderedHelpers.get(renderRoot) || new Set();
+    keys.add(buildRenderedHelperKey(candidate, semanticCallKey));
+    liveGeneratedRenderedHelpers.set(renderRoot, keys);
+    // A host can recycle the same React message root. Generation evidence is
+    // deliberately candidate-bound, so it is safe to release only this exact
+    // helper from a cold-history baseline when the assistant later emits the
+    // same semantic Skill into that root. Ordinary redraws have no generation
+    // evidence and therefore keep the durable baseline marker.
+    clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
+  }
+}
+
+function trackAssistantGenerationHelperRoots(records = []) {
+  if (!assistantGenerationEpoch) {
+    return;
+  }
+  const conversationRoot = getConversationRoot();
+  const consider = (node) => {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof Element) ||
+        !(conversationRoot instanceof Element) ||
+        (element !== conversationRoot && !conversationRoot.contains(element))) {
+      return;
+    }
+    const elements = [element, ...Array.from(element.querySelectorAll?.("*") || [])];
+    for (const candidateRoot of elements) {
+      if (containsToolLanguageHint(candidateRoot.innerText || candidateRoot.textContent || "")) {
+        assistantGenerationEpoch.trackedRoots.add(candidateRoot);
+      }
+    }
+  };
+  for (const record of Array.from(records || [])) {
+    consider(record?.target);
+    for (const node of Array.from(record?.addedNodes || [])) {
+      consider(node);
+    }
+  }
+}
+
+function rememberKnownRenderedHelperSemantics() {
+  let candidates = [];
+  try {
+    candidates = extractShellCallCandidates(getConversationRoot());
+  } catch (_unused) {
+    return;
+  }
+  for (const candidate of candidates) {
+    const renderRoot = getCandidateRenderRoot(candidate);
+    if (!(renderRoot instanceof Element)) {
+      continue;
+    }
+    const keys = knownRenderedHelperSemantics.get(renderRoot) || new Set();
+    keys.add(buildSemanticCallKey(candidate.call));
+    knownRenderedHelperSemantics.set(renderRoot, keys);
+  }
+}
+
+function refreshKnownRenderedHelperSemantics(records = []) {
+  const forget = (node, includeDescendants = false) => {
+    let element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof Element)) {
+      return;
+    }
+    if (includeDescendants) {
+      for (const descendant of [element, ...Array.from(element.querySelectorAll?.("*") || [])]) {
+        knownRenderedHelperSemantics.delete(descendant);
+      }
+      return;
+    }
+    while (element instanceof Element) {
+      knownRenderedHelperSemantics.delete(element);
+      element = element.parentElement;
+    }
+  };
+  for (const record of Array.from(records || [])) {
+    if (!mutationTouchesHelperText(record)) {
+      continue;
+    }
+    forget(record?.target);
+    for (const node of [
+      ...Array.from(record?.addedNodes || []),
+      ...Array.from(record?.removedNodes || [])
+    ]) {
+      forget(node, true);
+    }
+  }
+  rememberKnownRenderedHelperSemantics();
+}
+
+function mutationRecordTouchesElement(record, element) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+  const target = record?.target instanceof Element
+    ? record.target
+    : record?.target?.parentElement;
+  if (target instanceof Element &&
+      (target === element || element.contains?.(target))) {
+    return true;
+  }
+  return [...Array.from(record?.addedNodes || []), ...Array.from(record?.removedNodes || [])]
+    .some((node) => node === element || element.contains?.(node) || node?.contains?.(element));
+}
+
+function isLiveGeneratedHelperCandidate(candidate) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return false;
+  }
+  const semanticCallKey = buildSemanticCallKey(candidate.call);
+  return liveGeneratedRenderedHelpers.get(renderRoot)?.has(
+    buildRenderedHelperKey(candidate, semanticCallKey)
+  ) === true;
 }
 
 function getLastShellCallCandidate(root) {
@@ -2016,6 +2499,60 @@ function getLastRunnableHelperCandidate(allCandidates, root = null) {
   return filtered.length > 0 ? filtered[filtered.length - 1] : null;
 }
 
+function getLastForceEligibleRunnableCandidate(allCandidates, root = null) {
+  const candidates = Array.from(allCandidates || [])
+    .filter((candidate) => isRunnableHelperCall(candidate.call))
+    .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node))
+    .filter((candidate) => getMessageAuthorRole(candidate.node) !== "user")
+    .filter((candidate) => !isM365SubmittedUserMessageNode(candidate.node));
+  return candidates.at(-1) || null;
+}
+
+function getLatestManualActionKind(allCandidates, runnableCandidate, skillCandidate, skillBoundaryCandidate = skillCandidate) {
+  if (!runnableCandidate && !skillBoundaryCandidate) {
+    return "";
+  }
+  if (!runnableCandidate) {
+    return skillCandidate && skillCandidate === skillBoundaryCandidate ? "skill" : "";
+  }
+  if (!skillBoundaryCandidate) {
+    return "force";
+  }
+  if (Array.from(allCandidates || []).lastIndexOf(skillBoundaryCandidate) >
+    Array.from(allCandidates || []).lastIndexOf(runnableCandidate)
+  ) {
+    return skillCandidate && skillCandidate === skillBoundaryCandidate ? "skill" : "";
+  }
+  return "force";
+}
+
+function getLastEligibleSkillCandidate(allCandidates, root = null) {
+  const candidates = Array.from(allCandidates || [])
+    .filter((candidate) => isSkillHelperCall(candidate.call))
+    .filter((candidate) => candidate.node === root || isVisibleElement(candidate.node));
+  const candidate = candidates.at(-1);
+  if (!candidate ||
+      getMessageAuthorRole(candidate.node) === "user" ||
+      isM365SubmittedUserMessageNode(candidate.node) ||
+      isShellOutputCandidate(candidate)) {
+    return null;
+  }
+  return candidate;
+}
+
+function getLastActionableSkillCandidate(allCandidates, root = null) {
+  const candidate = getLastEligibleSkillCandidate(allCandidates, root);
+  if (!candidate) {
+    return null;
+  }
+  const semanticCallKey = buildSemanticCallKey(candidate.call);
+  const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+  const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, candidate.call);
+  return handledReason && !isBaselineIgnoredHelperCandidate(candidate, semanticCallKey)
+    ? null
+    : candidate;
+}
+
 function processLatestDrawioCandidates(allCandidates) {
   const preview = globalThis.AiChatDrawioPreview;
   if (!preview?.validateDrawioXml || !preview?.consider) {
@@ -2026,6 +2563,7 @@ function processLatestDrawioCandidates(allCandidates) {
   const candidates = allCandidates
     .filter((candidate) => isDrawioHelperCall(candidate.call))
     .filter((candidate) => candidate.node === getConversationRoot() || isVisibleElement(candidate.node))
+    .filter((candidate) => !isBaselineIgnoredHelperCandidate(candidate))
     // Draw.io selection deliberately does not depend on the optional global
     // role filter. Reject only an explicitly identified user message; unknown
     // host containers remain eligible so supported hosts do not silently skip
@@ -2112,8 +2650,13 @@ async function queueDrawioErrorReply(candidate, result) {
   return attemptPendingHelperDelivery(pending, settings);
 }
 
-async function processLatestSkillCandidate(allCandidates, settings = {}) {
+async function processLatestSkillCandidate(allCandidates, settings = {}, options = {}) {
   if (skillHelperInFlight) {
+    // The last DOM mutation for a second Skill helper can arrive while the
+    // previous helper is still finalizing its composer delivery. Keep a
+    // debounced wake-up alive so releasing the single-flight lock cannot
+    // strand that newer helper until an unrelated page mutation occurs.
+    scheduleScan();
     return false;
   }
   const candidates = Array.from(allCandidates || [])
@@ -2126,7 +2669,11 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
   const call = candidate.call;
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
-  if (getHandledHelperReason(candidate, callKey, semanticCallKey, call)) {
+  const dispatchContext = createSkillDispatchContext(candidate);
+  const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, call);
+  const baselineIgnored = isBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
+  const baselineRecovery = options.allowBaselineRecovery === true && baselineIgnored;
+  if ((handledReason || baselineIgnored) && !baselineRecovery) {
     return false;
   }
   if (getMessageAuthorRole(candidate.node) === "user" || isM365SubmittedUserMessageNode(candidate.node)) {
@@ -2140,13 +2687,16 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
     return false;
   }
   const validation = validateSkillHelperCall(call);
+  clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
   markCallProcessed(candidate, callKey, semanticCallKey);
+  setPanelSkillHelperActionable(false);
   if (!validation.ok) {
     await queueSkillComposerReply({
       callId: `skill-rejected:${callKey}`,
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: validation.reason },
-      reply: formatSkillProtocolError(validation.reason)
+      reply: formatSkillProtocolError(validation.reason),
+      dispatchContext
     });
     return false;
   }
@@ -2156,12 +2706,14 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
       callId: `skill-limit:${callKey}`,
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: `Chain limit reached (${maxChainCalls}).` },
-      reply: formatSkillProtocolError(`Chain limit reached (${maxChainCalls}). Ask the user before making more Skill requests.`)
+      reply: formatSkillProtocolError(`Chain limit reached (${maxChainCalls}). Ask the user before making more Skill requests.`),
+      dispatchContext
     });
     return false;
   }
 
   skillHelperInFlight = true;
+  updateContextualPanelActions();
   chainCallCount += 1;
   try {
     let response;
@@ -2170,13 +2722,17 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
         type: "skill-sync-list",
         challenge: call.challenge || ""
       });
+      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+        return reportStaleSkillDispatch();
+      }
       await queueSkillComposerReply({
         callId: `skill-list:${callKey}`,
         call: { ...call, kind: "skill-list" },
         response,
         reply: response?.ok === true
           ? formatSkillCatalogReply(response)
-          : formatSkillProtocolError(response?.error || "The local Skill catalog could not be listed.", response)
+          : formatSkillProtocolError(response?.error || "The local Skill catalog could not be listed.", response),
+        dispatchContext
       });
       return response?.ok === true;
     }
@@ -2186,13 +2742,17 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
         skillId: call.skillId,
         catalogSha: call.catalogSha
       });
+      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+        return reportStaleSkillDispatch();
+      }
       await queueSkillComposerReply({
         callId: `skill-load:${callKey}`,
         call: { ...call, kind: "skill-load" },
         response,
         reply: response?.ok === true
           ? formatSkillLoadReply(response)
-          : formatSkillProtocolError(response?.error || `Skill ${call.skillId} could not be loaded.`, response)
+          : formatSkillProtocolError(response?.error || `Skill ${call.skillId} could not be loaded.`, response),
+        dispatchContext
       });
       return response?.ok === true;
     }
@@ -2204,8 +2764,14 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
         catalogVersion: Number(call.catalogVersion),
         memoryEntry: call.memoryEntry
       });
+      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+        return reportStaleSkillDispatch();
+      }
       if (response?.ok === true) {
         await refreshSkillState({ quiet: true });
+        if (!isSkillDispatchContextCurrent(dispatchContext)) {
+          return reportStaleSkillDispatch();
+        }
         setStatus(`Skills v${response.version || skillPanelState?.version || "?"} acknowledged in ${SKILL_MEMORY_ENTRY}`, "ok");
         return true;
       }
@@ -2213,7 +2779,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
         callId: `skill-ack-rejected:${callKey}`,
         call: { ...call, kind: "skill-error" },
         response,
-        reply: formatSkillProtocolError(response?.error || "The Skill catalog acknowledgement was rejected.", response)
+        reply: formatSkillProtocolError(response?.error || "The Skill catalog acknowledgement was rejected.", response),
+        dispatchContext
       });
       return false;
     }
@@ -2225,7 +2792,13 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
       catalogVersion: Number(call.catalogVersion),
       reason: call.reason
     });
+    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      return reportStaleSkillDispatch();
+    }
     await refreshSkillState({ quiet: true });
+    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      return reportStaleSkillDispatch();
+    }
     setStatus(
       response?.ok === true
         ? `Skill memory update failed: ${summarizeCommand(call.reason)}`
@@ -2234,15 +2807,21 @@ async function processLatestSkillCandidate(allCandidates, settings = {}) {
     );
     return response?.ok === true;
   } catch (error) {
+    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      return reportStaleSkillDispatch();
+    }
     await queueSkillComposerReply({
       callId: `skill-error:${callKey}`,
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: error.message || String(error) },
-      reply: formatSkillProtocolError(error.message || String(error))
+      reply: formatSkillProtocolError(error.message || String(error)),
+      dispatchContext
     });
     return false;
   } finally {
     skillHelperInFlight = false;
+    updateContextualPanelActions();
+    scheduleScan();
   }
 }
 
@@ -2358,9 +2937,26 @@ function wrapSkillOutput(content) {
   return `${fence}skill-output\n${text}\n${fence}`;
 }
 
-async function queueSkillComposerReply({ callId, call, response, reply }) {
+async function queueSkillComposerReply({ callId, call, response, reply, dispatchContext }) {
   const settings = await chrome.storage.sync.get(["autoSend"]);
-  const pending = await rememberPendingHelperDelivery(callId, call, response, reply, settings);
+  if (dispatchContext && !isSkillDispatchContextCurrent(dispatchContext)) {
+    return reportStaleSkillDispatch();
+  }
+  const pending = await rememberPendingHelperDelivery(
+    callId,
+    call,
+    response,
+    reply,
+    settings,
+    {
+      lifecycleGuard: dispatchContext
+        ? () => isSkillDispatchContextCurrent(dispatchContext)
+        : null
+    }
+  );
+  if (!pending) {
+    return dispatchContext ? reportStaleSkillDispatch() : false;
+  }
   return attemptPendingHelperDelivery(pending, settings);
 }
 
@@ -3526,7 +4122,13 @@ async function runAndReply(callId, call, options = {}) {
   }
 
   const force = options.force === true;
+  const forceCandidateSnapshot = options.forceCandidateSnapshot || null;
   const settings = await chrome.storage.sync.get(["requireApproval", "autoSend"]);
+  if (force && !isForceRunCandidateSnapshotCurrent(forceCandidateSnapshot)) {
+    clearPendingForceRun();
+    setStatus("Force run cancelled because the latest helper changed", "idle");
+    return { retryable: false, cancelled: true, staleCandidate: true };
+  }
   if (!force && isPersistentResultHelperCall(call)) {
     await loadPendingHelperDeliveriesForCurrentPage();
     const pending = pendingHelperDeliveries.get(callId);
@@ -6854,6 +7456,11 @@ function injectStatus() {
       title: "Force run latest helper block (bypass dedup ledger)"
     },
     {
+      mode: "skill-recovery",
+      label: "Process Skill",
+      title: "Process the latest detected Skill helper through the validated Skill protocol"
+    },
+    {
       mode: "stop-helper",
       label: "Stop helper",
       title: "Terminate the currently running shell helper for this page role"
@@ -6871,6 +7478,10 @@ function injectStatus() {
       button.hidden = true;
       button.style.background = "#78350f";
       button.style.color = "#fde68a";
+    } else if (action.mode === "skill-recovery") {
+      button.hidden = true;
+      button.style.background = "#1e3a5f";
+      button.style.color = "#dbeafe";
     } else if (action.mode === "stop-helper") {
       button.hidden = true;
       button.disabled = true;
@@ -7672,6 +8283,11 @@ function setPanelForceRunAvailable(available) {
   updateContextualPanelActions();
 }
 
+function setPanelSkillHelperActionable(available) {
+  panelSkillHelperActionable = available === true;
+  updateContextualPanelActions();
+}
+
 function updateContextualPanelActions() {
   const panel = document.getElementById(STATUS_ID);
   const actions = panel?.querySelector?.('[data-shell-panel-group="common"]');
@@ -7680,22 +8296,36 @@ function updateContextualPanelActions() {
   }
   const check = actions.querySelector('[data-shell-tool-action="check"]');
   const force = actions.querySelector('[data-shell-tool-action="force"]');
+  const skillRecovery = actions.querySelector('[data-shell-tool-action="skill-recovery"]');
   const stop = actions.querySelector('[data-shell-tool-action="stop-helper"]');
   const more = actions.querySelector('[data-shell-tool-action="more"]');
-  const backendBusy = Boolean(activeCallId);
+  const backendBusy = Boolean(activeCallId) || skillHelperInFlight || skillRecoveryInFlight ||
+    pendingForceRunRequested || forceRunInFlight;
   const deliveryBusy = pendingHelperDeliveries.size > 0;
+  const agentComposerBusy = Boolean(
+    pendingAgentDelivery &&
+    pendingAgentDelivery.sent !== true &&
+    pendingAgentDelivery.cancelled !== true
+  );
+  const assistantBusy = isAssistantGenerating();
   const showCheck = !backendBusy && !panelShellHelperActive && panel.dataset.state === "error";
-  const showForce = !backendBusy && !deliveryBusy && !panelShellHelperActive && panelForceRunAvailable;
+  const showForce = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&
+    !panelShellHelperActive && panelForceRunAvailable && panelLatestManualActionKind === "force";
+  const showSkillRecovery = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&
+    !panelShellHelperActive && panelSkillHelperActionable && panelLatestManualActionKind === "skill";
   if (check) {
     check.hidden = !showCheck;
   }
   if (force) {
     force.hidden = !showForce;
   }
+  if (skillRecovery) {
+    skillRecovery.hidden = !showSkillRecovery;
+  }
   if (stop) {
     stop.hidden = !panelShellHelperActive || Boolean(activeShellRunNotice);
   }
-  const visibleActions = [check, force, stop, more].filter((button) => button && !button.hidden);
+  const visibleActions = [check, force, skillRecovery, stop, more].filter((button) => button && !button.hidden);
   actions.style.gridTemplateColumns = visibleActions
     .map((button) => button === more ? "32px" : "minmax(0,1fr)")
     .join(" ");
@@ -8115,9 +8745,15 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
     ? "candidates: 0/0"
     : `candidates: ${selectedIdx >= 0 ? selectedIdx + 1 : "?"}/${total}`;
   const activeSummary = `activeCall: ${activeCallId || "(none)"}${activeCallToken?.phase ? ` (${activeCallToken.phase})` : ""}`;
+  const latestSkillCandidate = list.filter((entry) => isSkillHelperCall(entry.call)).at(-1) || null;
+  const lifecycleSummary = `scanGate: baseline=${initialThreadSettled ? "settled" : "pending"}` +
+    ` generationObserved=${assistantGenerationObservedForLifecycle ? "yes" : "no"}` +
+    ` skillLive=${latestSkillCandidate && isLiveGeneratedHelperCandidate(latestSkillCandidate) ? "yes" : "no"}` +
+    ` skillInFlight=${skillHelperInFlight ? "yes" : "no"}` +
+    ` skillAction=${panelSkillHelperActionable ? "available" : "none"}`;
 
   if (!candidate && total === 0) {
-    const lines = [summary, activeSummary, "(no helper block detected)"];
+    const lines = [summary, activeSummary, lifecycleSummary, "(no helper block detected)"];
     if (lastSuppressedCallStatus) {
       lines.push(`lastSkippedReason: ${lastSuppressedCallStatus}`);
     }
@@ -8128,7 +8764,7 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
     return;
   }
 
-  const lines = [summary, activeSummary];
+  const lines = [summary, activeSummary, lifecycleSummary];
 
   if (total > 0) {
     const MAX_LISTED = 8;
@@ -8241,6 +8877,13 @@ function handlePanelAction(action) {
   if (action === "skill-rescan") {
     rescanSkillCatalog().catch((error) => {
       setStatus(`Skill rescan failed: ${summarizeCommand(error.message || String(error))}`, "error");
+    });
+    return;
+  }
+
+  if (action === "skill-recovery") {
+    processLatestSkillRecovery().catch((error) => {
+      setStatus(`Skill recovery failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
   }
@@ -8651,13 +9294,173 @@ async function registerTmuxAiSlaveFromPanel() {
 }
 
 async function forceRunLatestShellCall() {
+  if (Boolean(activeCallId) || pendingForceRunRequested || forceRunInFlight ||
+      skillHelperInFlight || skillRecoveryInFlight ||
+      pendingHelperDeliveries.size > 0 || hasPendingAgentComposerDelivery() ||
+      panelShellHelperActive || isAssistantGenerating()) {
+    return;
+  }
+  if (refreshPageLifecycle()) {
+    return;
+  }
+  const thread = getConversationRoot();
+  const allCandidates = extractShellCallCandidates(thread);
+  const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
+  const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
+  const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
+  if (!runnableCandidate || getLatestManualActionKind(
+    allCandidates,
+    runnableCandidate,
+    actionableSkillCandidate,
+    skillBoundaryCandidate
+  ) !== "force") {
+    setStatus("Force run cancelled because the latest helper is not executable", "idle");
+    return;
+  }
+  const forceCandidateSnapshot = createRenderedHelperCandidateSnapshot(runnableCandidate);
+  forceRunInFlight = true;
   pendingSelfTest = null;
   pendingForceRunRequested = true;
-  setStatus("Checking latest helper block once", "running");
-  await scanForShellCall({ force: true });
-  lastSuppressedCallStatus = "";
-  if (!pendingForceRunRequested) {
-    setForceButtonHighlight(false);
+  try {
+    setStatus("Checking latest helper block once", "running");
+    await scanForShellCall({ force: true, forceCandidateSnapshot });
+    lastSuppressedCallStatus = "";
+    if (!pendingForceRunRequested) {
+      setForceButtonHighlight(false);
+    }
+  } finally {
+    forceRunInFlight = false;
+    updateContextualPanelActions();
+  }
+}
+
+function hasPendingAgentComposerDelivery() {
+  return Boolean(
+    pendingAgentDelivery &&
+    pendingAgentDelivery.sent !== true &&
+    pendingAgentDelivery.cancelled !== true
+  );
+}
+
+function isSkillRecoveryBlocked(options = {}) {
+  return (options.ignoreRecovery !== true && skillRecoveryInFlight) ||
+    skillHelperInFlight ||
+    Boolean(activeCallId) ||
+    pendingHelperDeliveries.size > 0 ||
+    hasPendingAgentComposerDelivery() ||
+    panelShellHelperActive ||
+    pendingForceRunRequested ||
+    forceRunInFlight ||
+    isAssistantGenerating();
+}
+
+function isPageLifecycleSnapshotCurrent(snapshot) {
+  refreshPageLifecycle();
+  return snapshot?.pageIdentity === getCurrentPageIdentity() &&
+    snapshot?.generation === pageLifecycleGeneration;
+}
+
+function createRenderedHelperCandidateSnapshot(candidate) {
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    renderRoot: getCandidateRenderRoot(candidate),
+    semanticCallKey: buildSemanticCallKey(candidate?.call),
+    source: candidate?.source || "",
+    blockIndex: candidate?.blockIndex ?? candidate?.index ?? ""
+  };
+}
+
+function isRenderedHelperCandidateSnapshotCurrent(snapshot, candidate) {
+  return Boolean(candidate) &&
+    getCandidateRenderRoot(candidate) === snapshot?.renderRoot &&
+    buildSemanticCallKey(candidate.call) === snapshot?.semanticCallKey &&
+    (candidate.source || "") === snapshot?.source &&
+    (candidate.blockIndex ?? candidate.index ?? "") === snapshot?.blockIndex;
+}
+
+function isForceRunCandidateSnapshotCurrent(snapshot) {
+  if (!snapshot) {
+    return false;
+  }
+  refreshPageLifecycle();
+  if (snapshot.pageIdentity !== getCurrentPageIdentity() ||
+      snapshot.generation !== pageLifecycleGeneration) {
+    return false;
+  }
+  const thread = getConversationRoot();
+  const allCandidates = extractShellCallCandidates(thread);
+  const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
+  const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
+  const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
+  return getLatestManualActionKind(
+    allCandidates,
+    runnableCandidate,
+    actionableSkillCandidate,
+    skillBoundaryCandidate
+  ) === "force" &&
+    isRenderedHelperCandidateSnapshotCurrent(snapshot, runnableCandidate);
+}
+
+function createSkillRecoveryCandidateSnapshot(candidate) {
+  return createRenderedHelperCandidateSnapshot(candidate);
+}
+
+function isSkillRecoveryCandidateSnapshotCurrent(snapshot, candidate) {
+  return isRenderedHelperCandidateSnapshotCurrent(snapshot, candidate);
+}
+
+async function processLatestSkillRecovery() {
+  if (refreshPageLifecycle() || isSkillRecoveryBlocked()) {
+    return false;
+  }
+  const initialThread = getConversationRoot();
+  const initialCandidates = extractShellCallCandidates(initialThread);
+  const initialSkillCandidate = getLastActionableSkillCandidate(initialCandidates, initialThread);
+  const initialRunnableCandidate = getLastForceEligibleRunnableCandidate(initialCandidates, initialThread);
+  if (!initialSkillCandidate ||
+      getLatestManualActionKind(initialCandidates, initialRunnableCandidate, initialSkillCandidate) !== "skill") {
+    return false;
+  }
+  const candidateSnapshot = createSkillRecoveryCandidateSnapshot(initialSkillCandidate);
+  const lifecycleSnapshot = {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration
+  };
+  skillRecoveryInFlight = true;
+  updateContextualPanelActions();
+  try {
+    await loadPendingHelperDeliveriesForCurrentPage();
+    if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
+        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+      return false;
+    }
+    const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "maxChainCalls"]);
+    if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
+        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+      return false;
+    }
+    if (settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
+      return false;
+    }
+    const thread = getConversationRoot();
+    const allCandidates = extractShellCallCandidates(thread);
+    const skillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
+    const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
+    if (!isSkillRecoveryCandidateSnapshotCurrent(candidateSnapshot, skillCandidate) ||
+        getLatestManualActionKind(allCandidates, runnableCandidate, skillCandidate) !== "skill") {
+      setStatus("No recoverable Skill helper found on this page", "idle");
+      return false;
+    }
+    if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
+        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+      return false;
+    }
+    setStatus("Processing the latest Skill helper once", "running");
+    return processLatestSkillCandidate(allCandidates, settings, { allowBaselineRecovery: true });
+  } finally {
+    skillRecoveryInFlight = false;
+    updateContextualPanelActions();
   }
 }
 

@@ -24,11 +24,12 @@ assert.match(source, /activeAgentProfile = profile;[\s\S]*?updateAgentRoleBadge\
 
 const commonActions = source.match(/actions\.dataset\.shellPanelGroup = "common";[\s\S]*?panel\.appendChild\(actions\);/)?.[0] || "";
 assert.ok(commonActions, "Compact common action group must exist.");
-for (const action of ["check", "force", "stop-helper", "more"]) {
+for (const action of ["check", "force", "skill-recovery", "stop-helper", "more"]) {
   assert.match(commonActions, new RegExp(`mode: "${action}"`));
 }
 assert.match(commonActions, /action\.mode === "check"\) \{\s*button\.hidden = true;/);
 assert.match(commonActions, /action\.mode === "force"\) \{\s*button\.hidden = true;/);
+assert.match(commonActions, /action\.mode === "skill-recovery"\) \{\s*button\.hidden = true;/);
 assert.match(commonActions, /action\.mode === "stop-helper"\) \{\s*button\.hidden = true;/);
 for (const advancedOnlyAction of [
   "test",
@@ -81,13 +82,16 @@ assert.match(source, /button\.setAttribute\("aria-expanded", expanded \? "true" 
 assert.match(source, /advancedControls\.hidden = !expanded/);
 
 assert.match(source, /button\.disabled = !panelShellHelperActive;/);
-assert.match(source, /const backendBusy = Boolean\(activeCallId\);/);
+assert.match(source, /const backendBusy = Boolean\(activeCallId\) \|\| skillHelperInFlight \|\| skillRecoveryInFlight \|\|\s*pendingForceRunRequested \|\| forceRunInFlight;/);
 assert.match(source, /const deliveryBusy = pendingHelperDeliveries\.size > 0;/);
 assert.match(source, /const showCheck = !backendBusy && !panelShellHelperActive && panel\.dataset\.state === "error";/);
-assert.match(source, /const showForce = !backendBusy && !deliveryBusy && !panelShellHelperActive && panelForceRunAvailable;/);
+assert.match(source, /const showForce = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&[\s\S]*panelLatestManualActionKind === "force";/);
+assert.match(source, /const showSkillRecovery = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&[\s\S]*panelLatestManualActionKind === "skill";/);
 assert.match(source, /activeCallToken = null;\s*updateContextualPanelActions\(\);/);
 assert.match(source, /stop\.hidden = !panelShellHelperActive \|\| Boolean\(activeShellRunNotice\);/);
 assert.match(source, /setPanelForceRunAvailable\(Boolean\(runnableCandidate\)\)/);
+assert.match(source, /setPanelSkillHelperActionable\(Boolean\(actionableSkillCandidate\)\)/);
+assert.match(source, /Process the latest detected Skill helper through the validated Skill protocol/);
 assert.match(source, /createPanelSection\("Setup & recovery", "setup-recovery"\)[\s\S]*?mode: "check", label: "Server Check"/);
 assert.match(source, /choose Continue waiting or Stop helper/);
 const awaitingUserControls = source.match(/shellRunControl\.innerHTML = \[[\s\S]*?\]\.join\(""\);/)?.[0] || "";

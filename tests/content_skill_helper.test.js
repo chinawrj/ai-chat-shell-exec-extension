@@ -221,13 +221,16 @@ async function awaitTestCanonicalSkillDomFallback() {
   const originalRefreshSkillState = context.refreshSkillState;
   const originalQueueSkillComposerReply = context.queueSkillComposerReply;
   const originalGetConversationRoot = context.getConversationRoot;
+  const originalExtractShellCallCandidates = context.extractShellCallCandidates;
   const originalIsVisibleElement = context.isVisibleElement;
   const originalGetMessageAuthorRole = context.getMessageAuthorRole;
   const originalSetStatus = context.setStatus;
   let backendCalls = 0;
   let lastStatus = "";
   try {
-    context.getConversationRoot = () => new context.Element();
+    node.isConnected = true;
+    context.getConversationRoot = () => node;
+    context.extractShellCallCandidates = () => [candidate];
     context.isVisibleElement = () => true;
     context.getMessageAuthorRole = () => "assistant";
     context.setStatus = (value) => { lastStatus = String(value); };
@@ -281,6 +284,7 @@ async function awaitTestCanonicalSkillDomFallback() {
     context.refreshSkillState = originalRefreshSkillState;
     context.queueSkillComposerReply = originalQueueSkillComposerReply;
     context.getConversationRoot = originalGetConversationRoot;
+    context.extractShellCallCandidates = originalExtractShellCallCandidates;
     context.isVisibleElement = originalIsVisibleElement;
     context.getMessageAuthorRole = originalGetMessageAuthorRole;
     context.setStatus = originalSetStatus;
@@ -1214,6 +1218,9 @@ async function awaitTestExplicitUserAndProvenanceRejection() {
     queuedFailure = payload;
     return true;
   };
+  oversizedLoadNode.isConnected = true;
+  context.getConversationRoot = () => oversizedLoadNode;
+  context.extractShellCallCandidates = () => [oversizedLoadCandidate];
   vm.runInContext("chainCallCount = 0; skillHelperInFlight = false;", context);
   const oversizedLoadResult = await context.processLatestSkillCandidate([oversizedLoadCandidate], { maxChainCalls: 100 });
   assert.equal(oversizedLoadResult, false, "A formatter defense failure must not report the backend operation as successful.");

@@ -79,6 +79,16 @@ function createHelperBlock({ cmd }) {
   ].join("\n");
 }
 
+function createSkillLoadBlock({ helperId, skillId, catalogSha }) {
+  return [
+    `ai-helper-skill-start:${helperId}`,
+    "cmd: load",
+    `skill-id: ${skillId}`,
+    `catalog-sha: ${catalogSha}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+}
+
 function createAgentRosterBlock() {
   return [
     "ai-helper-agent-roster-start",
@@ -478,6 +488,53 @@ async function verifyPendingAgentDeliveryDefersWithoutConsumingHelper() {
   await context.scanForShellCall();
   assert.equal(runCalls.length, 1, "A sent agent message waiting only for hub ack must not block a helper.");
   assert.equal(runCalls[0][1].cmd, cmd);
+}
+
+async function verifyPendingAgentDeliveryDefersSkillWithoutConsumingHelper() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const message = createAssistantMessage({
+    order: 1,
+    text: createSkillLoadBlock({
+      helperId: "pending-agent-skill",
+      skillId: "example",
+      catalogSha: "a".repeat(64)
+    })
+  });
+  const root = createRoot([message]);
+  let backendCalls = 0;
+  context.document.body = root;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100
+  });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "skill-load") {
+      backendCalls += 1;
+      return { ok: false, error: "expected test rejection" };
+    }
+    return { ok: true };
+  };
+  context.getConversationRoot = () => root;
+  context.updateSiteActionButton = () => {};
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.queueSkillComposerReply = async () => true;
+  vm.runInContext(
+    `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000; pendingAgentDelivery = { messageId: 'pending-agent-skill' };`,
+    context
+  );
+
+  await context.scanForShellCall();
+  assert.equal(backendCalls, 0, "A pending agent composer delivery must defer Skill backend dispatch.");
+
+  vm.runInContext("pendingAgentDelivery = { messageId: 'sent-agent-skill', sent: true }; lastThreadTextAt = Date.now() - 2000;", context);
+  await context.scanForShellCall();
+  assert.equal(backendCalls, 1, "The unchanged Skill helper must remain eligible after the agent composer delivery is sent.");
 }
 
 async function verifyRetryableAttemptDoesNotConsumeSameRenderedHelper() {
@@ -3188,6 +3245,7 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyHiddenStopButtonDoesNotBlockHelperScan())
   .then(() => verifyUnexpectedHelperCancelsSelfTestAndRuns())
   .then(() => verifyPendingAgentDeliveryDefersWithoutConsumingHelper())
+  .then(() => verifyPendingAgentDeliveryDefersSkillWithoutConsumingHelper())
   .then(() => verifyRetryableAttemptDoesNotConsumeSameRenderedHelper())
   .then(() => verifyStaleLongCallCannotAffectNewPageCall())
   .then(() => verifyRuntimeChannelCloseRecoversByStatusOnly())

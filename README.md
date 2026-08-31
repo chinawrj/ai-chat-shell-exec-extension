@@ -292,7 +292,7 @@ On an enabled chat site, click the chat input once. The content script remembers
 
 By default, shell scanning is auto-enabled on `chatgpt.com` and `m365.cloud.microsoft`. On every other site, including `claude.ai`, the extension does not inject page UI, scan content, or bind page events until you add the hostname in the toolbar popup. To enable a site, open the extension popup, add the hostname to enabled sites, save, then refresh that page.
 
-The floating status panel defaults to a compact, state-driven 292px bar so it does not cover the chat. It shows the local `Skills vN` chip beside the concise status; the chip becomes a highlighted green action only when the latest catalog has not been acknowledged. An error adds `Server Check`, a runnable executable helper adds `Force run`, and active shell execution hides Force run and shows `Stop helper`. Select `More` to reveal the controls in five groups:
+The floating status panel defaults to a compact, state-driven 292px bar so it does not cover the chat. It shows the local `Skills vN` chip beside the concise status; the chip becomes a highlighted green action only when the latest catalog has not been acknowledged. An error adds `Server Check`, a runnable executable helper adds `Force run`, and an unhandled assistant Skill helper that could not be proven live exposes the separate `Process Skill` recovery action. Only the action matching the latest eligible helper is shown. Active shell execution hides manual actions and shows `Stop helper`. Select `More` to reveal the controls in five groups:
 
 - Setup & recovery: an always-available `Server Check`, `Test`, `Enable site`, `Reset tmux`, and `Role filter`.
 - Page binding: `Bind input`, `Bind send`, `Bind shell`, and `Clear`.
@@ -310,6 +310,7 @@ The individual controls behave as follows:
 - `Server Check`: verify local shell server release/protocol/helper compatibility, `ForAI` host/board/cwd readiness, and whether input/send/shell bindings exist for the current origin.
 - `Reset tmux`: recreate only this tab's active tmux session. Role `None` resets the default `ForAI`; `Master` or `Slave` resets that role's exact `ForAI-<agentId>` session without touching the default or other agents.
 - `Force run`: manually recheck the current page once and explicitly rerun the latest helper block, bypassing the shell server's completed-execution duplicate decision.
+- `Process Skill`: manually process the latest eligible Skill helper through the validated Skill list/load/ACK protocol. It never executes shell, bypasses duplicate adjudication, or installs a Skill.
 - `Stop helper`: terminate only the currently owned shell helper in this tab's active role workspace. It appears only while a helper is active. When a running helper produces no observable output for the configured idle timeout, the panel places `Continue waiting` and `Stop helper` side by side in the same decision card and hides the redundant upper Stop control. Continuing resets the idle clock.
 - `Bind input`: click it, then click the page's chat input.
 - `Bind send`: click it, then click the page's send control.
