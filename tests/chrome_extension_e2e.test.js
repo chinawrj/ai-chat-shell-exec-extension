@@ -74,7 +74,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.skillProtocolVersion,
-      3,
+      4,
       `Existing Skill protocol is ${serverHealth.skillProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -307,6 +307,8 @@ async function main() {
   await waitForEvaluate(page, `document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === true`, "compact panel advanced controls to collapse");
 
   if (DRAWIO_ONLY) {
+    await page.send("Page.bringToFront");
+    await waitForEvaluate(page, "document.visibilityState === 'visible'", "Draw.io-only preview page to become visible");
     await runDrawioPreviewE2E(page);
     return;
   }
@@ -316,6 +318,7 @@ async function main() {
     await runSkillE2E(page, debugPort, {
       skillPath,
       skillInstallRunPath,
+      shellStateDir,
       expectedHome: helperFileTestHome,
       allowedValue: skillAllowedValue,
       secretValue: skillSecretValue
@@ -1653,6 +1656,7 @@ async function runEmptySkillCatalogE2E(page, { skillPath, skillInstallPath, skil
 async function runSkillE2E(page, debugPort, {
   skillPath,
   skillInstallRunPath,
+  shellStateDir,
   expectedHome,
   allowedValue,
   secretValue
@@ -2096,6 +2100,70 @@ async function runSkillE2E(page, debugPort, {
   assert.match(loadReply, /ai-helper-skill-end/);
   assert.ok(!loadReply.includes(secretValue), "A non-allowlisted local environment variable must not leak to the AI.");
   await assertUserMessageCountStable(page, beforeLoad + 1, "Loaded Skill helper examples must stay inert inside skill-output provenance");
+
+  const failingSkillId = "e2e-failing-skill";
+  const failingSkillDir = path.join(path.dirname(path.dirname(skillPath)), failingSkillId);
+  fs.mkdirSync(failingSkillDir, { recursive: true });
+  fs.writeFileSync(path.join(failingSkillDir, "SKILL.md"), [
+    "---",
+    `name: ${failingSkillId}`,
+    "description: E2E failing Skill installer diagnostics",
+    "---",
+    "failure coverage",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(path.join(failingSkillDir, "install.sh"), [
+    "#!/bin/sh",
+    "printf 'installer stdout tail\\n'",
+    "printf '\\033[31minstaller stderr <script>plain-text-only</script>\\033[0m\\n' >&2",
+    "exit 23",
+    ""
+  ].join("\n"), { mode: 0o700 });
+  const beforeFailedInstall = await pageUserMessageCount(page);
+  const composerBeforeFailedInstall = await page.evaluate(`document.getElementById("composer")?.innerText || ""`);
+  await page.evaluate(`document.querySelector('[data-shell-tool-action="skill-rescan"]')?.click(); true`);
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    return /Rescanned 2 Skills/i.test(panel?.innerText || "");
+  })()`, "failing Skill to appear after rescan");
+  await page.evaluate(`(() => {
+    document.getElementById("ai-chat-shell-exec-skill-dialog")?.remove();
+    document.querySelector('[data-shell-tool-action="skill-view"]')?.click();
+    return true;
+  })()`);
+  await waitForEvaluate(page, `Boolean(document.querySelector(${JSON.stringify(`#ai-chat-shell-exec-skill-dialog [data-skill-id="${failingSkillId}"] [data-skill-install]`)}))`,
+    "failing Skill install action");
+  await trustedDoubleClick(page, `#ai-chat-shell-exec-skill-dialog [data-skill-id="${failingSkillId}"] [data-skill-install]`);
+  const failureTarget = await waitForValue(async () => {
+    const targets = await fetchHttpJson(`http://127.0.0.1:${debugPort}/json/list`).catch(() => []);
+    return targets.find((target) => target.type === "page" &&
+      String(target.url || "").startsWith(`${EXPECTED_EXTENSION_ORIGIN}/skill-install-result.html`)) || null;
+  }, "extension-owned Skill install failure result window");
+  const failurePage = await CdpClient.connect(failureTarget.webSocketDebuggerUrl);
+  cleanup.push(() => failurePage.close());
+  await failurePage.send("Page.enable");
+  await failurePage.send("Runtime.enable");
+  const failureText = await waitForEvaluateValue(failurePage, `(() => {
+    const text = document.body?.innerText || "";
+    return text.includes("Exit code: 23") && text.includes("installer stderr") ? text : "";
+  })()`, "Skill install failure details to render in the extension window");
+  assert.match(failureText, /Skill installation failed/);
+  assert.match(failureText, /Exit code: 23/);
+  assert.match(failureText, /installer stderr <script>plain-text-only<\/script>/);
+  assert.doesNotMatch(failureText, /\x1b\[/, "ANSI controls must not survive into the result window.");
+  await waitForEvaluate(page, `(() => {
+    const row = document.querySelector(${JSON.stringify(`#ai-chat-shell-exec-skill-dialog [data-skill-id="${failingSkillId}"]`)});
+    return row && /Retry/.test(row.querySelector('[data-skill-install]')?.textContent || "");
+  })()`, "failed Skill row to remain retryable");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(shellStateDir, "skill-install-state.json"), "utf8")).skills[failingSkillId].installed, false);
+  assert.equal(await page.evaluate(`document.getElementById("composer")?.innerText || ""`), composerBeforeFailedInstall,
+    "Installer diagnostics must not alter the chat composer.");
+  const chatPageTextAfterFailure = await page.evaluate(`document.body?.innerText || ""`);
+  assert.doesNotMatch(chatPageTextAfterFailure, /installer stderr|installer stdout tail/,
+    "Raw installer diagnostics must not enter any DOM owned by the AI chat page.");
+  await assertUserMessageCountStable(page, beforeFailedInstall,
+    "A failed Skill installer and its local result window must not write to the AI chat");
+  await failurePage.evaluate(`document.getElementById("close")?.click(); true`).catch(() => null);
 }
 
 async function installSkillThroughDialog(page, skillId) {
@@ -2737,6 +2805,11 @@ function drawioHelper(xml, identity) {
 }
 
 async function runDrawioPreviewE2E(page) {
+  await ensureDrawioPageVisible(page);
+  const keepVisibleTimer = setInterval(() => {
+    page.send("Page.bringToFront").catch(() => {});
+  }, 750);
+  keepVisibleTimer.unref?.();
   const baseline = await page.evaluate(`(() => ({
     composer: document.getElementById("composer")?.innerText || "",
     userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
@@ -2812,6 +2885,7 @@ async function runDrawioPreviewE2E(page) {
   assert.equal(state.title, "Draw.io E2E v1", "An incomplete streamed helper must keep the old SVG visible.");
   assert.equal(state.renderCount, 1, "An incomplete streamed helper must not mount a renderer.");
 
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`(() => {
     const code = document.querySelector("#thread article:last-child code");
     code.textContent = ${JSON.stringify(drawioHelper(streamingXml, "drawio-e2e-v2"))};
@@ -2837,7 +2911,17 @@ async function runDrawioPreviewE2E(page) {
         helperDebug: document.getElementById("ai-chat-shell-exec-debug-body")?.textContent || ""
       };
     })()`);
-    throw new Error(`${error.message}; drawioState=${JSON.stringify(diagnostics)}; console=${JSON.stringify(page.consoleMessages.slice(-20))}`);
+    const frameDiagnostics = await page.evaluateAcrossContexts(`(() => ({
+      url: location.href,
+      hidden: document.hidden,
+      visibility: document.visibilityState,
+      viewerText: document.getElementById("viewer")?.innerText || "",
+      svgCount: document.querySelectorAll("svg").length,
+      graphCount: document.querySelectorAll(".mxgraph").length,
+      errorCount: document.querySelectorAll(".render-error").length,
+      graphViewer: typeof globalThis.GraphViewer?.processElements
+    }))()`);
+    throw new Error(`${error.message}; drawioState=${JSON.stringify(diagnostics)}; frames=${JSON.stringify(frameDiagnostics)}; console=${JSON.stringify(page.consoleMessages.slice(-20))}`);
   }
   state = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
@@ -2848,6 +2932,7 @@ async function runDrawioPreviewE2E(page) {
   const rapidV3 = drawioHelper(drawioXml("Draw.io E2E v3"), "drawio-e2e-v3");
   const rapidV4Xml = drawioXml("Draw.io E2E v4", "Only this rapid helper should render");
   const rapidV4 = drawioHelper(rapidV4Xml, "drawio-e2e-v4");
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`(() => {
     appendAssistantToolCall(${JSON.stringify(rapidV3)}, "text");
     appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text");
@@ -2869,6 +2954,7 @@ async function runDrawioPreviewE2E(page) {
     "ai-helper-drawio-end"
   ].join("\n");
   const errorCountBeforeMalformed = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(malformed)}, "text")`);
   await waitForEvaluate(page, `(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
@@ -2887,15 +2973,37 @@ async function runDrawioPreviewE2E(page) {
 
   const brokenRendererXml = '<mxfile><diagram name="Broken renderer">definitely-not-valid-compressed-drawio-data</diagram></mxfile>';
   const errorCountBeforeRenderFailure = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(brokenRendererXml, "drawio-e2e-render-fail"))}, "text")`);
-  await waitForEvaluate(page, `(() => {
-    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
-    return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeRenderFailure} &&
-      host.dataset.state === "error" &&
-      host.dataset.currentArtifactId === "" &&
-      /render failed/i.test(host.dataset.lastError || "") &&
-      !/malformed/i.test(host.shadowRoot?.querySelector("details pre")?.innerText || "");
-  })()`, "latest draw.io renderer failure replacing the previous error log");
+  try {
+    await waitForEvaluate(page, `(() => {
+      const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+      return Number(host?.dataset.errorCount || 0) > ${errorCountBeforeRenderFailure} &&
+        host.dataset.state === "error" &&
+        host.dataset.currentArtifactId === "" &&
+        /render failed/i.test(host.dataset.lastError || "") &&
+        !/malformed/i.test(host.shadowRoot?.querySelector("details pre")?.innerText || "");
+    })()`, "latest draw.io renderer failure replacing the previous error log");
+  } catch (error) {
+    const diagnostics = await page.evaluate(`(() => {
+      const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+      return {
+        hostState: host?.dataset.state || "",
+        currentTitle: host?.dataset.currentTitle || "",
+        currentArtifactId: host?.dataset.currentArtifactId || "",
+        pendingArtifactId: host?.dataset.pendingArtifactId || "",
+        renderCount: Number(host?.dataset.renderCount || 0),
+        errorCount: Number(host?.dataset.errorCount || 0),
+        lastError: host?.dataset.lastError || "",
+        frameCount: host?.shadowRoot?.querySelectorAll("iframe")?.length || 0,
+        status: host?.shadowRoot?.querySelector(".status")?.innerText || "",
+        errorLog: host?.shadowRoot?.querySelector("details pre")?.innerText || "",
+        visibility: document.visibilityState,
+        latestArticles: Array.from(document.querySelectorAll("#thread article")).slice(-3).map((node) => node.innerText)
+      };
+    })()`);
+    throw new Error(`${error.message}; drawioState=${JSON.stringify(diagnostics)}; console=${JSON.stringify(page.consoleMessages.slice(-30))}`);
+  }
   await waitForEvaluate(page, `(() => {
     const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
     return users.length === ${baseline.userCount + 2} && /Draw\.io helper failed:/.test(users.at(-1)?.innerText || "") && /drawio-e2e-render-fail/.test(users.at(-1)?.innerText || "");
@@ -2905,6 +3013,7 @@ async function runDrawioPreviewE2E(page) {
     "A renderer failure must be emitted to the browser console as well as the preview log."
   );
 
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text")`);
   await waitForEvaluate(page, `(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
@@ -2920,6 +3029,7 @@ async function runDrawioPreviewE2E(page) {
   assert.equal(state.artifactId, v4ArtifactId);
   assert.equal(state.userCount, baseline.userCount + 2, "A successful Draw.io helper must not send a reply.");
 
+  await ensureDrawioPageVisible(page);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(rapidV4)}, "text")`);
   await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3200))");
   state = await page.evaluate(`(() => {
@@ -2942,6 +3052,12 @@ async function runDrawioPreviewE2E(page) {
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-drawio.png"));
   }
+  clearInterval(keepVisibleTimer);
+}
+
+async function ensureDrawioPageVisible(page) {
+  await page.send("Page.bringToFront");
+  await waitForEvaluate(page, "document.visibilityState === 'visible'", "Draw.io E2E page to be visible");
 }
 
 async function runDrawioSupersedeE2E(page, currentXml, currentArtifactId) {

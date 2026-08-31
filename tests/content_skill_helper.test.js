@@ -608,6 +608,7 @@ async function testSkillInstallActionIsExplicitAndSingleFlight() {
     assert.deepEqual(installMessage, {
       type: "skill-install",
       skillId: skill.id,
+      skillName: skill.name,
       skillSha: skill.sha,
       installSha: skill.installSha,
       catalogSha
@@ -616,9 +617,19 @@ async function testSkillInstallActionIsExplicitAndSingleFlight() {
     assert.equal(shownDialogs, 1, "A still-open current dialog may refresh after installation.");
 
     currentUi = createSkillInstallUi(skill.id);
+    const failedMessages = [];
     context.chrome.runtime.sendMessage = async (message) => {
+      failedMessages.push({ ...message });
       if (message.type === "skill-install") {
-        return { ok: false, errorCode: "installer-failed", error: "Installer exited with code 9." };
+        return {
+          ok: false,
+          errorCode: "installer-failed",
+          error: "Installer exited with code 9.",
+          installFailureToken: "d".repeat(32)
+        };
+      }
+      if (message.type === "skill-install-failure-show") {
+        return { ok: true, shown: true };
       }
       throw new Error("list offline");
     };
@@ -631,6 +642,12 @@ async function testSkillInstallActionIsExplicitAndSingleFlight() {
     assert.equal(currentUi.button.attributes["aria-label"], "Retry installing install-test");
     assert.match(currentUi.feedback.textContent, /code 9/);
     assert.equal(currentUi.feedback.attributes.role, "alert");
+    assert.deepEqual(failedMessages.find((message) => message.type === "skill-install-failure-show"), {
+      type: "skill-install-failure-show",
+      token: "d".repeat(32)
+    });
+    assert.equal(failedMessages.some((message) => Object.prototype.hasOwnProperty.call(message, "installerOutput")), false,
+      "The chat content script must never receive or forward raw installer output.");
 
     currentUi = createSkillInstallUi(skill.id);
     context.chrome.runtime.sendMessage = async (message) => {
@@ -643,6 +660,44 @@ async function testSkillInstallActionIsExplicitAndSingleFlight() {
     assert.equal(currentUi.button.textContent, "Retry");
     assert.match(currentUi.feedback.textContent, /runtime channel lost/);
 
+    vm.runInContext("extensionActive = true; pageLifecycleGeneration = 41;", context);
+    currentUi = createSkillInstallUi(skill.id);
+    let releaseFailedLifecycle;
+    const failedLifecycleGate = new Promise((resolve) => { releaseFailedLifecycle = resolve; });
+    const failedLifecycleMessages = [];
+    context.chrome.runtime.sendMessage = async (message) => {
+      failedLifecycleMessages.push({ ...message });
+      if (message.type === "skill-install") {
+        await failedLifecycleGate;
+        return {
+          ok: false,
+          errorCode: "installer-failed",
+          error: "Installer exited with code 11.",
+          installFailureToken: "e".repeat(32)
+        };
+      }
+      if (message.type === "skill-install-failure-discard") {
+        return { ok: true, discarded: true };
+      }
+      throw new Error(`Unexpected lifecycle message ${message.type}`);
+    };
+    const failedAfterNavigation = context.installSkillFromPanel(skill, catalogSha, {
+      overlay: currentUi.overlay,
+      pageGeneration: 41
+    });
+    currentUi.overlay.isConnected = false;
+    currentUi.button.isConnected = false;
+    vm.runInContext("extensionActive = false; pageLifecycleGeneration = 42;", context);
+    releaseFailedLifecycle();
+    assert.equal(await failedAfterNavigation, false);
+    assert.equal(failedLifecycleMessages.some((message) => message.type === "skill-install-failure-show"), false,
+      "A stale page lifecycle must not open a late result window.");
+    assert.deepEqual(failedLifecycleMessages.find((message) => message.type === "skill-install-failure-discard"), {
+      type: "skill-install-failure-discard",
+      token: "e".repeat(32)
+    }, "A stale page lifecycle must immediately discard its sensitive one-use result.");
+
+    vm.runInContext("extensionActive = true; pageLifecycleGeneration = 41;", context);
     currentUi = createSkillInstallUi(skill.id);
     context.chrome.runtime.sendMessage = async (message) => {
       if (message.type === "skill-install") {

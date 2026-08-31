@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-08-31
+
+- Replaces the Skill installer's absolute 120-second deadline with a 600-second stdout/stderr idle deadline. Either stream resets the clock even after bounded output capture is full, while the browser keeps long installation WebSockets alive without a shorter absolute watchdog.
+- Requires explicit exit code 0 with no signal or idle timeout before a Skill can become installed; unknown and signal-terminated results now fail closed.
+- Adds bounded main-shell-exit and idle-kill settlement so installer descendants holding inherited output pipes cannot permanently block later serialized installs.
+- Shows nonzero, signal, and idle-timeout diagnostics in a one-use extension-origin result window. Sanitized bounded output remains in background memory only and never enters the chat page DOM, composer, AI messages, ledgers, logs, or extension storage.
+- Bumps the Skill protocol to 4 so a new extension cannot silently use the old 120-second server behavior and an old extension cannot abandon a new long-running installer.
+- Adds focused server/background/content/result-page regressions plus a real unpacked-Chrome exit-23 installer test covering the failure window, Retry state, uninstalled state, and composer/message isolation.
+- Keeps Draw.io replacement renderers inside the viewport while transparent, noninteractive, and accessibility-hidden, preventing Chrome 151 from freezing cross-origin staging SVG layout and failure timers.
+
 ## [0.11.6] - 2026-08-30
 
 - Splits Draw.io sandbox startup from render acceptance, pauses visible-time budgets while the page is hidden, retries one fresh local iframe when the first attempt does not accept the request, and uses iframe load as a fallback for a lost ready message.

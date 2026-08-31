@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { StringDecoder } = require("node:string_decoder");
 const { TextDecoder } = require("node:util");
 
 const SKILL_FILE_NAME = "SKILL.md";
@@ -38,7 +39,9 @@ const MAX_SKILL_LOAD_REPLY_CHARS = 500_000;
 const MAX_SKILL_DESCRIPTION_CHARS = 512;
 const MAX_SKILL_CATALOG_JSON_CHARS = 350_000;
 const SKILL_CATALOG_CACHE_MS = 10_000;
-const SKILL_INSTALL_TIMEOUT_MS = 120_000;
+const SKILL_INSTALL_IDLE_TIMEOUT_MS = 600_000;
+const SKILL_INSTALL_EXIT_DRAIN_GRACE_MS = 250;
+const SKILL_INSTALL_KILL_SETTLE_GRACE_MS = 1_000;
 const MAX_SKILL_INSTALL_SCRIPT_BYTES = 256 * 1024;
 const MAX_SKILL_INSTALL_OUTPUT_CHARS = 20_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -161,7 +164,7 @@ class SkillCatalogService {
         scriptPath: snapshot.scriptPath,
         skillDir: path.dirname(skill.filePath),
         env: buildSkillInstallEnvironment(this.env),
-        timeoutMs: SKILL_INSTALL_TIMEOUT_MS,
+        idleTimeoutMs: SKILL_INSTALL_IDLE_TIMEOUT_MS,
         maxOutputChars: MAX_SKILL_INSTALL_OUTPUT_CHARS
       });
     } catch (error) {
@@ -172,17 +175,32 @@ class SkillCatalogService {
     } finally {
       snapshot?.cleanup();
     }
-    if (result?.timedOut === true) {
-      console.error(`[skill-install] ${requestedSkillId} timed out`);
-      return skillError(catalog, "installer-timeout", `Skill ${requestedSkillId} installer exceeded ${SKILL_INSTALL_TIMEOUT_MS / 1000} seconds.`, {
-        durationMs: Date.now() - startedAt
+    const installerOutput = publicSkillInstallerOutput(result);
+    if (result?.idleTimedOut === true || result?.timedOut === true) {
+      console.error(`[skill-install] ${requestedSkillId} produced no output for ${SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000} seconds`);
+      return skillError(catalog, "installer-timeout", `Skill ${requestedSkillId} installer produced no stdout or stderr for ${SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000} seconds.`, {
+        durationMs: Date.now() - startedAt,
+        idleTimeoutSeconds: SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000,
+        installerOutput
       }, "skill-install");
     }
-    if (Number(result?.code) !== 0) {
-      console.error(`[skill-install] ${requestedSkillId} exited ${String(result?.code)}`);
-      return skillError(catalog, "installer-failed", `Skill ${requestedSkillId} installer exited with code ${Number.isInteger(result?.code) ? result.code : "unknown"}. Check the shell server console.`, {
+    const signal = String(result?.signal || "").slice(0, 64);
+    if (signal) {
+      console.error(`[skill-install] ${requestedSkillId} terminated by signal ${signal}`);
+      return skillError(catalog, "installer-signaled", `Skill ${requestedSkillId} installer was terminated by signal ${signal}.`, {
         exitCode: Number.isInteger(result?.code) ? result.code : null,
-        durationMs: Date.now() - startedAt
+        signal,
+        durationMs: Date.now() - startedAt,
+        installerOutput
+      }, "skill-install");
+    }
+    if (result?.code !== 0) {
+      const exitCode = Number.isInteger(result?.code) ? result.code : null;
+      console.error(`[skill-install] ${requestedSkillId} exited ${exitCode === null ? "without a valid exit code" : exitCode}`);
+      return skillError(catalog, "installer-failed", `Skill ${requestedSkillId} installer exited with code ${exitCode === null ? "unknown" : exitCode}.`, {
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        installerOutput
       }, "skill-install");
     }
 
@@ -786,7 +804,7 @@ function runSkillInstallScript({
   scriptPath,
   skillDir,
   env = {},
-  timeoutMs = SKILL_INSTALL_TIMEOUT_MS,
+  idleTimeoutMs = SKILL_INSTALL_IDLE_TIMEOUT_MS,
   maxOutputChars = MAX_SKILL_INSTALL_OUTPUT_CHARS
 } = {}) {
   let safeScriptPath;
@@ -810,22 +828,26 @@ function runSkillInstallScript({
     });
     let settled = false;
     let timedOut = false;
+    let exitObserved = false;
+    let exitCode = null;
+    let exitSignal = "";
     let stdout = "";
     let stderr = "";
-    const appendBounded = (current, chunk) => {
-      if (current.length >= maxOutputChars) {
-        return current;
-      }
-      return (current + String(chunk || "")).slice(0, maxOutputChars);
-    };
-    child.stdout?.on("data", (chunk) => {
-      stdout = appendBounded(stdout, chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr = appendBounded(stderr, chunk);
-    });
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let idleTimer = 0;
+    let forcedSettleTimer = 0;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const requestedIdleTimeoutMs = Number(idleTimeoutMs);
+    const effectiveIdleTimeoutMs = Number.isFinite(requestedIdleTimeoutMs) && requestedIdleTimeoutMs > 0
+      ? requestedIdleTimeoutMs
+      : SKILL_INSTALL_IDLE_TIMEOUT_MS;
+    const requestedMaxOutputChars = Number(maxOutputChars);
+    const effectiveMaxOutputChars = Number.isFinite(requestedMaxOutputChars) && requestedMaxOutputChars > 0
+      ? Math.floor(requestedMaxOutputChars)
+      : MAX_SKILL_INSTALL_OUTPUT_CHARS;
+    const killProcessGroup = () => {
       try {
         if (process.platform !== "win32" && child.pid) {
           process.kill(-child.pid, "SIGKILL");
@@ -833,27 +855,126 @@ function runSkillInstallScript({
           child.kill("SIGKILL");
         }
       } catch (_error) {
-        child.kill("SIGKILL");
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The installer process group already ended.
+        }
       }
-    }, Math.max(1, Number(timeoutMs || SKILL_INSTALL_TIMEOUT_MS)));
-    timeout.unref?.();
+    };
+    const destroyOutputPipes = () => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+    const appendBounded = (current, text, markTruncated) => {
+      const combined = current + String(text || "");
+      if (combined.length <= effectiveMaxOutputChars) {
+        return combined;
+      }
+      markTruncated();
+      return combined.slice(-effectiveMaxOutputChars);
+    };
+    const finish = (code = exitCode, signal = exitSignal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(idleTimer);
+      clearTimeout(forcedSettleTimer);
+      stdout = appendBounded(stdout, stdoutDecoder.end(), () => { stdoutTruncated = true; });
+      stderr = appendBounded(stderr, stderrDecoder.end(), () => { stderrTruncated = true; });
+      destroyOutputPipes();
+      resolve({
+        code,
+        signal: signal || "",
+        timedOut,
+        idleTimedOut: timedOut,
+        stdout,
+        stderr,
+        stdoutTruncated,
+        stderrTruncated
+      });
+    };
+    const scheduleForcedSettle = (delayMs) => {
+      clearTimeout(forcedSettleTimer);
+      forcedSettleTimer = setTimeout(() => {
+        killProcessGroup();
+        destroyOutputPipes();
+        finish();
+      }, delayMs);
+      forcedSettleTimer.unref?.();
+    };
+    const resetIdleTimer = () => {
+      if (exitObserved) {
+        return;
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+      }
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        killProcessGroup();
+        destroyOutputPipes();
+        scheduleForcedSettle(SKILL_INSTALL_KILL_SETTLE_GRACE_MS);
+      }, effectiveIdleTimeoutMs);
+      idleTimer.unref?.();
+    };
+    const captureChunk = (current, decoder, chunk, markTruncated) => {
+      if (!chunk || chunk.length === 0) {
+        return current;
+      }
+      resetIdleTimer();
+      return appendBounded(current, decoder.write(chunk), markTruncated);
+    };
+    child.stdout?.on("data", (chunk) => {
+      stdout = captureChunk(stdout, stdoutDecoder, chunk, () => { stdoutTruncated = true; });
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = captureChunk(stderr, stderrDecoder, chunk, () => { stderrTruncated = true; });
+    });
+    resetIdleTimer();
     child.once("error", (error) => {
       if (settled) {
         return;
       }
       settled = true;
-      clearTimeout(timeout);
+      clearTimeout(idleTimer);
+      clearTimeout(forcedSettleTimer);
+      destroyOutputPipes();
       reject(error);
     });
-    child.once("close", (code, signal) => {
+    child.once("exit", (code, signal) => {
       if (settled) {
         return;
       }
-      settled = true;
-      clearTimeout(timeout);
-      resolve({ code, signal: signal || "", timedOut, stdout, stderr });
+      exitObserved = true;
+      exitCode = code;
+      exitSignal = signal || "";
+      clearTimeout(idleTimer);
+      scheduleForcedSettle(SKILL_INSTALL_EXIT_DRAIN_GRACE_MS);
+    });
+    child.once("close", (code, signal) => {
+      finish(code, signal || "");
     });
   });
+}
+
+function publicSkillInstallerOutput(result = {}) {
+  const bound = (value) => {
+    const text = String(value || "");
+    return {
+      text: text.slice(-MAX_SKILL_INSTALL_OUTPUT_CHARS),
+      truncated: text.length > MAX_SKILL_INSTALL_OUTPUT_CHARS
+    };
+  };
+  const stdout = bound(result.stdout);
+  const stderr = bound(result.stderr);
+  return {
+    stdout: stdout.text,
+    stderr: stderr.text,
+    stdoutTruncated: stdout.truncated || result.stdoutTruncated === true,
+    stderrTruncated: stderr.truncated || result.stderrTruncated === true
+  };
 }
 
 function parseSkillFrontmatter(source) {
@@ -1456,7 +1577,7 @@ module.exports = {
   SKILL_ID_PATTERN,
   SKILL_INSTALL_SCRIPT_NAME,
   SKILL_INSTALL_STATE_FILE,
-  SKILL_INSTALL_TIMEOUT_MS,
+  SKILL_INSTALL_IDLE_TIMEOUT_MS,
   SKILL_ROOTS_RUNTIME_VARIABLE,
   SKILL_ROOT_SOURCE_RUNTIME_VARIABLE,
   SkillCatalogService,

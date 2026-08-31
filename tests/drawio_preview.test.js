@@ -296,10 +296,14 @@ assert.doesNotMatch(previewSource, /Draw\.io renderer timed out after \$\{DRAWIO
   "The old combined startup-and-render 7000ms watchdog must not return.");
 assert.doesNotMatch(previewSource, /stopped responding after rendering began/,
   "The parent must not impose a hard deadline after the isolated viewer acknowledges that rendering began.");
-assert.match(previewSource, /\.drawio-frame-staging \{ inset: 0 auto 0 -200vw; width: 100%; visibility: visible; opacity: 0; pointer-events: none; \}/,
-  "The staging iframe must remain renderable while it is visually hidden offscreen.");
+assert.match(previewSource, /\.drawio-frame-staging \{ inset: 0; width: 100%; visibility: visible; opacity: 0; pointer-events: none; \}/,
+  "The staging iframe must intersect the viewport while remaining transparent and noninteractive.");
+assert.doesNotMatch(previewSource, /\.drawio-frame-staging \{[^}]*-(?:100|200)vw/,
+  "A cross-origin staging iframe must not be moved offscreen where Chromium can freeze its renderer and timers.");
 assert.doesNotMatch(previewSource, /\.drawio-frame-staging \{ visibility: hidden/,
   "Chromium may skip SVG layout in a visibility-hidden staging iframe.");
+assert.match(previewSource, /iframe\.setAttribute\("aria-hidden", "true"\)/,
+  "The transparent staging renderer must remain hidden from the accessibility tree until it becomes current.");
 assert.match(previewSource, /oldLayer\?\.remove\(\)/, "The old SVG frame is removed only after a fresh renderer succeeds.");
 assert.match(previewSource, /clearCurrentArtifact\("No render is available for the latest helper\."\)/,
   "A confirmed latest-helper failure must clear the older rendered artifact.");

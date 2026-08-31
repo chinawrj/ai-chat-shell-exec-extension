@@ -70,7 +70,7 @@ fi
 
 (
   cd "$ROOT_DIR/extension"
-  zip -qr "$EXTENSION_ZIP" manifest.json popup.html src drawio vendor
+  zip -qr "$EXTENSION_ZIP" manifest.json popup.html skill-install-result.html skill-install-result.css src drawio vendor
 )
 
 (

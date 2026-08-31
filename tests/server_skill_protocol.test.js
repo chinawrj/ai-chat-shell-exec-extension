@@ -40,7 +40,7 @@ main()
 
 async function main() {
   const health = buildHealthResponse();
-  assert.equal(health.skillProtocolVersion, 3);
+  assert.equal(health.skillProtocolVersion, 4);
   assert.equal(health.skillCatalogOk, true, JSON.stringify(health.skillCatalogErrors));
   assert.equal(health.skillCount, 0);
   assert.equal(health.discoveredSkillCount, 1);
@@ -50,7 +50,7 @@ async function main() {
   const status = await request({ type: "skill-catalog-status" });
   assert.equal(status.ok, true, JSON.stringify(status));
   assert.equal(status.type, "skill-catalog-status");
-  assert.equal(status.skillProtocolVersion, 3);
+  assert.equal(status.skillProtocolVersion, 4);
   assert.equal(status.skillCount, 0);
   assert.equal(status.discoveredSkillCount, 1);
   assert.equal(status.skills, undefined, "Status should not unnecessarily disclose the catalog list.");

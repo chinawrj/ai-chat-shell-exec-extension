@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Skill installation result</title>
+  <link rel="stylesheet" href="skill-install-result.css">
+</head>
+<body>
+  <main aria-live="polite">
+    <header>
+      <div>
+        <p class="eyebrow">AI Chat Shell Exec</p>
+        <h1 id="title">Skill installation failed</h1>
+      </div>
+      <span class="failure-badge">Not installed</span>
+    </header>
+
+    <section id="loading" class="card">Loading local installer details…</section>
+    <section id="result" class="hidden" role="alert" aria-labelledby="title">
+      <p id="summary" class="summary"></p>
+      <p id="metadata" class="metadata hidden"></p>
+
+      <section id="stderr-section" class="output-section hidden" aria-labelledby="stderr-title">
+        <h2 id="stderr-title">stderr</h2>
+        <pre id="stderr"></pre>
+      </section>
+
+      <details id="stdout-section" class="output-section hidden">
+        <summary id="stdout-title">stdout</summary>
+        <pre id="stdout"></pre>
+      </details>
+
+      <p id="empty-output" class="empty hidden">The installer produced no captured stdout or stderr.</p>
+      <p class="privacy">Shown only in this extension-owned window. The installer output was not written to the chat composer, sent to the AI, logged, or persisted.</p>
+      <p class="warning">Installer output may contain sensitive information. Review it before copying or sharing.</p>
+    </section>
+
+    <footer>
+      <button id="copy" class="secondary hidden" type="button">Copy details</button>
+      <button id="close" class="primary" type="button">Close</button>
+    </footer>
+  </main>
+  <script src="src/skill-install-result.js"></script>
+</body>
+</html>

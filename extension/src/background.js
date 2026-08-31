@@ -14,9 +14,12 @@ const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_PREFIX = "skillCatalogSync:v1:";
 const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_SYNC_TTL_MS = 10 * 60 * 1000;
+const SKILL_INSTALL_FAILURE_TTL_MS = 5 * 60 * 1000;
+const SKILL_INSTALL_FAILURE_LIMIT = 8;
+const SKILL_INSTALL_FAILURE_OUTPUT_CHARS = 20_000;
 const REQUIRED_SERVER_PROTOCOL_VERSION = 11;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 4;
-const REQUIRED_SKILL_PROTOCOL_VERSION = 3;
+const REQUIRED_SKILL_PROTOCOL_VERSION = 4;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
@@ -51,10 +54,15 @@ const BACKGROUND_SKILL_MESSAGE_TYPES = new Set([
   "skill-management-list",
   "skill-catalog-rescan",
   "skill-install",
+  "skill-install-failure-show",
+  "skill-install-failure-consume",
+  "skill-install-failure-discard",
   "skill-load"
 ]);
 const skillScopeTails = new Map();
 const recentlyClosedSkillTabIds = new Set();
+const pendingSkillInstallFailures = new Map();
+const activeSkillInstallRequests = new Set();
 const DEFAULT_SETTINGS = {
   enabled: true,
   enabledHosts: DEFAULT_ENABLED_HOSTS,
@@ -76,6 +84,16 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.tabs?.onRemoved?.addListener((tabId) => {
   chrome.storage.session.remove([`${TAB_AGENT_PROFILE_PREFIX}${tabId}`]).catch(() => {});
+  for (const [token, entry] of pendingSkillInstallFailures) {
+    if (entry?.tabId === Number(tabId)) {
+      pendingSkillInstallFailures.delete(token);
+    }
+  }
+  for (const request of activeSkillInstallRequests) {
+    if (request.tabId === Number(tabId)) {
+      request.tabClosed = true;
+    }
+  }
   recentlyClosedSkillTabIds.add(Number(tabId));
   const cleanupTimer = setTimeout(() => recentlyClosedSkillTabIds.delete(Number(tabId)), 60_000);
   cleanupTimer?.unref?.();
@@ -294,17 +312,49 @@ async function handleSkillMessage(message, sender = {}) {
       error: `Unsupported background Skill message type: ${message.type || ""}`
     };
   }
+  if (message.type === "skill-install-failure-show") {
+    return showSkillInstallFailure(message, sender);
+  }
+  if (message.type === "skill-install-failure-consume") {
+    return consumeSkillInstallFailure(message, sender);
+  }
+  if (message.type === "skill-install-failure-discard") {
+    return discardSkillInstallFailure(message, sender);
+  }
   const scope = getSkillMemoryScope(sender);
   if (message.type === "skill-install") {
-    await requireShellServerReady();
-    return runShellViaWebSocket({
-      type: "skill-install",
-      skillId: message.skillId,
-      skillSha: message.skillSha,
-      installSha: message.installSha,
-      catalogSha: message.catalogSha,
-      timeoutMs: 125000
-    });
+    const requestOwner = {
+      tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
+      tabClosed: false
+    };
+    activeSkillInstallRequests.add(requestOwner);
+    try {
+      await requireShellServerReady();
+      const response = await runShellViaWebSocket({
+        type: "skill-install",
+        skillId: message.skillId,
+        skillSha: message.skillSha,
+        installSha: message.installSha,
+        catalogSha: message.catalogSha
+      });
+      if (!isSkillInstallerExecutionFailure(response)) {
+        return response;
+      }
+      const safeResponse = { ...response };
+      delete safeResponse.installerOutput;
+      if (requestOwner.tabClosed) {
+        return safeResponse;
+      }
+      safeResponse.installFailureToken = rememberSkillInstallFailure({
+        response,
+        skillId: message.skillId,
+        skillName: message.skillName,
+        tabId: requestOwner.tabId
+      });
+      return safeResponse;
+    } finally {
+      activeSkillInstallRequests.delete(requestOwner);
+    }
   }
   return withSkillScopeLock(scope, async () => {
     if (message.type === "skill-state-get") {
@@ -340,6 +390,145 @@ async function handleSkillMessage(message, sender = {}) {
     });
   });
 }
+
+function isSkillInstallerExecutionFailure(response) {
+  return response?.ok === false && ["installer-failed", "installer-signaled", "installer-timeout"]
+    .includes(String(response?.errorCode || ""));
+}
+
+function rememberSkillInstallFailure({ response = {}, skillId = "", skillName = "", tabId = null } = {}) {
+  const now = Date.now();
+  for (const [token, entry] of pendingSkillInstallFailures) {
+    if (Number(entry?.expiresAt || 0) <= now) {
+      pendingSkillInstallFailures.delete(token);
+    }
+  }
+  while (pendingSkillInstallFailures.size >= SKILL_INSTALL_FAILURE_LIMIT) {
+    pendingSkillInstallFailures.delete(pendingSkillInstallFailures.keys().next().value);
+  }
+  let token = createSkillChallenge();
+  while (pendingSkillInstallFailures.has(token)) {
+    token = createSkillChallenge();
+  }
+  const output = response?.installerOutput && typeof response.installerOutput === "object"
+    ? response.installerOutput
+    : {};
+  const expiresAt = now + SKILL_INSTALL_FAILURE_TTL_MS;
+  pendingSkillInstallFailures.set(token, {
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    expiresAt,
+    opening: false,
+    shown: false,
+    detail: {
+      skillId: String(skillId || ""),
+      skillName: String(skillName || skillId || "Skill").slice(0, 256),
+      errorCode: String(response?.errorCode || "installer-failed"),
+      error: String(response?.error || "The installer did not complete successfully.").slice(0, 1_000),
+      exitCode: Number.isInteger(response?.exitCode) ? response.exitCode : null,
+      signal: String(response?.signal || "").slice(0, 64),
+      durationMs: Number.isFinite(Number(response?.durationMs)) ? Math.max(0, Number(response.durationMs)) : null,
+      idleTimeoutSeconds: Number.isFinite(Number(response?.idleTimeoutSeconds))
+        ? Math.max(0, Number(response.idleTimeoutSeconds))
+        : null,
+      installerOutput: {
+        stderr: sanitizeSkillInstallerOutput(output.stderr),
+        stdout: sanitizeSkillInstallerOutput(output.stdout),
+        stderrTruncated: output.stderrTruncated === true,
+        stdoutTruncated: output.stdoutTruncated === true
+      }
+    }
+  });
+  const cleanupTimer = setTimeout(() => {
+    const current = pendingSkillInstallFailures.get(token);
+    if (current?.expiresAt === expiresAt) {
+      pendingSkillInstallFailures.delete(token);
+    }
+  }, SKILL_INSTALL_FAILURE_TTL_MS);
+  cleanupTimer?.unref?.();
+  return token;
+}
+
+function sanitizeSkillInstallerOutput(value) {
+  const tail = String(value || "").slice(-SKILL_INSTALL_FAILURE_OUTPUT_CHARS);
+  return tail
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u009d[^\u0007\u009c]*(?:\u0007|\u009c)/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\u009b[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+    .replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/\r\n?/g, "\n");
+}
+
+async function showSkillInstallFailure(message, sender = {}) {
+  const token = String(message?.token || "");
+  const entry = pendingSkillInstallFailures.get(token);
+  const senderTabId = Number(sender?.tab?.id);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    pendingSkillInstallFailures.delete(token);
+    return { ok: false, errorCode: "install-failure-expired", error: "The local installer failure detail is no longer available." };
+  }
+  if (!Number.isInteger(senderTabId) || senderTabId !== entry.tabId) {
+    return { ok: false, errorCode: "install-failure-owner-mismatch", error: "The installer failure belongs to another tab." };
+  }
+  if (entry.shown === true || entry.opening === true) {
+    return { ok: true, alreadyShown: true };
+  }
+  if (typeof chrome.windows?.create !== "function") {
+    return { ok: false, errorCode: "install-failure-window-unavailable", error: "The extension result window is unavailable." };
+  }
+  entry.opening = true;
+  try {
+    await chrome.windows.create({
+      url: chrome.runtime.getURL(`${skillInstallResultPagePath()}#${encodeURIComponent(token)}`),
+      type: "popup",
+      focused: true,
+      width: 720,
+      height: 640
+    });
+    entry.shown = true;
+    return { ok: true, shown: true };
+  } finally {
+    entry.opening = false;
+  }
+}
+
+function consumeSkillInstallFailure(message, sender = {}) {
+  const expectedUrl = chrome.runtime.getURL(skillInstallResultPagePath());
+  const senderPageUrl = String(sender?.url || "").replace(/[?#].*$/, "");
+  if (sender?.id !== chrome.runtime.id || senderPageUrl !== expectedUrl) {
+    return { ok: false, errorCode: "install-failure-consumer-rejected", error: "Only the extension result page may read installer details." };
+  }
+  const token = String(message?.token || "");
+  const entry = pendingSkillInstallFailures.get(token);
+  pendingSkillInstallFailures.delete(token);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    return { ok: false, errorCode: "install-failure-expired", error: "The installer failure detail expired before it could be displayed." };
+  }
+  return { ok: true, detail: entry.detail };
+}
+
+function skillInstallResultPagePath() {
+  const serviceWorker = String(chrome.runtime.getManifest()?.background?.service_worker || "");
+  return serviceWorker.startsWith("extension/")
+    ? "extension/skill-install-result.html"
+    : "skill-install-result.html";
+}
+
+function discardSkillInstallFailure(message, sender = {}) {
+  const token = String(message?.token || "");
+  const entry = pendingSkillInstallFailures.get(token);
+  if (!entry) {
+    return { ok: true, discarded: false };
+  }
+  const senderTabId = Number(sender?.tab?.id);
+  if (!Number.isInteger(senderTabId) || senderTabId !== entry.tabId) {
+    return { ok: false, errorCode: "install-failure-owner-mismatch", error: "The installer failure belongs to another tab." };
+  }
+  pendingSkillInstallFailures.delete(token);
+  return { ok: true, discarded: true };
+}
+
 
 async function getSkillState(scope, sender = {}) {
   await requireShellServerReady();
@@ -1462,11 +1651,12 @@ function runShellViaWebSocket(payload, options = {}) {
 function shouldKeepWebSocketAlive(payload) {
   return payload?.type === "run" ||
     payload?.type === "run-board" ||
+    payload?.type === "skill-install" ||
     VISION_COMMAND_MESSAGE_TYPES.has(payload?.type);
 }
 
 function getWebSocketWatchdogMs(payload) {
-  if (payload && (payload.type === "run" || payload.type === "run-board")) {
+  if (payload && (payload.type === "run" || payload.type === "run-board" || payload.type === "skill-install")) {
     return 0;
   }
   return Math.max(5000, Number(payload?.timeoutMs || 30000) + 5000);

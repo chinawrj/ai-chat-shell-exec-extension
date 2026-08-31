@@ -10,9 +10,12 @@ const sessionStore = {};
 const syncStore = {};
 const websocketPayloads = [];
 const tabRemovedListeners = [];
+const createdWindows = [];
 let challengeSequence = 1;
 let catalog = makeCatalog("a", 1);
 let installResponseGate = null;
+let skillInstallResponseOverride = null;
+let windowCreateGate = null;
 
 async function main() {
   let context = createBackgroundContext();
@@ -265,6 +268,7 @@ async function main() {
   const installPending = context.handleSkillMessage({
     type: "skill-install",
     skillId: "example",
+    skillName: "Example Skill",
     skillSha: catalog.skills[0].sha,
     installSha,
     catalogSha: catalog.catalogSha
@@ -278,11 +282,200 @@ async function main() {
   const install = await installPending;
   assert.equal(stateWhileInstalling?.ok, true, "A long installer must not hold the origin-scoped sync/status lock.");
   assert.equal(install.ok, true);
+  assert.equal(install.installFailureToken, undefined, "A successful install must not create a result-window token.");
   const installPayload = websocketPayloads.findLast((payload) => payload.type === "skill-install");
   assert.equal(installPayload.skillId, "example");
   assert.equal(installPayload.skillSha, catalog.skills[0].sha);
   assert.equal(installPayload.installSha, installSha);
   assert.equal(installPayload.catalogSha, catalog.catalogSha);
+  assert.equal(installPayload.skillName, undefined, "A display label must not change the authenticated server install protocol.");
+  assert.equal(context.getWebSocketWatchdogMs({ type: "skill-install" }), 0,
+    "Skill installation must not regain an absolute browser watchdog.");
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "skill-install" }), true,
+    "Long Skill installation must use the Chrome 116+ WebSocket heartbeat path.");
+
+  skillInstallResponseOverride = {
+    ...catalog,
+    ok: false,
+    type: "skill-install",
+    errorCode: "installer-failed",
+    error: "Installer exited with code 23.",
+    exitCode: 23,
+    durationMs: 4321,
+    installerOutput: {
+      stderr: "\u001b[31m\u009b32m<script>failure</script>\u001b[0m\u0000\u009dhidden-title\u009c\u061c\u200e\u200f\u202e",
+      stdout: "setup tail",
+      stderrTruncated: true,
+      stdoutTruncated: false
+    }
+  };
+  const failedInstall = await context.handleSkillMessage({
+    type: "skill-install",
+    skillId: "example",
+    skillName: "Example Skill",
+    skillSha: catalog.skills[0].sha,
+    installSha,
+    catalogSha: catalog.catalogSha
+  }, chatgptTab1);
+  skillInstallResponseOverride = null;
+  assert.equal(failedInstall.ok, false);
+  assert.match(failedInstall.installFailureToken, /^[a-f0-9]{32}$/);
+  assert.equal(failedInstall.installerOutput, undefined,
+    "Raw installer output must stop in background memory and never enter the chat content-script response.");
+  assert.equal(localStore[failedInstall.installFailureToken], undefined);
+  assert.equal(sessionStore[failedInstall.installFailureToken], undefined,
+    "Failure details must remain ephemeral background memory, not extension storage.");
+
+  const ownerMismatch = await context.handleSkillMessage({
+    type: "skill-install-failure-show",
+    token: failedInstall.installFailureToken
+  }, chatgptTab2);
+  assert.equal(ownerMismatch.errorCode, "install-failure-owner-mismatch");
+  windowCreateGate = deferred();
+  const showing = context.handleSkillMessage({
+    type: "skill-install-failure-show",
+    token: failedInstall.installFailureToken
+  }, chatgptTab1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(createdWindows.length, 1);
+  assert.equal(createdWindows[0].type, "popup");
+  assert.match(createdWindows[0].url, new RegExp(`${failedInstall.installFailureToken}$`));
+  const shownAgain = await context.handleSkillMessage({
+    type: "skill-install-failure-show",
+    token: failedInstall.installFailureToken
+  }, chatgptTab1);
+  assert.equal(shownAgain.alreadyShown, true);
+  windowCreateGate.resolve();
+  windowCreateGate = null;
+  const shown = await showing;
+  assert.equal(shown.ok, true);
+  assert.equal(createdWindows.length, 1, "One failure token must open at most one result window.");
+
+  const rejectedConsumer = await context.handleSkillMessage({
+    type: "skill-install-failure-consume",
+    token: failedInstall.installFailureToken
+  }, { id: context.chrome.runtime.id, url: "https://chatgpt.com/skill-install-result.html" });
+  assert.equal(rejectedConsumer.errorCode, "install-failure-consumer-rejected");
+  const rejectedPrefixConsumer = await context.handleSkillMessage({
+    type: "skill-install-failure-consume",
+    token: failedInstall.installFailureToken
+  }, {
+    id: context.chrome.runtime.id,
+    url: `${context.chrome.runtime.getURL("skill-install-result.html")}-spoof#${failedInstall.installFailureToken}`
+  });
+  assert.equal(rejectedPrefixConsumer.errorCode, "install-failure-consumer-rejected",
+    "A URL that merely starts with the extension result-page URL must not consume installer details.");
+  const consumed = await context.handleSkillMessage({
+    type: "skill-install-failure-consume",
+    token: failedInstall.installFailureToken
+  }, {
+    id: context.chrome.runtime.id,
+    url: context.chrome.runtime.getURL(`skill-install-result.html#${failedInstall.installFailureToken}`)
+  });
+  assert.equal(consumed.ok, true);
+  assert.equal(consumed.detail.exitCode, 23);
+  assert.equal(consumed.detail.installerOutput.stderr, "<script>failure</script>",
+    "The isolated result UI receives plain sanitized text without ANSI, NUL, or bidi controls.");
+  assert.equal(consumed.detail.installerOutput.stderrTruncated, true);
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 0,
+    "Reading a result must consume its ephemeral detail exactly once.");
+
+  const expiryToken = context.rememberSkillInstallFailure({
+    response: skillInstallResponseOverride || {
+      ok: false,
+      errorCode: "installer-failed",
+      error: "expired detail",
+      installerOutput: { stderr: "expired secret" }
+    },
+    skillId: "expired",
+    tabId: 11
+  });
+  vm.runInContext(`pendingSkillInstallFailures.get(${JSON.stringify(expiryToken)}).expiresAt = 0`, context);
+  const expiredShow = await context.handleSkillMessage({ type: "skill-install-failure-show", token: expiryToken }, chatgptTab1);
+  assert.equal(expiredShow.errorCode, "install-failure-expired");
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 0);
+
+  const boundedTokens = [];
+  for (let index = 0; index < 9; index += 1) {
+    boundedTokens.push(context.rememberSkillInstallFailure({
+      response: {
+        ok: false,
+        errorCode: "installer-failed",
+        error: `bounded detail ${index}`,
+        installerOutput: {
+          stderr: index === 8 ? `discarded-head-${"x".repeat(20_000)}tail-sentinel` : `bounded ${index}`
+        }
+      },
+      skillId: `bounded-${index}`,
+      tabId: 11
+    }));
+  }
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 8,
+    "The ninth pending failure must evict the oldest record instead of growing background memory.");
+  assert.equal(vm.runInContext(`pendingSkillInstallFailures.has(${JSON.stringify(boundedTokens[0])})`, context), false);
+  assert.equal(vm.runInContext(`pendingSkillInstallFailures.has(${JSON.stringify(boundedTokens[8])})`, context), true);
+  const boundedConsumed = await context.handleSkillMessage({
+    type: "skill-install-failure-consume",
+    token: boundedTokens[8]
+  }, {
+    id: context.chrome.runtime.id,
+    url: context.chrome.runtime.getURL(`skill-install-result.html#${boundedTokens[8]}`)
+  });
+  assert.equal(boundedConsumed.detail.installerOutput.stderr.length, 20_000);
+  assert.doesNotMatch(boundedConsumed.detail.installerOutput.stderr, /discarded-head/,
+    "The background must independently keep only the bounded diagnostic tail.");
+  assert.match(boundedConsumed.detail.installerOutput.stderr, /tail-sentinel$/);
+  for (const token of boundedTokens.slice(1, 8)) {
+    await context.handleSkillMessage({ type: "skill-install-failure-discard", token }, chatgptTab1);
+  }
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 0);
+
+  const closeToken = context.rememberSkillInstallFailure({
+    response: {
+      ok: false,
+      errorCode: "installer-failed",
+      error: "close cleanup",
+      installerOutput: { stderr: "close secret" }
+    },
+    skillId: "close-cleanup",
+    tabId: 98
+  });
+  assert.match(closeToken, /^[a-f0-9]{32}$/);
+  context.__tabRemovedListener(98);
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 0,
+    "Closing the owner tab must immediately erase any unconsumed diagnostic.");
+
+  skillInstallResponseOverride = {
+    ...catalog,
+    ok: false,
+    type: "skill-install",
+    errorCode: "installer-failed",
+    error: "late failure",
+    exitCode: 19,
+    installerOutput: { stderr: "late close secret", stdout: "" }
+  };
+  installResponseGate = deferred();
+  const closedDuringInstall = context.handleSkillMessage({
+    type: "skill-install",
+    skillId: "example",
+    skillName: "Example Skill",
+    skillSha: catalog.skills[0].sha,
+    installSha,
+    catalogSha: catalog.catalogSha
+  }, sender(99, "https://chatgpt.com/closed-during-install"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  context.__tabRemovedListener(99);
+  installResponseGate.resolve();
+  installResponseGate = null;
+  const lateFailure = await closedDuringInstall;
+  skillInstallResponseOverride = null;
+  assert.equal(lateFailure.ok, false);
+  assert.equal(lateFailure.installerOutput, undefined);
+  assert.equal(lateFailure.installFailureToken, undefined,
+    "A tab closed during an arbitrarily long install must not create an orphan diagnostic after the response arrives.");
+  assert.equal(vm.runInContext("pendingSkillInstallFailures.size", context), 0);
+  assert.doesNotMatch(JSON.stringify({ localStore, sessionStore }), /late close secret|close secret|expired secret|setup tail|<script>failure/i,
+    "Installer diagnostics must not enter any persistent or session extension store value.");
   const load = await context.handleSkillMessage({
     type: "skill-load",
     skillId: "example",
@@ -431,13 +624,28 @@ function createBackgroundContext({ healthGate } = {}) {
       runtime: {
         id: "lkmeogidbglhedgekjgbpbfjkpapnhke",
         getManifest: () => ({ version: "0.11.2" }),
+        getURL: (resource) => `chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke/${resource}`,
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener() {} }
       },
       tabs: {
-        onRemoved: { addListener(callback) { tabRemovedListeners.push(callback); } },
+        onRemoved: {
+          addListener(callback) {
+            tabRemovedListeners.push(callback);
+            context.__tabRemovedListener = callback;
+          }
+        },
         sendMessage: async () => ({ ok: true })
+      },
+      windows: {
+        create: async (options) => {
+          createdWindows.push({ ...options });
+          if (windowCreateGate) {
+            await windowCreateGate.promise;
+          }
+          return { id: createdWindows.length };
+        }
       },
       storage: {
         sync: storageArea(syncStore, true),
@@ -473,7 +681,7 @@ function createBackgroundContext({ healthGate } = {}) {
           protocolVersion: 11,
           serverProtocolVersion: 11,
           helperProtocolVersion: 4,
-          skillProtocolVersion: 3
+          skillProtocolVersion: 4
         })
       };
     },
@@ -548,6 +756,9 @@ function skillServerResponse(payload) {
     };
   }
   if (payload.type === "skill-install") {
+    if (skillInstallResponseOverride) {
+      return { ...skillInstallResponseOverride };
+    }
     return {
       ...catalog,
       ok: true,

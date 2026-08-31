@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.6";
+const CONTENT_SCRIPT_VERSION = "0.11.7";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -7597,16 +7597,19 @@ async function installSkillFromPanel(skill, catalogSha, dialogContext = null) {
   }
   let installed = false;
   let installError = "";
+  let installFailureToken = "";
   try {
     const response = await chrome.runtime.sendMessage({
       type: "skill-install",
       skillId,
+      skillName: String(skill?.name || skillId || "Skill"),
       skillSha: String(skill?.sha || ""),
       installSha: String(skill?.installSha || ""),
       catalogSha: String(catalogSha || "")
     });
     if (response?.ok !== true) {
       installError = summarizeCommand(response?.error || "Skill installation failed.");
+      installFailureToken = String(response?.installFailureToken || "");
       skillInstallErrors.set(skillId, installError);
       updateSkillInstallRowLocally(currentButton, skill, { error: installError });
       setStatus(`Skill ${skillId} install failed: ${installError}`, "error");
@@ -7637,6 +7640,23 @@ async function installSkillFromPanel(skill, catalogSha, dialogContext = null) {
             : { error: installError || "Skill installation failed and the catalog could not be refreshed." });
         }
       }
+    }
+    const samePageLifecycle = extensionActive && (
+      !dialogContext || dialogContext.pageGeneration === pageLifecycleGeneration
+    );
+    if (installFailureToken && samePageLifecycle) {
+      const popup = await chrome.runtime.sendMessage({
+        type: "skill-install-failure-show",
+        token: installFailureToken
+      }).catch(() => null);
+      if (popup?.ok !== true) {
+        setStatus(`Skill ${skillId} install failed; local error details could not be opened`, "error");
+      }
+    } else if (installFailureToken) {
+      await chrome.runtime.sendMessage({
+        type: "skill-install-failure-discard",
+        token: installFailureToken
+      }).catch(() => null);
     }
   }
 }

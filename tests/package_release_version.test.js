@@ -63,6 +63,9 @@ const listResult = spawnSync("unzip", ["-Z1", extensionZip], { encoding: "utf8" 
 assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
 const archiveEntries = new Set(listResult.stdout.trim().split(/\r?\n/));
 for (const entry of [
+  "skill-install-result.html",
+  "skill-install-result.css",
+  "src/skill-install-result.js",
   "drawio/viewer.html",
   "drawio/viewer.js",
   "vendor/drawio/viewer-static.min.js",

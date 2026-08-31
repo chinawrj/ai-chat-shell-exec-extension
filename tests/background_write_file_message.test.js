@@ -151,7 +151,7 @@ const context = {
       protocolVersion: 11,
       serverProtocolVersion: 11,
       helperProtocolVersion: 4,
-      skillProtocolVersion: 3
+      skillProtocolVersion: 4
     })
   }),
   setTimeout,

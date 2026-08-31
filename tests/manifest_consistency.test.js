@@ -9,6 +9,7 @@ const rootManifest = readJson(path.join(rootDir, "manifest.json"));
 const extensionManifest = readJson(path.join(rootDir, "extension", "manifest.json"));
 const contentSource = fs.readFileSync(path.join(rootDir, "extension", "src", "content.js"), "utf8");
 const backgroundSource = fs.readFileSync(path.join(rootDir, "extension", "src", "background.js"), "utf8");
+const skillInstallResultHtml = fs.readFileSync(path.join(rootDir, "extension", "skill-install-result.html"), "utf8");
 const changelog = fs.readFileSync(path.join(rootDir, "CHANGELOG.md"), "utf8");
 
 assert.equal(rootManifest.manifest_version, extensionManifest.manifest_version);
@@ -71,7 +72,7 @@ assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /message\.type === "tmux-reset-forai"/);
 assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 11/);
 assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 4/);
-assert.match(backgroundSource, /const REQUIRED_SKILL_PROTOCOL_VERSION = 3/);
+assert.match(backgroundSource, /const REQUIRED_SKILL_PROTOCOL_VERSION = 4/);
 assert.match(backgroundSource, /startsWith\("vision-"\)/);
 assert.match(backgroundSource, /function handleVisionMessage\(/);
 assert.match(backgroundSource, /BACKGROUND_VISION_MESSAGE_TYPES/);
@@ -82,6 +83,11 @@ assert.doesNotMatch(backgroundSource, /"vision-tmux-run"/);
 assert.match(backgroundSource, /function buildProtocolMismatchMessage\(/);
 assert.match(backgroundSource, /function requireShellServerReady\(\)/);
 assert.match(backgroundSource, /function getExtensionVersionInfo\(\)/);
+assert.match(backgroundSource, /function skillInstallResultPagePath\(\)/);
+assert.match(backgroundSource, /serviceWorker\.startsWith\("extension\/"\)/,
+  "The result page must resolve under both the repo-root and packaged-extension manifests.");
+assert.match(skillInstallResultHtml, /src\/skill-install-result\.js/);
+assert.equal(fs.existsSync(path.join(rootDir, "extension", "skill-install-result.css")), true);
 assert.match(backgroundSource, /body\?\.error/);
 assert.match(changelog, new RegExp(`## \\[${escapeRegExp(version)}\\]`));
 assert.equal(fs.existsSync(path.join(rootDir, "docs", "release-notes", `v${version}.md`)), true);

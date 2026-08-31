@@ -7,8 +7,10 @@ const path = require("node:path");
 
 const {
   MAX_SKILL_INSTALL_SCRIPT_BYTES,
+  SKILL_INSTALL_IDLE_TIMEOUT_MS,
   SKILL_INSTALL_STATE_FILE,
-  SkillCatalogService
+  SkillCatalogService,
+  runSkillInstallScript
 } = require("../server/skill_catalog");
 
 const temporaryPaths = [];
@@ -24,6 +26,8 @@ main()
 async function main() {
   await testDefaultInstallSuccessAndInstalledOnlyCatalog();
   await testFailureMissingScriptStaleAndTimeoutStayUninstalled();
+  await testSignalAndMissingExitCodeStayUninstalled();
+  await testOutputIdleRunnerSemantics();
   await testConcurrentInstallRunsScriptOnce();
   await testChangesDuringInstallFailClosed();
   await testInstallerSnapshotAndChangeRaceFailClosed();
@@ -79,6 +83,7 @@ async function testDefaultInstallSuccessAndInstalledOnlyCatalog() {
   });
   assert.equal(installed.ok, true, JSON.stringify(installed));
   assert.equal(installed.exitCode, 0);
+  assert.equal(installed.installerOutput, undefined, "Successful installer output must not enter any response.");
   assert.equal(installed.skill.installed, true);
   assert.equal(runs, 1);
   assert.equal(installed.catalogSha, initialSha, "Install status does not invent a second effective SHA.");
@@ -149,7 +154,10 @@ async function testFailureMissingScriptStaleAndTimeoutStayUninstalled() {
   assert.equal(failed.ok, false);
   assert.equal(failed.errorCode, "installer-failed");
   assert.equal(failed.exitCode, 9);
-  assert.ok(!JSON.stringify(failed).includes("/private/path"), "Installer output and local paths must not enter public responses.");
+  assert.equal(failed.installerOutput.stderr, "/private/path must stay local");
+  assert.equal(failed.installerOutput.stdout, "fake success");
+  assert.equal(failed.installerOutput.stderrTruncated, false);
+  assert.equal(failed.installerOutput.stdoutTruncated, false);
   assert.ok(!logged.join("\n").includes("/private/path"), "Installer stderr must not enter shell-server logs.");
   assert.equal(service.list().skillCount, 0);
 
@@ -203,7 +211,123 @@ async function testFailureMissingScriptStaleAndTimeoutStayUninstalled() {
     catalogSha: timeoutManagement.catalogSha
   });
   assert.equal(timedOut.errorCode, "installer-timeout");
+  assert.equal(timedOut.idleTimeoutSeconds, 600);
+  assert.match(timedOut.error, /no stdout or stderr for 600 seconds/i);
   assert.equal(timeoutService.list().skillCount, 0);
+}
+
+async function testSignalAndMissingExitCodeStayUninstalled() {
+  for (const result of [
+    { code: null, signal: "SIGTERM", timedOut: false, stdout: "before signal", stderr: "terminated" },
+    { code: 0, signal: "SIGKILL", timedOut: false, stdout: "", stderr: "killed" },
+    { code: null, signal: "", timedOut: false, stdout: "", stderr: "missing exit" }
+  ]) {
+    const fixture = makeFixture("skill-install-signal-");
+    const skillPath = writeSkill(fixture.root, "signal-test", "Signal test", "body");
+    writeInstaller(path.dirname(skillPath), "exit 0");
+    const service = makeService(fixture, async () => result);
+    const management = service.manage();
+    const record = management.skills[0];
+    const installed = await service.install({
+      skillId: record.id,
+      skillSha: record.sha,
+      installSha: record.installSha,
+      catalogSha: management.catalogSha
+    });
+    assert.equal(installed.ok, false, `Result ${JSON.stringify(result)} must fail closed.`);
+    assert.equal(installed.errorCode, result.signal ? "installer-signaled" : "installer-failed");
+    assert.equal(service.manage().skills[0].installed, false);
+    assert.equal(service.list().skillCount, 0, "A signaled or indeterminate installer must never enter the AI catalog.");
+  }
+}
+
+async function testOutputIdleRunnerSemantics() {
+  assert.equal(SKILL_INSTALL_IDLE_TIMEOUT_MS, 600_000);
+  const fixture = makeFixture("skill-install-idle-runner-");
+  const skillDir = path.join(fixture.root, "runner");
+  fs.mkdirSync(skillDir, { recursive: true });
+  const scriptPath = path.join(skillDir, "runner.sh");
+
+  fs.writeFileSync(scriptPath, [
+    "printf 'stdout-1'",
+    "sleep 0.1",
+    "printf 'stderr-1' >&2",
+    "sleep 0.1",
+    "printf 'stdout-2'",
+    "sleep 0.1",
+    "exit 0"
+  ].join("\n"));
+  let result = await runSkillInstallScript({
+    scriptPath,
+    skillDir,
+    env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    idleTimeoutMs: 250,
+    maxOutputChars: 100
+  });
+  assert.equal(result.code, 0, JSON.stringify(result));
+  assert.equal(result.idleTimedOut, false, "Alternating stdout/stderr activity must reset one shared idle clock.");
+  assert.equal(result.stdout, "stdout-1stdout-2");
+  assert.equal(result.stderr, "stderr-1");
+
+  fs.writeFileSync(scriptPath, [
+    "printf '0123456789ABCDEFGHIJ'",
+    "sleep 0.1",
+    "printf 'tail-one'",
+    "sleep 0.1",
+    "printf 'tail-two'",
+    "sleep 0.1",
+    "exit 0"
+  ].join("\n"));
+  result = await runSkillInstallScript({
+    scriptPath,
+    skillDir,
+    env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    idleTimeoutMs: 250,
+    maxOutputChars: 12
+  });
+  assert.equal(result.code, 0, JSON.stringify(result));
+  assert.equal(result.idleTimedOut, false, "Output must reset the idle clock after the capture buffer is already full.");
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stdout, "-onetail-two", "Bounded diagnostics should preserve the most useful output tail.");
+
+  fs.writeFileSync(scriptPath, "printf 'before-idle'; sleep 0.4; printf 'too-late'");
+  const timeoutStartedAt = Date.now();
+  result = await runSkillInstallScript({
+    scriptPath,
+    skillDir,
+    env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    idleTimeoutMs: 80,
+    maxOutputChars: 100
+  });
+  assert.equal(result.idleTimedOut, true);
+  assert.ok(Date.now() - timeoutStartedAt < 1_500, "An idle-killed installer must settle within a bounded grace period.");
+  assert.match(result.stdout, /before-idle/);
+
+  fs.writeFileSync(scriptPath, "printf 'before-signal'; kill -TERM $$");
+  result = await runSkillInstallScript({
+    scriptPath,
+    skillDir,
+    env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    idleTimeoutMs: 500,
+    maxOutputChars: 100
+  });
+  assert.equal(result.code, null);
+  assert.equal(result.signal, "SIGTERM", "The real runner must preserve signal termination instead of coercing it to exit 0.");
+  assert.equal(result.idleTimedOut, false);
+
+  fs.writeFileSync(scriptPath, "(while :; do printf 'descendant-output'; sleep 0.03; done) &\nexit 0\n");
+  const descendantStartedAt = Date.now();
+  result = await runSkillInstallScript({
+    scriptPath,
+    skillDir,
+    env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    idleTimeoutMs: 80,
+    maxOutputChars: 100
+  });
+  assert.equal(result.code, 0, JSON.stringify(result));
+  assert.equal(result.idleTimedOut, false);
+  assert.ok(Date.now() - descendantStartedAt < 1_500,
+    "A descendant holding inherited stdio must not permanently block the serialized install queue after the installer shell exits.");
 }
 
 async function testConcurrentInstallRunsScriptOnce() {
