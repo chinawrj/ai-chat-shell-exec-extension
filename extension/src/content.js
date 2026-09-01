@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.9";
+const CONTENT_SCRIPT_VERSION = "0.11.10";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -2784,7 +2784,8 @@ function getExplicitMessageRoots(conversationRoot) {
     "[data-message-author-role]",
     "[data-author-role]",
     '.fai-UserMessage[role="article"]',
-    '.fai-AssistantMessage[role="article"]'
+    '.fai-AssistantMessage[role="article"]',
+    '.fai-CopilotMessage[role="article"]'
   ].join(",");
   return Array.from(conversationRoot.querySelectorAll?.(selector) || [])
     .filter((root, index, all) =>
@@ -2805,7 +2806,8 @@ function getExplicitMessageContainer(node) {
     "[data-message-author-role]",
     "[data-author-role]",
     '.fai-UserMessage[role="article"]',
-    '.fai-AssistantMessage[role="article"]'
+    '.fai-AssistantMessage[role="article"]',
+    '.fai-CopilotMessage[role="article"]'
   ].join(",")) || null;
 }
 
@@ -2858,7 +2860,8 @@ function collectCurrentAssistantResponseRoots(records = []) {
       "[data-message-author-role]",
       "[data-author-role]",
       '.fai-UserMessage[role="article"]',
-      '.fai-AssistantMessage[role="article"]'
+      '.fai-AssistantMessage[role="article"]',
+      '.fai-CopilotMessage[role="article"]'
     ].join(",")) || [])) {
       destination.add(descendant);
     }
@@ -3660,6 +3663,8 @@ function getTextScanRoots(root) {
     '[data-message-author-role="assistant"]',
     "article",
     '[role="article"]',
+    ".fai-AssistantMessage__content",
+    ".fai-CopilotMessage__content",
     ".markdown",
     "pre",
     "code",
@@ -3732,8 +3737,8 @@ function getMessageAuthorRole(node) {
         node?.closest?.('.fai-UserMessage[role="article"]')) {
       return "user";
     }
-    if (node?.matches?.('.fai-AssistantMessage[role="article"]') === true ||
-        node?.closest?.('.fai-AssistantMessage[role="article"]')) {
+    if (node?.matches?.('.fai-AssistantMessage[role="article"], .fai-CopilotMessage[role="article"]') === true ||
+        node?.closest?.('.fai-AssistantMessage[role="article"], .fai-CopilotMessage[role="article"]')) {
       return "assistant";
     }
   }
@@ -3772,7 +3777,14 @@ function selectCanonicalSkillTextFallback(root, renderedText, renderedBlocks) {
   const rendered = String(renderedText || "");
   const raw = String(root?.textContent || "");
   const unchanged = { text: rendered, blocks: renderedBlocks };
-  if (!raw || raw === rendered || stripOnlyLineBreaks(rendered) !== stripOnlyLineBreaks(raw)) {
+  if (!raw || raw === rendered) {
+    return unchanged;
+  }
+
+  const lineBreakOnlyEquivalent = stripOnlyLineBreaks(rendered) === stripOnlyLineBreaks(raw);
+  const m365CollapsedEquivalent = isM365AssistantLayoutRoot(root) &&
+    rendered === normalizeM365CollapsedAssistantText(raw);
+  if (!lineBreakOnlyEquivalent && !m365CollapsedEquivalent) {
     return unchanged;
   }
 
@@ -3782,11 +3794,25 @@ function selectCanonicalSkillTextFallback(root, renderedText, renderedBlocks) {
   // protocol strict: use textContent only when the two DOM representations
   // differ by line breaks alone, each is exactly one complete Skill envelope,
   // rendered parsing fails, and canonical parsing fully validates.
-  const renderedCall = parsePlainTextHelperPayload(rendered);
   const rawCall = parsePlainTextHelperPayload(raw);
-  if (!isSkillHelperCall(renderedCall) || !isSkillHelperCall(rawCall) ||
-      renderedBlocks.length !== 1 || parsePlainTextHelperBlocks(raw).length !== 1 ||
-      validateSkillHelperCall(renderedCall).ok || !validateSkillHelperCall(rawCall).ok) {
+  if (!isSkillHelperCall(rawCall) || parsePlainTextHelperBlocks(raw).length !== 1 ||
+      !validateSkillHelperCall(rawCall).ok) {
+    return unchanged;
+  }
+
+  if (m365CollapsedEquivalent) {
+    // Current M365 Copilot visually lays every canonical line out as one
+    // ordinary-space-separated line while preserving exact line boundaries in
+    // textContent. Accept that one host-specific representation only when the
+    // entire raw node is one valid Skill envelope inside an explicitly authored
+    // assistant article. Prefixes, suffixes, extra envelopes, hidden fields,
+    // or any other whitespace change remain invalid.
+    return { text: raw, blocks: [rawCall] };
+  }
+
+  const renderedCall = parsePlainTextHelperPayload(rendered);
+  if (!isSkillHelperCall(renderedCall) || renderedBlocks.length !== 1 ||
+      validateSkillHelperCall(renderedCall).ok) {
     return unchanged;
   }
   const renderedHasExplicitIdentity = renderedCall.helperIdSource === "marker";
@@ -3796,6 +3822,19 @@ function selectCanonicalSkillTextFallback(root, renderedText, renderedBlocks) {
     return unchanged;
   }
   return { text: raw, blocks: [rawCall] };
+}
+
+function isM365AssistantLayoutRoot(root) {
+  if (location.hostname !== "m365.cloud.microsoft") {
+    return false;
+  }
+  const selector = '.fai-AssistantMessage[role="article"], .fai-CopilotMessage[role="article"]';
+  const messageRoot = root?.matches?.(selector) === true ? root : root?.closest?.(selector);
+  return messageRoot instanceof Element && getMessageAuthorRole(messageRoot) === "assistant";
+}
+
+function normalizeM365CollapsedAssistantText(value) {
+  return String(value || "").replace(/\r\n?|\n/g, " ");
 }
 
 function stripOnlyLineBreaks(value) {
@@ -7750,10 +7789,30 @@ function isM365FlattenableStructuredDelivery(expectedText) {
   if (extractExpectedRenderedCodeBlock(expected)) {
     return true;
   }
+  if (isExactSkillSyncPrompt(expected)) {
+    return true;
+  }
   return /^Message from [^\n]+:\n/.test(expected) && (
     /\nMessage id: [^\n]+(?:\n|$)/.test(expected) ||
     /\n> reply-to: [^\n]+(?:\n|$)/.test(expected)
   );
+}
+
+function isExactSkillSyncPrompt(expectedText) {
+  const lines = normalizeCommand(expectedText).split("\n");
+  return lines.length === 12 &&
+    lines[0] === "The local SKILLS catalog has changed." &&
+    /^Local catalog version: [1-9][0-9]*$/.test(lines[1]) &&
+    /^Local catalog SHA: [a-f0-9]{64}$/.test(lines[2]) &&
+    lines[3] === `The catalog must be stored in the single memory entry named ${SKILL_MEMORY_ENTRY}.` &&
+    lines[4] === "" &&
+    lines[5] === "Request the complete latest catalog of installed and loadable Skills now by replying with exactly one plain helper block and no prose." &&
+    lines[6] === "Use the words ai helper skill start and ai helper skill end as its opening and closing delimiters, replacing spaces with hyphens in the actual delimiters." &&
+    lines[7] === "Put these two fields between the delimiters:" &&
+    lines[8] === "cmd: list" &&
+    /^challenge: [a-f0-9]{32}$/.test(lines[9]) &&
+    lines[10] === "" &&
+    lines[11] === "The next local response will contain the complete catalog, exact memory replacement instructions, and the required success or failure acknowledgement fields.";
 }
 
 function extractExpectedRenderedCodeBlock(expectedText) {

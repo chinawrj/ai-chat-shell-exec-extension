@@ -23,6 +23,7 @@ testEmptyCatalogPanelStates();
 testSkillStatusActionRouting();
 testComposerRecoveryPreference();
 awaitTestCanonicalSkillDomFallback()
+  .then(() => awaitTestM365SkillSyncSubmissionLifecycle())
   .then(() => awaitTestExplicitComposerBindingPersistence())
   .then(() => awaitTestDurableForceSyncCleanup())
   .then(() => awaitTestExplicitUserAndProvenanceRejection())
@@ -217,6 +218,80 @@ async function awaitTestCanonicalSkillDomFallback() {
   assert.equal(candidate.call.catalogVersion, "2");
   assert.equal(context.validateHelperCall(candidate.call).ok, true);
 
+  const originalHostname = context.location.hostname;
+  const m365List = [
+    "ai-helper-skill-start:m365-copilot-list",
+    "cmd: list",
+    `challenge: ${challenge}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const copilotArticle = new context.Element();
+  copilotArticle.matches = (selector) => String(selector).includes('.fai-CopilotMessage[role="article"]');
+  copilotArticle.closest = () => null;
+  const copilotContent = new context.Element();
+  copilotContent.innerText = m365List.replace(/\n/g, " ");
+  copilotContent.textContent = m365List;
+  copilotContent.matches = () => false;
+  copilotContent.closest = (selector) => String(selector).includes('.fai-CopilotMessage[role="article"]')
+    ? copilotArticle
+    : null;
+  context.location.hostname = "m365.cloud.microsoft";
+  const [copilotCandidate] = context.extractPlainTextShellCallBlocks(copilotContent);
+  assert.ok(copilotCandidate,
+    "M365's current Copilot article must recover one exact canonical Skill envelope from its collapsed visual text.");
+  assert.equal(copilotCandidate.call.kind, "skill");
+  assert.equal(copilotCandidate.call.challenge, challenge);
+  assert.equal(context.getMessageAuthorRole(copilotArticle), "assistant",
+    "The current M365 fai-CopilotMessage article is an explicit assistant root.");
+
+  const legacyAssistant = new context.Element();
+  legacyAssistant.matches = (selector) => String(selector).includes('.fai-AssistantMessage[role="article"]');
+  legacyAssistant.closest = () => null;
+  assert.equal(context.getMessageAuthorRole(legacyAssistant), "assistant",
+    "The legacy M365 fai-AssistantMessage article must remain supported.");
+
+  const collapsedNegativeCases = [
+    {
+      label: "hidden field",
+      raw: m365List.replace("cmd: list", "cmd: list\nreason: hidden"),
+      rendered: m365List.replace(/\n/g, " ")
+    },
+    {
+      label: "prose prefix",
+      raw: `Copilot said:\n${m365List}`
+    },
+    {
+      label: "second envelope",
+      raw: `${m365List}\n${m365List.replace("m365-copilot-list", "m365-copilot-list-2")}`
+    }
+  ];
+  for (const testCase of collapsedNegativeCases) {
+    const unsafe = new context.Element();
+    unsafe.textContent = testCase.raw;
+    unsafe.innerText = testCase.rendered || testCase.raw.replace(/\n/g, " ");
+    unsafe.matches = () => false;
+    unsafe.closest = copilotContent.closest;
+    assert.equal(context.extractPlainTextShellCallBlocks(unsafe).length, 0,
+      `M365 canonical fallback must reject a ${testCase.label}.`);
+  }
+
+  const changedWhitespace = new context.Element();
+  changedWhitespace.textContent = m365List;
+  changedWhitespace.innerText = m365List.replace(/\n/g, "  ");
+  changedWhitespace.matches = () => false;
+  changedWhitespace.closest = copilotContent.closest;
+  assert.equal(context.extractPlainTextShellCallBlocks(changedWhitespace).length, 0,
+    "M365 canonical fallback must reject noncanonical whitespace changes.");
+
+  const untrustedCopilotContent = new context.Element();
+  untrustedCopilotContent.textContent = m365List;
+  untrustedCopilotContent.innerText = m365List.replace(/\n/g, " ");
+  untrustedCopilotContent.matches = () => false;
+  untrustedCopilotContent.closest = () => null;
+  assert.equal(context.extractPlainTextShellCallBlocks(untrustedCopilotContent).length, 0,
+    "A collapsed Skill-shaped string outside an exact authored M365 assistant article must remain inert.");
+  context.location.hostname = originalHostname;
+
   const originalSendMessage = context.chrome.runtime.sendMessage;
   const originalRefreshSkillState = context.refreshSkillState;
   const originalQueueSkillComposerReply = context.queueSkillComposerReply;
@@ -291,6 +366,66 @@ async function awaitTestCanonicalSkillDomFallback() {
   }
 }
 
+async function awaitTestM365SkillSyncSubmissionLifecycle() {
+  const local = createContentContext();
+  local.location.hostname = "m365.cloud.microsoft";
+  local.location.origin = "https://m365.cloud.microsoft";
+  local.location.pathname = "/chat/conversation/submission-proof";
+  const prompt = local.buildSkillSyncPrompt({ version: 7, catalogSha, challenge });
+  const submitted = [];
+  const makeM365UserMessage = (text, id = "") => {
+    const node = new local.Element();
+    node.innerText = `You said:\n${text}`;
+    node.textContent = node.innerText;
+    node.matches = (selector) => selector === '.fai-UserMessage[role="article"]';
+    node.closest = (selector) => selector === '.fai-UserMessage[role="article"]' ? node : null;
+    node.getAttribute = (name) => name === "id" ? id : name === "role" ? "article" : "";
+    return node;
+  };
+  const historical = makeM365UserMessage(prompt.replace(/\n/g, ""), "historical-sync-prompt");
+  submitted.push(historical);
+  local.document.querySelectorAll = (selector) => String(selector).includes("fai-UserMessage")
+    ? submitted
+    : [];
+  let completionStatuses = 0;
+  local.setHelperCompletionStatus = () => { completionStatuses += 1; };
+  const entry = await local.rememberPendingHelperDelivery(
+    `skill-sync-prompt:${challenge}`,
+    { kind: "skill-sync-prompt", challenge },
+    { ok: true },
+    prompt,
+    { autoSend: true }
+  );
+  entry.phase = "submitted-unconfirmed";
+
+  assert.equal(local.hasPendingHelperSubmissionProof(entry), false,
+    "A historical exact M365 message present at queue creation must not prove a new submission.");
+  local.observePendingHelperSubmissionProof();
+  await Promise.resolve();
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1);
+
+  submitted.push(makeM365UserMessage(`${prompt.replace(/\n/g, "")}extra`, "suffix"));
+  submitted.push(makeM365UserMessage(
+    local.buildSkillSyncPrompt({ version: 7, catalogSha, challenge: "2".repeat(32) }).replace(/\n/g, ""),
+    "different-challenge"
+  ));
+  assert.equal(local.hasPendingHelperSubmissionProof(entry), false,
+    "A suffix or different challenge must not finalize the pending Skill sync prompt.");
+
+  submitted.push(makeM365UserMessage(prompt.replace(/\n/g, ""), "fresh-sync-prompt"));
+  assert.equal(local.hasPendingHelperSubmissionProof(entry), true,
+    "One fresh exact M365 user-message root must prove the plugin-owned flattened submission.");
+  local.observePendingHelperSubmissionProof();
+  local.observePendingHelperSubmissionProof();
+  await entry.finalizationInFlight;
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 0,
+    "The fresh exact root must finalize and clear the pending prompt.");
+  assert.equal(vm.runInContext("recentSubmittedPluginReplies.length", local), 1,
+    "Repeated mutation observations must finalize the same prompt only once.");
+  assert.ok(completionStatuses >= 1,
+    "Fresh exact submission proof must surface the completed prompt state immediately.");
+}
+
 function testSelfExplainingPromptsCannotTriggerTheSkillParser() {
   const syncPrompt = context.buildSkillSyncPrompt({
     version: 7,
@@ -302,6 +437,39 @@ function testSelfExplainingPromptsCannotTriggerTheSkillParser() {
   assert.match(syncPrompt, new RegExp(`challenge: ${challenge}`));
   assert.match(syncPrompt, /replacing spaces with hyphens/i);
   assertSafePrompt(syncPrompt, "The initial update prompt");
+  assert.equal(
+    context.m365SubmittedMessageTextMatches(`You said:\n${syncPrompt.replace(/\n/g, "")}`, syncPrompt),
+    true,
+    "M365's exact flattened serialization must prove the plugin-owned Skill sync prompt submission."
+  );
+  assert.equal(
+    context.m365SubmittedMessageTextMatches(`You said:\n${syncPrompt.replace(/\n/g, "")}extra`, syncPrompt),
+    false,
+    "A suffix must invalidate flattened Skill sync prompt proof."
+  );
+  assert.equal(
+    context.m365SubmittedMessageTextMatches(`You said:\nprefix${syncPrompt.replace(/\n/g, "")}`, syncPrompt),
+    false,
+    "A prefix must invalidate flattened Skill sync prompt proof."
+  );
+  const differentChallengePrompt = context.buildSkillSyncPrompt({
+    version: 7,
+    catalogSha,
+    challenge: "2".repeat(32)
+  });
+  assert.equal(
+    context.m365SubmittedMessageTextMatches(
+      `You said:\n${differentChallengePrompt.replace(/\n/g, "")}`,
+      syncPrompt
+    ),
+    false,
+    "A different challenge must not confirm the current Skill sync prompt."
+  );
+  assert.equal(
+    context.m365SubmittedMessageTextMatches("You said:\nordinarymultilinetext", "ordinary\nmultiline\ntext"),
+    false,
+    "M365 line-collapse equivalence must not apply to arbitrary user or plugin text."
+  );
 
   const catalogReply = context.formatSkillCatalogReply({
     ok: true,

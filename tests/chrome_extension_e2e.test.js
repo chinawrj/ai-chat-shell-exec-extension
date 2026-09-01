@@ -12,6 +12,7 @@ const { CdpPipeClient } = require("./helpers/cdp_pipe_client");
 const ROOT_DIR = path.join(__dirname, "..");
 const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
 const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
+const M365_TEST_PAGE_URL = "https://m365.cloud.microsoft:17443/tmux-test-page.html";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
 const DRAWIO_PREVIEW_ID = "ai-chat-shell-exec-drawio-preview";
 const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
@@ -147,6 +148,7 @@ async function main() {
     `--user-data-dir=${profileDir}`,
     "--allow-insecure-localhost",
     "--ignore-certificate-errors",
+    "--host-resolver-rules=MAP m365.cloud.microsoft 127.0.0.1",
     "--remote-debugging-port=0",
     "--no-first-run",
     "--no-default-browser-check",
@@ -2181,6 +2183,148 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     endMarker
   ].join("\n");
 
+  await withFreshSkillCasePage(debugPort, "m365-copilot-sync-chain", async (page, nonce) => {
+    const beforeSync = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click();
+      return true;
+    })()`);
+    const flattenedPrompt = await waitForNewUserMessage(
+      page,
+      beforeSync,
+      "The local SKILLS catalog has changed.",
+      "M365-flattened Skill sync prompt"
+    );
+    assert.doesNotMatch(flattenedPrompt.replace(/^You said:\n/, ""), /\n/,
+      "The isolated compatibility page must reproduce M365's irreversible prompt line collapse.");
+    const syncChallenge = /challenge: ([a-f0-9]{32})/.exec(flattenedPrompt)?.[1] || "";
+    assert.match(syncChallenge, /^[a-f0-9]{32}$/);
+    assert.match(flattenedPrompt, new RegExp(`Local catalog SHA: ${catalogSha}`));
+
+    await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof pendingHelperDeliveries === "undefined") return null;
+        return {
+          contentWorld: true,
+          matching: Array.from(pendingHelperDeliveries.values()).filter((entry) =>
+            entry.kind === "skill-sync-prompt" && entry.call?.challenge === ${JSON.stringify(syncChallenge)}
+          ).length,
+          activeKind: activeComposerDeliveryToken?.kind || ""
+        };
+      })()`);
+      const state = worlds.find((entry) => entry.value?.contentWorld)?.value;
+      return state && state.matching === 0 && state.activeKind !== "skill-sync-prompt" ? state : undefined;
+    }, "flattened M365 Skill sync prompt to finalize exactly once before the helper reply");
+
+    const listHelper = [
+      `${startMarker}:m365-copilot-list-${nonce}`,
+      "cmd: list",
+      `challenge: ${syncChallenge}`,
+      endMarker
+    ].join("\n");
+    const beforeCatalog = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(listHelper)};
+      article.appendChild(content);
+      document.querySelector("main").appendChild(stop);
+      document.getElementById("thread").appendChild(article);
+      queueMicrotask(() => stop.remove());
+      return {
+        innerText: content.innerText,
+        textContent: content.textContent,
+        hasExplicitDataRole: article.hasAttribute("data-message-author-role")
+      };
+    })()`);
+    const m365Dom = await page.evaluate(`(() => {
+      const content = document.querySelector('.fai-CopilotMessage:last-of-type .fai-CopilotMessage__content') ||
+        Array.from(document.querySelectorAll('.fai-CopilotMessage__content')).at(-1);
+      const article = content?.closest('.fai-CopilotMessage[role="article"]');
+      return {
+        innerText: content?.innerText || "",
+        textContent: content?.textContent || "",
+        hasExplicitDataRole: article?.hasAttribute("data-message-author-role") === true
+      };
+    })()`);
+    assert.equal(m365Dom.textContent, listHelper);
+    assert.equal(m365Dom.innerText, listHelper.replace(/\n/g, " "));
+    assert.equal(m365Dom.hasExplicitDataRole, false,
+      "The M365 compatibility case must rely on the exact Copilot class and role, not a generic data-role shortcut.");
+    const scanWorlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof extractShellCallCandidates !== "function") return null;
+      const candidates = extractShellCallCandidates(getConversationRoot()).filter((candidate) =>
+        candidate.call?.helperId === ${JSON.stringify(`m365-copilot-list-${nonce}`)}
+      );
+      return {
+        contentWorld: true,
+        count: candidates.length,
+        role: candidates[0] ? getMessageAuthorRole(candidates[0].node) : "",
+        valid: candidates[0] ? validateHelperCall(candidates[0].call).ok : false
+      };
+    })()`);
+    const scanState = scanWorlds.find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(scanState, { contentWorld: true, count: 1, role: "assistant", valid: true },
+      "The real Chrome DOM scan must recover exactly one valid helper from collapsed M365 Copilot content.");
+    const flattenedCatalog = await waitForNewUserMessage(
+      page,
+      beforeCatalog,
+      "Local SKILLS catalog synchronization response:",
+      "catalog response after the current M365 Copilot helper"
+    );
+    assert.doesNotMatch(flattenedCatalog.replace(/^You said:\n/, ""), /\n/,
+      "The catalog response must also survive M365's one-line submitted-message serialization.");
+    const catalogVersion = /catalog-version: ([1-9][0-9]*)/.exec(flattenedCatalog)?.[1] || "";
+    assert.match(catalogVersion, /^[1-9][0-9]*$/);
+
+    const beforeAck = await pageUserMessageCount(page);
+    const ackHelper = [
+      `${startMarker}:m365-copilot-ack-${nonce}`,
+      "cmd: list-updated",
+      `challenge: ${syncChallenge}`,
+      `catalog-sha: ${catalogSha}`,
+      `catalog-version: ${catalogVersion}`,
+      "memory-entry: AI_CHAT_SHELL_SKILLS_CATALOG",
+      endMarker
+    ].join("\n");
+    await page.evaluate(`(() => {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(ackHelper)};
+      article.appendChild(content);
+      document.querySelector("main").appendChild(stop);
+      document.getElementById("thread").appendChild(article);
+      queueMicrotask(() => stop.remove());
+      return true;
+    })()`);
+    await waitForEvaluate(page, `(() => {
+      const chip = document.getElementById("ai-chat-shell-exec-skill-status");
+      return chip && !chip.disabled && !chip.textContent.includes("↑") && /View local Skills/i.test(chip.title || "");
+    })()`, "M365 Copilot ACK to make the Skill catalog current");
+    await assertUserMessageCountStable(page, beforeAck,
+      "A valid M365 Copilot Skill ACK must remain silent.");
+  }, { baseUrl: M365_TEST_PAGE_URL });
+
   await withFreshSkillCasePage(debugPort, "new-chat-live-load", async (page, nonce) => {
     const helper = makeLoad(`new-chat-live-${nonce}`);
     await page.evaluate(`(async () => {
@@ -2680,9 +2824,10 @@ async function waitForIsolatedEmptySkillLifecycle(page, description) {
   }, description);
 }
 
-async function withFreshSkillCasePage(debugPort, caseName, task) {
+async function withFreshSkillCasePage(debugPort, caseName, task, options = {}) {
   const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const url = `${TEST_PAGE_URL}?isolated-skill-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
+  const baseUrl = String(options.baseUrl || TEST_PAGE_URL);
+  const url = `${baseUrl}?isolated-skill-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
   const page = await openChromePage(debugPort, url);
   try {
     await page.send("Page.enable");
@@ -2794,12 +2939,12 @@ async function appendLiveAssistantHelper(page, complete) {
 }
 
 function pageUserMessageCount(page) {
-  return page.evaluate(`document.querySelectorAll('[data-message-author-role="user"]').length`);
+  return page.evaluate(`document.querySelectorAll('[data-message-author-role="user"], .fai-UserMessage[role="article"]').length`);
 }
 
 function waitForNewUserMessage(page, previousCount, includedText, description) {
   return waitForEvaluateValue(page, `(() => {
-    const messages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+    const messages = Array.from(document.querySelectorAll('[data-message-author-role="user"], .fai-UserMessage[role="article"]'))
       .slice(${Number(previousCount)});
     const matched = messages.find((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(includedText)}));
     return matched ? (matched.innerText || matched.textContent || "") : "";

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-09-01
+
+- Recognizes M365's current exact `.fai-CopilotMessage[role="article"]` assistant root throughout authored-message discovery and generation binding while retaining compatibility with the legacy `.fai-AssistantMessage` class.
+- Recovers one complete valid Skill envelope when current M365 Copilot content preserves canonical protocol lines in `textContent` but collapses those same lines to exactly one ordinary space each in `innerText`; prose, suffixes, hidden fields, second envelopes, changed whitespace, unknown roles, and non-M365 roots remain rejected.
+- Treats only the exact fixed plugin-owned Skill sync prompt as M365-flattenable submission content, and still requires a fresh exact `.fai-UserMessage[role="article"]` root beyond the pending delivery's baseline before finalizing it.
+- Adds focused positive, negative, history, identity, hidden-content, whitespace, challenge, and one-finalization regressions plus a host-mapped real Chrome M365 DOM scan and complete flattened prompt → Copilot list → catalog → Copilot ACK E2E.
+
 ## [0.11.9] - 2026-09-01
 
 - Records and immediately persists a monotonic cancellation boundary when composer ownership is first lost, including trusted Enter/LineBreak emptying and the submitted-unconfirmed interval, and synchronously revalidates origin/attempt ownership after the async guard. Delayed cancellation recognition, reload, and same-URL replacement can no longer authorize stale Skill side effects or erase a genuinely newer helper result.

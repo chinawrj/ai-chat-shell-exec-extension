@@ -410,7 +410,10 @@
         if (!text) {
           return;
         }
-        appendMessage("user", text);
+        const submittedText = window.__flattenSubmittedPluginText === true
+          ? text.replace(/\r?\n/g, "")
+          : text;
+        appendMessage("user", submittedText);
         currentComposer.textContent = "";
         setStatus("Composer message appended to thread.");
       });
@@ -684,10 +687,15 @@
       }
 
       function appendMessage(role, text) {
-        const article = document.createElement("article");
-        article.className = "message";
-        article.dataset.messageAuthorRole = role;
-        const roleLabel = role === "assistant" ? "Assistant" : "User";
+        const m365User = window.__m365DomMode === true && role === "user";
+        const article = document.createElement(m365User ? "div" : "article");
+        article.className = m365User ? "fai-UserMessage" : "message";
+        if (m365User) {
+          article.setAttribute("role", "article");
+        } else {
+          article.dataset.messageAuthorRole = role;
+        }
+        const roleLabel = m365User ? "You said:" : role === "assistant" ? "Assistant" : "User";
         const pre = text.includes("```") || text.includes("shell-output");
         article.innerHTML = `<div class="role">${roleLabel}</div>`;
         if (pre) {

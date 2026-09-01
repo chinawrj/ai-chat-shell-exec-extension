@@ -9,6 +9,7 @@ const context = createContentContext();
 
 testLiveGenerationEvidenceSurvivesRemoval();
 testStableGenerationControlEvidenceBoundaries();
+testM365CopilotCurrentResponseGenerationIsEligible();
 testGenerationEvidenceIsCandidateBound();
 testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute();
 testUnrelatedGenerationCannotReviveKnownHistory();
@@ -137,6 +138,136 @@ function testStableGenerationControlEvidenceBoundaries() {
   const genericStop = new local.Element({ role: "button", label: "Stop" });
   assert.equal(local.isAssistantGenerationControl(genericStop), false,
     "An unrelated generic Stop button remains insufficient generation evidence.");
+}
+
+function testM365CopilotCurrentResponseGenerationIsEligible() {
+  const local = createContentContext();
+  local.location.hostname = "m365.cloud.microsoft";
+  local.location.origin = "https://m365.cloud.microsoft";
+  local.location.href = "https://m365.cloud.microsoft/chat/conversation/current";
+
+  const decorateM365Article = (node, className) => {
+    node.role = "article";
+    node.matches = (selector) => String(selector).includes(`.${className}[role="article"]`);
+    node.closest = (selector) => String(selector).includes(`.${className}[role="article"]`) ? node : null;
+    return node;
+  };
+  const conversation = new local.Element();
+  const user = decorateM365Article(new local.Element(), "fai-UserMessage");
+  user.textContent = "Load the installed Skill.";
+  const assistant = decorateM365Article(new local.Element(), "fai-CopilotMessage");
+  const helperText = [
+    "ai-helper-skill-start:m365-current-load",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"7".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(user);
+  conversation.append(assistant);
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__m365Conversation = conversation;
+  local.__m365Candidate = candidate;
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__m365Conversation;
+    extractShellCallCandidates = () => [globalThis.__m365Candidate];
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEpoch = null;
+  `, local);
+
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  const records = [{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop, assistant],
+    removedNodes: []
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(records), true,
+    "A live M365 generation control must establish the current generation epoch.");
+  local.trackAssistantGenerationHelperRoots(records);
+  local.markLiveGeneratedHelperCandidates(records);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A complete helper in the current fai-CopilotMessage root must be eligible for automatic dispatch.");
+
+  const legacy = decorateM365Article(new local.Element(), "fai-AssistantMessage");
+  assert.equal(local.getMessageAuthorRole(legacy), "assistant",
+    "The legacy M365 assistant article remains recognized.");
+  const similarButUntrusted = new local.Element();
+  similarButUntrusted.role = "article";
+  similarButUntrusted.matches = (selector) => String(selector).includes(".fai-CopilotMessageLike") && false;
+  similarButUntrusted.closest = () => null;
+  assert.equal(local.getMessageAuthorRole(similarButUntrusted), "",
+    "A similar class without the exact M365 authored-message selector must not gain assistant authority.");
+
+  const historyLocal = createContentContext();
+  historyLocal.location.hostname = "m365.cloud.microsoft";
+  const historyConversation = new historyLocal.Element();
+  const oldCopilot = new historyLocal.Element();
+  oldCopilot.role = "article";
+  oldCopilot.matches = (selector) => String(selector).includes('.fai-CopilotMessage[role="article"]');
+  oldCopilot.closest = (selector) => String(selector).includes('.fai-CopilotMessage[role="article"]')
+    ? oldCopilot
+    : null;
+  oldCopilot.textContent = helperText;
+  const currentUser = new historyLocal.Element();
+  currentUser.role = "article";
+  currentUser.matches = (selector) => String(selector).includes('.fai-UserMessage[role="article"]');
+  currentUser.closest = (selector) => String(selector).includes('.fai-UserMessage[role="article"]')
+    ? currentUser
+    : null;
+  currentUser.textContent = "Generate a different response.";
+  const currentCopilot = new historyLocal.Element();
+  currentCopilot.role = "article";
+  currentCopilot.matches = oldCopilot.matches;
+  currentCopilot.closest = (selector) => String(selector).includes('.fai-CopilotMessage[role="article"]')
+    ? currentCopilot
+    : null;
+  currentCopilot.textContent = "This current response contains no helper.";
+  historyConversation.append(oldCopilot);
+  historyConversation.append(currentUser);
+  historyConversation.append(currentCopilot);
+  const oldCandidate = {
+    call: historyLocal.parseCallPayload(helperText),
+    node: oldCopilot,
+    textRoot: oldCopilot,
+    source: "text",
+    blockIndex: 0
+  };
+  historyLocal.__m365HistoryConversation = historyConversation;
+  historyLocal.__m365HistoryCandidate = oldCandidate;
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__m365HistoryConversation;
+    extractShellCallCandidates = () => [globalThis.__m365HistoryCandidate];
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEpoch = null;
+  `, historyLocal);
+  const currentStop = new historyLocal.Element({ role: "button", label: "Stop generating" });
+  historyLocal.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: historyConversation,
+    addedNodes: [currentStop, currentCopilot],
+    removedNodes: []
+  }]);
+  const oldRedraw = [{
+    type: "characterData",
+    target: oldCopilot,
+    oldValue: helperText,
+    addedNodes: [],
+    removedNodes: []
+  }];
+  historyLocal.trackAssistantGenerationHelperRoots(oldRedraw);
+  historyLocal.markLiveGeneratedHelperCandidates(oldRedraw);
+  assert.equal(historyLocal.isLiveGeneratedHelperCandidate(oldCandidate), false,
+    "An older M365 Copilot helper before the current user turn must not borrow the current Stop control.");
+
+  const exactClassMissingRole = new historyLocal.Element();
+  exactClassMissingRole.role = "";
+  exactClassMissingRole.matches = () => false;
+  exactClassMissingRole.closest = () => null;
+  assert.equal(historyLocal.getMessageAuthorRole(exactClassMissingRole), "",
+    "An M365 Copilot-like node without role=article must fail closed.");
 }
 
 function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
