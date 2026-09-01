@@ -544,6 +544,7 @@ async function getSkillState(scope, sender = {}) {
     sync = null;
   }
   const updateAvailable = skillCatalogNeedsSync(ack, status);
+  const syncOwnedByCurrentTab = Boolean(sync && Number(sender?.tab?.id) === sync.ownerTabId);
   return {
     ...status,
     type: "skill-state",
@@ -556,8 +557,14 @@ async function getSkillState(scope, sender = {}) {
     updateAvailable,
     syncing: Boolean(sync),
     syncOwnerTabId: sync?.ownerTabId ?? null,
-    syncOwnedByCurrentTab: Boolean(sync && Number(sender?.tab?.id) === sync.ownerTabId),
+    syncOwnedByCurrentTab,
+    // Only the owning content script may recover an exact in-progress Skill
+    // protocol response after a page/content-script reload. Other tabs need
+    // ownership status for UI, but must never receive the active challenge.
+    syncChallenge: syncOwnedByCurrentTab ? sync?.challenge || "" : "",
     syncCatalogSha: sync?.catalogSha || "",
+    syncCatalogVersion: syncOwnedByCurrentTab ? Number(sync?.catalogVersion || 0) : 0,
+    syncPhase: syncOwnedByCurrentTab ? sync?.phase || "" : "",
     syncStartedAt: sync?.startedAt || 0,
     syncExpiresAt: sync?.expiresAt || 0
   };
@@ -614,6 +621,7 @@ async function beginSkillSync(scope, sender, { force = false } = {}) {
     challenge: createSkillChallenge(),
     catalogSha: String(status.catalogSha || ""),
     catalogVersion: Number(status.version || 0),
+    phase: "list",
     ownerTabId: tabId,
     startedAt: now,
     expiresAt: now + SKILL_SYNC_TTL_MS,
@@ -636,6 +644,8 @@ async function beginSkillSync(scope, sender, { force = false } = {}) {
     forced: force,
     syncing: true,
     syncOwnerTabId: tabId,
+    syncPhase: "list",
+    syncCatalogVersion: sync.catalogVersion,
     syncStartedAt: sync.startedAt,
     syncExpiresAt: sync.expiresAt
   };
@@ -667,6 +677,7 @@ async function getSkillListForAi(scope, sender, message) {
   if (sync) {
     sync.catalogSha = String(list.catalogSha || "");
     sync.catalogVersion = Number(list.version || 0);
+    sync.phase = "ack";
     sync.expiresAt = Date.now() + SKILL_SYNC_TTL_MS;
     await chrome.storage.session.set({ [key]: sync });
   }
@@ -676,7 +687,9 @@ async function getSkillListForAi(scope, sender, message) {
     memoryScope: scope,
     memoryEntry: SKILL_MEMORY_ENTRY,
     challenge,
-    syncRequired: Boolean(sync)
+    syncRequired: Boolean(sync),
+    syncPhase: sync ? "ack" : "",
+    syncCatalogVersion: sync ? Number(sync.catalogVersion || 0) : 0
   };
 }
 
@@ -692,6 +705,9 @@ async function acknowledgeSkillSync(scope, sender, message) {
   const validation = validateSkillSyncOwner(sync, { tabId, challenge });
   if (validation) {
     return validation;
+  }
+  if (sync.phase !== "ack") {
+    return skillSyncRejection("skill-sync-phase-mismatch", "The Skill catalog must be listed before it can be acknowledged.");
   }
   if (memoryEntry !== SKILL_MEMORY_ENTRY) {
     return skillSyncRejection("memory-entry-mismatch", `Skill sync ACK must name the fixed memory entry ${SKILL_MEMORY_ENTRY}.`);
@@ -744,6 +760,9 @@ async function failSkillSync(scope, sender, message) {
   const validation = validateSkillSyncOwner(sync, { tabId, challenge });
   if (validation) {
     return validation;
+  }
+  if (sync.phase !== "ack") {
+    return skillSyncRejection("skill-sync-phase-mismatch", "The Skill catalog must be listed before an update failure can be reported.");
   }
   const catalogSha = String(message.catalogSha || "").trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(catalogSha) || catalogSha !== sync.catalogSha) {
@@ -854,6 +873,7 @@ function normalizeSkillSync(value) {
     challenge,
     catalogSha: String(value.catalogSha || "").toLowerCase(),
     catalogVersion: Math.max(0, Number(value.catalogVersion || 0)),
+    phase: value.phase === "ack" ? "ack" : "list",
     ownerTabId,
     startedAt: Math.max(0, Number(value.startedAt || 0)),
     expiresAt,

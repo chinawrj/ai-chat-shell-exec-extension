@@ -2188,6 +2188,8 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     await page.evaluate(`(() => {
       window.__m365DomMode = true;
       window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
       document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click();
       return true;
     })()`);
@@ -2218,6 +2220,33 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       return state && state.matching === 0 && state.activeKind !== "skill-sync-prompt" ? state : undefined;
     }, "flattened M365 Skill sync prompt to finalize exactly once before the helper reply");
 
+    await page.evaluate(`(() => {
+      const composer = document.getElementById("composer");
+      composer.setAttribute("aria-label", "Message Copilot");
+      window.__m365CorruptedSkillCatalogInsertions = 0;
+      composer.addEventListener("input", () => {
+        if (window.__m365CorruptedSkillCatalogInsertions !== 0) return;
+        const current = composer.innerText || composer.textContent || "";
+        if (!current.startsWith("Local SKILLS catalog synchronization response:")) return;
+        if (!/(?:^|\\n)\\{\\n/.test(current) || !/\\n\\}(?:\\n|$)/.test(current)) return;
+        const flattened = current.replace(/\\r?\\n/g, "");
+        const corrupted = flattened
+          .replace("\`\`\`\`skill-output{", "\`\`\`\`skill-output")
+          .replace("}\`\`\`\`After the memory entry", "\`\`\`\`After the memory entry");
+        if (corrupted === flattened) return;
+        window.__m365CorruptedSkillCatalogInsertions += 1;
+        const text = document.createElement("span");
+        text.setAttribute("data-lexical-text", "true");
+        text.textContent = corrupted;
+        const sentinel = document.createElement("span");
+        sentinel.setAttribute("aria-hidden", "true");
+        sentinel.setAttribute("data-lexical-text", "true");
+        sentinel.textContent = "\u200b\u200c";
+        composer.replaceChildren(text, sentinel);
+      });
+      return true;
+    })()`);
+
     const listHelper = [
       `${startMarker}:m365-copilot-list-${nonce}`,
       "cmd: list",
@@ -2226,22 +2255,17 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     ].join("\n");
     const beforeCatalog = await pageUserMessageCount(page);
     await page.evaluate(`(() => {
-      const stop = document.createElement("button");
-      stop.type = "button";
-      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
-      stop.setAttribute("aria-label", "Stop generating");
-      stop.textContent = "Stop generating";
       const article = document.createElement("div");
       article.className = "fai-CopilotMessage";
       article.setAttribute("role", "article");
       const content = document.createElement("div");
       content.className = "fai-CopilotMessage__content";
       content.style.whiteSpace = "normal";
-      content.textContent = ${JSON.stringify(listHelper)};
+      content.textContent = ${JSON.stringify(`${listHelper}\n`)};
       article.appendChild(content);
-      document.querySelector("main").appendChild(stop);
+      // Reproduce M365's late-final response: by the time the complete
+      // Copilot article is observable, the generation control is already gone.
       document.getElementById("thread").appendChild(article);
-      queueMicrotask(() => stop.remove());
       return {
         innerText: content.innerText,
         textContent: content.textContent,
@@ -2258,7 +2282,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
         hasExplicitDataRole: article?.hasAttribute("data-message-author-role") === true
       };
     })()`);
-    assert.equal(m365Dom.textContent, listHelper);
+    assert.equal(m365Dom.textContent, `${listHelper}\n`);
     assert.equal(m365Dom.innerText, listHelper.replace(/\n/g, " "));
     assert.equal(m365Dom.hasExplicitDataRole, false,
       "The M365 compatibility case must rely on the exact Copilot class and role, not a generic data-role shortcut.");
@@ -2285,6 +2309,74 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     );
     assert.doesNotMatch(flattenedCatalog.replace(/^You said:\n/, ""), /\n/,
       "The catalog response must also survive M365's one-line submitted-message serialization.");
+    assert.match(flattenedCatalog, /````skill-output\{/,
+      "The pre-projected M365 write must preserve the opening catalog JSON brace.");
+    assert.match(flattenedCatalog, /\}````After the memory entry/,
+      "The pre-projected M365 write must preserve the closing catalog JSON brace before submission.");
+    assert.equal(await page.evaluate(`window.__m365CorruptedSkillCatalogInsertions`), 0,
+      "The host-mapped page must prove the vulnerable standalone-brace insertion never reaches M365's corrupting path.");
+    const recoveryWorlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof lastOwnedSkillSyncRecoveryStatus === "undefined") return null;
+      const candidate = extractShellCallCandidates(getConversationRoot()).find((entry) =>
+        entry.call?.helperId === ${JSON.stringify(`m365-copilot-list-${nonce}`)}
+      );
+      return {
+        contentWorld: true,
+        skillLive: candidate ? isLiveGeneratedHelperCandidate(candidate) : null,
+        baselineIgnored: candidate ? isBaselineIgnoredHelperCandidate(candidate) : null,
+        recoveryStatus: lastOwnedSkillSyncRecoveryStatus,
+        syncPhase: skillPanelState?.syncPhase || ""
+      };
+    })()`);
+    const recoveryState = recoveryWorlds.find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(recoveryState, {
+      contentWorld: true,
+      skillLive: false,
+      baselineIgnored: false,
+      recoveryStatus: "used",
+      syncPhase: "ack"
+    }, "The no-Stop M365 fixture must exercise exact owner-turn recovery rather than ordinary live-generation dispatch.");
+
+    const beforeListRedraw = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      const helperId = ${JSON.stringify(`m365-copilot-list-${nonce}`)};
+      const oldArticle = Array.from(document.querySelectorAll('.fai-CopilotMessage[role="article"]'))
+        .find((article) => (article.textContent || "").includes(helperId));
+      if (!oldArticle) return false;
+      const replacement = document.createElement("div");
+      replacement.className = "fai-CopilotMessage";
+      replacement.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(`${listHelper}\n`)};
+      replacement.appendChild(content);
+      oldArticle.replaceWith(replacement);
+      return true;
+    })()`);
+    const listRedrawWorlds = await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof getHandledHelperReason !== "function") return null;
+        const candidate = extractShellCallCandidates(getConversationRoot()).find((entry) =>
+          entry.call?.helperId === ${JSON.stringify(`m365-copilot-list-${nonce}`)}
+        );
+        if (!candidate) return null;
+        const semantic = buildSemanticCallKey(candidate.call);
+        return {
+          contentWorld: true,
+          handled: getHandledHelperReason(candidate, "redraw", semantic, candidate.call),
+          baselineIgnored: isBaselineIgnoredHelperCandidate(candidate, semantic)
+        };
+      })()`);
+      return worlds.find((entry) => entry.value?.contentWorld)?.value || undefined;
+    }, "committed M365 list helper replacement root to become inert");
+    assert.deepEqual(listRedrawWorlds, {
+      contentWorld: true,
+      handled: "committed owner-sync helper",
+      baselineIgnored: false
+    });
+    await assertUserMessageCountStable(page, beforeListRedraw,
+      "A committed M365 list helper replacement root must not send a second catalog.");
     const catalogVersion = /catalog-version: ([1-9][0-9]*)/.exec(flattenedCatalog)?.[1] || "";
     assert.match(catalogVersion, /^[1-9][0-9]*$/);
 
@@ -2299,22 +2391,17 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       endMarker
     ].join("\n");
     await page.evaluate(`(() => {
-      const stop = document.createElement("button");
-      stop.type = "button";
-      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
-      stop.setAttribute("aria-label", "Stop generating");
-      stop.textContent = "Stop generating";
       const article = document.createElement("div");
       article.className = "fai-CopilotMessage";
       article.setAttribute("role", "article");
       const content = document.createElement("div");
       content.className = "fai-CopilotMessage__content";
       content.style.whiteSpace = "normal";
-      content.textContent = ${JSON.stringify(ackHelper)};
+      content.textContent = ${JSON.stringify(`${ackHelper}\n`)};
       article.appendChild(content);
-      document.querySelector("main").appendChild(stop);
+      // The exact owner challenge, not a broad generation flag, must recover
+      // this late-final ACK and keep it silent.
       document.getElementById("thread").appendChild(article);
-      queueMicrotask(() => stop.remove());
       return true;
     })()`);
     await waitForEvaluate(page, `(() => {
@@ -2323,6 +2410,172 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     })()`, "M365 Copilot ACK to make the Skill catalog current");
     await assertUserMessageCountStable(page, beforeAck,
       "A valid M365 Copilot Skill ACK must remain silent.");
+    await page.evaluate(`(() => {
+      const helperId = ${JSON.stringify(`m365-copilot-ack-${nonce}`)};
+      const oldArticle = Array.from(document.querySelectorAll('.fai-CopilotMessage[role="article"]'))
+        .find((article) => (article.textContent || "").includes(helperId));
+      if (!oldArticle) return false;
+      const replacement = document.createElement("div");
+      replacement.className = "fai-CopilotMessage";
+      replacement.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(`${ackHelper}\n`)};
+      replacement.appendChild(content);
+      oldArticle.replaceWith(replacement);
+      return true;
+    })()`);
+    const ackRedrawWorlds = await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof getHandledHelperReason !== "function") return null;
+        const candidate = extractShellCallCandidates(getConversationRoot()).find((entry) =>
+          entry.call?.helperId === ${JSON.stringify(`m365-copilot-ack-${nonce}`)}
+        );
+        if (!candidate) return null;
+        const semantic = buildSemanticCallKey(candidate.call);
+        return {
+          contentWorld: true,
+          handled: getHandledHelperReason(candidate, "redraw", semantic, candidate.call),
+          baselineIgnored: isBaselineIgnoredHelperCandidate(candidate, semantic)
+        };
+      })()`);
+      return worlds.find((entry) => entry.value?.contentWorld)?.value || undefined;
+    }, "committed M365 ACK replacement root to become inert");
+    assert.deepEqual(ackRedrawWorlds, {
+      contentWorld: true,
+      handled: "committed owner-sync helper",
+      baselineIgnored: false
+    });
+    await assertUserMessageCountStable(page, beforeAck,
+      "A committed M365 ACK replacement root must remain silent and must not report no-active-sync to the AI.");
+  }, { baseUrl: M365_TEST_PAGE_URL });
+
+  await withFreshSkillCasePage(debugPort, "m365-owned-sync-wrong-prompt", async (page, nonce) => {
+    const beforeSync = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click();
+      return true;
+    })()`);
+    const prompt = await waitForNewUserMessage(
+      page,
+      beforeSync,
+      "The local SKILLS catalog has changed.",
+      "M365 negative exact sync prompt"
+    );
+    const challenge = /challenge: ([a-f0-9]{32})/.exec(prompt)?.[1] || "";
+    assert.match(challenge, /^[a-f0-9]{32}$/);
+    await waitForSkillPromptLifecycleSettled(page, challenge, "M365 negative prompt finalization");
+    const helperId = `m365-wrong-prompt-${nonce}`;
+    const helper = [
+      `${startMarker}:${helperId}`,
+      "cmd: list",
+      `challenge: ${challenge}`,
+      endMarker
+    ].join("\n");
+    const beforeCatalog = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      const users = Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'));
+      users.at(-1)?.append(document.createTextNode("unexpected suffix"));
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(helper)};
+      article.appendChild(content);
+      document.getElementById("thread").appendChild(article);
+      return true;
+    })()`);
+    const state = await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof isBaselineIgnoredHelperCandidate !== "function") return null;
+        const candidate = extractShellCallCandidates(getConversationRoot()).find((entry) =>
+          entry.call?.helperId === ${JSON.stringify(helperId)}
+        );
+        return candidate && isBaselineIgnoredHelperCandidate(candidate) && !skillHelperInFlight ? {
+          contentWorld: true,
+          live: isLiveGeneratedHelperCandidate(candidate),
+          recovery: isActiveOwnedSkillSyncCandidate(candidate),
+          recoveryStatus: lastOwnedSkillSyncRecoveryStatus,
+          processVisible: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.hidden === false
+        } : null;
+      })()`);
+      return worlds.find((entry) => entry.value?.contentWorld)?.value || undefined;
+    }, "tampered M365 sync prompt to remain baseline-only");
+    assert.deepEqual(state, {
+      contentWorld: true,
+      live: false,
+      recovery: false,
+      recoveryStatus: "none",
+      processVisible: true
+    });
+    await assertUserMessageCountStable(page, beforeCatalog,
+      "A near-match M365 prompt must not authorize an automatic catalog response.");
+  }, { baseUrl: M365_TEST_PAGE_URL });
+
+  await withFreshSkillCasePage(debugPort, "m365-owned-sync-later-user", async (page, nonce) => {
+    const beforeSync = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      document.querySelector('[data-shell-tool-action="skill-force-sync"]')?.click();
+      return true;
+    })()`);
+    const prompt = await waitForNewUserMessage(
+      page,
+      beforeSync,
+      "The local SKILLS catalog has changed.",
+      "M365 later-user sync prompt"
+    );
+    const challenge = /challenge: ([a-f0-9]{32})/.exec(prompt)?.[1] || "";
+    assert.match(challenge, /^[a-f0-9]{32}$/);
+    await waitForSkillPromptLifecycleSettled(page, challenge, "M365 later-user prompt finalization");
+    const helperId = `m365-later-user-${nonce}`;
+    const helper = [
+      `${startMarker}:${helperId}`,
+      "cmd: list",
+      `challenge: ${challenge}`,
+      endMarker
+    ].join("\n");
+    await page.evaluate(`(() => {
+      appendMessage("user", "A real later user message owns the next turn.");
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "normal";
+      content.textContent = ${JSON.stringify(helper)};
+      article.appendChild(content);
+      document.getElementById("thread").appendChild(article);
+      return true;
+    })()`);
+    const afterManualUser = await pageUserMessageCount(page);
+    const state = await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof isBaselineIgnoredHelperCandidate !== "function") return null;
+        const candidate = extractShellCallCandidates(getConversationRoot()).find((entry) =>
+          entry.call?.helperId === ${JSON.stringify(helperId)}
+        );
+        return candidate && isBaselineIgnoredHelperCandidate(candidate) && !skillHelperInFlight ? {
+          contentWorld: true,
+          recovery: isActiveOwnedSkillSyncCandidate(candidate),
+          processVisible: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.hidden === false
+        } : null;
+      })()`);
+      return worlds.find((entry) => entry.value?.contentWorld)?.value || undefined;
+    }, "later M365 user turn to keep old sync helper inert");
+    assert.deepEqual(state, { contentWorld: true, recovery: false, processVisible: true });
+    await assertUserMessageCountStable(page, afterManualUser,
+      "A Skill helper after a later ordinary user turn must not reuse the plugin sync prompt.");
   }, { baseUrl: M365_TEST_PAGE_URL });
 
   await withFreshSkillCasePage(debugPort, "new-chat-live-load", async (page, nonce) => {

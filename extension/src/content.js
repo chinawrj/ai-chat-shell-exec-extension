@@ -79,6 +79,9 @@ const processedRenderedHelpers = new WeakMap();
 const baselineIgnoredRenderedHelpers = new WeakMap();
 const liveGeneratedRenderedHelpers = new WeakMap();
 const knownRenderedHelperSemantics = new WeakMap();
+const rejectedOwnedSkillSyncRecoveries = new WeakMap();
+const committedOwnedSkillSyncRecoveries = new WeakMap();
+const committedOwnedSkillSyncSemanticKeys = new Set();
 let assistantGenerationEpoch = null;
 let staleRouteGenerationControls = new WeakSet();
 // Keep per-helper scan metadata in memory only. This prevents the same rendered
@@ -161,6 +164,7 @@ let skillStatePollTimer = 0;
 let skillStatePollInFlight = false;
 let skillHelperInFlight = false;
 let skillRecoveryInFlight = false;
+let lastOwnedSkillSyncRecoveryStatus = "none";
 const skillInstallInFlight = new Set();
 const skillInstallErrors = new Map();
 
@@ -240,6 +244,8 @@ function deactivateExtension() {
   panelForceRunAvailable = false;
   panelSkillHelperActionable = false;
   panelLatestManualActionKind = "";
+  lastOwnedSkillSyncRecoveryStatus = "none";
+  committedOwnedSkillSyncSemanticKeys.clear();
   panelShellHelperActive = false;
   clearTimeout(scanTimer);
   clearPendingForceRun();
@@ -363,6 +369,7 @@ function invalidateRenderedHelperTracking(records) {
         processedRenderedHelpers.delete(element);
         helperRenderRootGenerations.set(element, getHelperRenderRootGeneration(element) + 1);
       }
+      committedOwnedSkillSyncRecoveries.delete(element);
     };
     for (const node of [
       ...Array.from(record?.addedNodes || []),
@@ -1046,6 +1053,13 @@ function getHandledHelperReason(candidate, _callKey, semanticCallKey, call) {
   if (isBaselineIgnoredHelperCandidate(candidate, semanticCallKey)) {
     return "initial-history baseline";
   }
+  if (isCommittedOwnedSkillSyncRecovery(candidate, semanticCallKey)) {
+    // A host redraw may replace the accepted late-final M365 article with a
+    // new DOM root carrying the same exact helper. The semantic commitment is
+    // a tombstone, not fresh execution evidence: make every such redraw inert
+    // before per-root processed state is consulted.
+    return "committed owner-sync helper";
+  }
   if (processedRenderedHelpers.get(renderRoot)?.has(renderedHelperKey)) {
     return "processed rendered helper";
   }
@@ -1141,6 +1155,8 @@ function beginPageLifecycle(options = {}) {
   panelForceRunAvailable = false;
   panelSkillHelperActionable = false;
   panelLatestManualActionKind = "";
+  lastOwnedSkillSyncRecoveryStatus = "none";
+  committedOwnedSkillSyncSemanticKeys.clear();
   updateContextualPanelActions();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
@@ -2320,6 +2336,10 @@ function isSkillDispatchContextCurrent(context) {
   if (!retainedCandidate) {
     return false;
   }
+  if (context.skillSyncTurnProof &&
+      !isOwnedSkillSyncTurnProofCurrent(context.skillSyncTurnProof, retainedCandidate)) {
+    return false;
+  }
   if (context.pageIdentity === currentPageIdentity &&
       context.generation === pageLifecycleGeneration) {
     return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
@@ -2329,6 +2349,12 @@ function isSkillDispatchContextCurrent(context) {
   // originating render root is still connected inside the current transcript.
   // A result from a removed/older chat therefore cannot enter the new chat.
   if (routeHandoffPreviousPageIdentity !== context.pageIdentity) {
+    return false;
+  }
+  if (context.skillSyncTurnProof) {
+    // Owner-challenge recovery is deliberately bound to one exact M365 page
+    // lifecycle. It must not inherit the broader retained-root route handoff
+    // used by normally observed Skill helpers.
     return false;
   }
   // A route assignment can share a batch with a React redraw, which invalidates
@@ -2490,7 +2516,8 @@ function markCallBaselineIgnored(candidate, semanticCallKey) {
 
 function markBaselineIgnoredCandidates(candidates = []) {
   for (const candidate of Array.from(candidates || [])) {
-    if (!isLiveGeneratedHelperCandidate(candidate)) {
+    if (!isLiveGeneratedHelperCandidate(candidate) &&
+        !isCommittedOwnedSkillSyncRecovery(candidate)) {
       markCallBaselineIgnored(candidate, buildSemanticCallKey(candidate.call));
     }
   }
@@ -2499,7 +2526,8 @@ function markBaselineIgnoredCandidates(candidates = []) {
 function markUnprovenAutomaticHelperCandidatesAsBaseline(candidates = []) {
   for (const candidate of Array.from(candidates || [])) {
     if (!(isRunnableHelperCall(candidate?.call) || isSkillHelperCall(candidate?.call)) ||
-        isLiveGeneratedHelperCandidate(candidate)) {
+        isLiveGeneratedHelperCandidate(candidate) ||
+        isCommittedOwnedSkillSyncRecovery(candidate)) {
       continue;
     }
     if (isShellOutputCandidate(candidate)) {
@@ -3316,7 +3344,18 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
   const dispatchContext = createSkillDispatchContext(candidate);
   const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, call);
   const baselineIgnored = isBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
-  const baselineRecovery = options.allowBaselineRecovery === true && baselineIgnored;
+  const ownedSyncRecovery = baselineIgnored &&
+    !isLiveGeneratedHelperCandidate(candidate) &&
+    isActiveOwnedSkillSyncCandidate(candidate);
+  if (ownedSyncRecovery) {
+    dispatchContext.skillSyncTurnProof = createOwnedSkillSyncTurnProof(candidate);
+    if (!dispatchContext.skillSyncTurnProof) {
+      return false;
+    }
+  }
+  const baselineRecovery = baselineIgnored && (
+    options.allowBaselineRecovery === true || ownedSyncRecovery
+  );
   if ((handledReason || baselineIgnored) && !baselineRecovery) {
     return false;
   }
@@ -3331,9 +3370,11 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     return false;
   }
   const validation = validateSkillHelperCall(call);
-  clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
-  markCallProcessed(candidate, callKey, semanticCallKey);
-  setPanelSkillHelperActionable(false);
+  if (!ownedSyncRecovery) {
+    claimProcessedSkillCandidate(candidate, callKey, semanticCallKey);
+  } else {
+    lastOwnedSkillSyncRecoveryStatus = "reserved";
+  }
   if (!validation.ok) {
     await queueSkillComposerReply({
       callId: `skill-rejected:${callKey}`,
@@ -3346,6 +3387,14 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
   }
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
   if (chainCallCount >= maxChainCalls) {
+    if (ownedSyncRecovery) {
+      rejectOwnedSkillSyncRecoveryLocally(
+        candidate,
+        semanticCallKey,
+        `Skill sync helper remains available because the chain limit (${maxChainCalls}) was reached.`
+      );
+      return false;
+    }
     await queueSkillComposerReply({
       callId: `skill-limit:${callKey}`,
       call: { ...call, kind: "skill-error" },
@@ -3369,13 +3418,34 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       if (!isSkillDispatchContextCurrent(dispatchContext)) {
         return reportStaleSkillDispatch(dispatchContext);
       }
+      if (ownedSyncRecovery) {
+        if (response?.ok !== true) {
+          await rejectOwnedSkillSyncRecoveryResponse(candidate, semanticCallKey, response);
+          return false;
+        }
+        if (!commitOwnedSkillSyncRecovery(candidate, callKey, semanticCallKey, dispatchContext)) {
+          return false;
+        }
+      }
+      if (response?.ok === true && response?.syncRequired === true) {
+        skillPanelState = {
+          ...(skillPanelState || {}),
+          syncPhase: "ack",
+          syncCatalogSha: String(response.catalogSha || ""),
+          syncCatalogVersion: Number(response.version || 0)
+        };
+      }
+      const catalogReply = response?.ok === true
+        ? formatSkillCatalogReply(response)
+        : formatSkillProtocolError(response?.error || "The local Skill catalog could not be listed.", response);
+      if (ownedSyncRecovery && dispatchContext.skillSyncTurnProof) {
+        dispatchContext.skillSyncTurnProof.allowedNextUserReply = catalogReply;
+      }
       await queueSkillComposerReply({
         callId: `skill-list:${callKey}`,
         call: { ...call, kind: "skill-list" },
         response,
-        reply: response?.ok === true
-          ? formatSkillCatalogReply(response)
-          : formatSkillProtocolError(response?.error || "The local Skill catalog could not be listed.", response),
+        reply: catalogReply,
         dispatchContext
       });
       return response?.ok === true;
@@ -3412,12 +3482,20 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         return reportStaleSkillDispatch(dispatchContext);
       }
       if (response?.ok === true) {
+        if (ownedSyncRecovery &&
+            !commitOwnedSkillSyncRecovery(candidate, callKey, semanticCallKey, dispatchContext)) {
+          return false;
+        }
         await refreshSkillState({ quiet: true });
         if (!isSkillDispatchContextCurrent(dispatchContext)) {
           return reportStaleSkillDispatch(dispatchContext);
         }
         setStatus(`Skills v${response.version || skillPanelState?.version || "?"} acknowledged in ${SKILL_MEMORY_ENTRY}`, "ok");
         return true;
+      }
+      if (ownedSyncRecovery) {
+        await rejectOwnedSkillSyncRecoveryResponse(candidate, semanticCallKey, response);
+        return false;
       }
       await queueSkillComposerReply({
         callId: `skill-ack-rejected:${callKey}`,
@@ -3439,6 +3517,15 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
       return reportStaleSkillDispatch(dispatchContext);
     }
+    if (ownedSyncRecovery) {
+      if (response?.ok !== true) {
+        await rejectOwnedSkillSyncRecoveryResponse(candidate, semanticCallKey, response);
+        return false;
+      }
+      if (!commitOwnedSkillSyncRecovery(candidate, callKey, semanticCallKey, dispatchContext)) {
+        return false;
+      }
+    }
     await refreshSkillState({ quiet: true });
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
       return reportStaleSkillDispatch(dispatchContext);
@@ -3454,6 +3541,14 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
       return reportStaleSkillDispatch(dispatchContext);
     }
+    if (ownedSyncRecovery) {
+      rejectOwnedSkillSyncRecoveryLocally(
+        candidate,
+        semanticCallKey,
+        `Skill sync recovery failed locally and remains available: ${summarizeCommand(error.message || String(error))}`
+      );
+      return false;
+    }
     await queueSkillComposerReply({
       callId: `skill-error:${callKey}`,
       call: { ...call, kind: "skill-error" },
@@ -3467,6 +3562,275 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     updateContextualPanelActions();
     scheduleScan();
   }
+}
+
+function claimProcessedSkillCandidate(candidate, callKey, semanticCallKey) {
+  clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
+  markCallProcessed(candidate, callKey, semanticCallKey);
+  setPanelSkillHelperActionable(false);
+}
+
+function commitOwnedSkillSyncRecovery(candidate, callKey, semanticCallKey, dispatchContext) {
+  if (!isSkillDispatchContextCurrent(dispatchContext) ||
+      !isActiveOwnedSkillSyncCandidate(candidate)) {
+    lastOwnedSkillSyncRecoveryStatus = "stale-after-backend";
+    setStatus("Skill sync response stayed local because its prompt, owner, challenge, or chat changed; Process Skill remains available", "idle");
+    return false;
+  }
+  claimProcessedSkillCandidate(candidate, callKey, semanticCallKey);
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (renderRoot instanceof Element) {
+    // The recovery proof requires this entire render root to be exactly one
+    // canonical Skill envelope, so no unrelated baseline claim can share it.
+    // Clear the root atomically in case the host produced equivalent scan
+    // candidates with different transient source indexes before quiet settle.
+    baselineIgnoredRenderedHelpers.delete(renderRoot);
+    const keys = committedOwnedSkillSyncRecoveries.get(renderRoot) || new Set();
+    keys.add(buildBaselineIgnoredHelperKey(candidate, semanticCallKey));
+    committedOwnedSkillSyncRecoveries.set(renderRoot, keys);
+  }
+  committedOwnedSkillSyncSemanticKeys.add(
+    buildCommittedOwnedSkillSyncSemanticKey(semanticCallKey)
+  );
+  if (dispatchContext?.skillSyncTurnProof) {
+    dispatchContext.skillSyncTurnProof.backendAccepted = true;
+  }
+  lastOwnedSkillSyncRecoveryStatus = "used";
+  return true;
+}
+
+function isCommittedOwnedSkillSyncRecovery(candidate, semanticCallKey = "") {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return false;
+  }
+  const key = semanticCallKey || buildSemanticCallKey(candidate?.call);
+  return committedOwnedSkillSyncSemanticKeys.has(
+    buildCommittedOwnedSkillSyncSemanticKey(key)
+  ) || committedOwnedSkillSyncRecoveries.get(renderRoot)?.has(
+    buildBaselineIgnoredHelperKey(candidate, key)
+  ) === true;
+}
+
+function buildCommittedOwnedSkillSyncSemanticKey(semanticCallKey) {
+  return `${getCurrentPageIdentity()}\n${String(semanticCallKey || "")}`;
+}
+
+async function rejectOwnedSkillSyncRecoveryResponse(candidate, semanticCallKey, response) {
+  await refreshSkillState({ quiet: true }).catch(() => {});
+  rejectOwnedSkillSyncRecoveryLocally(
+    candidate,
+    semanticCallKey,
+    `Skill sync response was rejected locally and was not sent to the AI: ${summarizeCommand(response?.error || "owner, challenge, or phase changed")}`
+  );
+}
+
+function rejectOwnedSkillSyncRecoveryLocally(candidate, semanticCallKey, message) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (renderRoot instanceof Element) {
+    const keys = rejectedOwnedSkillSyncRecoveries.get(renderRoot) || new Set();
+    keys.add(buildOwnedSkillSyncRecoveryKey(candidate, semanticCallKey));
+    rejectedOwnedSkillSyncRecoveries.set(renderRoot, keys);
+  }
+  lastOwnedSkillSyncRecoveryStatus = "rejected-local";
+  setPanelSkillHelperActionable(true);
+  setStatus(message, "error");
+}
+
+function isActiveOwnedSkillSyncCandidate(candidate) {
+  const call = candidate?.call;
+  if (location.hostname !== "m365.cloud.microsoft" ||
+      !isSkillHelperCall(call) ||
+      !["list", "list-updated", "list-update-failed"].includes(String(call.cmd || ""))) {
+    return false;
+  }
+  if (!validateSkillHelperCall(call).ok) {
+    return false;
+  }
+  const challenge = String(call.challenge || "");
+  const ownedChallenge = String(
+    skillPanelState?.syncChallenge || skillPanelState?.challenge || ""
+  );
+  const expectedPhase = call.cmd === "list" ? "list" : "ack";
+  if (skillPanelState?.ok !== true ||
+      skillPanelState?.syncing !== true ||
+      skillPanelState?.syncOwnedByCurrentTab !== true ||
+      String(skillPanelState?.syncPhase || "") !== expectedPhase ||
+      !/^[a-f0-9]{32}$/.test(challenge) ||
+      challenge !== ownedChallenge) {
+    return false;
+  }
+  if (expectedPhase === "ack" && (
+    String(call.catalogSha || "") !== String(skillPanelState?.syncCatalogSha || "") ||
+    Number(call.catalogVersion || 0) !== Number(skillPanelState?.syncCatalogVersion || 0)
+  )) {
+    return false;
+  }
+
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getExplicitMessageContainer(renderRoot) ||
+    getExplicitMessageContainer(candidate.node);
+  const m365AssistantSelector = '.fai-AssistantMessage[role="article"], .fai-CopilotMessage[role="article"]';
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      messageRoot.matches?.(m365AssistantSelector) !== true ||
+      getMessageAuthorRole(messageRoot) !== "assistant" ||
+      (messageRoot !== renderRoot && !messageRoot.contains(renderRoot)) ||
+      !isExactWholeSkillEnvelope(renderRoot, call)) {
+    return false;
+  }
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const lastUserRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(lastUserRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  if (userIndex < 0 ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1 ||
+      !ownedSkillSyncUserTurnMatches(lastUserRoot, call, expectedPhase)) {
+    return false;
+  }
+  const semanticCallKey = buildSemanticCallKey(call);
+  const rejected = rejectedOwnedSkillSyncRecoveries.get(renderRoot);
+  return rejected?.has(buildOwnedSkillSyncRecoveryKey(candidate, semanticCallKey)) !== true;
+}
+
+function isExactWholeSkillEnvelope(renderRoot, call) {
+  const lines = splitShellCallLines(renderRoot?.textContent || "");
+  const calls = parsePlainTextHelperBlocks(lines.join("\n"));
+  return calls.length === 1 &&
+    calls[0].sourceStartLine === 0 &&
+    calls[0].sourceEndLine === lines.length - 1 &&
+    validateSkillHelperCall(calls[0]).ok &&
+    buildSemanticCallKey(calls[0]) === buildSemanticCallKey(call);
+}
+
+function ownedSkillSyncUserTurnMatches(userRoot, call, expectedPhase) {
+  if (!(userRoot instanceof Element) || !isM365SubmittedUserMessageNode(userRoot)) {
+    return false;
+  }
+  const expectedReply = getOwnedSkillSyncExpectedUserReply(call, expectedPhase);
+  return Boolean(expectedReply) && submittedUserMessageRootMatches(userRoot, expectedReply);
+}
+
+function getOwnedSkillSyncExpectedUserReply(call, expectedPhase) {
+  if (expectedPhase === "list") {
+    const expectedPrompt = buildSkillSyncPrompt({
+      challenge: call.challenge,
+      catalogSha: skillPanelState?.syncCatalogSha || skillPanelState?.catalogSha,
+      version: skillPanelState?.syncCatalogVersion || skillPanelState?.version
+    });
+    return isExactSkillSyncPrompt(expectedPrompt) ? expectedPrompt : "";
+  }
+  return getCurrentSkillCatalogSyncReplies(call)[0] || "";
+}
+
+function createOwnedSkillSyncTurnProof(candidate) {
+  const call = candidate?.call;
+  const expectedPhase = call?.cmd === "list" ? "list" : "ack";
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getExplicitMessageContainer(renderRoot) ||
+    getExplicitMessageContainer(candidate?.node);
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const expectedUserReply = getOwnedSkillSyncExpectedUserReply(call, expectedPhase);
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      !expectedUserReply ||
+      !submittedUserMessageRootMatches(userRoot, expectedUserReply)) {
+    return null;
+  }
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    challenge: String(call.challenge || ""),
+    phase: expectedPhase,
+    userRoot,
+    userRootIdentity: getSubmittedMessageRootIdentity(userRoot),
+    expectedUserReply,
+    messageRoot,
+    renderRoot,
+    semanticCallKey: buildSemanticCallKey(call)
+  };
+}
+
+function isOwnedSkillSyncTurnProofCurrent(proof, candidate) {
+  if (!proof ||
+      proof.pageIdentity !== getCurrentPageIdentity() ||
+      proof.generation !== pageLifecycleGeneration ||
+      proof.userRoot?.isConnected !== true ||
+      proof.messageRoot?.isConnected !== true ||
+      proof.renderRoot?.isConnected !== true ||
+      getSubmittedMessageRootIdentity(proof.userRoot) !== proof.userRootIdentity ||
+      buildSemanticCallKey(candidate?.call) !== proof.semanticCallKey ||
+      getCandidateRenderRoot(candidate) !== proof.renderRoot ||
+      !submittedUserMessageRootMatches(proof.userRoot, proof.expectedUserReply)) {
+    return false;
+  }
+  const conversationRoot = getConversationRoot();
+  if (!(conversationRoot instanceof Element) ||
+      (proof.userRoot !== conversationRoot && !conversationRoot.contains(proof.userRoot)) ||
+      (proof.messageRoot !== conversationRoot && !conversationRoot.contains(proof.messageRoot)) ||
+      (proof.renderRoot !== proof.messageRoot && !proof.messageRoot.contains(proof.renderRoot))) {
+    return false;
+  }
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(proof.userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(proof.messageRoot);
+  const originalTurnCurrent = userIndex >= 0 &&
+    responseIndex === userIndex + 1 &&
+    responseIndex === authoredRoots.length - 1 &&
+    getLastExplicitUserMessageRoot(conversationRoot) === proof.userRoot;
+  if (originalTurnCurrent) {
+    return true;
+  }
+  if (proof.backendAccepted !== true || !proof.allowedNextUserReply) {
+    return false;
+  }
+  const submittedCatalogRoot = authoredRoots[responseIndex + 1];
+  if (!(submittedCatalogRoot instanceof Element) ||
+      getMessageAuthorRole(submittedCatalogRoot) !== "user" ||
+      !submittedUserMessageRootMatches(submittedCatalogRoot, proof.allowedNextUserReply) ||
+      getLastExplicitUserMessageRoot(conversationRoot) !== submittedCatalogRoot) {
+    return false;
+  }
+  return authoredRoots.slice(responseIndex + 2)
+    .every((root) => getMessageAuthorRole(root) === "assistant");
+}
+
+function getCurrentSkillCatalogSyncReplies(call) {
+  const now = Date.now();
+  const pageIdentity = getCurrentPageIdentity();
+  const challengeLine = `challenge: ${String(call?.challenge || "")}`;
+  const catalogShaLine = `catalog-sha: ${String(call?.catalogSha || "")}`;
+  const catalogVersionLine = `catalog-version: ${String(call?.catalogVersion || "")}`;
+  const candidates = [
+    ...recentSubmittedPluginReplies
+      .filter((entry) => now - Number(entry.submittedAt || 0) < RECENT_SUBMITTED_PLUGIN_REPLY_MAX_AGE_MS &&
+        entry.pageIdentity === pageIdentity)
+      .map((entry) => entry.reply),
+    ...Array.from(pendingHelperDeliveries.values())
+      .filter((entry) => entry.pageIdentity === pageIdentity && entry.kind === "skill-list")
+      .map((entry) => entry.reply)
+  ];
+  return Array.from(new Set(candidates.map((reply) => String(reply || ""))))
+    .filter((reply) => reply.startsWith("Local SKILLS catalog synchronization response:\n"))
+    .filter((reply) => reply.split("\n").includes(challengeLine))
+    .filter((reply) => reply.split("\n").includes(catalogShaLine))
+    .filter((reply) => reply.split("\n").includes(catalogVersionLine));
+}
+
+function buildOwnedSkillSyncRecoveryKey(candidate, semanticCallKey) {
+  return [
+    getCurrentPageIdentity(),
+    getHelperRenderRootGeneration(getCandidateRenderRoot(candidate)),
+    String(skillPanelState?.syncChallenge || skillPanelState?.challenge || ""),
+    String(skillPanelState?.syncPhase || ""),
+    semanticCallKey || buildSemanticCallKey(candidate?.call)
+  ].join("\n");
 }
 
 function formatSkillCatalogReply(response) {
@@ -3834,7 +4198,15 @@ function isM365AssistantLayoutRoot(root) {
 }
 
 function normalizeM365CollapsedAssistantText(value) {
-  return String(value || "").replace(/\r\n?|\n/g, " ");
+  const normalized = String(value || "").replace(/\r\n?/g, "\n");
+  // M365 currently leaves one layout newline at the end of markdown-reply's
+  // canonical textContent while innerText has no matching trailing space.
+  // Remove only that single host artifact; a second newline or any other
+  // hidden suffix must still break exact equivalence and fail closed.
+  const withoutOneTerminalLineBreak = normalized.endsWith("\n")
+    ? normalized.slice(0, -1)
+    : normalized;
+  return withoutOneTerminalLineBreak.replace(/\n/g, " ");
 }
 
 function stripOnlyLineBreaks(value) {
@@ -6789,21 +7161,35 @@ async function insertReply(text, options = {}) {
 
   rememberComposer(input, { force: true });
   input.focus();
+  const insertionText = getHostCompatibleComposerInsertionText(text);
 
   if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
-    setNativeInputValue(input, text);
+    setNativeInputValue(input, insertionText);
     input.dispatchEvent(new InputEvent("input", {
       bubbles: true,
       composed: true,
       inputType: "insertText",
-      data: text
+      data: insertionText
     }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
     return input;
   }
 
-  setContentEditableText(input, text);
+  setContentEditableText(input, insertionText);
   return input;
+}
+
+function getHostCompatibleComposerInsertionText(text) {
+  const intended = normalizeCommand(text);
+  if (location.hostname === "m365.cloud.microsoft" &&
+      isM365FlattenableStructuredDelivery(intended)) {
+    // M365 irreversibly serializes these exact plugin-owned payloads without
+    // line boundaries. Supplying that same projection up front also prevents
+    // Lexical from treating standalone JSON-brace paragraphs as formatting
+    // and deleting them before the ownership guard can send the message.
+    return intended.replace(/\n/g, "");
+  }
+  return text;
 }
 
 function setNativeInputValue(input, text) {
@@ -6912,6 +7298,18 @@ function insertContentEditableWithEditingCommand(input, text) {
 }
 
 function contentEditableHasText(input, expected) {
+  // M365's Lexical editor can report a successful execCommand insertion while
+  // silently dropping the outer JSON braces from a Skill catalog. Its old
+  // prefix-based check then treated the corrupted draft as complete and the
+  // delivery guard correctly cancelled it. Require full post-write ownership
+  // on the exact Copilot composer so setContentEditableText can fall through
+  // to its existing DOM replacement path when the editing command corrupts
+  // any non-layout character.
+  if (isM365CopilotComposerElement(input)) {
+    return Boolean(getValidatedComposerOwnershipText(input, expected, {
+      allowM365HostNormalization: true
+    }));
+  }
   const actual = normalizeCommand(input.innerText || input.textContent || "");
   const normalizedExpected = normalizeCommand(expected);
   const compactActual = actual.replace(/\s+/g, "");
@@ -7381,12 +7779,7 @@ function getValidatedComposerOwnershipText(composer, intendedText, options = {})
 }
 
 function isM365FlattenedLexicalComposerOwnership(composer, actualText, intendedText) {
-  if (location.hostname !== "m365.cloud.microsoft" || !(composer instanceof Element)) {
-    return false;
-  }
-  if (String(composer.getAttribute?.("role") || "").toLowerCase() !== "textbox" ||
-      String(composer.getAttribute?.("contenteditable") || "").toLowerCase() !== "true" ||
-      !/copilot/i.test(String(composer.getAttribute?.("aria-label") || ""))) {
+  if (!isM365CopilotComposerElement(composer)) {
     return false;
   }
   const sentinel = composer.querySelector?.('[aria-hidden="true"][data-lexical-text="true"]');
@@ -7394,6 +7787,14 @@ function isM365FlattenedLexicalComposerOwnership(composer, actualText, intendedT
     return false;
   }
   return m365FlattenedComposerTextMatches(actualText, intendedText);
+}
+
+function isM365CopilotComposerElement(composer) {
+  return location.hostname === "m365.cloud.microsoft" &&
+    composer instanceof Element &&
+    String(composer.getAttribute?.("role") || "").toLowerCase() === "textbox" &&
+    String(composer.getAttribute?.("contenteditable") || "").toLowerCase() === "true" &&
+    /copilot/i.test(String(composer.getAttribute?.("aria-label") || ""));
 }
 
 function m365FlattenedComposerTextMatches(actualText, intendedText) {
@@ -7637,50 +8038,56 @@ function getSubmittedMessageRootsMatching(text) {
   if (!expected || typeof document.querySelectorAll !== "function") {
     return [];
   }
-  const comparableExpected = normalizeComposerOwnershipText(expected);
-  const expectedRenderedCodeBlock = extractExpectedRenderedCodeBlock(expected);
   return Array.from(document.querySelectorAll(
     '[data-message-author-role="user"], [data-author-role="user"], .fai-UserMessage[role="article"]'
   ))
     .filter(isSubmittedUserMessageNode)
-    .filter((node) => {
-      const rawCandidates = [node.innerText, node.textContent]
-        .map((value) => String(value || "").replace(/\r\n?/g, "\n"))
-        .filter(Boolean);
-      if (isM365SubmittedUserMessageNode(node)) {
-        return rawCandidates.some((candidate) => m365SubmittedMessageTextMatches(candidate, expected));
+    .filter((node) => submittedUserMessageRootMatches(node, expected));
+}
+
+function submittedUserMessageRootMatches(node, text) {
+  const expected = normalizeCommand(text);
+  if (!expected || !isSubmittedUserMessageNode(node)) {
+    return false;
+  }
+  const comparableExpected = normalizeComposerOwnershipText(expected);
+  const expectedRenderedCodeBlock = extractExpectedRenderedCodeBlock(expected);
+  const rawCandidates = [node.innerText, node.textContent]
+    .map((value) => String(value || "").replace(/\r\n?/g, "\n"))
+    .filter(Boolean);
+  if (isM365SubmittedUserMessageNode(node)) {
+    return rawCandidates.some((candidate) => m365SubmittedMessageTextMatches(candidate, expected));
+  }
+  const candidates = rawCandidates
+    .map((value) => normalizeCommand(value || ""))
+    .filter(Boolean);
+  const roleNode = node.querySelector?.('.role, [data-message-role-label], [class*="role"]');
+  const roleText = normalizeCommand(roleNode?.textContent || roleNode?.innerText || "");
+  if (roleText) {
+    for (const candidate of [...candidates]) {
+      if (candidate.startsWith(roleText)) {
+        candidates.push(normalizeCommand(candidate.slice(roleText.length)));
       }
-      const candidates = rawCandidates
-        .map((value) => normalizeCommand(value || ""))
-        .filter(Boolean);
-      const roleNode = node.querySelector?.('.role, [data-message-role-label], [class*="role"]');
-      const roleText = normalizeCommand(roleNode?.textContent || roleNode?.innerText || "");
-      if (roleText) {
-        for (const candidate of [...candidates]) {
-          if (candidate.startsWith(roleText)) {
-            candidates.push(normalizeCommand(candidate.slice(roleText.length)));
-          }
-        }
-      }
-      if (expectedRenderedCodeBlock && renderedCodeBlockMatchesExpected(node, expectedRenderedCodeBlock, candidates)) {
-        return true;
-      }
-      return candidates.some((messageText) => {
-        if (messageText === expected) {
-          return true;
-        }
-        // Host renderers commonly collapse blank paragraphs after submission.
-        // Compare the complete message after removing only an explicit role
-        // label and normalizing CRLF, NBSP, and empty-paragraph count. Preserve
-        // every non-empty line boundary and its internal whitespace: stdout is
-        // semantic, so `a b` must never prove submission of `a\nb`.
-        const lines = messageText.split("\n");
-        if (/^(user|you)$/i.test(lines[0]?.trim() || "")) {
-          lines.shift();
-        }
-        return normalizeComposerOwnershipText(lines.join("\n")) === comparableExpected;
-      });
-    });
+    }
+  }
+  if (expectedRenderedCodeBlock && renderedCodeBlockMatchesExpected(node, expectedRenderedCodeBlock, candidates)) {
+    return true;
+  }
+  return candidates.some((messageText) => {
+    if (messageText === expected) {
+      return true;
+    }
+    // Host renderers commonly collapse blank paragraphs after submission.
+    // Compare the complete message after removing only an explicit role
+    // label and normalizing CRLF, NBSP, and empty-paragraph count. Preserve
+    // every non-empty line boundary and its internal whitespace: stdout is
+    // semantic, so `a b` must never prove submission of `a\nb`.
+    const lines = messageText.split("\n");
+    if (/^(user|you)$/i.test(lines[0]?.trim() || "")) {
+      lines.shift();
+    }
+    return normalizeComposerOwnershipText(lines.join("\n")) === comparableExpected;
+  });
 }
 
 function getSubmittedMessageRootIdentity(node) {
@@ -8599,13 +9006,19 @@ async function startSkillSync({ force = false } = {}) {
     setStatus(response?.error || "Skill synchronization could not start", response?.errorCode === "skills-already-current" ? "ok" : "error");
     return false;
   }
+  lastOwnedSkillSyncRecoveryStatus = "none";
+  committedOwnedSkillSyncSemanticKeys.clear();
   skillPanelState = {
     ...(skillPanelState || {}),
     ...response,
     ok: true,
     updateAvailable: true,
     syncing: true,
-    syncOwnedByCurrentTab: true
+    syncOwnedByCurrentTab: true,
+    syncChallenge: response.challenge,
+    syncCatalogSha: response.catalogSha,
+    syncCatalogVersion: Number(response.version || 0),
+    syncPhase: "list"
   };
   updateSkillPanelState();
   await removeObsoleteSkillSyncPromptDeliveries(response.challenge);
@@ -9474,9 +9887,15 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
     : `candidates: ${selectedIdx >= 0 ? selectedIdx + 1 : "?"}/${total}`;
   const activeSummary = `activeCall: ${activeCallId || "(none)"}${activeCallToken?.phase ? ` (${activeCallToken.phase})` : ""}`;
   const latestSkillCandidate = list.filter((entry) => isSkillHelperCall(entry.call)).at(-1) || null;
+  const ownedSyncRecoverySummary = latestSkillCandidate &&
+    isBaselineIgnoredHelperCandidate(latestSkillCandidate) &&
+    isActiveOwnedSkillSyncCandidate(latestSkillCandidate)
+    ? "eligible"
+    : lastOwnedSkillSyncRecoveryStatus;
   const lifecycleSummary = `scanGate: baseline=${initialThreadSettled ? "settled" : "pending"}` +
     ` generationObserved=${assistantGenerationObservedForLifecycle ? "yes" : "no"}` +
     ` skillLive=${latestSkillCandidate && isLiveGeneratedHelperCandidate(latestSkillCandidate) ? "yes" : "no"}` +
+    ` skillSyncRecovery=${ownedSyncRecoverySummary}` +
     ` skillInFlight=${skillHelperInFlight ? "yes" : "no"}` +
     ` skillAction=${panelSkillHelperActionable ? "available" : "none"}`;
 

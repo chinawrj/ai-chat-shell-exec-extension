@@ -7,7 +7,11 @@
 - Recognizes M365's current exact `.fai-CopilotMessage[role="article"]` assistant root throughout authored-message discovery and generation binding while retaining compatibility with the legacy `.fai-AssistantMessage` class.
 - Recovers one complete valid Skill envelope when current M365 Copilot content preserves canonical protocol lines in `textContent` but collapses those same lines to exactly one ordinary space each in `innerText`; prose, suffixes, hidden fields, second envelopes, changed whitespace, unknown roles, and non-M365 roots remain rejected.
 - Treats only the exact fixed plugin-owned Skill sync prompt as M365-flattenable submission content, and still requires a fresh exact `.fai-UserMessage[role="article"]` root beyond the pending delivery's baseline before finalizing it.
-- Adds focused positive, negative, history, identity, hidden-content, whitespace, challenge, and one-finalization regressions plus a host-mapped real Chrome M365 DOM scan and complete flattened prompt → Copilot list → catalog → Copilot ACK E2E.
+- Recovers a late-final M365 list/ACK only for the current tab's exact active challenge and synchronization phase; stale challenges, other tabs, later user turns, loads, and shell helpers remain inert.
+- Makes each accepted late-final list/ACK semantic an inert page-scoped tombstone across replacement DOM roots, so M365 redraws cannot repeat the backend request, catalog message, or error reply.
+- Accepts M365's single terminal markdown layout newline without tolerating a second newline or any hidden suffix.
+- Pre-projects only known plugin-owned structured payloads to M365's newline-free form before the first composer write, preserving JSON braces that Lexical otherwise deletes while leaving arbitrary text and user drafts untouched.
+- Adds focused positive, negative, history, identity, hidden-content, whitespace, terminal-newline, owner/phase, race, challenge, and one-finalization regressions plus host-mapped real Chrome M365 pages covering the complete flattened prompt → late-final Copilot list → brace-preserving catalog → Copilot ACK chain and tampered-prompt/later-user rejection.
 
 ## [0.11.9] - 2026-09-01
 

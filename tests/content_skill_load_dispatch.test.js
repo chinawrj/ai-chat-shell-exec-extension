@@ -30,6 +30,9 @@ testColdHistoryRequiresExplicitSkillRecovery()
   .then(() => testVisibleOldRouteStopCannotAuthorizeReplacementHistory())
   .then(() => testLiveStopSkillCompletionDispatchesExactlyOnce())
   .then(() => testAtomicCurrentAssistantSkillDispatchesExactlyOnce())
+  .then(() => testOwnedSyncChallengeRecoversLateFinalM365Helper())
+  .then(() => testCommittedOwnedSyncRedrawStaysHandled())
+  .then(() => testOwnedSyncRecoveryAwaitRacesStayLocal())
   .then(() => testUnknownRoleAtomicSkillFailsClosed())
   .then(() => testColdBaselineSurvivesRedrawButYieldsToLiveGeneration())
   .then(() => testStaleBackendResultCannotEnterAnotherChat())
@@ -1341,6 +1344,325 @@ async function testAtomicCurrentAssistantSkillDispatchesExactlyOnce() {
   await local.scanForShellCall();
   assert.equal(backendCalls, 1,
     "An atomic current-assistant Skill must dispatch exactly once across repeated scans.");
+}
+
+async function testOwnedSyncChallengeRecoversLateFinalM365Helper() {
+  const fixture = createOwnedSyncRecoveryFixture("9".repeat(32));
+  const { local, conversation, user, candidate, call, challenge, catalogSha, catalogVersion } = fixture;
+  let backendCalls = 0;
+  let queuedReplies = 0;
+  vm.runInContext("queueSkillComposerReply = async () => { globalThis.__ownedQueuedReplies += 1; return true; }; globalThis.__ownedQueuedReplies = 0;", local);
+  local.chrome.runtime.sendMessage = async (message) => {
+    backendCalls += 1;
+    assert.equal(message.type, "skill-sync-list");
+    assert.equal(message.challenge, challenge);
+    return {
+      ok: true,
+      syncRequired: true,
+      challenge,
+      catalogSha,
+      version: catalogVersion,
+      skills: []
+    };
+  };
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["m365.cloud.microsoft"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+
+  local.markCallBaselineIgnored(candidate, local.buildSemanticCallKey(call));
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(candidate), true,
+    "The exact active owner challenge in the final current assistant root must be recoverable without broad lifecycle authority.");
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true);
+  queuedReplies = vm.runInContext("globalThis.__ownedQueuedReplies", local);
+  assert.equal(backendCalls, 1,
+    "A late-final M365 Skill sync helper must dispatch exactly once after baseline recovery.");
+  assert.equal(queuedReplies, 1, "The recovered helper must queue exactly one catalog response.");
+  assert.equal(local.isBaselineIgnoredHelperCandidate(candidate), false,
+    "Successful owned-challenge recovery must clear only that candidate's baseline marker.");
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([candidate]);
+  assert.equal(local.isBaselineIgnoredHelperCandidate(candidate), false,
+    "Ordinary post-catalog scans must not regress a committed owner-sync candidate back to Process Skill.");
+  const acceptedProof = local.createOwnedSkillSyncTurnProof(candidate);
+  const catalogReply = local.formatSkillCatalogReply({
+    ok: true,
+    syncRequired: true,
+    challenge,
+    catalogSha,
+    version: catalogVersion,
+    skills: []
+  });
+  acceptedProof.backendAccepted = true;
+  acceptedProof.allowedNextUserReply = catalogReply;
+  const catalogUser = fixture.decorateM365Article(new local.Element({ author: "user" }), "fai-UserMessage");
+  catalogUser.innerText = `You said:\n${catalogReply.replace(/\n/g, "")}`;
+  catalogUser.textContent = catalogUser.innerText;
+  conversation.append(catalogUser);
+  assert.equal(local.isOwnedSkillSyncTurnProofCurrent(acceptedProof, candidate), true,
+    "The delivery guard must accept only its exact plugin catalog message as the next user turn.");
+  conversation.children.pop();
+  catalogUser.isConnected = false;
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), false);
+  assert.equal(backendCalls, 1, "Repeated scans must not repeat the recovered Skill list operation.");
+
+  vm.runInContext(`skillPanelState.syncPhase = "list"; skillPanelState.syncChallenge = ${JSON.stringify(challenge)};`, local);
+  user.innerText += "unexpected suffix";
+  user.textContent = user.innerText;
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(candidate), false,
+    "A near-match or suffixed user prompt must not establish plugin ownership.");
+  fixture.restorePrompt();
+
+  vm.runInContext(`skillPanelState.syncChallenge = ${JSON.stringify("8".repeat(32))};`, local);
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(candidate), false,
+    "A stale or different challenge must remain inert.");
+  vm.runInContext(`
+    skillPanelState.syncChallenge = ${JSON.stringify(challenge)};
+    skillPanelState.syncOwnedByCurrentTab = false;
+  `, local);
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(candidate), false,
+    "Another tab's active sync must not authorize recovery.");
+  vm.runInContext("skillPanelState.syncOwnedByCurrentTab = true;", local);
+  const laterUser = fixture.decorateM365Article(new local.Element({ author: "user" }), "fai-UserMessage");
+  laterUser.textContent = "A later user turn.";
+  laterUser.innerText = "You said:\nA later user turn.";
+  conversation.append(laterUser);
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(candidate), false,
+    "A helper before the latest user turn must not borrow the active challenge.");
+
+  const loadCall = local.parseCallPayload([
+    "ai-helper-skill-start:not-sync-recovery",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"b".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n"));
+  const loadCandidate = { ...candidate, call: loadCall };
+  assert.equal(local.isActiveOwnedSkillSyncCandidate(loadCandidate), false,
+    "Ordinary Skill loads must retain candidate-bound generation proof and cannot use sync recovery.");
+}
+
+async function testOwnedSyncRecoveryAwaitRacesStayLocal() {
+  const newUserFixture = createOwnedSyncRecoveryFixture("7".repeat(32));
+  const first = newUserFixture;
+  first.local.markCallBaselineIgnored(first.candidate, first.local.buildSemanticCallKey(first.call));
+  let releaseBackend;
+  let backendStarted;
+  const backendGate = new Promise((resolve) => { releaseBackend = resolve; });
+  const started = new Promise((resolve) => { backendStarted = resolve; });
+  first.local.chrome.runtime.sendMessage = async () => {
+    backendStarted();
+    return backendGate;
+  };
+  vm.runInContext("globalThis.__raceQueuedReplies = 0; queueSkillComposerReply = async () => { globalThis.__raceQueuedReplies += 1; return true; };", first.local);
+  const pending = first.local.processLatestSkillCandidate([first.candidate], { maxChainCalls: 100 });
+  await started;
+  const laterUser = first.decorateM365Article(new first.local.Element({ author: "user" }), "fai-UserMessage");
+  laterUser.innerText = "You said:\nA real later user message.";
+  laterUser.textContent = laterUser.innerText;
+  first.conversation.append(laterUser);
+  releaseBackend({
+    ok: true,
+    syncRequired: true,
+    challenge: first.challenge,
+    catalogSha: first.catalogSha,
+    version: first.catalogVersion,
+    skills: []
+  });
+  assert.equal(await pending, false,
+    "A later user turn during the backend await must invalidate owner-turn recovery.");
+  assert.equal(vm.runInContext("globalThis.__raceQueuedReplies", first.local), 0,
+    "No catalog response may be queued into the later user turn.");
+  assert.equal(first.local.isBaselineIgnoredHelperCandidate(first.candidate), true,
+    "The exact helper must remain manually recoverable after the await race.");
+
+  const replaced = createOwnedSyncRecoveryFixture("6".repeat(32));
+  replaced.local.markCallBaselineIgnored(replaced.candidate, replaced.local.buildSemanticCallKey(replaced.call));
+  let releaseReplaced;
+  let replacedStarted;
+  const replacedGate = new Promise((resolve) => { releaseReplaced = resolve; });
+  const replacedStartedPromise = new Promise((resolve) => { replacedStarted = resolve; });
+  replaced.local.chrome.runtime.sendMessage = async () => {
+    replacedStarted();
+    return replacedGate;
+  };
+  vm.runInContext("globalThis.__forceRaceReplies = 0; queueSkillComposerReply = async () => { globalThis.__forceRaceReplies += 1; return true; };", replaced.local);
+  const replacedPending = replaced.local.processLatestSkillCandidate([replaced.candidate], { maxChainCalls: 100 });
+  await replacedStartedPromise;
+  vm.runInContext(`skillPanelState.syncChallenge = ${JSON.stringify("5".repeat(32))};`, replaced.local);
+  releaseReplaced({
+    ok: true,
+    syncRequired: true,
+    challenge: replaced.challenge,
+    catalogSha: replaced.catalogSha,
+    version: replaced.catalogVersion,
+    skills: []
+  });
+  assert.equal(await replacedPending, false,
+    "A force-replaced challenge during the backend await must invalidate recovery.");
+  assert.equal(vm.runInContext("globalThis.__forceRaceReplies", replaced.local), 0,
+    "The obsolete challenge must not queue an AI-visible response.");
+  assert.equal(replaced.local.isBaselineIgnoredHelperCandidate(replaced.candidate), true);
+
+  const rejected = createOwnedSyncRecoveryFixture("4".repeat(32));
+  rejected.local.markCallBaselineIgnored(rejected.candidate, rejected.local.buildSemanticCallKey(rejected.call));
+  vm.runInContext("globalThis.__rejectedReplies = 0; queueSkillComposerReply = async () => { globalThis.__rejectedReplies += 1; return true; };", rejected.local);
+  rejected.local.chrome.runtime.sendMessage = async () => ({
+    ok: false,
+    errorCode: "skill-sync-challenge-mismatch",
+    error: "challenge changed"
+  });
+  assert.equal(await rejected.local.processLatestSkillCandidate([rejected.candidate], { maxChainCalls: 100 }), false);
+  assert.equal(vm.runInContext("globalThis.__rejectedReplies", rejected.local), 0,
+    "A backend owner/challenge rejection is a local race and must never be sent to the AI.");
+  assert.equal(rejected.local.isBaselineIgnoredHelperCandidate(rejected.candidate), true);
+}
+
+async function testCommittedOwnedSyncRedrawStaysHandled() {
+  const fixture = createOwnedSyncRecoveryFixture("3".repeat(32));
+  const { local, conversation, assistant, candidate, call, challenge, catalogSha, catalogVersion } = fixture;
+  const semanticCallKey = local.buildSemanticCallKey(call);
+  let backendCalls = 0;
+  let queuedReplies = 0;
+  local.chrome.runtime.sendMessage = async () => {
+    backendCalls += 1;
+    return {
+      ok: true,
+      syncRequired: true,
+      challenge,
+      catalogSha,
+      version: catalogVersion,
+      skills: []
+    };
+  };
+  local.queueSkillComposerReply = async () => {
+    queuedReplies += 1;
+    return true;
+  };
+  local.markCallBaselineIgnored(candidate, semanticCallKey);
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true);
+  assert.equal(backendCalls, 1);
+  assert.equal(queuedReplies, 1);
+
+  const redraw = fixture.decorateM365Article(new local.Element({ author: "assistant" }), "fai-CopilotMessage");
+  redraw.textContent = assistant.textContent;
+  redraw.innerText = assistant.innerText;
+  redraw.parentElement = conversation;
+  assistant.isConnected = false;
+  conversation.children[1] = redraw;
+  const redrawCandidate = {
+    call,
+    node: redraw,
+    textRoot: redraw,
+    source: candidate.source,
+    blockIndex: candidate.blockIndex
+  };
+  local.__ownedSyncCandidate = redrawCandidate;
+
+  assert.equal(local.isCommittedOwnedSkillSyncRecovery(redrawCandidate, semanticCallKey), true,
+    "The page-scoped semantic tombstone must recognize an equivalent helper on a replacement DOM root.");
+  local.markBaselineIgnoredCandidates([redrawCandidate]);
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([redrawCandidate]);
+  assert.equal(local.isBaselineIgnoredHelperCandidate(redrawCandidate, semanticCallKey), false,
+    "A committed redraw is already handled and must not regress to manual Process Skill state.");
+  assert.equal(
+    local.getHandledHelperReason(redrawCandidate, "redraw", semanticCallKey, call),
+    "committed owner-sync helper"
+  );
+  assert.equal(await local.processLatestSkillCandidate([redrawCandidate], { maxChainCalls: 100 }), false,
+    "A replacement root with the committed semantic must remain inert.");
+  assert.equal(backendCalls, 1,
+    "A committed list helper DOM redraw must never issue a second backend list request.");
+  assert.equal(queuedReplies, 1,
+    "A committed list helper DOM redraw must never queue a second catalog message.");
+}
+
+function createOwnedSyncRecoveryFixture(challenge) {
+  const local = createContentContext();
+  local.location.hostname = "m365.cloud.microsoft";
+  local.location.origin = "https://m365.cloud.microsoft";
+  local.location.href = `https://m365.cloud.microsoft/chat/conversation/${challenge.slice(0, 8)}`;
+  const decorateM365Article = (node, className) => {
+    const originalClosest = node.closest.bind(node);
+    const originalMatches = node.matches.bind(node);
+    node.role = "article";
+    node.matches = (selector) => String(selector).includes(`.${className}[role="article"]`) || originalMatches(selector);
+    node.closest = (selector) => String(selector).includes(`.${className}[role="article"]`)
+      ? node
+      : originalClosest(selector);
+    return node;
+  };
+  const catalogSha = "a".repeat(64);
+  const catalogVersion = 3;
+  const conversation = new local.Element();
+  const user = decorateM365Article(new local.Element({ author: "user" }), "fai-UserMessage");
+  const prompt = local.buildSkillSyncPrompt({ challenge, catalogSha, version: catalogVersion });
+  const restorePrompt = () => {
+    user.innerText = `You said:\n${prompt.replace(/\n/g, "")}`;
+    user.textContent = user.innerText;
+  };
+  restorePrompt();
+  const assistant = decorateM365Article(new local.Element({ author: "assistant" }), "fai-CopilotMessage");
+  const helperText = [
+    "ai-helper-skill-start:owned-sync-late-final",
+    "cmd: list",
+    `challenge: ${challenge}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  assistant.innerText = helperText.replace(/\n/g, " ");
+  conversation.append(user);
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__ownedSyncConversation = conversation;
+  local.__ownedSyncCandidate = candidate;
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__ownedSyncConversation;
+    extractShellCallCandidates = () => [globalThis.__ownedSyncCandidate];
+    skillPanelState = {
+      ok: true,
+      syncing: true,
+      syncOwnedByCurrentTab: true,
+      syncChallenge: ${JSON.stringify(challenge)},
+      syncCatalogSha: ${JSON.stringify(catalogSha)},
+      syncCatalogVersion: ${catalogVersion},
+      syncPhase: "list",
+      catalogSha: ${JSON.stringify(catalogSha)},
+      version: ${catalogVersion}
+    };
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    lastThreadText = normalizeText(globalThis.__ownedSyncConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["m365.cloud.microsoft"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  return {
+    local,
+    conversation,
+    user,
+    assistant,
+    candidate,
+    call,
+    challenge,
+    catalogSha,
+    catalogVersion,
+    prompt,
+    restorePrompt,
+    decorateM365Article
+  };
 }
 
 async function testUnknownRoleAtomicSkillFailsClosed() {

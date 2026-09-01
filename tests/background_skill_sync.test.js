@@ -37,6 +37,25 @@ async function main() {
   assert.equal(begun.ok, true, JSON.stringify(begun));
   assert.match(begun.challenge, /^[a-f0-9]{32}$/);
   assert.equal(begun.syncOwnerTabId, 11);
+  assert.equal(begun.syncPhase, "list");
+  const prematureAck = await context.handleSkillMessage({
+    type: "skill-sync-ack",
+    challenge: begun.challenge,
+    catalogSha: begun.catalogSha,
+    catalogVersion: begun.version,
+    memoryEntry: "AI_CHAT_SHELL_SKILLS_CATALOG"
+  }, chatgptTab1);
+  assert.equal(prematureAck.errorCode, "skill-sync-phase-mismatch",
+    "An ACK cannot skip the catalog-list phase even with the exact owner challenge and initial SHA/version.");
+  const prematureFailure = await context.handleSkillMessage({
+    type: "skill-sync-failed",
+    challenge: begun.challenge,
+    catalogSha: begun.catalogSha,
+    catalogVersion: begun.version,
+    reason: "premature"
+  }, chatgptTab1);
+  assert.equal(prematureFailure.errorCode, "skill-sync-phase-mismatch",
+    "A failure report cannot skip the catalog-list phase.");
   const sameOwner = await context.handleSkillMessage({ type: "skill-sync-begin" }, chatgptTab1);
   assert.equal(sameOwner.errorCode, "skill-sync-already-active");
   const otherOwnerForced = await context.handleSkillMessage({ type: "skill-sync-begin", force: true }, chatgptTab2);
@@ -57,6 +76,14 @@ async function main() {
   const nonOwnerState = await context.handleSkillMessage({ type: "skill-state-get" }, chatgptTab2);
   assert.equal(ownerState.syncOwnedByCurrentTab, true, "The owner tab must be distinguishable after a state refresh.");
   assert.equal(nonOwnerState.syncOwnedByCurrentTab, false, "A non-owner tab must display that another tab owns the sync.");
+  assert.equal(ownerState.syncChallenge, begun.challenge,
+    "Only the owner tab must recover the exact active challenge after a content-script reload.");
+  assert.equal(nonOwnerState.syncChallenge, "",
+    "A non-owner tab must never receive another tab's active Skill challenge.");
+  assert.equal(ownerState.syncPhase, "list");
+  assert.equal(ownerState.syncCatalogVersion, begun.version);
+  assert.equal(nonOwnerState.syncPhase, "");
+  assert.equal(nonOwnerState.syncCatalogVersion, 0);
 
   const otherScope = await context.handleSkillMessage({ type: "skill-sync-begin" }, m365Tab);
   assert.equal(otherScope.ok, true, "Different AI origins must have independent memory sync ownership.");
@@ -78,6 +105,7 @@ async function main() {
   }, chatgptTab1);
   assert.equal(list.ok, true);
   assert.equal(list.syncRequired, true);
+  assert.equal(list.syncPhase, "ack");
   assert.equal(list.catalogSha, catalog.catalogSha);
   assert.equal(list.memoryEntry, "AI_CHAT_SHELL_SKILLS_CATALOG");
 

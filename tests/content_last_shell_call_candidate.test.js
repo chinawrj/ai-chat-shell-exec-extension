@@ -3098,6 +3098,49 @@ async function verifyM365LexicalFlatteningKeepsOriginalSendActuator() {
     composer.innerText,
     "M365's exact Lexical newline flattening remains the plugin-owned text."
   );
+  assert.equal(
+    context.contentEditableHasText(composer, intended),
+    true,
+    "M365's exact newline-only Lexical projection remains a complete insertion."
+  );
+  const intendedCatalog = [
+    "Local SKILLS catalog synchronization response:",
+    "",
+    "````skill-output",
+    "{",
+    '  "catalogSha": "abc",',
+    '  "skills": []',
+    "}",
+    "````"
+  ].join("\n");
+  assert.equal(
+    context.getHostCompatibleComposerInsertionText(intendedCatalog),
+    intendedCatalog.replace(/\n/g, ""),
+    "M365 must write a known structured catalog in the exact newline-free form the host will submit."
+  );
+  assert.match(context.getHostCompatibleComposerInsertionText(intendedCatalog), /skill-output\{/,
+    "Pre-flattening must preserve every JSON brace instead of accepting host corruption.");
+  assert.equal(
+    context.getHostCompatibleComposerInsertionText("ordinary\nuser text"),
+    "ordinary\nuser text",
+    "M365 host projection must never flatten arbitrary text."
+  );
+  composer.innerText = `${intendedCatalog.replace(/\n/g, "").replace("{", "").replace("}", "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  assert.equal(
+    context.contentEditableHasText(composer, intendedCatalog),
+    false,
+    "A prefix-matching M365 insertion with stripped JSON braces must fall through to the exact DOM replacement path."
+  );
+  composer.innerText = `${intended.replace(/\n/g, "")}\u200b\u200c`;
+  composer.textContent = composer.innerText;
+  context.location.hostname = "example.com";
+  assert.equal(
+    context.getHostCompatibleComposerInsertionText(intendedCatalog),
+    intendedCatalog,
+    "Other hosts must retain the original multiline composer payload."
+  );
+  context.location.hostname = "m365.cloud.microsoft";
   const delivered = await context.deliverHelperReply({
     pageIdentity: context.getCurrentPageIdentity(),
     generation: vm.runInContext("pageLifecycleGeneration", context),

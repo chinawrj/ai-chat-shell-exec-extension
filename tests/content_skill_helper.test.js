@@ -244,6 +244,16 @@ async function awaitTestCanonicalSkillDomFallback() {
   assert.equal(context.getMessageAuthorRole(copilotArticle), "assistant",
     "The current M365 fai-CopilotMessage article is an explicit assistant root.");
 
+  const copilotContentWithTerminalNewline = new context.Element();
+  copilotContentWithTerminalNewline.innerText = m365List.replace(/\n/g, " ");
+  copilotContentWithTerminalNewline.textContent = `${m365List}\n`;
+  copilotContentWithTerminalNewline.matches = () => false;
+  copilotContentWithTerminalNewline.closest = copilotContent.closest;
+  const [terminalNewlineCandidate] = context.extractPlainTextShellCallBlocks(copilotContentWithTerminalNewline);
+  assert.ok(terminalNewlineCandidate,
+    "M365's single terminal markdown layout newline must not hide an otherwise exact Skill envelope.");
+  assert.equal(terminalNewlineCandidate.call.challenge, challenge);
+
   const legacyAssistant = new context.Element();
   legacyAssistant.matches = (selector) => String(selector).includes('.fai-AssistantMessage[role="article"]');
   legacyAssistant.closest = () => null;
@@ -263,6 +273,11 @@ async function awaitTestCanonicalSkillDomFallback() {
     {
       label: "second envelope",
       raw: `${m365List}\n${m365List.replace("m365-copilot-list", "m365-copilot-list-2")}`
+    },
+    {
+      label: "second terminal newline",
+      raw: `${m365List}\n\n`,
+      rendered: m365List.replace(/\n/g, " ")
     }
   ];
   for (const testCase of collapsedNegativeCases) {
