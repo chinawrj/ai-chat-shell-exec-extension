@@ -38,7 +38,7 @@ const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.8";
+const CONTENT_SCRIPT_VERSION = "0.11.9";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -80,6 +80,7 @@ const baselineIgnoredRenderedHelpers = new WeakMap();
 const liveGeneratedRenderedHelpers = new WeakMap();
 const knownRenderedHelperSemantics = new WeakMap();
 let assistantGenerationEpoch = null;
+let staleRouteGenerationControls = new WeakSet();
 // Keep per-helper scan metadata in memory only. This prevents the same rendered
 // helper block from being submitted repeatedly, but it is not command dedup:
 // only the shell server can decide whether a command already ran on a tmux pane.
@@ -92,6 +93,7 @@ let pageLifecycleGeneration = 0;
 let observedPageIdentity = "";
 let routeHandoffPreviousPageIdentity = "";
 let composerDeliverySequence = 0;
+let pendingHelperDeliveryAttemptSequence = 0;
 let composerDeliveryTail = Promise.resolve();
 let activeComposerDeliveryToken = null;
 let activeOriginalSendActuatorGuard = null;
@@ -138,6 +140,7 @@ let pendingHelperDeliveriesLoadedKey = "";
 let pendingHelperDeliveryRetryTimer = 0;
 let pendingHelperDeliveryRetryInFlight = false;
 let pendingHelperDeliveryStorageTail = Promise.resolve();
+let pendingHelperDeliveryCreationSequence = 0;
 // The author-role filter is opt-in. The legacy heuristic that decided whether a
 // helper block came from the assistant or the user produced false positives on
 // hosts that don't expose `data-message-author-role` (or whose nearest
@@ -293,14 +296,20 @@ function observeThread() {
     // the only evidence that a completed helper came from a response generated
     // in this page lifecycle rather than from pre-existing conversation history.
     const routeChanged = refreshPageLifecycle();
+    if (routeChanged) {
+      reconcileStaleRouteGenerationControls(pageRecords);
+    }
     const generationEvidenceActive = observeAssistantGenerationEvidence(pageRecords, {
       allowRemovedControls: !routeChanged
     });
     invalidateRenderedHelperTracking(pageRecords);
     if (generationEvidenceActive) {
-      if (!routeChanged || assistantGenerationEpoch?.routeCarryOnly !== true) {
+      if (assistantGenerationEpoch?.routeCarryOnly !== true) {
         trackAssistantGenerationHelperRoots(pageRecords);
       }
+      // The epoch is bound to one explicit current assistant message, so an
+      // atomic short response may be proved and accepted in its first observer
+      // batch without allowing an older/unknown message to borrow a Stop.
       markLiveGeneratedHelperCandidates(pageRecords);
     }
     refreshKnownRenderedHelperSemantics(pageRecords);
@@ -327,6 +336,7 @@ function observePendingHelperSubmissionProof() {
   for (const entry of pendingHelperDeliveries.values()) {
     if (!["inserted", "submitted-unconfirmed"].includes(entry.phase) ||
         entry.finalizationInFlight ||
+        !isPendingSkillDeliveryOriginCurrent(entry) ||
         !hasPendingHelperSubmissionProof(entry)) {
       continue;
     }
@@ -343,12 +353,33 @@ function invalidateRenderedHelperTracking(records) {
     if (!mutationTouchesHelperText(record)) {
       continue;
     }
-    let element = record.target instanceof Element ? record.target : record.target?.parentElement;
-    while (element instanceof Element) {
+    const invalidated = new Set();
+    const invalidate = (element) => {
+      if (!(element instanceof Element) || invalidated.has(element)) {
+        return;
+      }
+      invalidated.add(element);
       if (processedRenderedHelpers.has(element)) {
         processedRenderedHelpers.delete(element);
         helperRenderRootGenerations.set(element, getHelperRenderRootGeneration(element) + 1);
       }
+    };
+    for (const node of [
+      ...Array.from(record?.addedNodes || []),
+      ...Array.from(record?.removedNodes || [])
+    ]) {
+      const element = node instanceof Element ? node : node?.parentElement;
+      if (!(element instanceof Element)) {
+        continue;
+      }
+      invalidate(element);
+      for (const descendant of Array.from(element.querySelectorAll?.("*") || [])) {
+        invalidate(descendant);
+      }
+    }
+    let element = record.target instanceof Element ? record.target : record.target?.parentElement;
+    while (element instanceof Element) {
+      invalidate(element);
       element = element.parentElement;
     }
   }
@@ -545,10 +576,12 @@ function recordTrustedPendingHelperComposerMutation(event) {
     // or clicked again while the matching user-message root catches up.
     if (!currentText && /^(insertParagraph|insertLineBreak)$/.test(inputType)) {
       markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+        cancellationBoundary: true,
         reason: "composer was cleared after a trusted submit-like edit"
       }).catch(() => {});
       continue;
     }
+    markPendingHelperCancellationBoundary(entry);
     entry.userCancellationObserved = true;
     entry.updatedAt = Date.now();
     cancelPendingHelperDeliveryAfterComposerRemoval(entry).catch(() => {});
@@ -825,6 +858,16 @@ async function scanForShellCall(options = {}) {
     }
   }
 
+  if (!force) {
+    // A chat host can quiet-settle an empty shell and hydrate old transcript
+    // rows several seconds later. DOM arrival alone is not proof that the AI
+    // generated an executable/Skill helper in this lifecycle. Keep every
+    // first-seen unproved helper inert; a genuine streamed response carries
+    // candidate-bound generation evidence, while historical rows remain
+    // available through Force run or Process Skill.
+    markUnprovenAutomaticHelperCandidatesAsBaseline(allCandidates);
+  }
+
   if (!force && hasDrawioCandidate) {
     processLatestDrawioCandidates(allCandidates);
   }
@@ -1067,7 +1110,17 @@ function beginPageLifecycle(options = {}) {
   activeCallId = "";
   activeCallToken = null;
   initialThreadSettled = false;
-  if (options.routeTransition === true && assistantGenerationEpoch) {
+  staleRouteGenerationControls = options.routeTransition === true
+    ? new WeakSet(getAssistantGenerationControls())
+    : new WeakSet();
+  if (options.routeTransition === true && assistantGenerationEpoch &&
+      assistantGenerationEpoch.routeCarryOnly !== true) {
+    assistantGenerationEpoch.routeCarryUserText = getGenerationRouteText(
+      assistantGenerationEpoch.userAnchor
+    );
+    assistantGenerationEpoch.routeCarryResponsePrefix = getGenerationRouteText(
+      assistantGenerationEpoch.responseMessageRoot
+    );
     assistantGenerationEpoch.routeCarryOnly = true;
     assistantGenerationObservedForLifecycle = true;
   } else {
@@ -1096,6 +1149,29 @@ function beginPageLifecycle(options = {}) {
     const nextPageIdentity = getCurrentPageIdentity();
     for (const entry of routeHandoffEntries) {
       entry.pageIdentity = nextPageIdentity;
+      if (entry.skillOriginProof) {
+        // A URL change is not proof of a provisional-to-permanent route
+        // assignment: it can also be a user navigating to another chat. Carry
+        // local Skill content only while the exact originating helper root is
+        // still owned by this route lifecycle. The volatile guard reclaims the
+        // retained candidate through isSkillDispatchContextCurrent; the stored
+        // proof then protects reload recovery on the assigned URL.
+        // Do not validate while the old route's DOM may still be mounted.
+        // attemptPendingHelperDelivery waits for the new thread to settle and
+        // then requires exact runtime root continuity before rebasing proof.
+        entry.skillRouteRevision = Number(entry.skillRouteRevision || 0) + 1;
+        entry.activeDeliveryAttemptToken = null;
+        const handoffCount = Number(entry.skillRouteHandoffCount || 0);
+        if (["inserted", "submitted-unconfirmed"].includes(entry.phase) || handoffCount >= 1) {
+          // Text already written to a composer must never acquire send
+          // authority in another route. A second route is likewise ambiguous,
+          // even if React temporarily retains the same DOM objects.
+          entry.volatileStaleHandler?.();
+          continue;
+        }
+        entry.skillRouteHandoffCount = handoffCount + 1;
+        entry.skillRouteHandoffPending = entry.phase === "queued";
+      }
       entry.restored = false;
       entry.deliveryInFlight = false;
       entry.updatedAt = Date.now();
@@ -1179,6 +1255,16 @@ async function loadPendingHelperDeliveriesForCurrentPage() {
       .filter((entry) => !(entry.removeWhenQueuedAfterSkillSync === true && entry.phase === "queued"))
       .map((entry) => {
         const restored = { ...entry, restored: true };
+        const storedSequence = Number(restored.creationSequence || 0);
+        if (Number.isSafeInteger(storedSequence) && storedSequence > 0) {
+          pendingHelperDeliveryCreationSequence = Math.max(
+            pendingHelperDeliveryCreationSequence,
+            storedSequence
+          );
+        } else {
+          pendingHelperDeliveryCreationSequence += 1;
+          restored.creationSequence = pendingHelperDeliveryCreationSequence;
+        }
         delete restored.removeWhenQueuedAfterSkillSync;
         return restored;
       });
@@ -1259,7 +1345,8 @@ function prunePendingHelperDeliveryEntries(entries, now = Date.now()) {
 function pendingHelperDeliveryStoredChars(entry) {
   return String(entry?.reply || "").length +
     String(entry?.call?.cmd || "").length +
-    String(entry?.call?.error || "").length;
+    String(entry?.call?.error || "").length +
+    String(entry?.skillOriginProof?.transcriptHash || "").length;
 }
 
 function isStoredPendingHelperDelivery(entry, now = Date.now()) {
@@ -1396,8 +1483,10 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     }
   }
   const submittedMessageRootsBefore = getSubmittedMessageRootsMatching(reply);
+  pendingHelperDeliveryCreationSequence += 1;
   const entry = {
     callId,
+    creationSequence: pendingHelperDeliveryCreationSequence,
     executionId,
     kind: pendingHelperDeliveryKind(call),
     call: snapshotPendingHelperCall(call),
@@ -1415,7 +1504,14 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     updatedAt: now,
     attempts: 0,
     lastError: "",
-    restored: false
+    restored: false,
+    skillOriginProof: options.skillOriginProof || null,
+    volatileLifecycleGuard: typeof options.lifecycleGuard === "function"
+      ? options.lifecycleGuard
+      : null,
+    volatileStaleHandler: typeof options.staleHandler === "function"
+      ? options.staleHandler
+      : null
   };
   pendingHelperDeliveries.set(callId, entry);
   const pruned = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()));
@@ -1437,6 +1533,9 @@ function persistPendingHelperDeliveries(
       pendingTrustedMutation: _pendingTrustedMutation,
       submittedMessageRootsBefore: _submittedMessageRootsBefore,
       finalizationInFlight: _finalizationInFlight,
+      activeDeliveryAttemptToken: _activeDeliveryAttemptToken,
+      volatileLifecycleGuard: _volatileLifecycleGuard,
+      volatileStaleHandler: _volatileStaleHandler,
       ...entry
     }) => entry);
   const presentedExecutions = pruneLocallyPresentedHelperExecutions(
@@ -1466,17 +1565,66 @@ async function clearPendingHelperDelivery(entry) {
   await persistPendingHelperDeliveries();
 }
 
-async function cancelPendingHelperDeliveryAfterComposerRemoval(entry) {
+function markPendingHelperCancellationBoundary(entry) {
+  if (!entry || Number.isSafeInteger(Number(entry.cancellationBatchSequence)) &&
+      Number(entry.cancellationBatchSequence) > 0) {
+    return;
+  }
+  entry.cancellationBatchSequence = pendingHelperDeliveryCreationSequence;
+  entry.updatedAt = Date.now();
+  // Capture the boundary in the serialized snapshot immediately. The write is
+  // best-effort and non-blocking for event callbacks, but its snapshot is built
+  // synchronously before any later submission-proof await or route transition.
+  persistPendingHelperDeliveries().catch(() => {});
+}
+
+async function cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken = null) {
   if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
     return true;
   }
-  if (await waitForPendingHelperSubmissionProof(entry)) {
+  if (!isPendingHelperDeliverySideEffectCurrent(entry, attemptToken)) {
+    return false;
+  }
+  markPendingHelperCancellationBoundary(entry);
+  const cancellationBatchSequence = Number(entry.cancellationBatchSequence || 0);
+  // Freeze only the batch that existed when the user cancelled this delivery.
+  // Cancellation may be recognized only after a later helper has filled the
+  // empty composer, so use the boundary recorded when ownership was first
+  // lost instead of the later recognition time.
+  const cancellationBatch = new Map(Array.from(pendingHelperDeliveries.entries()).filter(([, pending]) => {
+    const creationSequence = Number(pending?.creationSequence || 0);
+    return !Number.isSafeInteger(creationSequence) || creationSequence <= 0 ||
+      creationSequence <= cancellationBatchSequence;
+  }));
+  const hasSubmissionProof = await waitForPendingHelperSubmissionProof(entry);
+  if (pendingHelperDeliveries.get(entry.callId) !== entry ||
+      entry.pageIdentity !== getCurrentPageIdentity()) {
+    return false;
+  }
+  if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+    return false;
+  }
+  // The async guard above may itself yield after it observes a valid Skill
+  // origin. Recheck synchronously so same-URL transcript replacement cannot
+  // interleave between the final ownership proof and the following mutation.
+  if (!isPendingHelperDeliverySideEffectCurrent(entry, attemptToken)) {
+    // The mutation is no longer authorized. Let the existing exact-entry
+    // cleanup path discard a stale Skill delivery, but never continue into
+    // batch cancellation or presentation after this awaited cleanup.
+    await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken);
+    return false;
+  }
+  if (hasSubmissionProof) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
   // Emptying or replacing the current text is an explicit user cancellation.
   // Do not immediately fill the composer with another result that was already
   // queued behind it. A later new helper may still create a fresh delivery.
-  pendingHelperDeliveries.clear();
+  for (const [callId, pending] of cancellationBatch.entries()) {
+    if (pendingHelperDeliveries.get(callId) === pending) {
+      pendingHelperDeliveries.delete(callId);
+    }
+  }
   await persistPendingHelperDeliveries();
   const label = pendingHelperDeliveryLabel(entry);
   setStatus(`${label} result delivery and the current queued batch were cancelled because composer content was removed or changed; they will not be inserted again.`, "ok");
@@ -1579,6 +1727,9 @@ async function markPendingHelperDeliverySubmittedUnconfirmed(entry, options = {}
   entry.phase = "submitted-unconfirmed";
   entry.composerElement = null;
   entry.pendingTrustedMutation = null;
+  if (options.cancellationBoundary === true) {
+    markPendingHelperCancellationBoundary(entry);
+  }
   entry.lastError = String(options.reason || "waiting for exact submitted-message proof");
   entry.updatedAt = Date.now();
   persistPendingHelperDeliveries().catch(() => {});
@@ -1587,7 +1738,10 @@ async function markPendingHelperDeliverySubmittedUnconfirmed(entry, options = {}
   return false;
 }
 
-async function retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings) {
+async function retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings, attemptToken = null) {
+  if (!isPendingHelperDeliverySideEffectCurrent(entry, attemptToken)) {
+    return false;
+  }
   if (hasPendingHelperSubmissionProof(entry)) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
@@ -1597,11 +1751,15 @@ async function retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySet
   } catch (_unused) {
     composer = null;
   }
+  if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+    return false;
+  }
   if (composer && !entry.userCancellationObserved && getValidatedComposerOwnershipText(
     composer,
     entry.reply,
     { allowM365HostNormalization: true }
   )) {
+    delete entry.cancellationBatchSequence;
     if (isAssistantGenerating()) {
       setPendingHelperDeliveryStatus(entry);
       schedulePendingHelperDeliveryRetry();
@@ -1612,11 +1770,12 @@ async function retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySet
     entry.lastError = "the exact plugin-owned text is still present; resuming safe send-only attempts";
     entry.updatedAt = Date.now();
     persistPendingHelperDeliveries().catch(() => {});
-    return retryInsertedPendingHelperDelivery(entry, deliverySettings);
+    return retryInsertedPendingHelperDelivery(entry, deliverySettings, attemptToken);
   }
   if (composer && getComposerText(composer)) {
+    markPendingHelperCancellationBoundary(entry);
     entry.userCancellationObserved = true;
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken);
   }
   setPendingHelperDeliveryStatus(entry);
   schedulePendingHelperDeliveryRetry();
@@ -1632,7 +1791,7 @@ function isExplicitUserComposerCancellation(details, composerText) {
   return type === "cut" || type === "paste" || /^(delete|insertText|insertFrom)/.test(inputType);
 }
 
-async function settlePendingHelperAfterUnconfirmedSend(entry, callToken) {
+async function settlePendingHelperAfterUnconfirmedSend(entry, callToken, attemptToken = null) {
   if (entry.phase !== "inserted") {
     entry.lastError = "chat composer insertion has not completed; waiting to perform the single allowed composer write";
     entry.updatedAt = Date.now();
@@ -1642,6 +1801,9 @@ async function settlePendingHelperAfterUnconfirmedSend(entry, callToken) {
     return false;
   }
   const ownership = await inspectCurrentComposerOwnership(entry.composerElement, entry.reply);
+  if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+    return false;
+  }
   if (hasPendingHelperSubmissionProof(entry)) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
@@ -1650,15 +1812,18 @@ async function settlePendingHelperAfterUnconfirmedSend(entry, callToken) {
     callToken.composerCancellation,
     currentText
   )) {
+    markPendingHelperCancellationBoundary(entry);
     entry.userCancellationObserved = true;
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken);
   }
   if (ownership.state === "changed" && currentText) {
+    markPendingHelperCancellationBoundary(entry);
     entry.userCancellationObserved = true;
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken);
   }
   if (ownership.state === "changed" && !currentText) {
     return markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+      cancellationBoundary: true,
       reason: callToken?.composerCancelled
         ? "composer was cleared after a trusted submit-like action; waiting for exact submission proof"
         : "composer was cleared after a send attempt; waiting for exact submission proof"
@@ -1674,7 +1839,10 @@ async function settlePendingHelperAfterUnconfirmedSend(entry, callToken) {
   return false;
 }
 
-async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
+async function retryInsertedPendingHelperDelivery(entry, deliverySettings, attemptToken = null) {
+  if (!isPendingHelperDeliverySideEffectCurrent(entry, attemptToken)) {
+    return false;
+  }
   if (hasPendingHelperSubmissionProof(entry)) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
@@ -1683,6 +1851,9 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     composer = await findReplyInput();
   } catch (_unused) {
     composer = null;
+  }
+  if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+    return false;
   }
   if (!composer) {
     entry.lastError = "composer unavailable after the result was inserted; waiting without reinserting";
@@ -1694,7 +1865,8 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
   }
 
   if (entry.userCancellationObserved) {
-    return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+    markPendingHelperCancellationBoundary(entry);
+    return cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken);
   }
   const expectedComposerText = getValidatedComposerOwnershipText(composer, entry.reply, {
     allowM365HostNormalization: true
@@ -1704,10 +1876,12 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
       return finalizePendingHelperDelivery(entry, "submitted");
     }
     if (getComposerText(composer)) {
+      markPendingHelperCancellationBoundary(entry);
       entry.userCancellationObserved = true;
-      return cancelPendingHelperDeliveryAfterComposerRemoval(entry);
+      return cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptToken);
     }
     return markPendingHelperDeliverySubmittedUnconfirmed(entry, {
+      cancellationBoundary: true,
       reason: "composer is empty after a prior send attempt; waiting for exact submission proof"
     });
   }
@@ -1716,6 +1890,9 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     entry.lastError = "auto-send is disabled; waiting for exact manual submission proof";
     entry.updatedAt = Date.now();
     await persistPendingHelperDeliveries();
+    if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+      return false;
+    }
     setPendingHelperDeliveryStatus(entry);
     schedulePendingHelperDeliveryRetry();
     return false;
@@ -1739,12 +1916,14 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
     pageIdentity: callToken.pageIdentity,
     generation: callToken.generation
   }, async (deliveryToken) => {
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+    if (!isComposerDeliveryTokenCurrent(deliveryToken) ||
+        !isPendingHelperDeliverySideEffectCurrent(entry, attemptToken)) {
       return false;
     }
     return runOriginalSendActuatorForOwnedComposer(
       composer,
-      () => isComposerDeliveryTokenCurrent(deliveryToken),
+      () => isComposerDeliveryTokenCurrent(deliveryToken) &&
+        isPendingHelperDeliverySideEffectCurrent(entry, attemptToken),
       entry.reply,
       {
         onStarted: async () => {
@@ -1754,16 +1933,20 @@ async function retryInsertedPendingHelperDelivery(entry, deliverySettings) {
           persistPendingHelperDeliveries().catch(() => {});
         },
         onUserCancellation: (details) => {
+          markPendingHelperCancellationBoundary(entry);
           callToken.composerCancelled = true;
           callToken.composerCancellation = details || null;
         }
       }
     );
   });
+  if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+    return false;
+  }
   if (sent) {
     return finalizePendingHelperDelivery(entry, "submitted");
   }
-  return settlePendingHelperAfterUnconfirmedSend(entry, callToken);
+  return settlePendingHelperAfterUnconfirmedSend(entry, callToken, attemptToken);
 }
 
 async function attemptPendingHelperDelivery(entry, settings = null) {
@@ -1773,17 +1956,74 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
   if (entry.deliveryInFlight === true) {
     return false;
   }
+  pendingHelperDeliveryAttemptSequence += 1;
+  const attemptToken = {
+    sequence: pendingHelperDeliveryAttemptSequence,
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    skillRouteRevision: Number(entry.skillRouteRevision || 0)
+  };
+  entry.activeDeliveryAttemptToken = attemptToken;
   entry.deliveryInFlight = true;
   try {
+    if (entry.skillRouteHandoffPending === true) {
+      if (!initialThreadSettled) {
+        setPendingHelperDeliveryStatus(entry);
+        schedulePendingHelperDeliveryRetry();
+        return false;
+      }
+      if (typeof entry.volatileLifecycleGuard !== "function" ||
+          entry.volatileLifecycleGuard() !== true) {
+        entry.volatileStaleHandler?.();
+        await discardStaleSkillPendingDelivery(entry);
+        return false;
+      }
+      entry.skillOriginProof = {
+        ...entry.skillOriginProof,
+        pageIdentity: getCurrentPageIdentity()
+      };
+      entry.skillRouteHandoffPending = false;
+      entry.updatedAt = Date.now();
+      if (!isStoredSkillOriginProofCurrent(entry.skillOriginProof)) {
+        entry.volatileStaleHandler?.();
+        await discardStaleSkillPendingDelivery(entry);
+        return false;
+      }
+      await persistPendingHelperDeliveries();
+      if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+        return false;
+      }
+    }
+    if (!isPendingSkillDeliveryOriginCurrent(entry)) {
+      entry.volatileStaleHandler?.();
+      await discardStaleSkillPendingDelivery(entry);
+      return false;
+    }
+    const restoredSkillReplyNeedsOrigin = entry.phase === "queued" &&
+      entry.restored === true &&
+      ["skill-list", "skill-load", "skill-error"].includes(entry.kind);
+    if (restoredSkillReplyNeedsOrigin &&
+        (!entry.skillOriginProof || !isStoredSkillOriginProofCurrent(entry.skillOriginProof))) {
+      if (!initialThreadSettled) {
+        setPendingHelperDeliveryStatus(entry);
+        schedulePendingHelperDeliveryRetry();
+        return false;
+      }
+      await discardStaleSkillPendingDelivery(entry);
+      return false;
+    }
     if (entry.phase === "submitted" || entry.phase === "presented") {
-      return finalizePendingHelperDelivery(
+      return await finalizePendingHelperDelivery(
         entry,
         entry.phase === "presented" ? "presented" : "submitted"
       );
     }
     if (entry.phase === "submitted-unconfirmed") {
       const deliverySettings = settings || await chrome.storage.sync.get(["autoSend"]);
-      return retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings);
+      if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+        return false;
+      }
+      return await retrySubmittedUnconfirmedPendingHelperDelivery(entry, deliverySettings, attemptToken);
     }
     if (entry.restored === true && entry.phase === "inserted" && !initialThreadSettled) {
       setPendingHelperDeliveryStatus(entry);
@@ -1791,8 +2031,11 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       return false;
     }
     const deliverySettings = settings || await chrome.storage.sync.get(["autoSend"]);
+    if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+      return false;
+    }
     if (entry.phase === "inserted") {
-      return retryInsertedPendingHelperDelivery(entry, deliverySettings);
+      return await retryInsertedPendingHelperDelivery(entry, deliverySettings, attemptToken);
     }
     const callToken = {
       callId: entry.callId,
@@ -1817,27 +2060,96 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       entry.updatedAt = Date.now();
       persistPendingHelperDeliveries().catch(() => {});
     }, (details) => {
+      markPendingHelperCancellationBoundary(entry);
       callToken.composerCancelled = true;
       callToken.composerCancellation = details || null;
-    });
+    }, () => isPendingHelperDeliverySideEffectCurrent(entry, attemptToken));
+    if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+      return false;
+    }
     if (delivered) {
       if (deliverySettings.autoSend === false) {
         entry.lastError = "auto-send is disabled; waiting for exact manual submission proof";
         entry.updatedAt = Date.now();
         await persistPendingHelperDeliveries();
+        if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+          return false;
+        }
         setPendingHelperDeliveryStatus(entry);
         schedulePendingHelperDeliveryRetry();
         return false;
       }
-      return finalizePendingHelperDelivery(entry, "submitted");
+      return await finalizePendingHelperDelivery(entry, "submitted");
     }
-    return settlePendingHelperAfterUnconfirmedSend(entry, callToken);
+    return await settlePendingHelperAfterUnconfirmedSend(entry, callToken, attemptToken);
   } finally {
-    await finishPendingHelperDeliveryAttempt(entry);
+    await finishPendingHelperDeliveryAttempt(entry, attemptToken);
   }
 }
 
-async function finishPendingHelperDeliveryAttempt(entry) {
+function isPendingHelperDeliveryAttemptCurrent(entry, attemptToken) {
+  return Boolean(entry && attemptToken) &&
+    pendingHelperDeliveries.get(entry.callId) === entry &&
+    entry.activeDeliveryAttemptToken === attemptToken &&
+    entry.pageIdentity === attemptToken.pageIdentity &&
+    getCurrentPageIdentity() === attemptToken.pageIdentity &&
+    pageLifecycleGeneration === attemptToken.generation &&
+    Number(entry.skillRouteRevision || 0) === attemptToken.skillRouteRevision;
+}
+
+function isPendingHelperDeliverySideEffectCurrent(entry, attemptToken = null) {
+  if (attemptToken && !isPendingHelperDeliveryAttemptCurrent(entry, attemptToken)) {
+    return false;
+  }
+  return isPendingSkillDeliveryOriginCurrent(entry);
+}
+
+async function requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken = null) {
+  if (attemptToken && !isPendingHelperDeliveryAttemptCurrent(entry, attemptToken)) {
+    // A route migration may legitimately retain a queued entry for a new
+    // attempt. The stale old attempt must stop without discarding that handoff.
+    return false;
+  }
+  if (isPendingSkillDeliveryOriginCurrent(entry)) {
+    return true;
+  }
+  if (entry?.skillOriginProof && pendingHelperDeliveries.get(entry.callId) === entry) {
+    entry.volatileStaleHandler?.();
+    await discardStaleSkillPendingDelivery(entry);
+  }
+  return false;
+}
+
+function isPendingSkillDeliveryOriginCurrent(entry) {
+  if (!entry?.skillOriginProof ||
+      !["queued", "inserted", "submitted-unconfirmed"].includes(entry.phase)) {
+    return true;
+  }
+  if (entry.skillRouteHandoffPending === true) {
+    return false;
+  }
+  if (typeof entry.volatileLifecycleGuard === "function") {
+    return entry.volatileLifecycleGuard() === true;
+  }
+  return isStoredSkillOriginProofCurrent(entry.skillOriginProof);
+}
+
+async function discardStaleSkillPendingDelivery(entry) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return;
+  }
+  pendingHelperDeliveries.delete(entry.callId);
+  await persistPendingHelperDeliveries();
+  setStatus("Discarded a cached Skill result because its originating chat could no longer be proven; process the current helper again if needed", "idle");
+}
+
+async function finishPendingHelperDeliveryAttempt(entry, attemptToken = null) {
+  if (attemptToken && entry.activeDeliveryAttemptToken !== attemptToken) {
+    return;
+  }
+  if (entry.activeDeliveryAttemptToken === attemptToken) {
+    entry.activeDeliveryAttemptToken = null;
+  }
   entry.deliveryInFlight = false;
   const removeAfterSkillSync = entry.removeWhenQueuedAfterSkillSync === true;
   if (removeAfterSkillSync && entry.phase === "queued" &&
@@ -1981,11 +2293,15 @@ function migratePendingAgentDeliveryToCurrentPage(options = {}) {
 }
 
 function createSkillDispatchContext(candidate) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const semanticCallKey = buildSemanticCallKey(candidate?.call);
   return {
     pageIdentity: getCurrentPageIdentity(),
     generation: pageLifecycleGeneration,
-    renderRoot: getCandidateRenderRoot(candidate),
-    semanticCallKey: buildSemanticCallKey(candidate?.call),
+    renderRoot,
+    renderGeneration: getHelperRenderRootGeneration(renderRoot),
+    renderedHelperKey: buildRenderedHelperKey(candidate, semanticCallKey),
+    semanticCallKey,
     source: candidate?.source || "",
     blockIndex: candidate?.blockIndex ?? candidate?.index ?? ""
   };
@@ -2006,7 +2322,7 @@ function isSkillDispatchContextCurrent(context) {
   }
   if (context.pageIdentity === currentPageIdentity &&
       context.generation === pageLifecycleGeneration) {
-    return true;
+    return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
   }
   // Chat hosts commonly assign the permanent conversation URL while keeping
   // the response DOM intact. Permit that one route handoff only when the exact
@@ -2022,6 +2338,8 @@ function isSkillDispatchContextCurrent(context) {
   markCallProcessed(retainedCandidate, "skill-route-handoff", context.semanticCallKey);
   context.pageIdentity = currentPageIdentity;
   context.generation = pageLifecycleGeneration;
+  context.renderGeneration = getHelperRenderRootGeneration(context.renderRoot);
+  context.renderedHelperKey = buildRenderedHelperKey(retainedCandidate, context.semanticCallKey);
   return true;
 }
 
@@ -2046,10 +2364,80 @@ function findRetainedSkillDispatchCandidate(context) {
   }
 }
 
-function reportStaleSkillDispatch() {
+function reportStaleSkillDispatch(context = null) {
+  releaseStaleSkillDispatchForRecovery(context);
   console.warn("[AI Chat Skills] Ignored a backend response after the originating chat changed.");
   setStatus("Skill result ignored because the originating chat changed; process the helper again in the current chat", "idle");
   return false;
+}
+
+function releaseStaleSkillDispatchForRecovery(context) {
+  const renderRoot = context?.renderRoot;
+  if (!(renderRoot instanceof Element)) {
+    return;
+  }
+  const retainedCandidate = findRetainedSkillDispatchCandidate(context);
+  // A connected root outside the current transcript belongs to a different
+  // chat and must stay inert there. Clear the old claim only when the same
+  // candidate is still recoverable here, or when a temporarily detached root
+  // may later be reattached to this transcript.
+  if (!retainedCandidate && renderRoot.isConnected === true) {
+    return;
+  }
+  const handled = processedRenderedHelpers.get(renderRoot);
+  handled?.delete(context.renderedHelperKey);
+  if (handled?.size === 0) {
+    processedRenderedHelpers.delete(renderRoot);
+  }
+  if (retainedCandidate) {
+    markCallBaselineIgnored(retainedCandidate, context.semanticCallKey);
+  }
+}
+
+function createStoredSkillOriginProof(context) {
+  const conversationRoot = getConversationRoot();
+  const transcript = normalizeText(
+    conversationRoot?.innerText || conversationRoot?.textContent || ""
+  );
+  return context ? {
+    pageIdentity: String(context.pageIdentity || ""),
+    semanticCallKey: String(context.semanticCallKey || ""),
+    source: String(context.source || ""),
+    blockIndex: context.blockIndex ?? "",
+    transcriptHash: stableHash(transcript),
+    transcriptLength: transcript.length
+  } : null;
+}
+
+function isStoredSkillOriginProofCurrent(proof) {
+  if (!proof || proof.pageIdentity !== getCurrentPageIdentity()) {
+    return false;
+  }
+  const conversationRoot = getConversationRoot();
+  const transcript = normalizeText(
+    conversationRoot?.innerText || conversationRoot?.textContent || ""
+  );
+  if (!proof.transcriptHash ||
+      proof.transcriptHash !== stableHash(transcript) ||
+      Number(proof.transcriptLength) !== transcript.length) {
+    return false;
+  }
+  let candidates = [];
+  try {
+    candidates = extractShellCallCandidates(conversationRoot);
+  } catch (_unused) {
+    return false;
+  }
+  return candidates.some((candidate) =>
+    isSkillHelperCall(candidate.call) &&
+    (candidate.node === conversationRoot || isVisibleElement(candidate.node)) &&
+    getMessageAuthorRole(candidate.node) !== "user" &&
+    !isM365SubmittedUserMessageNode(candidate.node) &&
+    !isShellOutputCandidate(candidate) &&
+    buildSemanticCallKey(candidate.call) === proof.semanticCallKey &&
+    (candidate.source || "") === proof.source &&
+    (candidate.blockIndex ?? candidate.index ?? "") === proof.blockIndex
+  );
 }
 
 function buildRenderedHelperKey(candidate, semanticCallKey, pageIdentity = getCurrentPageIdentity()) {
@@ -2104,6 +2492,35 @@ function markBaselineIgnoredCandidates(candidates = []) {
   for (const candidate of Array.from(candidates || [])) {
     if (!isLiveGeneratedHelperCandidate(candidate)) {
       markCallBaselineIgnored(candidate, buildSemanticCallKey(candidate.call));
+    }
+  }
+}
+
+function markUnprovenAutomaticHelperCandidatesAsBaseline(candidates = []) {
+  for (const candidate of Array.from(candidates || [])) {
+    if (!(isRunnableHelperCall(candidate?.call) || isSkillHelperCall(candidate?.call)) ||
+        isLiveGeneratedHelperCandidate(candidate)) {
+      continue;
+    }
+    if (isShellOutputCandidate(candidate)) {
+      // Exact plugin-owned output provenance is a stronger structural reason
+      // than missing generation proof. Let the existing shell/Skill
+      // suppression branches record it so the panel keeps the intentional
+      // Force-run recovery semantics without ever auto-executing the echo.
+      continue;
+    }
+    if (isSkillHelperCall(candidate.call) &&
+        (getMessageAuthorRole(candidate.node) === "user" ||
+          isM365SubmittedUserMessageNode(candidate.node))) {
+      // Let the Skill dispatcher record the more specific, permanently inert
+      // user-message/plugin-output reason. A generic cold-history baseline
+      // here would mask that structural rejection and leave misleading UI.
+      continue;
+    }
+    const semanticCallKey = buildSemanticCallKey(candidate.call);
+    const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+    if (!getHandledHelperReason(candidate, callKey, semanticCallKey, candidate.call)) {
+      markCallBaselineIgnored(candidate, semanticCallKey);
     }
   }
 }
@@ -2217,37 +2634,69 @@ function getCurrentChatFeed() {
 }
 
 function isAssistantGenerating() {
-  const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
-    .filter(isVisibleElement);
-  return candidates.some(isAssistantGenerationControl);
+  return getAssistantGenerationControls()
+    .some((control) => !staleRouteGenerationControls.has(control));
+}
+
+function getAssistantGenerationControls() {
+  return Array.from(document.querySelectorAll?.("button, [role='button']") || [])
+    .filter(isVisibleElement)
+    .filter(isAssistantGenerationControl);
 }
 
 function isAssistantGenerationControl(button) {
-  const label = `${button?.getAttribute?.("aria-label") || ""} ${button?.textContent || ""}`.trim().toLowerCase();
-  return label.includes("stop streaming") ||
-    label.includes("stop generating") ||
-    label.includes("stop response") ||
-    label.includes("stop answering") ||
-    label === "stop";
+  if (getExplicitMessageContainer(button) || isInsideShellToolPanel(button)) {
+    // Helper text and debug/status surfaces are untrusted page content. A host
+    // generation control must live outside authored messages and our panel.
+    return false;
+  }
+  const testId = String(button?.getAttribute?.("data-testid") || "").trim().toLowerCase();
+  if (["stop-button", "stop-response-button", "stop-generating-button", "stop-streaming-button"].includes(testId)) {
+    return true;
+  }
+  if (isLocalManualTestPage() &&
+      button?.getAttribute?.("data-ai-chat-shell-generation-control") === "true") {
+    return true;
+  }
+  const supportedLabels = [
+    "stop streaming",
+    "stop generating",
+    "stop response",
+    "stop answering"
+  ];
+  return [button?.getAttribute?.("aria-label"), button?.textContent]
+    .map((value) => normalizeText(value || "").toLowerCase())
+    .some((label) => supportedLabels.includes(label));
 }
 
 function observeAssistantGenerationEvidence(records = [], options = {}) {
-  const visibleControl = isAssistantGenerating();
-  const addedControl = Array.from(records || []).some((record) =>
-    Array.from(record?.addedNodes || []).some(nodeContainsAssistantGenerationControl)
-  );
-  const removedControl = options.allowRemovedControls !== false && Array.from(records || []).some((record) =>
-    Array.from(record?.removedNodes || []).some(nodeContainsAssistantGenerationControl)
-  );
+  if (assistantGenerationEpoch &&
+      getLastExplicitUserMessageRoot(getConversationRoot()) !== assistantGenerationEpoch.userAnchor) {
+    // A later user turn ends ownership of the previous assistant response
+    // immediately. The old root cannot use the three-second tail (or a route
+    // carry) to complete a helper after the conversation has advanced.
+    assistantGenerationEpoch = null;
+    assistantGenerationEvidenceUntil = 0;
+  }
+  const visibleControls = getAssistantGenerationControls();
+  const visibleControl = visibleControls.some((control) => !staleRouteGenerationControls.has(control));
+  const addedControls = collectAssistantGenerationControls(records, "addedNodes");
+  const allRemovedControls = collectAssistantGenerationControls(records, "removedNodes");
+  const removedControls = options.allowRemovedControls !== false ? allRemovedControls : [];
+  const addedControl = addedControls.some((control) => !staleRouteGenerationControls.has(control));
+  const removedControl = removedControls.some((control) => !staleRouteGenerationControls.has(control));
   const changedControls = addedControl || removedControl;
-  if (visibleControl || changedControls) {
+  const responseRoots = collectCurrentAssistantResponseRoots(records);
+  const freshAddedControl = addedControls.some((control) =>
+    !staleRouteGenerationControls.has(control) &&
+    assistantGenerationEpoch?.generationControls?.has(control) !== true
+  );
+  const canStartEpoch = freshAddedControl;
+  if ((assistantGenerationEpoch && Date.now() <= assistantGenerationEvidenceUntil &&
+      (visibleControl || changedControls)) || canStartEpoch) {
     let createdEpoch = false;
-    if (!assistantGenerationEpoch || Date.now() > assistantGenerationEvidenceUntil) {
-      assistantGenerationEpoch = {
-        trackedRoots: new WeakSet(),
-        historicalSemantics: new WeakMap(),
-        routeCarryOnly: false
-      };
+    if (!assistantGenerationEpoch || Date.now() > assistantGenerationEvidenceUntil || freshAddedControl) {
+      assistantGenerationEpoch = createAssistantGenerationEpoch();
       createdEpoch = true;
     } else if (visibleControl || addedControl) {
       // A still-visible or newly added Stop control proves generation in the
@@ -2255,17 +2704,228 @@ function observeAssistantGenerationEvidence(records = [], options = {}) {
       // carried only by a removed old Stop remains restricted to pre-route roots.
       assistantGenerationEpoch.routeCarryOnly = false;
     }
+    if (!(assistantGenerationEpoch.generationControls instanceof WeakSet)) {
+      assistantGenerationEpoch.generationControls = new WeakSet();
+    }
+    for (const control of [...visibleControls, ...addedControls, ...removedControls]) {
+      if (!staleRouteGenerationControls.has(control)) {
+        assistantGenerationEpoch.generationControls.add(control);
+        assistantGenerationEpoch.generationControlRefs.add(control);
+      }
+    }
     if (createdEpoch || addedControl) {
       captureAssistantGenerationHistoricalSemantics(records);
     }
+    bindAssistantGenerationResponseRoot(responseRoots);
     assistantGenerationObservedForLifecycle = true;
     assistantGenerationEvidenceUntil = Date.now() + 3000;
   }
-  const active = visibleControl || changedControls || Date.now() <= assistantGenerationEvidenceUntil;
+  const carriedRootTouched = assistantGenerationEpoch?.routeCarryOnly === true &&
+    assistantGenerationEpoch.responseMessageRoot instanceof Element &&
+    isCurrentAssistantResponseRoot(
+      assistantGenerationEpoch.responseMessageRoot,
+      assistantGenerationEpoch
+    ) &&
+    Array.from(records || []).some((record) =>
+      mutationRecordTouchesElement(record, assistantGenerationEpoch.responseMessageRoot)
+    );
+  const carriedControlVisible = assistantGenerationEpoch?.routeCarryOnly === true &&
+    isCurrentAssistantResponseRoot(
+      assistantGenerationEpoch.responseMessageRoot,
+      assistantGenerationEpoch
+    ) &&
+    Array.from(assistantGenerationEpoch.generationControlRefs || [])
+      .some((control) => control?.isConnected === true && isVisibleElement(control));
+  const active = Boolean(assistantGenerationEpoch) && (
+    visibleControl || changedControls ||
+    carriedRootTouched || carriedControlVisible || Date.now() <= assistantGenerationEvidenceUntil
+  );
   if (!active) {
     assistantGenerationEpoch = null;
   }
+  // A control retained from the previous route stays untrusted for the batch
+  // in which it is removed. If React later reuses that same DOM node in a
+  // separate current-route generation batch, the fresh add may establish new
+  // evidence instead of remaining permanently stale.
+  const addedControlSet = new Set(addedControls);
+  for (const control of allRemovedControls) {
+    if (!addedControlSet.has(control)) {
+      assistantGenerationEpoch?.generationControls?.delete(control);
+      assistantGenerationEpoch?.generationControlRefs?.delete(control);
+    }
+  }
   return active;
+}
+
+function createAssistantGenerationEpoch() {
+  return {
+    userAnchor: getLastExplicitUserMessageRoot(getConversationRoot()),
+    responseMessageRoot: null,
+    historicalSemantics: new WeakMap(),
+    generationControls: new WeakSet(),
+    generationControlRefs: new Set(),
+    routeCarryOnly: false,
+    routeCarryUserText: "",
+    routeCarryResponsePrefix: ""
+  };
+}
+
+function getGenerationRouteText(root) {
+  return root instanceof Element
+    ? normalizeText(root.innerText || root.textContent || "")
+    : "";
+}
+
+function getExplicitMessageRoots(conversationRoot) {
+  if (!(conversationRoot instanceof Element)) {
+    return [];
+  }
+  const selector = [
+    "[data-message-author-role]",
+    "[data-author-role]",
+    '.fai-UserMessage[role="article"]',
+    '.fai-AssistantMessage[role="article"]'
+  ].join(",");
+  return Array.from(conversationRoot.querySelectorAll?.(selector) || [])
+    .filter((root, index, all) =>
+      root instanceof Element &&
+      all.indexOf(root) === index &&
+      (getMessageAuthorRole(root) === "user" || getMessageAuthorRole(root) === "assistant")
+    );
+}
+
+function getLastExplicitUserMessageRoot(conversationRoot) {
+  return getExplicitMessageRoots(conversationRoot)
+    .filter((root) => getMessageAuthorRole(root) === "user")
+    .at(-1) || null;
+}
+
+function getExplicitMessageContainer(node) {
+  return node?.closest?.([
+    "[data-message-author-role]",
+    "[data-author-role]",
+    '.fai-UserMessage[role="article"]',
+    '.fai-AssistantMessage[role="article"]'
+  ].join(",")) || null;
+}
+
+function isCurrentAssistantResponseRoot(root, epoch = assistantGenerationEpoch) {
+  const conversationRoot = getConversationRoot();
+  if (!(root instanceof Element) || !(conversationRoot instanceof Element) ||
+      root.isConnected !== true ||
+      (root !== conversationRoot && !conversationRoot.contains(root)) ||
+      getMessageAuthorRole(root) !== "assistant" ||
+      !(epoch?.userAnchor instanceof Element) ||
+      epoch.userAnchor.isConnected !== true ||
+      getLastExplicitUserMessageRoot(conversationRoot) !== epoch.userAnchor) {
+    return false;
+  }
+  if (epoch.routeCarryOnly === true) {
+    const currentUserText = getGenerationRouteText(epoch.userAnchor);
+    const currentResponseText = getGenerationRouteText(root);
+    if (!epoch.routeCarryUserText ||
+        !epoch.routeCarryResponsePrefix ||
+        currentUserText !== epoch.routeCarryUserText ||
+        !currentResponseText.startsWith(epoch.routeCarryResponsePrefix)) {
+      // React may recycle the same authored-message Elements for a different
+      // chat. Exact object identity is insufficient across a route: the old
+      // user text must remain exact and the tracked response may only append.
+      return false;
+    }
+  }
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(epoch.userAnchor);
+  const responseIndex = authoredRoots.lastIndexOf(root);
+  return userIndex >= 0 && responseIndex > userIndex && responseIndex === authoredRoots.length - 1;
+}
+
+function collectCurrentAssistantResponseRoots(records = []) {
+  const removedRoots = new Set();
+  const candidates = new Set();
+  const collect = (node, destination, includeDescendants = false) => {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof Element)) {
+      return;
+    }
+    const direct = getExplicitMessageContainer(element);
+    if (direct) {
+      destination.add(direct);
+    }
+    if (!includeDescendants) {
+      return;
+    }
+    for (const descendant of Array.from(element.querySelectorAll?.([
+      "[data-message-author-role]",
+      "[data-author-role]",
+      '.fai-UserMessage[role="article"]',
+      '.fai-AssistantMessage[role="article"]'
+    ].join(",")) || [])) {
+      destination.add(descendant);
+    }
+  };
+  for (const record of Array.from(records || [])) {
+    for (const node of Array.from(record?.removedNodes || [])) {
+      collect(node, removedRoots, true);
+    }
+    collect(record?.target, candidates);
+    for (const node of Array.from(record?.addedNodes || [])) {
+      collect(node, candidates, true);
+    }
+  }
+  const epoch = assistantGenerationEpoch || createAssistantGenerationEpoch();
+  return Array.from(candidates)
+    .filter((root) => !removedRoots.has(root))
+    .filter((root) => containsToolLanguageHint(root.innerText || root.textContent || ""))
+    .filter((root) => isCurrentAssistantResponseRoot(root, epoch));
+}
+
+function bindAssistantGenerationResponseRoot(responseRoots = []) {
+  const epoch = assistantGenerationEpoch;
+  if (!epoch || epoch.routeCarryOnly === true || epoch.responseMessageRoot) {
+    return;
+  }
+  const unique = Array.from(new Set(responseRoots || []));
+  if (unique.length === 1 && isCurrentAssistantResponseRoot(unique[0], epoch)) {
+    epoch.responseMessageRoot = unique[0];
+  }
+}
+
+function collectAssistantGenerationControls(records = [], field = "addedNodes") {
+  const controls = [];
+  const collect = (node) => {
+    if (!(node instanceof Element)) {
+      return;
+    }
+    if (node.matches?.("button, [role='button']") && isAssistantGenerationControl(node)) {
+      controls.push(node);
+    }
+    for (const control of Array.from(node.querySelectorAll?.("button, [role='button']") || [])) {
+      if (isAssistantGenerationControl(control)) {
+        controls.push(control);
+      }
+    }
+  };
+  for (const record of Array.from(records || [])) {
+    for (const node of Array.from(record?.[field] || [])) {
+      collect(node);
+    }
+  }
+  return controls;
+}
+
+function reconcileStaleRouteGenerationControls(records = []) {
+  const addedControls = collectAssistantGenerationControls(records, "addedNodes");
+  const removedControls = new Set(collectAssistantGenerationControls(records, "removedNodes"));
+  for (const control of addedControls) {
+    if (!removedControls.has(control)) {
+      // refreshPageLifecycle runs after the host mutation. A Stop created for
+      // the first response on the newly assigned route is therefore visible
+      // while beginPageLifecycle snapshots old controls. Only a control that
+      // was genuinely added in this observer batch (and not moved out of the
+      // old tree in the same batch) may be removed from that stale snapshot.
+      staleRouteGenerationControls.delete(control);
+    }
+  }
 }
 
 function nodeContainsAssistantGenerationControl(node) {
@@ -2347,15 +3007,15 @@ function markLiveGeneratedHelperCandidates(records = []) {
   }
   for (const candidate of candidates) {
     const renderRoot = getCandidateRenderRoot(candidate);
+    const messageRoot = getExplicitMessageContainer(renderRoot);
     if (!(renderRoot instanceof Element) ||
-        !Array.from(records || []).some((record) => mutationRecordTouchesElement(record, renderRoot))) {
+        !Array.from(records || []).some((record) => mutationRecordTouchesElement(record, renderRoot)) ||
+        !(messageRoot instanceof Element) ||
+        assistantGenerationEpoch?.responseMessageRoot !== messageRoot ||
+        !isCurrentAssistantResponseRoot(messageRoot, assistantGenerationEpoch)) {
       continue;
     }
     const semanticCallKey = buildSemanticCallKey(candidate.call);
-    if (assistantGenerationEpoch?.routeCarryOnly === true &&
-        assistantGenerationEpoch.trackedRoots.has(renderRoot) !== true) {
-      continue;
-    }
     if (assistantGenerationEpoch?.historicalSemantics?.get(renderRoot)?.has(semanticCallKey) ||
         knownRenderedHelperSemantics.get(renderRoot)?.has(semanticCallKey)) {
       // The same complete helper already existed before this generation batch.
@@ -2376,30 +3036,11 @@ function markLiveGeneratedHelperCandidates(records = []) {
 }
 
 function trackAssistantGenerationHelperRoots(records = []) {
-  if (!assistantGenerationEpoch) {
+  if (!assistantGenerationEpoch || assistantGenerationEpoch.routeCarryOnly === true ||
+      assistantGenerationEpoch.responseMessageRoot) {
     return;
   }
-  const conversationRoot = getConversationRoot();
-  const consider = (node) => {
-    const element = node instanceof Element ? node : node?.parentElement;
-    if (!(element instanceof Element) ||
-        !(conversationRoot instanceof Element) ||
-        (element !== conversationRoot && !conversationRoot.contains(element))) {
-      return;
-    }
-    const elements = [element, ...Array.from(element.querySelectorAll?.("*") || [])];
-    for (const candidateRoot of elements) {
-      if (containsToolLanguageHint(candidateRoot.innerText || candidateRoot.textContent || "")) {
-        assistantGenerationEpoch.trackedRoots.add(candidateRoot);
-      }
-    }
-  };
-  for (const record of Array.from(records || [])) {
-    consider(record?.target);
-    for (const node of Array.from(record?.addedNodes || [])) {
-      consider(node);
-    }
-  }
+  bindAssistantGenerationResponseRoot(collectCurrentAssistantResponseRoots(records));
 }
 
 function rememberKnownRenderedHelperSemantics() {
@@ -2723,7 +3364,7 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         challenge: call.challenge || ""
       });
       if (!isSkillDispatchContextCurrent(dispatchContext)) {
-        return reportStaleSkillDispatch();
+        return reportStaleSkillDispatch(dispatchContext);
       }
       await queueSkillComposerReply({
         callId: `skill-list:${callKey}`,
@@ -2743,7 +3384,7 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         catalogSha: call.catalogSha
       });
       if (!isSkillDispatchContextCurrent(dispatchContext)) {
-        return reportStaleSkillDispatch();
+        return reportStaleSkillDispatch(dispatchContext);
       }
       await queueSkillComposerReply({
         callId: `skill-load:${callKey}`,
@@ -2765,12 +3406,12 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         memoryEntry: call.memoryEntry
       });
       if (!isSkillDispatchContextCurrent(dispatchContext)) {
-        return reportStaleSkillDispatch();
+        return reportStaleSkillDispatch(dispatchContext);
       }
       if (response?.ok === true) {
         await refreshSkillState({ quiet: true });
         if (!isSkillDispatchContextCurrent(dispatchContext)) {
-          return reportStaleSkillDispatch();
+          return reportStaleSkillDispatch(dispatchContext);
         }
         setStatus(`Skills v${response.version || skillPanelState?.version || "?"} acknowledged in ${SKILL_MEMORY_ENTRY}`, "ok");
         return true;
@@ -2793,11 +3434,11 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       reason: call.reason
     });
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
-      return reportStaleSkillDispatch();
+      return reportStaleSkillDispatch(dispatchContext);
     }
     await refreshSkillState({ quiet: true });
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
-      return reportStaleSkillDispatch();
+      return reportStaleSkillDispatch(dispatchContext);
     }
     setStatus(
       response?.ok === true
@@ -2808,7 +3449,7 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     return response?.ok === true;
   } catch (error) {
     if (!isSkillDispatchContextCurrent(dispatchContext)) {
-      return reportStaleSkillDispatch();
+      return reportStaleSkillDispatch(dispatchContext);
     }
     await queueSkillComposerReply({
       callId: `skill-error:${callKey}`,
@@ -2940,7 +3581,7 @@ function wrapSkillOutput(content) {
 async function queueSkillComposerReply({ callId, call, response, reply, dispatchContext }) {
   const settings = await chrome.storage.sync.get(["autoSend"]);
   if (dispatchContext && !isSkillDispatchContextCurrent(dispatchContext)) {
-    return reportStaleSkillDispatch();
+    return reportStaleSkillDispatch(dispatchContext);
   }
   const pending = await rememberPendingHelperDelivery(
     callId,
@@ -2951,11 +3592,15 @@ async function queueSkillComposerReply({ callId, call, response, reply, dispatch
     {
       lifecycleGuard: dispatchContext
         ? () => isSkillDispatchContextCurrent(dispatchContext)
-        : null
+        : null,
+      staleHandler: dispatchContext
+        ? () => releaseStaleSkillDispatchForRecovery(dispatchContext)
+        : null,
+      skillOriginProof: createStoredSkillOriginProof(dispatchContext)
     }
   );
   if (!pending) {
-    return dispatchContext ? reportStaleSkillDispatch() : false;
+    return dispatchContext ? reportStaleSkillDispatch(dispatchContext) : false;
   }
   return attemptPendingHelperDelivery(pending, settings);
 }
@@ -3081,6 +3726,16 @@ function getMessageAuthorRole(node) {
   const normalized = String(explicit || "").toLowerCase();
   if (normalized === "assistant" || normalized === "user") {
     return normalized;
+  }
+  if (location.hostname === "m365.cloud.microsoft") {
+    if (node?.matches?.('.fai-UserMessage[role="article"]') === true ||
+        node?.closest?.('.fai-UserMessage[role="article"]')) {
+      return "user";
+    }
+    if (node?.matches?.('.fai-AssistantMessage[role="article"]') === true ||
+        node?.closest?.('.fai-AssistantMessage[role="article"]')) {
+      return "assistant";
+    }
   }
   return "";
 }
@@ -4436,19 +5091,25 @@ async function deliverHelperReply(
   onInserted = () => {},
   onWriteAttempted = () => {},
   onSendActuatorStarted = () => {},
-  onSendActuatorCancelled = () => {}
+  onSendActuatorCancelled = () => {},
+  shouldContinue = () => true
 ) {
   return withComposerDeliveryLease({
     kind: "helper-output",
     pageIdentity: callToken.pageIdentity,
     generation: callToken.generation
   }, async (deliveryToken) => {
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+    const canContinue = () => isComposerDeliveryTokenCurrent(deliveryToken) &&
+      shouldContinue() === true;
+    if (!canContinue()) {
       return false;
     }
     let composer;
     try {
-      composer = await insertReply(reply, { preserveExisting: true });
+      composer = await insertReply(reply, {
+        preserveExisting: true,
+        shouldContinue: canContinue
+      });
     } catch (_unused) {
       return false;
     }
@@ -4460,24 +5121,27 @@ async function deliverHelperReply(
       // The queued result already exists durably. Best-effort inserted-phase
       // persistence must never create a post-write/pre-send blocking gap.
     }
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+    if (!canContinue()) {
       return false;
     }
     const ownership = await inspectCurrentComposerOwnership(composer, reply);
+    if (!canContinue()) {
+      return false;
+    }
     if (ownership.state !== "owned") {
       return false;
     }
     composer = ownership.composer;
     callToken.phase = "reply-inserted";
     await onInserted();
-    if (!isComposerDeliveryTokenCurrent(deliveryToken)) {
+    if (!canContinue()) {
       return false;
     }
     if (settings.autoSend !== false) {
       callToken.phase = "auto-send";
       const sent = await runOriginalSendActuatorForOwnedComposer(
         composer,
-        () => isComposerDeliveryTokenCurrent(deliveryToken),
+        canContinue,
         reply,
         {
           onStarted: onSendActuatorStarted,
@@ -6069,6 +6733,11 @@ async function insertReply(text, options = {}) {
   const input = await findReplyInput();
   if (!input) {
     throw new Error("Could not find a chat composer. Click the chat input once, then ask the AI for a helper block again.");
+  }
+  if (typeof options.shouldContinue === "function" && options.shouldContinue() !== true) {
+    const error = new Error("Composer delivery was cancelled because the page lifecycle changed.");
+    error.code = "composer-delivery-cancelled";
+    throw error;
   }
 
   if (options.preserveExisting === true) {

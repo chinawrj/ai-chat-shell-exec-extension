@@ -392,8 +392,8 @@
       let agentRequestId = "";
       let lastPolledAgentMessageId = "";
 
-      document.getElementById("insertCall").addEventListener("click", () => {
-        appendAssistantToolCall(formatPlainTextShellCall(
+      document.getElementById("insertCall").addEventListener("click", async () => {
+        await appendLiveAssistantToolCall(formatPlainTextShellCall(
           command.value.trim() || "pwd"
         ), "text");
       });
@@ -490,8 +490,8 @@
         });
       });
 
-      document.getElementById("insertAgentMessage").addEventListener("click", () => {
-        appendAssistantToolCall(formatAgentMessageCall({
+      document.getElementById("insertAgentMessage").addEventListener("click", async () => {
+        await appendLiveAssistantToolCall(formatAgentMessageCall({
           to: agentField("agentTo"),
           taskId: agentField("agentTaskId"),
           body: agentField("agentBody")
@@ -633,6 +633,35 @@
         thread.appendChild(article);
         article.scrollIntoView({ block: "end", behavior: "smooth" });
         setStatus("Inserted assistant tool call. The extension should run it after the page settles.");
+      }
+
+      async function appendLiveAssistantToolCall(body, language = "text", options = {}) {
+        const stop = document.createElement("button");
+        stop.type = "button";
+        stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+        stop.setAttribute("aria-label", String(options.stopLabel || "Generating response"));
+        stop.textContent = String(options.stopText || "Generating response");
+        document.querySelector("main").appendChild(stop);
+        await new Promise((resolve) => setTimeout(resolve, Number(options.delayMs || 60)));
+
+        const article = document.createElement("article");
+        article.className = "message";
+        article.dataset.messageAuthorRole = "assistant";
+        article.innerHTML = [
+          '<div class="role">Assistant</div>',
+          `<pre><code class="language-${language}"></code></pre>`
+        ].join("");
+        const lines = String(body || "").split("\n");
+        article.querySelector("code").textContent = lines.slice(0, Math.min(2, lines.length)).join("\n");
+        thread.appendChild(article);
+        article.scrollIntoView({ block: "end", behavior: "smooth" });
+        await new Promise((resolve) => setTimeout(resolve, Number(options.delayMs || 60)));
+
+        article.querySelector("code").textContent = String(body || "");
+        await new Promise((resolve) => setTimeout(resolve, Number(options.delayMs || 60)));
+        stop.remove();
+        setStatus("Inserted a streamed assistant tool call. The extension should run it after the page settles.");
+        return article;
       }
 
       function formatPlainTextShellCall(commandValue) {

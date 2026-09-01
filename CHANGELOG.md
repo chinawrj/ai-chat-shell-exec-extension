@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-09-01
+
+- Records and immediately persists a monotonic cancellation boundary when composer ownership is first lost, including trusted Enter/LineBreak emptying and the submitted-unconfirmed interval, and synchronously revalidates origin/attempt ownership after the async guard. Delayed cancellation recognition, reload, and same-URL replacement can no longer authorize stale Skill side effects or erase a genuinely newer helper result.
+- Binds automatic executable and Skill detection to the latest explicit user turn and one exact current assistant response. Late-hydrated history, unknown-role content, authored/panel Stop lookalikes, removed-only controls, stale old-route controls, later user turns, second routes, and same-Element transcript rewrites now fail closed to explicit recovery.
+- Preserves legitimate atomic, streamed, localized stable-control, same-route Stop-node reuse, and one-time provisional-to-permanent route flows, including slow completion beyond the previous generation tail.
+- Binds every completed Skill result to its exact helper root, render generation, transcript, page lifecycle, and delivery attempt. Queued content can cross one settled exact-root URL assignment, while cross-chat, same-URL replacement, second-route, detach, reload-without-proof, and stale-backend cases are discarded without rerunning the backend.
+- Adds a unified attempt-plus-origin guard before composer focus/write, after every asynchronous composer/proof/storage boundary, and throughout send-only actuator retries. Old queued, inserted, submitted-unconfirmed, or trusted-mutation work cannot write into another chat, send from another chat, finalize on copied proof, or clear a newer queue.
+- Keeps historical helpers recoverable through **Force run** or **Process Skill**, and preserves exact one-write/one-backend semantics for valid pending delivery.
+- Adds dedicated positive, negative, route, same-URL, DOM-reuse, cancellation, backend-race, independent-tab, and real Chrome Skill E2E regressions, with the feature matrix updated to match.
+
 ## [0.11.8] - 2026-08-31
 
 - Fixes a new-chat SPA lifecycle race that parsed a live Skill `load` helper into Debug but then misclassified its first stable scan as existing history, leaving no backend request or AI-visible load result.

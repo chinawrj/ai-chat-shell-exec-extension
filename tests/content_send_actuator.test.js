@@ -376,6 +376,8 @@ async function verifyPreflightVetoDoesNotConsumeOrMisreportActuatorGeneration() 
     getValidatedComposerOwnershipText: () => "plugin output",
     withComposerDeliveryLease: async (_metadata, action) => action({ id: "lease" }),
     isComposerDeliveryTokenCurrent: () => true,
+    isPendingHelperDeliverySideEffectCurrent: () => true,
+    requirePendingHelperDeliverySideEffectCurrent: async () => true,
     runOriginalSendActuatorForOwnedComposer: async () => {
       wrapperCalls += 1;
       return false;

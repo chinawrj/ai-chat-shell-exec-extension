@@ -8,17 +8,47 @@ const vm = require("node:vm");
 const context = createContentContext();
 
 testLiveGenerationEvidenceSurvivesRemoval();
+testStableGenerationControlEvidenceBoundaries();
 testGenerationEvidenceIsCandidateBound();
 testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute();
 testUnrelatedGenerationCannotReviveKnownHistory();
 testTwoPhaseHistoricalRedrawCannotBecomeLive();
+testCompleteHelperCannotBorrowUnrelatedGeneration();
+testStaleRouteStopNodeCannotProveLaterHydration();
+testReusedStopNodeStartsASeparateSameRouteGeneration();
+testOldResponseCannotCompleteAfterLaterUserTurn();
+testSameBatchRouteStopReconciliation();
+testRouteCarriedResponseSurvivesExpiredTail();
+testRouteCarriedStopCannotAuthorizeNewRoot();
+testRouteCarriedRecycledElementsCannotAuthorizeRewrittenChat();
 testSkillForceEligibilityFailsClosed();
 testLatestManualActionIsUnambiguous();
 testColdHistoryRequiresExplicitSkillRecovery()
+  .then(() => testLateHydratedHistoryRequiresExplicitSkillRecovery())
+  .then(() => testLateHydratedShellRequiresExplicitForce())
+  .then(() => testVisibleOldRouteStopCannotAuthorizeReplacementHistory())
+  .then(() => testLiveStopSkillCompletionDispatchesExactlyOnce())
+  .then(() => testAtomicCurrentAssistantSkillDispatchesExactlyOnce())
+  .then(() => testUnknownRoleAtomicSkillFailsClosed())
   .then(() => testColdBaselineSurvivesRedrawButYieldsToLiveGeneration())
   .then(() => testStaleBackendResultCannotEnterAnotherChat())
   .then(() => testRetainedRouteRedrawKeepsExactlyOneBackendDispatch())
   .then(() => testDetachAfterRouteAcceptanceCannotQueueResult())
+  .then(() => testSameRootGenerationChangeRejectsBackendResult())
+  .then(() => testDetachedBackendResultRemainsManuallyRecoverable())
+  .then(() => testQueuedSkillResultRejectsSameUrlTranscriptReplacement())
+  .then(() => testQueuedSkillWriteAbortsDuringSameUrlReplacement())
+  .then(() => testQueuedSkillResultSurvivesOneRouteHandoff())
+  .then(() => testQueuedSkillResultCannotCrossIntoAnotherChat())
+  .then(() => testQueuedSkillAttemptCannotWriteAfterTwoRoutes())
+  .then(() => testWrittenSkillPhasesCannotResumeAfterRoute())
+  .then(() => testWrittenSkillPhasesAbortDuringSameUrlReplacement())
+  .then(() => testStaleInsertedCancellationCannotClearNewRouteQueue())
+  .then(() => testTrustedMutationCancellationCannotClearNewRouteQueue())
+  .then(() => testTrustedMutationCancellationCannotClearSameUrlReplacementQueue())
+  .then(() => testTrustedCancellationRechecksAfterAsyncGuardResolution())
+  .then(() => testRestoredQueuedSkillRequiresMatchingTranscript())
+  .then(() => testLegacyRestoredQueuedSkillWithoutOriginIsDiscarded())
   .then(() => testSkillRecoveryAbortsAcrossRouteAwait())
   .then(() => testSkillRecoveryRejectsSameUrlTranscriptReplacement())
   .then(() => testSkillSingleFlightAlwaysWakesScanner())
@@ -38,8 +68,17 @@ function testLiveGenerationEvidenceSurvivesRemoval() {
   context.observeAssistantGenerationEvidence([{ addedNodes: [], removedNodes: [stop] }]);
   assert.equal(
     vm.runInContext("assistantGenerationObservedForLifecycle", context),
+    false,
+    "A removed-only control without a prior observed generation must not turn late-hydrated history into a live helper."
+  );
+
+  vm.runInContext("assistantGenerationObservedForLifecycle = false; assistantGenerationEvidenceUntil = 0; assistantGenerationEpoch = null", context);
+  context.observeAssistantGenerationEvidence([{ addedNodes: [stop], removedNodes: [] }]);
+  context.observeAssistantGenerationEvidence([{ addedNodes: [], removedNodes: [stop] }]);
+  assert.equal(
+    vm.runInContext("assistantGenerationObservedForLifecycle", context),
     true,
-    "A removed generation control in the same mutation batch must still prove that the helper is live."
+    "After a fresh Stop add establishes the epoch, its later removal must preserve the bounded completion tail."
   );
 
   vm.runInContext("assistantGenerationObservedForLifecycle = false; assistantGenerationEvidenceUntil = 0; assistantGenerationEpoch = null", context);
@@ -62,11 +101,52 @@ function testLiveGenerationEvidenceSurvivesRemoval() {
   );
 }
 
+function testStableGenerationControlEvidenceBoundaries() {
+  const local = createContentContext();
+  const stableControl = new local.Element({ role: "button", label: "停止生成" });
+  const stableGetAttribute = stableControl.getAttribute.bind(stableControl);
+  stableControl.getAttribute = (name) => name === "data-testid"
+    ? "stop-button"
+    : stableGetAttribute(name);
+  assert.equal(local.isAssistantGenerationControl(stableControl), true,
+    "A production stable Stop test id must prove generation independently of localized button text.");
+
+  const authoredControl = new local.Element({
+    author: "assistant",
+    role: "button",
+    label: "停止生成"
+  });
+  const authoredGetAttribute = authoredControl.getAttribute.bind(authoredControl);
+  authoredControl.getAttribute = (name) => name === "data-testid"
+    ? "stop-button"
+    : authoredGetAttribute(name);
+  assert.equal(local.isAssistantGenerationControl(authoredControl), false,
+    "A stable-looking Stop id rendered inside authored assistant content is untrusted page text.");
+
+  const panelControl = new local.Element({ role: "button", label: "停止生成" });
+  const panelGetAttribute = panelControl.getAttribute.bind(panelControl);
+  panelControl.getAttribute = (name) => name === "data-testid"
+    ? "stop-button"
+    : panelGetAttribute(name);
+  panelControl.closest = (selector) => String(selector).includes("data-message-author-role")
+    ? null
+    : {};
+  assert.equal(local.isAssistantGenerationControl(panelControl), false,
+    "A stable-looking Stop id inside the extension panel must not become generation evidence.");
+
+  const genericStop = new local.Element({ role: "button", label: "Stop" });
+  assert.equal(local.isAssistantGenerationControl(genericStop), false,
+    "An unrelated generic Stop button remains insufficient generation evidence.");
+}
+
 function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
   const local = createContentContext();
   const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "assign this generated response to its permanent URL";
   const helperRoot = new local.Element({ author: "assistant" });
   helperRoot.textContent = "ai-helper-skill-start:route-completion\ncmd: load";
+  conversation.append(user);
   conversation.append(helperRoot);
   local.__epochConversation = conversation;
   vm.runInContext("getConversationRoot = () => globalThis.__epochConversation; observedPageIdentity = location.href; pageLifecycleGeneration = 50;", local);
@@ -76,14 +156,15 @@ function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
 
   local.location.href = "https://chatgpt.com/c/assigned-during-generation";
   local.refreshPageLifecycle();
-  const call = local.parseCallPayload([
+  const completedHelperText = [
     "ai-helper-skill-start:route-completion",
     "cmd: load",
     "skill-id: example",
     `catalog-sha: ${"2".repeat(64)}`,
     "ai-helper-skill-end"
-  ].join("\n"));
-  helperRoot.textContent = call.raw;
+  ].join("\n");
+  const call = local.parseCallPayload(completedHelperText);
+  helperRoot.textContent = completedHelperText;
   const candidate = { call, node: helperRoot, textRoot: helperRoot, source: "text", blockIndex: 0 };
   local.__epochCandidate = candidate;
   vm.runInContext("extractShellCallCandidates = () => [globalThis.__epochCandidate];", local);
@@ -192,6 +273,467 @@ function testTwoPhaseHistoricalRedrawCannotBecomeLive() {
     "The fail-closed historical Skill must remain available through explicit Process Skill recovery.");
 }
 
+function testCompleteHelperCannotBorrowUnrelatedGeneration() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const currentUser = new local.Element({ author: "user" });
+  const call = local.parseCallPayload([
+    "ai-helper-skill-start:unrelated-complete",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"8".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n"));
+  assistant.textContent = [
+    "ai-helper-skill-start:unrelated-complete",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"8".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  conversation.append(assistant);
+  conversation.append(currentUser);
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__unrelatedCompleteConversation = conversation;
+  local.__unrelatedCompleteCandidates = [candidate];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__unrelatedCompleteConversation;
+    extractShellCallCandidates = () => globalThis.__unrelatedCompleteCandidates;
+  `, local);
+
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
+  const completeArrival = [{
+    type: "childList",
+    target: conversation,
+    addedNodes: [assistant],
+    removedNodes: []
+  }];
+  local.trackAssistantGenerationHelperRoots(completeArrival);
+  local.markLiveGeneratedHelperCandidates(completeArrival);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+    "A complete historical helper before the current user turn must not borrow unrelated Stop evidence.");
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([candidate]);
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "The fail-closed complete helper must remain available through explicit Process Skill recovery.");
+}
+
+function testStaleRouteStopNodeCannotProveLaterHydration() {
+  const local = createContentContext();
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.__reusedStopControls = [stop];
+  local.document.querySelectorAll = (selector) => String(selector).includes("button")
+    ? local.__reusedStopControls
+    : [];
+  vm.runInContext("observedPageIdentity = location.href; pageLifecycleGeneration = 12;", local);
+  local.location.href = "https://chatgpt.com/c/reused-stop-node";
+  local.refreshPageLifecycle();
+
+  local.__reusedStopControls = [];
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: new local.Element(),
+    addedNodes: [],
+    removedNodes: [stop]
+  }], { allowRemovedControls: false });
+  assert.equal(local.isAssistantGenerating(), false,
+    "Removing a previous-route Stop must not create current-route generation evidence.");
+
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  const assistant = new local.Element({ author: "assistant" });
+  assistant.textContent = "ai-helper-skill-start:reused-stop\ncmd: load";
+  conversation.append(user);
+  conversation.append(assistant);
+  local.__reusedStopConversation = conversation;
+  local.__reusedStopCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__reusedStopConversation;
+    extractShellCallCandidates = () => globalThis.__reusedStopCandidates;
+  `, local);
+  local.__reusedStopControls = [stop];
+  assert.equal(local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop],
+    removedNodes: []
+  }]), false, "A Stop node snapshotted from the old route must remain stale for the entire new page lifecycle.");
+  local.trackAssistantGenerationHelperRoots([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [assistant],
+    removedNodes: []
+  }]);
+
+  const call = local.parseCallPayload([
+    "ai-helper-skill-start:reused-stop",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"7".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n"));
+  assistant.textContent = call.raw;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__reusedStopCandidates = [candidate];
+  local.markLiveGeneratedHelperCandidates([{
+    type: "characterData",
+    target: assistant,
+    oldValue: "ai-helper-skill-start:reused-stop\ncmd: load",
+    addedNodes: [],
+    removedNodes: []
+  }]);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+    "Reusing an old-route Stop during late transcript hydration must not authorize the historical helper.");
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([candidate]);
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "The fail-closed historical helper must remain available through explicit Process Skill recovery.");
+}
+
+function testReusedStopNodeStartsASeparateSameRouteGeneration() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  const firstAssistant = new local.Element({ author: "assistant" });
+  firstAssistant.textContent = "ai-helper-skill-start:first-generation\ncmd: load";
+  conversation.append(user);
+  conversation.append(firstAssistant);
+  local.__sameRouteConversation = conversation;
+  local.__sameRouteControls = [];
+  local.__sameRouteCandidates = [];
+  local.document.querySelectorAll = (selector) => String(selector).includes("button")
+    ? local.__sameRouteControls
+    : [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__sameRouteConversation;
+    extractShellCallCandidates = () => globalThis.__sameRouteCandidates;
+  `, local);
+
+  const reusedStop = new local.Element({ role: "button", label: "Stop generating" });
+  local.__sameRouteControls = [reusedStop];
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [reusedStop, firstAssistant],
+    removedNodes: []
+  }]);
+  local.trackAssistantGenerationHelperRoots([{
+    type: "childList",
+    target: firstAssistant,
+    addedNodes: [firstAssistant],
+    removedNodes: []
+  }]);
+
+  local.__sameRouteControls = [];
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [],
+    removedNodes: [reusedStop]
+  }]);
+
+  firstAssistant.isConnected = false;
+  const secondAssistant = new local.Element({ author: "assistant" });
+  const secondHelperText = [
+    "ai-helper-skill-start:second-generation",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"9".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(secondHelperText);
+  secondAssistant.textContent = secondHelperText;
+  conversation.append(secondAssistant);
+  const candidate = {
+    call,
+    node: secondAssistant,
+    textRoot: secondAssistant,
+    source: "text",
+    blockIndex: 0
+  };
+  local.__sameRouteCandidates = [candidate];
+  local.__sameRouteControls = [reusedStop];
+  const secondBatch = [{
+    type: "childList",
+    target: conversation,
+    addedNodes: [reusedStop, secondAssistant],
+    removedNodes: [firstAssistant]
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(secondBatch), true);
+  local.trackAssistantGenerationHelperRoots(secondBatch);
+  local.markLiveGeneratedHelperCandidates(secondBatch);
+  assert.equal(
+    vm.runInContext("assistantGenerationEpoch?.responseMessageRoot === globalThis.__sameRouteConversation.children[2]", local),
+    true,
+    "A separately removed and re-added host Stop node must bind the new assistant response, not remain owned by the old generation."
+  );
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A host that reuses its Stop DOM node must not cause a genuine later Skill helper to be missed.");
+}
+
+function testOldResponseCannotCompleteAfterLaterUserTurn() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const firstUser = new local.Element({ author: "user" });
+  const oldAssistant = new local.Element({ author: "assistant" });
+  oldAssistant.textContent = "ai-helper-skill-start:old-response\ncmd: load";
+  conversation.append(firstUser);
+  conversation.append(oldAssistant);
+  local.__laterUserConversation = conversation;
+  local.__laterUserCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__laterUserConversation;
+    extractShellCallCandidates = () => globalThis.__laterUserCandidates;
+  `, local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop, oldAssistant],
+    removedNodes: []
+  }]);
+  local.trackAssistantGenerationHelperRoots([{
+    type: "childList",
+    target: oldAssistant,
+    addedNodes: [oldAssistant],
+    removedNodes: []
+  }]);
+
+  const laterUser = new local.Element({ author: "user" });
+  conversation.append(laterUser);
+  const call = local.parseCallPayload([
+    "ai-helper-skill-start:old-response",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"a".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n"));
+  oldAssistant.textContent = call.raw;
+  const candidate = { call, node: oldAssistant, textRoot: oldAssistant, source: "text", blockIndex: 0 };
+  local.__laterUserCandidates = [candidate];
+  const completion = [{
+    type: "characterData",
+    target: oldAssistant,
+    addedNodes: [],
+    removedNodes: [stop]
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(completion), false,
+    "A later explicit user turn must end the old assistant generation epoch immediately.");
+  local.markLiveGeneratedHelperCandidates(completion);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+    "An old response completing after the next user turn must never dispatch its Skill helper automatically.");
+}
+
+function testSameBatchRouteStopReconciliation() {
+  for (const movedFromOldRoute of [false, true]) {
+    const local = createContentContext();
+    const stop = new local.Element({ role: "button", label: "Stop generating" });
+    local.__sameBatchControls = [];
+    local.document.querySelectorAll = (selector) => String(selector).includes("button")
+      ? local.__sameBatchControls
+      : [];
+    vm.runInContext("observedPageIdentity = location.href; pageLifecycleGeneration = 22;", local);
+    local.location.href = `https://chatgpt.com/c/same-batch-stop-${movedFromOldRoute}`;
+    local.__sameBatchControls = [stop];
+    assert.equal(local.refreshPageLifecycle(), true);
+    assert.equal(local.isAssistantGenerating(), false,
+      "The route-transition snapshot must initially treat every already-visible Stop as stale.");
+    const records = [{
+      type: "childList",
+      target: new local.Element(),
+      addedNodes: [stop],
+      removedNodes: movedFromOldRoute ? [stop] : []
+    }];
+    local.reconcileStaleRouteGenerationControls(records);
+    assert.equal(
+      local.isAssistantGenerating(),
+      !movedFromOldRoute,
+      movedFromOldRoute
+        ? "A Stop moved from the old tree in the route batch must remain stale."
+        : "A newly added Stop in the route batch must prove the first current-route response."
+    );
+    const evidence = local.observeAssistantGenerationEvidence(records, { allowRemovedControls: false });
+    assert.equal(evidence, !movedFromOldRoute,
+      "The route batch itself must distinguish a genuinely new Stop from a moved old Stop.");
+    if (movedFromOldRoute) {
+      assert.equal(local.observeAssistantGenerationEvidence([{
+        type: "childList",
+        target: new local.Element(),
+        addedNodes: [new local.Element()],
+        removedNodes: []
+      }]), false,
+      "A moved old Stop must remain stale across a later unrelated observer batch.");
+      assert.equal(local.isAssistantGenerating(), false,
+        "A moved old Stop must not become current-route generation evidence one batch later.");
+    }
+  }
+}
+
+function testRouteCarriedResponseSurvivesExpiredTail() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "load the slow route skill";
+  const assistant = new local.Element({ author: "assistant" });
+  assistant.textContent = "ai-helper-skill-start:slow-route\ncmd: load";
+  conversation.append(user);
+  conversation.append(assistant);
+  local.__slowRouteConversation = conversation;
+  local.__slowRouteCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__slowRouteConversation;
+    extractShellCallCandidates = () => globalThis.__slowRouteCandidates;
+    observedPageIdentity = location.href;
+  `, local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop, assistant],
+    removedNodes: []
+  }]);
+  local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.responseMessageRoot === globalThis.__slowRouteConversation.children[1]", local), true);
+
+  local.location.href = "https://chatgpt.com/c/slow-assigned-route";
+  local.refreshPageLifecycle();
+  vm.runInContext("assistantGenerationEvidenceUntil = 0", local);
+  const completedHelperText = [
+    "ai-helper-skill-start:slow-route",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"4".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(completedHelperText);
+  assistant.textContent = completedHelperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__slowRouteCandidates = [candidate];
+  const completion = [{
+    type: "characterData",
+    target: assistant,
+    oldValue: "ai-helper-skill-start:slow-route\ncmd: load",
+    addedNodes: [],
+    removedNodes: [stop]
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(completion, { allowRemovedControls: false }), true,
+    "A mutation in the exact carried response root must survive the old three-second tail.");
+  local.markLiveGeneratedHelperCandidates(completion);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A slow helper completing in the frozen pre-route response root must stay live.");
+}
+
+function testRouteCarriedStopCannotAuthorizeNewRoot() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "load only the tracked route response";
+  const oldAssistant = new local.Element({ author: "assistant" });
+  oldAssistant.textContent = "ai-helper-skill-start:old-route-root\ncmd: load";
+  conversation.append(user);
+  conversation.append(oldAssistant);
+  local.__frozenRouteConversation = conversation;
+  local.__frozenRouteCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__frozenRouteConversation;
+    extractShellCallCandidates = () => globalThis.__frozenRouteCandidates;
+    observedPageIdentity = location.href;
+  `, local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop, oldAssistant], removedNodes: [] }]);
+  local.trackAssistantGenerationHelperRoots([{ target: oldAssistant, addedNodes: [oldAssistant], removedNodes: [] }]);
+  local.location.href = "https://chatgpt.com/c/replacement-route-root";
+  local.refreshPageLifecycle();
+  vm.runInContext("assistantGenerationEvidenceUntil = 0; initialThreadSettled = true", local);
+
+  const newAssistant = new local.Element({ author: "assistant" });
+  const call = local.parseCallPayload([
+    "ai-helper-skill-start:new-route-root",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"5".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n"));
+  newAssistant.textContent = call.raw;
+  conversation.append(newAssistant);
+  const candidate = { call, node: newAssistant, textRoot: newAssistant, source: "text", blockIndex: 0 };
+  local.__frozenRouteCandidates = [candidate];
+  const arrival = [{ target: conversation, addedNodes: [newAssistant], removedNodes: [] }];
+  const active = local.observeAssistantGenerationEvidence(arrival, { allowRemovedControls: false });
+  if (active) {
+    local.trackAssistantGenerationHelperRoots(arrival);
+    local.markLiveGeneratedHelperCandidates(arrival);
+  }
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+    "A retained old-route Stop must never authorize a new post-route response root.");
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([candidate]);
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "The rejected post-route root must remain explicitly recoverable.");
+}
+
+function testRouteCarriedRecycledElementsCannotAuthorizeRewrittenChat() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "chat A request";
+  const assistant = new local.Element({ author: "assistant" });
+  assistant.textContent = "ai-helper-skill-start:chat-a-partial\ncmd: load";
+  conversation.append(user);
+  conversation.append(assistant);
+  local.__recycledRouteConversation = conversation;
+  local.__recycledRouteCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__recycledRouteConversation;
+    extractShellCallCandidates = () => globalThis.__recycledRouteCandidates;
+    observedPageIdentity = location.href;
+  `, local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop, assistant],
+    removedNodes: []
+  }]);
+  local.trackAssistantGenerationHelperRoots([{
+    type: "childList",
+    target: assistant,
+    addedNodes: [assistant],
+    removedNodes: []
+  }]);
+
+  local.location.href = "https://chatgpt.com/c/recycled-route-elements";
+  assert.equal(local.refreshPageLifecycle(), true);
+  user.textContent = "chat B unrelated request";
+  const helperText = [
+    "ai-helper-skill-start:chat-b-rewrite",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"b".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__recycledRouteCandidates = [candidate];
+  vm.runInContext("assistantGenerationEvidenceUntil = 0", local);
+  const rewrite = [{
+    type: "characterData",
+    target: assistant,
+    addedNodes: [],
+    removedNodes: [stop]
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(rewrite, { allowRemovedControls: false }), false,
+    "Rewriting the same user/assistant Elements for another chat must invalidate route-carried generation evidence.");
+  local.markLiveGeneratedHelperCandidates(rewrite);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+    "DOM object reuse across chats must not authorize the rewritten Skill helper.");
+
+  local.location.href = "https://chatgpt.com/c/a-second-route";
+  assert.equal(local.refreshPageLifecycle(), true);
+  assert.equal(vm.runInContext("assistantGenerationEpoch", local), null,
+    "A generation epoch may cross at most one provisional-to-permanent route assignment.");
+}
+
 function testSkillForceEligibilityFailsClosed() {
   const assistant = new context.Element({ author: "assistant" });
   const user = new context.Element({ author: "user" });
@@ -267,6 +809,7 @@ async function testColdHistoryRequiresExplicitSkillRecovery() {
     `catalog-sha: ${"c".repeat(64)}`,
     "ai-helper-skill-end"
   ].join("\n"));
+  assistant.textContent = call.raw;
   const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
   const semanticKey = context.buildSemanticCallKey(call);
   context.markCallBaselineIgnored(candidate, semanticKey);
@@ -288,9 +831,454 @@ async function testColdHistoryRequiresExplicitSkillRecovery() {
   assert.equal(context.getLastActionableSkillCandidate([candidate], assistant), null);
 }
 
+async function testLateHydratedHistoryRequiresExplicitSkillRecovery() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  local.__lateHistoryConversation = conversation;
+  local.__lateHistoryCandidates = [];
+  let backendCalls = 0;
+  local.chrome.runtime.sendMessage = async (message) => {
+    if (message?.type === "skill-load") {
+      backendCalls += 1;
+    }
+    return { ok: false, error: "expected test rejection" };
+  };
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    getConversationRoot = () => globalThis.__lateHistoryConversation;
+    extractShellCallCandidates = () => globalThis.__lateHistoryCandidates;
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    queueSkillComposerReply = async () => true;
+    lastThreadText = "";
+    lastThreadTextAt = 0;
+  `, local);
+
+  await local.scanForShellCall();
+  assert.equal(vm.runInContext("initialThreadSettled", local), true,
+    "The regression must begin after an empty fresh lifecycle has explicitly settled.");
+
+  const user = new local.Element({ author: "user" });
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:late-history",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"6".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = "ai-helper-skill-start:late-history\ncmd: load";
+  conversation.append(user);
+  conversation.append(assistant);
+  assert.equal(local.observeAssistantGenerationEvidence([{
+    target: conversation,
+    addedNodes: [user, assistant],
+    removedNodes: []
+  }]), false,
+  "A late historical user+partial-assistant pair must not create generation evidence without a trusted control.");
+  assistant.textContent = helperText;
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__lateHistoryCandidates = [candidate];
+  const completion = [{ target: assistant, addedNodes: [new local.Element()], removedNodes: [] }];
+  assert.equal(local.observeAssistantGenerationEvidence(completion), false,
+    "Completing the late historical helper must not self-bootstrap a generation epoch.");
+  local.markLiveGeneratedHelperCandidates(completion);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false);
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__lateHistoryConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+
+  await local.scanForShellCall();
+  assert.deepEqual(
+    {
+      backendCalls,
+      processSkillActionable: local.getLastActionableSkillCandidate([candidate], conversation) === candidate
+    },
+    { backendCalls: 0, processSkillActionable: true },
+    "A historical Skill mounted after the initial empty lifecycle settled must stay inert and expose Process Skill."
+  );
+}
+
+async function testLateHydratedShellRequiresExplicitForce() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  local.__lateShellConversation = conversation;
+  local.__lateShellCandidates = [];
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    getConversationRoot = () => globalThis.__lateShellConversation;
+    extractShellCallCandidates = () => globalThis.__lateShellCandidates;
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    globalThis.__lateShellBackendRuns = 0;
+    runAndReply = async () => {
+      globalThis.__lateShellBackendRuns += 1;
+      return {};
+    };
+    lastThreadText = "";
+    lastThreadTextAt = 0;
+  `, local);
+  await local.scanForShellCall();
+  assert.equal(vm.runInContext("initialThreadSettled", local), true,
+    "The Shell regression must begin after the empty lifecycle is settled.");
+
+  const user = new local.Element({ author: "user" });
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-shell-start:late-shell-history",
+    "printf late-history",
+    "ai-helper-shell-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(user);
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__lateShellCandidates = [candidate];
+  const hydration = [{ target: conversation, addedNodes: [user, assistant], removedNodes: [] }];
+  assert.equal(local.observeAssistantGenerationEvidence(hydration), false,
+    "A late historical user+assistant Shell pair must not self-bootstrap generation evidence.");
+  local.markLiveGeneratedHelperCandidates(hydration);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false);
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__lateShellConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+
+  await local.scanForShellCall();
+  const forceCandidate = local.getLastForceEligibleRunnableCandidate([candidate], conversation);
+  assert.deepEqual(
+    {
+      backendRuns: vm.runInContext("globalThis.__lateShellBackendRuns", local),
+      forceAvailable: forceCandidate === candidate,
+      latestManualAction: local.getLatestManualActionKind([candidate], forceCandidate, null)
+    },
+    { backendRuns: 0, forceAvailable: true, latestManualAction: "force" },
+    "A late hydrated historical Shell helper must remain inert while exposing Force run."
+  );
+}
+
+async function testVisibleOldRouteStopCannotAuthorizeReplacementHistory() {
+  for (const kind of ["shell", "skill"]) {
+    const local = createContentContext();
+    const oldStop = new local.Element({ role: "button", label: "Stop generating" });
+    local.__oldRouteControls = [oldStop];
+    local.document.querySelectorAll = (selector) => String(selector).includes("button")
+      ? local.__oldRouteControls
+      : [];
+    local.__replacementConversation = new local.Element();
+    local.__replacementCandidates = [];
+    let skillBackendCalls = 0;
+    local.chrome.runtime.sendMessage = async (message) => {
+      if (message?.type === "skill-load") {
+        skillBackendCalls += 1;
+      }
+      return { ok: false, error: "unexpected replacement-history dispatch" };
+    };
+    local.chrome.storage.sync.get = async () => ({
+      enabled: true,
+      enabledHosts: ["chatgpt.com"],
+      maxChainCalls: 100,
+      autoSend: true
+    });
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      getConversationRoot = () => globalThis.__replacementConversation;
+      extractShellCallCandidates = () => globalThis.__replacementCandidates;
+      loadPendingHelperDeliveriesForCurrentPage = async () => {};
+      schedulePendingHelperDeliveryRetry = () => {};
+      scheduleScan = () => {};
+      updateSiteActionButton = () => {};
+      queueSkillComposerReply = async () => true;
+      globalThis.__replacementShellRuns = 0;
+      runAndReply = async () => {
+        globalThis.__replacementShellRuns += 1;
+        return {};
+      };
+    `, local);
+
+    local.location.href = `https://chatgpt.com/c/replacement-${kind}`;
+    local.refreshPageLifecycle();
+    assert.equal(local.isAssistantGenerating(), false,
+      `A still-visible Stop control captured from the old route must not block replacement ${kind} recovery forever.`);
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = kind === "skill"
+      ? [
+          `ai-helper-skill-start:old-route-${kind}`,
+          "cmd: load",
+          "skill-id: example",
+          `catalog-sha: ${"9".repeat(64)}`,
+          "ai-helper-skill-end"
+        ].join("\n")
+      : [
+          `ai-helper-shell-start:old-route-${kind}`,
+          "printf old-route-history",
+          "ai-helper-shell-end"
+        ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    local.__replacementConversation.append(assistant);
+    local.__replacementConversation.textContent = helperText;
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__replacementCandidates = [candidate];
+    const evidenceActive = local.observeAssistantGenerationEvidence([{
+      target: local.__replacementConversation,
+      addedNodes: [assistant],
+      removedNodes: []
+    }], { allowRemovedControls: false });
+    if (evidenceActive) {
+      local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
+      local.markLiveGeneratedHelperCandidates([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
+    }
+    assert.equal(local.isLiveGeneratedHelperCandidate(candidate), false,
+      `A Stop control retained from the old route must not make replacement ${kind} history live.`);
+    vm.runInContext(`
+      lastThreadText = normalizeText(globalThis.__replacementConversation.textContent);
+      lastThreadTextAt = 0;
+    `, local);
+    await local.scanForShellCall();
+    assert.deepEqual(
+      {
+        shellRuns: vm.runInContext("globalThis.__replacementShellRuns", local),
+        skillBackendCalls
+      },
+      { shellRuns: 0, skillBackendCalls: 0 },
+      `Visible old-route Stop evidence must not auto-dispatch replacement ${kind} history.`
+    );
+  }
+}
+
+async function testLiveStopSkillCompletionDispatchesExactlyOnce() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  const assistant = new local.Element({ author: "assistant" });
+  assistant.textContent = "ai-helper-skill-start:live-stop\ncmd: load";
+  conversation.append(user);
+  conversation.append(assistant);
+  conversation.textContent = assistant.textContent;
+  local.__liveStopConversation = conversation;
+  local.__liveStopCandidates = [];
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__liveStopConversation;
+    extractShellCallCandidates = () => globalThis.__liveStopCandidates;
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    queueSkillComposerReply = async () => true;
+  `, local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
+  local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
+
+  const helperText = [
+    "ai-helper-skill-start:live-stop",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"a".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__liveStopCandidates = [candidate];
+  local.markLiveGeneratedHelperCandidates([{ target: assistant, addedNodes: [new local.Element()], removedNodes: [stop] }]);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A Skill completed in the exact Stop-tracked assistant root must retain live generation proof.");
+  let backendCalls = 0;
+  local.chrome.runtime.sendMessage = async (message) => {
+    if (message?.type === "skill-load") {
+      backendCalls += 1;
+    }
+    return {
+      ok: true,
+      catalogSha: "a".repeat(64),
+      skill: { id: "example", sha: "b".repeat(64) },
+      content: "live Skill body"
+    };
+  };
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__liveStopConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+  await local.scanForShellCall();
+  await local.scanForShellCall();
+  assert.equal(backendCalls, 1,
+    "A genuinely live Stop-tracked Skill completion must dispatch exactly once across repeated scans.");
+}
+
+async function testAtomicCurrentAssistantSkillDispatchesExactlyOnce() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:atomic-current",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"6".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(user);
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__atomicConversation = conversation;
+  local.__atomicCandidates = [candidate];
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__atomicConversation;
+    extractShellCallCandidates = () => globalThis.__atomicCandidates;
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    queueSkillComposerReply = async () => true;
+  `, local);
+  let backendCalls = 0;
+  local.chrome.runtime.sendMessage = async () => {
+    backendCalls += 1;
+    return {
+      ok: true,
+      catalogSha: "6".repeat(64),
+      skill: { id: "example", sha: "7".repeat(64) },
+      content: "atomic Skill body"
+    };
+  };
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  const atomicBatch = [{
+    type: "childList",
+    target: conversation,
+    addedNodes: [stop, assistant],
+    removedNodes: []
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(atomicBatch), true);
+  local.trackAssistantGenerationHelperRoots(atomicBatch);
+  local.markLiveGeneratedHelperCandidates(atomicBatch);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A complete current assistant helper in the same observer batch as generation evidence must be live.");
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__atomicConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+  await local.scanForShellCall();
+  await local.scanForShellCall();
+  assert.equal(backendCalls, 1,
+    "An atomic current-assistant Skill must dispatch exactly once across repeated scans.");
+}
+
+async function testUnknownRoleAtomicSkillFailsClosed() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  const unknown = new local.Element();
+  const helperText = [
+    "ai-helper-skill-start:atomic-unknown",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"8".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  unknown.textContent = helperText;
+  conversation.append(user);
+  conversation.append(unknown);
+  conversation.textContent = helperText;
+  const candidate = { call, node: unknown, textRoot: unknown, source: "text", blockIndex: 0 };
+  local.__unknownConversation = conversation;
+  local.__unknownCandidates = [candidate];
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__unknownConversation;
+    extractShellCallCandidates = () => globalThis.__unknownCandidates;
+    loadPendingHelperDeliveriesForCurrentPage = async () => {};
+    schedulePendingHelperDeliveryRetry = () => {};
+    scheduleScan = () => {};
+    updateSiteActionButton = () => {};
+    queueSkillComposerReply = async () => true;
+  `, local);
+  let backendCalls = 0;
+  local.chrome.runtime.sendMessage = async () => {
+    backendCalls += 1;
+    return { ok: false };
+  };
+  local.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  const batch = [{ target: conversation, addedNodes: [stop, unknown], removedNodes: [] }];
+  local.observeAssistantGenerationEvidence(batch);
+  local.trackAssistantGenerationHelperRoots(batch);
+  local.markLiveGeneratedHelperCandidates(batch);
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__unknownConversation.textContent);
+    lastThreadTextAt = 0;
+  `, local);
+  await local.scanForShellCall();
+  assert.equal(backendCalls, 0,
+    "An unknown-role helper must not borrow generation proof even when it is atomic and DOM-latest.");
+  assert.equal(local.isBaselineIgnoredHelperCandidate(candidate), true);
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "Unknown-role helpers must fail closed while preserving explicit Process Skill recovery.");
+}
+
 async function testColdBaselineSurvivesRedrawButYieldsToLiveGeneration() {
   const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
   const assistant = new local.Element({ author: "assistant" });
+  conversation.append(user);
+  conversation.append(assistant);
   const call = local.parseCallPayload([
     "ai-helper-skill-start:recycled-root",
     "cmd: load",
@@ -298,11 +1286,12 @@ async function testColdBaselineSurvivesRedrawButYieldsToLiveGeneration() {
     `catalog-sha: ${"d".repeat(64)}`,
     "ai-helper-skill-end"
   ].join("\n"));
+  assistant.textContent = "ai-helper-skill-start:recycled-root";
   const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
   const semanticKey = local.buildSemanticCallKey(call);
   local.markCallBaselineIgnored(candidate, semanticKey);
   local.__candidate = candidate;
-  local.__conversation = assistant;
+  local.__conversation = conversation;
   vm.runInContext("helperRenderRootGenerations.set(__candidate.textRoot, 1);", local);
   let backendCalls = 0;
   local.chrome.runtime.sendMessage = async () => {
@@ -314,11 +1303,18 @@ async function testColdBaselineSurvivesRedrawButYieldsToLiveGeneration() {
   assert.equal(backendCalls, 0, "A same-root redraw without generation proof must preserve the cold baseline.");
 
   vm.runInContext("extractShellCallCandidates = () => [__candidate]; getConversationRoot = () => __conversation;", local);
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
+  local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.responseMessageRoot === __candidate.textRoot", local), true,
+    "The positive recycled-root path must bind the exact current assistant message.");
   local.markLiveGeneratedHelperCandidates([{
     target: assistant,
     addedNodes: [new local.Element()],
     removedNodes: []
   }]);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "The tracked recycled helper must receive exact candidate-bound live proof.");
   assert.equal(local.isBaselineIgnoredHelperCandidate(candidate, semanticKey), false,
     "Candidate-bound live generation must release the exact recycled helper from its old cold baseline.");
   assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), false);
@@ -446,6 +1442,1010 @@ async function testDetachAfterRouteAcceptanceCannotQueueResult() {
   await pending;
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 0,
     "Detaching the exact helper after route acceptance but before queue persistence must still block cross-chat delivery.");
+}
+
+async function testSameRootGenerationChangeRejectsBackendResult() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  conversation.append(assistant);
+  const helperText = [
+    "ai-helper-skill-start:same-root-generation",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"2".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__sameRootConversation = conversation;
+  local.__sameRootCandidates = [candidate];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__sameRootConversation;
+    extractShellCallCandidates = () => globalThis.__sameRootCandidates;
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 90;
+  `, local);
+  let resolveBackend;
+  local.chrome.runtime.sendMessage = () => new Promise((resolve) => { resolveBackend = resolve; });
+  const pending = local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 });
+  await Promise.resolve();
+
+  assistant.textContent = "This root now renders unrelated assistant text.";
+  local.__sameRootCandidates = [];
+  local.invalidateRenderedHelperTracking([{
+    type: "characterData",
+    target: assistant,
+    oldValue: helperText,
+    addedNodes: [],
+    removedNodes: []
+  }]);
+  assistant.textContent = helperText;
+  local.__sameRootCandidates = [candidate];
+  resolveBackend({
+    ok: true,
+    catalogSha: "2".repeat(64),
+    skill: { id: "example", sha: "3".repeat(64) },
+    content: "stale body"
+  });
+  assert.equal(await pending, false,
+    "A backend result must lose ownership when its render root changes generation, even if the old helper text returns.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 0,
+    "A same-root helper→other→helper race must not queue the old backend response.");
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "The restored exact helper must remain recoverable manually after the stale response is rejected.");
+}
+
+async function testDetachedBackendResultRemainsManuallyRecoverable() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  conversation.append(assistant);
+  const helperText = [
+    "ai-helper-skill-start:detached-backend",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"4".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__detachedConversation = conversation;
+  local.__detachedCandidates = [candidate];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__detachedConversation;
+    extractShellCallCandidates = () => globalThis.__detachedCandidates;
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 91;
+  `, local);
+  let resolveBackend;
+  local.chrome.runtime.sendMessage = () => new Promise((resolve) => { resolveBackend = resolve; });
+  const pending = local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 });
+  await Promise.resolve();
+
+  assistant.isConnected = false;
+  local.__detachedCandidates = [];
+  local.invalidateRenderedHelperTracking([{
+    type: "childList",
+    target: conversation,
+    addedNodes: [],
+    removedNodes: [assistant]
+  }]);
+  resolveBackend({
+    ok: true,
+    catalogSha: "4".repeat(64),
+    skill: { id: "example", sha: "5".repeat(64) },
+    content: "detached body"
+  });
+  assert.equal(await pending, false,
+    "A backend result completed while its exact helper root is detached must be discarded.");
+
+  assistant.isConnected = true;
+  local.__detachedCandidates = [candidate];
+  local.markUnprovenAutomaticHelperCandidatesAsBaseline([candidate]);
+  assert.equal(local.getLastActionableSkillCandidate([candidate], conversation), candidate,
+    "Reattaching the helper must expose Process Skill instead of leaving a permanent processed dead-end.");
+}
+
+async function testQueuedSkillResultRejectsSameUrlTranscriptReplacement() {
+  const local = createContentContext();
+  const originalConversation = new local.Element();
+  const originalRoot = new local.Element({ author: "assistant" });
+  originalConversation.append(originalRoot);
+  const helperText = [
+    "ai-helper-skill-start:queued-same-url",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"c".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  originalRoot.textContent = helperText;
+  originalConversation.textContent = helperText;
+  const candidate = { call, node: originalRoot, textRoot: originalRoot, source: "text", blockIndex: 0 };
+  local.__queuedSkillConversation = originalConversation;
+  local.__queuedSkillCandidates = [candidate];
+  let backendCalls = 0;
+  local.chrome.runtime.sendMessage = async (message) => {
+    if (message?.type === "skill-load") {
+      backendCalls += 1;
+    }
+    return {
+      ok: true,
+      catalogSha: "c".repeat(64),
+      skill: { id: "example", sha: "d".repeat(64) },
+      content: "queued Skill body"
+    };
+  };
+  local.chrome.storage.sync.get = async () => ({ autoSend: true });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 80;
+    getConversationRoot = () => globalThis.__queuedSkillConversation;
+    extractShellCallCandidates = () => globalThis.__queuedSkillCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    deliverHelperReply = async () => false;
+  `, local);
+
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true);
+  assert.equal(backendCalls, 1, "The Skill backend must finish exactly once before the composer-absent recovery race.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1,
+    "A completed Skill result must remain queued while the composer is absent.");
+  const pendingEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", local);
+  assert.equal(pendingEntry.phase, "queued");
+
+  originalRoot.isConnected = false;
+  local.__queuedSkillConversation = new local.Element();
+  local.__queuedSkillCandidates = [];
+  vm.runInContext(`
+    globalThis.__queuedSkillComposerWrites = 0;
+    deliverHelperReply = async () => {
+      globalThis.__queuedSkillComposerWrites += 1;
+      return true;
+    };
+  `, local);
+  assert.equal(await local.attemptPendingHelperDelivery(pendingEntry, { autoSend: true }), false,
+    "A queued Skill result must fail closed after same-URL transcript replacement.");
+  assert.deepEqual(
+    {
+      composerWrites: vm.runInContext("globalThis.__queuedSkillComposerWrites", local),
+      pending: vm.runInContext("pendingHelperDeliveries.size", local),
+      backendCalls
+    },
+    { composerWrites: 0, pending: 0, backendCalls: 1 },
+    "Retry after same-URL transcript replacement must discard the stale result without a composer write or backend replay."
+  );
+}
+
+async function testQueuedSkillWriteAbortsDuringSameUrlReplacement() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:queued-same-url-await",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"c".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__sameUrlAwaitConversation = conversation;
+  local.__sameUrlAwaitCandidates = [candidate];
+  let releaseComposer;
+  local.__sameUrlAwaitComposerGate = new Promise((resolve) => {
+    releaseComposer = resolve;
+  });
+  local.HTMLTextAreaElement = local.Element;
+  local.HTMLInputElement = class HTMLInputElement {};
+  local.Event = class Event {};
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 99;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__sameUrlAwaitConversation;
+    extractShellCallCandidates = () => globalThis.__sameUrlAwaitCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    globalThis.__sameUrlAwaitFindStarted = false;
+    findReplyInput = async () => {
+      globalThis.__sameUrlAwaitFindStarted = true;
+      return globalThis.__sameUrlAwaitComposerGate;
+    };
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const entry = await local.rememberPendingHelperDelivery(
+    "queued-same-url-await",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: same URL old transcript",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  const attempt = local.attemptPendingHelperDelivery(entry, { autoSend: true });
+  for (let round = 0; round < 8; round += 1) {
+    await Promise.resolve();
+    if (vm.runInContext("globalThis.__sameUrlAwaitFindStarted", local)) break;
+  }
+  assert.equal(vm.runInContext("globalThis.__sameUrlAwaitFindStarted", local), true);
+
+  assistant.isConnected = false;
+  local.__sameUrlAwaitConversation = new local.Element();
+  local.__sameUrlAwaitCandidates = [];
+  let focusCount = 0;
+  let mutationCount = 0;
+  const replacementComposer = new local.Element();
+  replacementComposer.focus = () => { focusCount += 1; };
+  replacementComposer.dispatchEvent = () => { mutationCount += 1; };
+  releaseComposer(replacementComposer);
+  assert.equal(await attempt, false);
+  assert.deepEqual({
+    focusCount,
+    mutationCount,
+    pending: vm.runInContext("pendingHelperDeliveries.size", local)
+  }, {
+    focusCount: 0,
+    mutationCount: 0,
+    pending: 0
+  }, "A same-URL transcript replacement during composer discovery must be rejected before focus or write.");
+}
+
+async function testQueuedSkillResultSurvivesOneRouteHandoff() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:queued-route-handoff",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"e".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__queuedRouteConversation = conversation;
+  local.__queuedRouteCandidates = [candidate];
+  local.chrome.runtime.sendMessage = async () => ({
+    ok: true,
+    catalogSha: "e".repeat(64),
+    skill: { id: "example", sha: "f".repeat(64) },
+    content: "queued route body"
+  });
+  local.chrome.storage.sync.get = async () => ({ autoSend: true });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 93;
+    getConversationRoot = () => globalThis.__queuedRouteConversation;
+    extractShellCallCandidates = () => globalThis.__queuedRouteCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    deliverHelperReply = async () => false;
+  `, local);
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1);
+
+  local.location.href = "https://chatgpt.com/c/permanent-queued-route";
+  assert.equal(local.refreshPageLifecycle(), true);
+  const migrated = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", local);
+  assert.ok(migrated, "The completed queued Skill result must migrate to the assigned route.");
+  assert.ok(migrated.skillOriginProof, "The route handoff must retain stored origin proof.");
+  assert.equal(migrated.skillRouteHandoffPending, true);
+  assert.equal(typeof migrated.volatileLifecycleGuard, "function");
+  migrated.restored = true;
+  vm.runInContext("initialThreadSettled = true", local);
+  vm.runInContext(`
+    globalThis.__queuedRouteWrites = 0;
+    deliverHelperReply = async () => {
+      globalThis.__queuedRouteWrites += 1;
+      return false;
+    };
+  `, local);
+  await local.attemptPendingHelperDelivery(migrated, { autoSend: true });
+  assert.equal(vm.runInContext("globalThis.__queuedRouteWrites", local), 1,
+    "A queued backend result may remain deliverable once only when the exact helper root survives the route handoff.");
+  assert.equal(migrated.skillRouteHandoffPending, false);
+  assert.equal(migrated.skillOriginProof.pageIdentity, local.location.href);
+}
+
+async function testQueuedSkillResultCannotCrossIntoAnotherChat() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:queued-cross-chat",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"1".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__crossChatConversation = conversation;
+  local.__crossChatCandidates = [candidate];
+  local.chrome.runtime.sendMessage = async () => ({
+    ok: true,
+    catalogSha: "1".repeat(64),
+    skill: { id: "example", sha: "2".repeat(64) },
+    content: "must remain in the originating chat"
+  });
+  local.chrome.storage.sync.get = async () => ({ autoSend: true });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 94;
+    getConversationRoot = () => globalThis.__crossChatConversation;
+    extractShellCallCandidates = () => globalThis.__crossChatCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    deliverHelperReply = async () => false;
+  `, local);
+  assert.equal(await local.processLatestSkillCandidate([candidate], { maxChainCalls: 100 }), true);
+
+  assistant.isConnected = false;
+  local.__crossChatConversation = new local.Element();
+  local.__crossChatCandidates = [];
+  local.location.href = "https://chatgpt.com/c/unrelated-existing-chat";
+  assert.equal(local.refreshPageLifecycle(), true);
+  const migrated = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", local);
+  assert.ok(migrated);
+  migrated.restored = true;
+  vm.runInContext(`
+    initialThreadSettled = true;
+    globalThis.__crossChatWrites = 0;
+    deliverHelperReply = async () => { globalThis.__crossChatWrites += 1; return false; };
+  `, local);
+  assert.equal(await local.attemptPendingHelperDelivery(migrated, { autoSend: true }), false);
+  assert.deepEqual({
+    writes: vm.runInContext("globalThis.__crossChatWrites", local),
+    pending: vm.runInContext("pendingHelperDeliveries.size", local)
+  }, { writes: 0, pending: 0 },
+  "A URL change plus a different transcript must discard local Skill content without writing it into another chat.");
+}
+
+async function testQueuedSkillAttemptCannotWriteAfterTwoRoutes() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:queued-two-routes",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"3".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__twoRouteConversation = conversation;
+  local.__twoRouteCandidates = [candidate];
+  let releaseComposer;
+  let findStarted = false;
+  local.__twoRouteComposerGate = new Promise((resolve) => {
+    releaseComposer = resolve;
+  });
+  local.HTMLTextAreaElement = local.Element;
+  local.HTMLInputElement = class HTMLInputElement {};
+  local.Event = class Event {};
+  local.chrome.storage.sync.get = async () => ({ autoSend: true });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 95;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__twoRouteConversation;
+    extractShellCallCandidates = () => globalThis.__twoRouteCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    findReplyInput = async () => {
+      globalThis.__twoRouteFindStarted = true;
+      return globalThis.__twoRouteComposerGate;
+    };
+    globalThis.__twoRouteFindStarted = false;
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const entry = await local.rememberPendingHelperDelivery(
+    "queued-two-routes",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: must stay in chat A",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  const attempt = local.attemptPendingHelperDelivery(entry, { autoSend: true });
+  for (let round = 0; round < 8; round += 1) {
+    await Promise.resolve();
+    findStarted = vm.runInContext("globalThis.__twoRouteFindStarted", local);
+    if (findStarted) break;
+  }
+  assert.equal(findStarted, true, "The stale-write regression must pause inside composer discovery.");
+
+  local.location.href = "https://chatgpt.com/c/first-assigned-route";
+  assert.equal(local.refreshPageLifecycle(), true);
+  local.location.href = "https://chatgpt.com/c/unrelated-second-route";
+  assert.equal(local.refreshPageLifecycle(), true);
+  let focusCount = 0;
+  let mutationCount = 0;
+  const composer = new local.Element();
+  composer.focus = () => { focusCount += 1; };
+  composer.dispatchEvent = () => { mutationCount += 1; };
+  releaseComposer(composer);
+  assert.equal(await attempt, false);
+  await vm.runInContext("pendingHelperDeliveryStorageTail.catch(() => {})", local);
+  assert.deepEqual({
+    focusCount,
+    mutationCount,
+    pending: vm.runInContext("pendingHelperDeliveries.size", local)
+  }, {
+    focusCount: 0,
+    mutationCount: 0,
+    pending: 0
+  }, "An old queued Skill attempt released after two routes must be cancelled before focus or any composer DOM write.");
+}
+
+async function testWrittenSkillPhasesCannotResumeAfterRoute() {
+  for (const phase of ["inserted", "submitted-unconfirmed"]) {
+    const local = createContentContext();
+    const conversation = new local.Element();
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = [
+      `ai-helper-skill-start:route-${phase}`,
+      "cmd: load",
+      "skill-id: example",
+      `catalog-sha: ${"5".repeat(64)}`,
+      "ai-helper-skill-end"
+    ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    conversation.append(assistant);
+    conversation.textContent = helperText;
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__writtenPhaseConversation = conversation;
+    local.__writtenPhaseCandidates = [candidate];
+    let releaseComposer;
+    local.__writtenPhaseComposerGate = new Promise((resolve) => {
+      releaseComposer = resolve;
+    });
+    local.chrome.storage.sync.get = async () => ({ autoSend: true });
+    vm.runInContext(`
+      observedPageIdentity = location.href;
+      pageLifecycleGeneration = 96;
+      initialThreadSettled = true;
+      getConversationRoot = () => globalThis.__writtenPhaseConversation;
+      extractShellCallCandidates = () => globalThis.__writtenPhaseCandidates;
+      schedulePendingHelperDeliveryRetry = () => {};
+      globalThis.__writtenPhaseFindStarted = false;
+      globalThis.__writtenPhaseSendCalls = 0;
+      findReplyInput = async () => {
+        globalThis.__writtenPhaseFindStarted = true;
+        return globalThis.__writtenPhaseComposerGate;
+      };
+      runOriginalSendActuatorForOwnedComposer = async () => {
+        globalThis.__writtenPhaseSendCalls += 1;
+        return true;
+      };
+    `, local);
+    const dispatchContext = local.createSkillDispatchContext(candidate);
+    const entry = await local.rememberPendingHelperDelivery(
+      `route-${phase}`,
+      { ...call, kind: "skill-load" },
+      { ok: true },
+      `Local Skill load result: ${phase}`,
+      { autoSend: true },
+      {
+        skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+        lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+      }
+    );
+    entry.phase = phase;
+    const attempt = local.attemptPendingHelperDelivery(entry, { autoSend: true });
+    for (let round = 0; round < 8; round += 1) {
+      await Promise.resolve();
+      if (vm.runInContext("globalThis.__writtenPhaseFindStarted", local)) break;
+    }
+    assert.equal(vm.runInContext("globalThis.__writtenPhaseFindStarted", local), true,
+      `The ${phase} regression must pause during composer discovery.`);
+    local.location.href = `https://chatgpt.com/c/after-${phase}`;
+    assert.equal(local.refreshPageLifecycle(), true);
+    releaseComposer(new local.Element());
+    assert.equal(await attempt, false);
+    assert.deepEqual({
+      sendCalls: vm.runInContext("globalThis.__writtenPhaseSendCalls", local),
+      pending: vm.runInContext("pendingHelperDeliveries.size", local)
+    }, {
+      sendCalls: 0,
+      pending: 0
+    }, `A ${phase} Skill delivery must lose all send/finalize authority after a route transition.`);
+  }
+}
+
+async function testWrittenSkillPhasesAbortDuringSameUrlReplacement() {
+  for (const phase of ["inserted", "submitted-unconfirmed"]) {
+    const local = createContentContext();
+    const conversation = new local.Element();
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = [
+      `ai-helper-skill-start:same-url-${phase}`,
+      "cmd: load",
+      "skill-id: example",
+      `catalog-sha: ${"6".repeat(64)}`,
+      "ai-helper-skill-end"
+    ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    conversation.append(assistant);
+    conversation.textContent = helperText;
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__sameUrlPhaseConversation = conversation;
+    local.__sameUrlPhaseCandidates = [candidate];
+    let releaseComposer;
+    local.__sameUrlPhaseComposerGate = new Promise((resolve) => {
+      releaseComposer = resolve;
+    });
+    vm.runInContext(`
+      observedPageIdentity = location.href;
+      pageLifecycleGeneration = 100;
+      initialThreadSettled = true;
+      getConversationRoot = () => globalThis.__sameUrlPhaseConversation;
+      extractShellCallCandidates = () => globalThis.__sameUrlPhaseCandidates;
+      schedulePendingHelperDeliveryRetry = () => {};
+      globalThis.__sameUrlPhaseFindStarted = false;
+      globalThis.__sameUrlPhaseSendCalls = 0;
+      findReplyInput = async () => {
+        globalThis.__sameUrlPhaseFindStarted = true;
+        return globalThis.__sameUrlPhaseComposerGate;
+      };
+      runOriginalSendActuatorForOwnedComposer = async () => {
+        globalThis.__sameUrlPhaseSendCalls += 1;
+        return true;
+      };
+    `, local);
+    const dispatchContext = local.createSkillDispatchContext(candidate);
+    const entry = await local.rememberPendingHelperDelivery(
+      `same-url-${phase}`,
+      { ...call, kind: "skill-load" },
+      { ok: true },
+      `Local Skill load result: same URL ${phase}`,
+      { autoSend: true },
+      {
+        skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+        lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+      }
+    );
+    entry.phase = phase;
+    const attempt = local.attemptPendingHelperDelivery(entry, { autoSend: true });
+    for (let round = 0; round < 8; round += 1) {
+      await Promise.resolve();
+      if (vm.runInContext("globalThis.__sameUrlPhaseFindStarted", local)) break;
+    }
+    assert.equal(vm.runInContext("globalThis.__sameUrlPhaseFindStarted", local), true);
+    assistant.isConnected = false;
+    local.__sameUrlPhaseConversation = new local.Element();
+    local.__sameUrlPhaseCandidates = [];
+    releaseComposer({
+      innerText: entry.reply,
+      textContent: entry.reply,
+      isConnected: true
+    });
+    assert.equal(await attempt, false);
+    assert.deepEqual({
+      sendCalls: vm.runInContext("globalThis.__sameUrlPhaseSendCalls", local),
+      pending: vm.runInContext("pendingHelperDeliveries.size", local)
+    }, {
+      sendCalls: 0,
+      pending: 0
+    }, `A same-URL transcript replacement must revoke ${phase} send/finalize authority after composer discovery.`);
+  }
+}
+
+async function testStaleInsertedCancellationCannotClearNewRouteQueue() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:stale-cancel",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"7".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__staleCancelConversation = conversation;
+  local.__staleCancelCandidates = [candidate];
+  let releaseProof;
+  local.__staleCancelProofGate = new Promise((resolve) => {
+    releaseProof = resolve;
+  });
+  const occupiedComposer = {
+    innerText: "new user draft",
+    textContent: "new user draft",
+    isConnected: true
+  };
+  local.__staleCancelComposer = occupiedComposer;
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 97;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__staleCancelConversation;
+    extractShellCallCandidates = () => globalThis.__staleCancelCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    findReplyInput = async () => globalThis.__staleCancelComposer;
+    globalThis.__staleCancelProofStarted = false;
+    waitForPendingHelperSubmissionProof = async () => {
+      globalThis.__staleCancelProofStarted = true;
+      return globalThis.__staleCancelProofGate;
+    };
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const oldEntry = await local.rememberPendingHelperDelivery(
+    "stale-cancel-old",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: old route",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  oldEntry.phase = "inserted";
+  const oldAttempt = local.attemptPendingHelperDelivery(oldEntry, { autoSend: true });
+  for (let round = 0; round < 8; round += 1) {
+    await Promise.resolve();
+    if (vm.runInContext("globalThis.__staleCancelProofStarted", local)) break;
+  }
+  assert.equal(vm.runInContext("globalThis.__staleCancelProofStarted", local), true,
+    "The old inserted delivery must pause while checking submission proof.");
+
+  local.location.href = "https://chatgpt.com/c/new-route-with-new-result";
+  assert.equal(local.refreshPageLifecycle(), true);
+  const newEntry = await local.rememberPendingHelperDelivery(
+    "new-route-result",
+    { kind: "shell", cmd: "printf new-route" },
+    { ok: true, executionId: "0123456789abcdef" },
+    "new route result",
+    { autoSend: true }
+  );
+  releaseProof(false);
+  assert.equal(await oldAttempt, false);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1,
+    "A stale old-route cancellation must not clear a newly queued delivery in the current route.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('new-route-result')", local), newEntry);
+}
+
+async function testTrustedMutationCancellationCannotClearNewRouteQueue() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:trusted-mutation-cancel",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"8".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__trustedCancelConversation = conversation;
+  local.__trustedCancelCandidates = [candidate];
+  let releaseProof;
+  local.__trustedCancelProofGate = new Promise((resolve) => {
+    releaseProof = resolve;
+  });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 98;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__trustedCancelConversation;
+    extractShellCallCandidates = () => globalThis.__trustedCancelCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    globalThis.__trustedCancelProofStarted = false;
+    waitForPendingHelperSubmissionProof = async () => {
+      globalThis.__trustedCancelProofStarted = true;
+      return globalThis.__trustedCancelProofGate;
+    };
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const oldEntry = await local.rememberPendingHelperDelivery(
+    "trusted-cancel-old",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: old trusted mutation",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  oldEntry.phase = "inserted";
+  const staleCancellation = local.cancelPendingHelperDeliveryAfterComposerRemoval(oldEntry);
+  for (let round = 0; round < 8; round += 1) {
+    await Promise.resolve();
+    if (vm.runInContext("globalThis.__trustedCancelProofStarted", local)) break;
+  }
+  assert.equal(vm.runInContext("globalThis.__trustedCancelProofStarted", local), true);
+
+  local.location.href = "https://chatgpt.com/c/new-route-after-trusted-edit";
+  assert.equal(local.refreshPageLifecycle(), true);
+  const newEntry = await local.rememberPendingHelperDelivery(
+    "new-route-after-trusted-edit",
+    { kind: "shell", cmd: "printf current" },
+    { ok: true, executionId: "fedcba9876543210" },
+    "current route result",
+    { autoSend: true }
+  );
+  releaseProof(false);
+  assert.equal(await staleCancellation, false);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1,
+    "The no-token trusted-mutation path must revalidate ownership after its proof await.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('new-route-after-trusted-edit')", local), newEntry);
+}
+
+async function testTrustedMutationCancellationCannotClearSameUrlReplacementQueue() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:trusted-same-url-cancel",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"0".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__trustedSameUrlConversation = conversation;
+  local.__trustedSameUrlCandidates = [candidate];
+  let releaseProof;
+  local.__trustedSameUrlProofGate = new Promise((resolve) => {
+    releaseProof = resolve;
+  });
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 101;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__trustedSameUrlConversation;
+    extractShellCallCandidates = () => globalThis.__trustedSameUrlCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    globalThis.__trustedSameUrlProofStarted = false;
+    waitForPendingHelperSubmissionProof = async () => {
+      globalThis.__trustedSameUrlProofStarted = true;
+      return globalThis.__trustedSameUrlProofGate;
+    };
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const oldEntry = await local.rememberPendingHelperDelivery(
+    "trusted-same-url-old",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: old same URL trusted mutation",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  oldEntry.phase = "inserted";
+  const staleCancellation = local.cancelPendingHelperDeliveryAfterComposerRemoval(oldEntry);
+  for (let round = 0; round < 8; round += 1) {
+    await Promise.resolve();
+    if (vm.runInContext("globalThis.__trustedSameUrlProofStarted", local)) break;
+  }
+  assert.equal(vm.runInContext("globalThis.__trustedSameUrlProofStarted", local), true);
+
+  assistant.isConnected = false;
+  local.__trustedSameUrlConversation = new local.Element();
+  local.__trustedSameUrlCandidates = [];
+  const newEntry = await local.rememberPendingHelperDelivery(
+    "trusted-same-url-new",
+    { kind: "shell", cmd: "printf replacement" },
+    { ok: true, executionId: "0011223344556677" },
+    "replacement route result",
+    { autoSend: true }
+  );
+  releaseProof(false);
+  assert.equal(await staleCancellation, false);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 1,
+    "A stale same-URL cancellation must delete only its old Skill entry, never the replacement queue.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('trusted-same-url-new')", local), newEntry);
+}
+
+async function testTrustedCancellationRechecksAfterAsyncGuardResolution() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const assistant = new local.Element({ author: "assistant" });
+  const helperText = [
+    "ai-helper-skill-start:post-guard-cancel",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"1".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+  assistant.textContent = helperText;
+  conversation.append(assistant);
+  conversation.textContent = helperText;
+  const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+  local.__postGuardConversation = conversation;
+  local.__postGuardCandidates = [candidate];
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 102;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__postGuardConversation;
+    extractShellCallCandidates = () => globalThis.__postGuardCandidates;
+    schedulePendingHelperDeliveryRetry = () => {};
+    waitForPendingHelperSubmissionProof = async () => false;
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(candidate);
+  const oldEntry = await local.rememberPendingHelperDelivery(
+    "post-guard-old",
+    { ...call, kind: "skill-load" },
+    { ok: true },
+    "Local Skill load result: post guard old",
+    { autoSend: true },
+    {
+      skillOriginProof: local.createStoredSkillOriginProof(dispatchContext),
+      lifecycleGuard: () => local.isSkillDispatchContextCurrent(dispatchContext)
+    }
+  );
+  oldEntry.phase = "inserted";
+  const currentEntry = await local.rememberPendingHelperDelivery(
+    "post-guard-current",
+    { kind: "shell", cmd: "printf still-current" },
+    { ok: true, executionId: "8899aabbccddeeff" },
+    "current result must survive",
+    { autoSend: true }
+  );
+
+  const originalGuard = oldEntry.volatileLifecycleGuard;
+  let guardCalls = 0;
+  oldEntry.volatileLifecycleGuard = () => {
+    guardCalls += 1;
+    const current = originalGuard() === true;
+    if (guardCalls === 2) {
+      queueMicrotask(() => {
+        assistant.isConnected = false;
+        local.__postGuardConversation = new local.Element();
+        local.__postGuardCandidates = [];
+      });
+    }
+    return current;
+  };
+
+  assert.equal(
+    await local.cancelPendingHelperDeliveryAfterComposerRemoval(oldEntry),
+    false,
+    "Same-URL replacement after the async guard resolves must revoke cancellation authority."
+  );
+  assert.ok(guardCalls >= 3, "Cancellation must perform a final synchronous origin preflight.");
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('post-guard-old')", local),
+    undefined,
+    "The stale exact Skill entry should be discarded by the stale-origin cleanup path."
+  );
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('post-guard-current')", local),
+    currentEntry,
+    "The stale cancellation must not clear another current pending result."
+  );
+}
+
+async function testRestoredQueuedSkillRequiresMatchingTranscript() {
+  for (const changed of [false, true]) {
+    const local = createContentContext();
+    const conversation = new local.Element();
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = [
+      `ai-helper-skill-start:restored-${changed ? "changed" : "same"}`,
+      "cmd: load",
+      "skill-id: example",
+      `catalog-sha: ${"6".repeat(64)}`,
+      "ai-helper-skill-end"
+    ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    conversation.append(assistant);
+    conversation.textContent = helperText;
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__restoredConversation = conversation;
+    local.__restoredCandidates = [candidate];
+    vm.runInContext(`
+      getConversationRoot = () => globalThis.__restoredConversation;
+      extractShellCallCandidates = () => globalThis.__restoredCandidates;
+      observedPageIdentity = location.href;
+      pageLifecycleGeneration = 92;
+      initialThreadSettled = true;
+      schedulePendingHelperDeliveryRetry = () => {};
+    `, local);
+    const context = local.createSkillDispatchContext(candidate);
+    const proof = local.createStoredSkillOriginProof(context);
+    const entry = await local.rememberPendingHelperDelivery(
+      `restored-${changed}`,
+      { ...call, kind: "skill-load" },
+      { ok: true },
+      "Local Skill load result: restored transcript proof",
+      { autoSend: true },
+      { skillOriginProof: proof }
+    );
+    entry.restored = true;
+    let writes = 0;
+    local.deliverHelperReply = undefined;
+    vm.runInContext(`
+      deliverHelperReply = async () => {
+        globalThis.__restoredWrites += 1;
+        return false;
+      };
+      globalThis.__restoredWrites = 0;
+    `, local);
+    if (changed) {
+      conversation.textContent = `${helperText}\nA different transcript message appeared.`;
+    }
+    await local.attemptPendingHelperDelivery(entry, { autoSend: true });
+    writes = vm.runInContext("globalThis.__restoredWrites", local);
+    assert.equal(writes, changed ? 0 : 1,
+      changed
+        ? "A restored queued Skill result must not write when the same-URL transcript fingerprint changed."
+        : "A restored queued Skill result must remain deliverable when the exact transcript proof is unchanged.");
+    if (changed) {
+      assert.equal(vm.runInContext("pendingHelperDeliveries.size", local), 0,
+        "A mismatched restored Skill result must be removed from the pending queue.");
+    }
+  }
+}
+
+async function testLegacyRestoredQueuedSkillWithoutOriginIsDiscarded() {
+  const local = createContentContext();
+  vm.runInContext(`
+    initialThreadSettled = true;
+    schedulePendingHelperDeliveryRetry = () => {};
+    globalThis.__legacySkillWrites = 0;
+    deliverHelperReply = async () => {
+      globalThis.__legacySkillWrites += 1;
+      return false;
+    };
+  `, local);
+  const entry = await local.rememberPendingHelperDelivery(
+    "legacy-skill-without-origin",
+    { kind: "skill-load", cmd: "load", skillId: "example" },
+    { ok: true },
+    "Local Skill load result: legacy unguarded entry",
+    { autoSend: true }
+  );
+  entry.restored = true;
+  await local.attemptPendingHelperDelivery(entry, { autoSend: true });
+  assert.deepEqual(
+    {
+      writes: vm.runInContext("globalThis.__legacySkillWrites", local),
+      pending: vm.runInContext("pendingHelperDeliveries.size", local)
+    },
+    { writes: 0, pending: 0 },
+    "A restored pre-fix Skill reply with neither transcript proof nor trusted route handoff must fail closed."
+  );
 }
 
 async function testSkillRecoveryAbortsAcrossRouteAwait() {

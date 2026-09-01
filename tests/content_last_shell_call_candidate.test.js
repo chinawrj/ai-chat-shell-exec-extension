@@ -406,13 +406,18 @@ async function verifyFrontendDoesNotDedupCommands() {
 async function verifyHiddenStopButtonDoesNotBlockHelperScan() {
   const context = loadContentContext();
   const hiddenStop = new MockNode({ text: "Stop generating", visible: false });
-  const visibleStop = new MockNode({ text: "Stop", visible: true });
+  const visibleStop = new MockNode({ text: "Stop generating", visible: true });
+  const ambiguousStop = new MockNode({ text: "Stop", visible: true });
 
   context.document.querySelectorAll = () => [hiddenStop];
   assert.equal(context.isAssistantGenerating(), false, "A hidden stale Stop button must not block helper execution.");
 
   context.document.querySelectorAll = () => [visibleStop];
-  assert.equal(context.isAssistantGenerating(), true, "A visible text-only Stop button must be recognized after trimming its label.");
+  assert.equal(context.isAssistantGenerating(), true, "A visible exact generation control label must be recognized.");
+
+  context.document.querySelectorAll = () => [ambiguousStop];
+  assert.equal(context.isAssistantGenerating(), false,
+    "A generic visible Stop button must not become executable-helper generation evidence.");
 }
 
 async function verifyUnexpectedHelperCancelsSelfTestAndRuns() {
@@ -443,7 +448,17 @@ async function verifyUnexpectedHelperCancelsSelfTestAndRuns() {
     runCalls.push({ callId, call, options });
   };
   vm.runInContext(
-    `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000; pendingSelfTest = { command: 'printf EXPECTED_SELF_TEST', cwd: '', token: 'expected', startedAt: Date.now() };`,
+    `extensionActive = true;
+     initialThreadSettled = true;
+     lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))};
+     lastThreadTextAt = Date.now() - 2000;
+     pendingSelfTest = { command: 'printf EXPECTED_SELF_TEST', cwd: '', token: 'expected', startedAt: Date.now() };
+     (() => {
+       const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+       const semanticKey = buildSemanticCallKey(candidate.call);
+       const renderRoot = getCandidateRenderRoot(candidate);
+       liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+     })();`,
     context
   );
 
@@ -477,7 +492,17 @@ async function verifyPendingAgentDeliveryDefersWithoutConsumingHelper() {
   context.resetChainForNewHumanPrompt = () => {};
   context.runAndReply = async (...args) => runCalls.push(args);
   vm.runInContext(
-    `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000; pendingAgentDelivery = { messageId: 'pending-agent' };`,
+    `extensionActive = true;
+     initialThreadSettled = true;
+     lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))};
+     lastThreadTextAt = Date.now() - 2000;
+     pendingAgentDelivery = { messageId: 'pending-agent' };
+     (() => {
+       const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+       const semanticKey = buildSemanticCallKey(candidate.call);
+       const renderRoot = getCandidateRenderRoot(candidate);
+       liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+     })();`,
     context
   );
 
@@ -525,7 +550,17 @@ async function verifyPendingAgentDeliveryDefersSkillWithoutConsumingHelper() {
   context.resetChainForNewHumanPrompt = () => {};
   context.queueSkillComposerReply = async () => true;
   vm.runInContext(
-    `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000; pendingAgentDelivery = { messageId: 'pending-agent-skill' };`,
+    `extensionActive = true;
+     initialThreadSettled = true;
+     lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))};
+     lastThreadTextAt = Date.now() - 2000;
+     pendingAgentDelivery = { messageId: 'pending-agent-skill' };
+     (() => {
+       const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+       const semanticKey = buildSemanticCallKey(candidate.call);
+       const renderRoot = getCandidateRenderRoot(candidate);
+       liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+     })();`,
     context
   );
 
@@ -558,7 +593,16 @@ async function verifyRetryableAttemptDoesNotConsumeSameRenderedHelper() {
     return { retryable: true };
   };
   vm.runInContext(
-    `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`,
+    `extensionActive = true;
+     initialThreadSettled = true;
+     lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))};
+     lastThreadTextAt = Date.now() - 2000;
+     (() => {
+       const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+       const semanticKey = buildSemanticCallKey(candidate.call);
+       const renderRoot = getCandidateRenderRoot(candidate);
+       liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+     })();`,
     context
   );
 
@@ -790,7 +834,17 @@ async function verifyAmbiguousShellRecoveryFailureDoesNotResendSameRenderedHelpe
     return { innerText: text, textContent: text, isConnected: true };
   };
   vm.runInContext(
-    `extensionActive = true; beginPageLifecycle(); initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`,
+    `extensionActive = true;
+     beginPageLifecycle();
+     initialThreadSettled = true;
+     lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))};
+     lastThreadTextAt = Date.now() - 2000;
+     (() => {
+       const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+       const semanticKey = buildSemanticCallKey(candidate.call);
+       const renderRoot = getCandidateRenderRoot(candidate);
+       liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+     })();`,
     context
   );
 
@@ -916,6 +970,15 @@ async function waitForTestCondition(check) {
   throw new Error("Timed out waiting for test condition.");
 }
 
+function markLatestHelperLive(context) {
+  vm.runInContext(`(() => {
+    const candidate = extractShellCallCandidates(getConversationRoot()).at(-1);
+    const semanticKey = buildSemanticCallKey(candidate.call);
+    const renderRoot = getCandidateRenderRoot(candidate);
+    liveGeneratedRenderedHelpers.set(renderRoot, new Set([buildRenderedHelperKey(candidate, semanticKey)]));
+  })();`, context);
+}
+
 async function verifyMixedShellOutputAndNewHelperRunsNormally() {
   const context = loadContentContext();
   const cmd = "echo MIXED_NORMAL_SCAN";
@@ -934,6 +997,7 @@ async function verifyMixedShellOutputAndNewHelperRunsNormally() {
   context.resetChainForNewHumanPrompt = () => {};
   context.runAndReply = async (callId, call) => runCalls.push({ callId, call });
   vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
 
   await context.scanForShellCall();
   assert.equal(runCalls.length, 1, "A closed historical shell-output must not suppress a later helper in the same message.");
@@ -956,12 +1020,14 @@ async function verifyVirtualizedReplacementAndSharedContainerRemainRunnable() {
   context.resetChainForNewHumanPrompt = () => {};
   context.runAndReply = async (callId, call) => runCalls.push({ callId, call });
   vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
   await context.scanForShellCall();
 
   const replacementMessage = createAssistantMessage({ order: 1, text: createHelperBlock({ cmd }) });
   root = createRoot([replacementMessage]);
   context.document.body = root;
   vm.runInContext(`extensionActive = true; activeCallId = ''; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
   const replacementCandidate = context.getLastShellCallCandidate(root);
   const replacementSemantic = context.buildSemanticCallKey(replacementCandidate.call);
   const replacementCallKey = context.buildCandidateCallKey(replacementCandidate, replacementSemantic);
@@ -1092,6 +1158,7 @@ async function verifyAgentHelperInsideShellOutputIsSuppressed() {
     runCalls.push({ callId, call, options });
   };
   vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
 
   await context.scanForShellCall();
 
@@ -1127,6 +1194,7 @@ async function verifyNewIdenticalHelperAfterFailedAttemptRuns() {
     runCalls.push({ callId, call, options });
   };
   vm.runInContext(`extensionActive = true; activeCallId = ''; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
 
   await context.scanForShellCall();
   assert.equal(runCalls.length, 1);
@@ -1138,6 +1206,7 @@ async function verifyNewIdenticalHelperAfterFailedAttemptRuns() {
   root = createRoot([firstMessage, secondMessage]);
   context.document.body = root;
   vm.runInContext(`extensionActive = true; activeCallId = ''; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
 
   const retryCandidates = context.extractShellCallCandidates(root);
   assert.equal(retryCandidates.length, 2);
@@ -2592,6 +2661,7 @@ async function verifyNewRenderRootCanRunWhileOldReplyIsPending() {
     `extensionActive = true; beginPageLifecycle(); initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`,
     context
   );
+  markLatestHelperLive(context);
   await context.scanForShellCall();
   assert.equal(backendRuns, 1);
 
@@ -2599,6 +2669,7 @@ async function verifyNewRenderRootCanRunWhileOldReplyIsPending() {
   root = createRoot([firstMessage, secondMessage]);
   context.document.body = root;
   vm.runInContext(`extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`, context);
+  markLatestHelperLive(context);
   await context.scanForShellCall();
 
   assert.equal(backendRuns, 2, "An identical helper in a new render root must receive its own backend adjudication.");
@@ -2703,6 +2774,7 @@ async function verifyDuplicateConsumesOnlySameRenderedHelper() {
     `extensionActive = true; initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000; beginPageLifecycle(); initialThreadSettled = true; lastThreadText = ${JSON.stringify(context.normalizeText(root.innerText))}; lastThreadTextAt = Date.now() - 2000;`,
     context
   );
+  markLatestHelperLive(context);
 
   await context.scanForShellCall();
   vm.runInContext("lastThreadTextAt = Date.now() - 2000;", context);

@@ -374,11 +374,7 @@ async function main() {
   const agentTmuxToken = `agent-tmux-e2e-${Date.now()}`;
   await page.evaluate(`(() => {
     document.getElementById("command").value = ${JSON.stringify(`printf ${agentTmuxToken}`)};
-    appendAssistantToolCall([
-      "ai-helper-shell-start:agent-tmux-e2e",
-      ${JSON.stringify(`printf ${agentTmuxToken}`)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
+    document.getElementById("insertCall").click();
     return true;
   })()`);
   const agentTmuxText = await waitForEvaluateValue(page, `(() => {
@@ -462,14 +458,11 @@ async function main() {
   }, "content script baseline scan after role refresh");
 
   const refreshedAgentTmuxToken = `agent-tmux-refresh-e2e-${Date.now()}`;
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:agent-tmux-refresh-e2e",
-      ${JSON.stringify(`printf ${refreshedAgentTmuxToken}`)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:agent-tmux-refresh-e2e",
+    `printf ${refreshedAgentTmuxToken}`,
+    "ai-helper-shell-end"
+  ].join("\n"));
   const refreshedAgentTmuxText = await waitForEvaluateValue(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes("targetName: ForAI-slave-a") &&
@@ -547,14 +540,10 @@ async function main() {
   const helperAgentTaskId = `task-helper-e2e-${Date.now()}`;
   const helperAgentBody = `master helper delegated to slave page ${helperAgentTaskId}`;
   await masterPage.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-agent-message-start:agent-e2e",
-      "to: slave-a",
-      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
-      "",
-      ${JSON.stringify(helperAgentBody)},
-      "ai-helper-agent-message-end"
-    ].join("\\n"), "text");
+    document.getElementById("agentTo").value = "slave-a";
+    document.getElementById("agentTaskId").value = ${JSON.stringify(helperAgentTaskId)};
+    document.getElementById("agentBody").value = ${JSON.stringify(helperAgentBody)};
+    document.getElementById("insertAgentMessage").click();
     return true;
   })()`);
 
@@ -574,14 +563,11 @@ async function main() {
   assert.match(slaveDeliveredText, new RegExp(escapeRegExp(helperAgentBody)));
 
   const rosterHelperId = `roster-e2e-${Date.now()}`;
-  await masterPage.evaluate(`(() => {
-    appendAssistantToolCall([
-      ${JSON.stringify(`ai-helper-agent-roster-start:${rosterHelperId}`)},
-      "role: slave",
-      "ai-helper-agent-roster-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(masterPage, [
+    `ai-helper-agent-roster-start:${rosterHelperId}`,
+    "role: slave",
+    "ai-helper-agent-roster-end"
+  ].join("\n"));
   const rosterHelperText = await waitForEvaluateValue(masterPage, `(() => {
     const text = document.body.innerText || "";
     return text.includes("Agent roster result:") &&
@@ -591,14 +577,11 @@ async function main() {
   assert.match(rosterHelperText, /Agent roster result:/);
 
   const statusHelperId = `status-e2e-${Date.now()}`;
-  await masterPage.evaluate(`(() => {
-    appendAssistantToolCall([
-      ${JSON.stringify(`ai-helper-agent-task-status-start:${statusHelperId}`)},
-      ${JSON.stringify(`task-id: ${helperAgentTaskId}`)},
-      "ai-helper-agent-task-status-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(masterPage, [
+    `ai-helper-agent-task-status-start:${statusHelperId}`,
+    `task-id: ${helperAgentTaskId}`,
+    "ai-helper-agent-task-status-end"
+  ].join("\n"));
   const statusHelperText = await waitForEvaluateValue(masterPage, `(() => {
     const text = document.body.innerText || "";
     return text.includes("Agent task status result:") &&
@@ -787,13 +770,13 @@ async function main() {
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
-    appendAssistantToolCall([
-      "ai-helper-shell-start:deleted-composer-e2e",
-      ${JSON.stringify(deletedComposerCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:deleted-composer-e2e",
+    deletedComposerCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   await waitForEvaluate(page, `(() => {
     const text = document.getElementById("composer")?.innerText || "";
     return text.includes(${JSON.stringify(deletedComposerToken)}) && text.includes("Shell call result:");
@@ -832,13 +815,13 @@ async function main() {
     window.__aiShellDeletionGuard?.abort();
     const send = document.getElementById("send");
     send.disabled = false;
-    appendAssistantToolCall([
-      "ai-helper-shell-start:after-deleted-composer-e2e",
-      ${JSON.stringify(`printf '${afterDeletionToken}'`)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:after-deleted-composer-e2e",
+    `printf '${afterDeletionToken}'`,
+    "ai-helper-shell-end"
+  ].join("\n"));
   try {
     await waitForEvaluate(page, `(() => {
       const composer = document.getElementById("composer");
@@ -910,13 +893,13 @@ async function main() {
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
-    appendAssistantToolCall([
-      "ai-helper-shell-start:refresh-old-page",
-      ${JSON.stringify(refreshOldCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:refresh-old-page",
+    refreshOldCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   try {
     await waitFor(
       () => fs.existsSync(refreshMarkerPath) && fs.readFileSync(refreshMarkerPath, "utf8").includes("started"),
@@ -946,13 +929,13 @@ async function main() {
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
-    appendAssistantToolCall([
-      "ai-helper-shell-start:refresh-new-page",
-      ${JSON.stringify(refreshNewCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:refresh-new-page",
+    refreshNewCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   const refreshText = await waitForEvaluateValue(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes("Shell call result:") &&
@@ -975,14 +958,11 @@ async function main() {
     userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
     composer: document.getElementById("composer")?.innerText || ""
   }))()`);
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:refresh-old-output-replay",
-      ${JSON.stringify(refreshOldCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:refresh-old-output-replay",
+    refreshOldCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   await waitForEvaluate(page, `(() => {
     const composer = document.getElementById("composer");
     const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
@@ -1016,14 +996,11 @@ async function main() {
     true,
     "Stop helper must be disabled while no helper is active."
   );
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:idle-control-e2e",
-      ${JSON.stringify(idleControlCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:idle-control-e2e",
+    idleControlCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   await waitForEvaluate(page, `(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const stop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
@@ -1078,14 +1055,11 @@ async function main() {
 
   const heartbeatToken = `ai-chat-shell-heartbeat-${Date.now()}`;
   const heartbeatCommand = `sleep 32; printf '${heartbeatToken}'`;
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:mv3-heartbeat-long-run",
-      ${JSON.stringify(heartbeatCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:mv3-heartbeat-long-run",
+    heartbeatCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   const heartbeatText = await waitForEvaluateValue(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes("Shell call result:") &&
@@ -1110,14 +1084,11 @@ async function main() {
   const largeCommandToken = `ai-chat-shell-large-command-${Date.now()}`;
   const largeCommand = `# ${"x".repeat(9000)}\nprintf '${largeCommandToken}'`;
   assert.ok(largeCommand.length > 8000, "The long-command e2e fixture must exceed the removed legacy limit.");
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:large-command-e2e",
-      ${JSON.stringify(largeCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:large-command-e2e",
+    largeCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   const largeCommandText = await waitForEvaluateValue(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes("Shell call result:") &&
@@ -1146,14 +1117,11 @@ async function main() {
     "AI_HELPER_OPAQUE_TEXT",
     `printf '${opaqueCommandToken}'`
   ].join("\n");
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      "ai-helper-shell-start:opaque-command-e2e",
-      ${JSON.stringify(opaqueCommand)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-shell-start:opaque-command-e2e",
+    opaqueCommand,
+    "ai-helper-shell-end"
+  ].join("\n"));
   await waitForEvaluate(page, `(() => {
     const text = document.body.innerText || "";
     return text.includes(${JSON.stringify(`stdout:\n${opaqueCommandToken}`)});
@@ -1272,13 +1240,13 @@ async function main() {
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
     document.getElementById("command").value = ${JSON.stringify(command)};
-    appendAssistantToolCall([
-      ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
-      ${JSON.stringify(command)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    `ai-helper-shell-start:${helperId}`,
+    command,
+    "ai-helper-shell-end"
+  ].join("\n"));
 
   let finalText = "";
   try {
@@ -1314,14 +1282,11 @@ async function main() {
     userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
     composer: document.getElementById("composer")?.innerText || ""
   }))()`);
-  await page.evaluate(`(() => {
-    appendAssistantToolCall([
-      ${JSON.stringify(`ai-helper-shell-start:${helperId}`)},
-      ${JSON.stringify(command)},
-      "ai-helper-shell-end"
-    ].join("\\n"), "text");
-    return true;
-  })()`);
+  await appendLiveAssistantHelper(page, [
+    `ai-helper-shell-start:${helperId}`,
+    command,
+    "ai-helper-shell-end"
+  ].join("\n"));
   await waitForEvaluate(page, `(() => {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const text = panel?.innerText || "";
@@ -1399,14 +1364,14 @@ async function main() {
     composer.focus();
     composer.click();
     composer.dispatchEvent(new Event("input", { bubbles: true }));
-    appendAssistantToolCall([
-      "ai-helper-file-start",
-      ${JSON.stringify(filename)},
-      ${JSON.stringify(fileContent)},
-      "ai-helper-file-end"
-    ].join("\\n"), "text");
     return true;
   })()`);
+  await appendLiveAssistantHelper(page, [
+    "ai-helper-file-start",
+    filename,
+    fileContent,
+    "ai-helper-file-end"
+  ].join("\n"));
 
   let fileText = "";
   try {
@@ -1513,15 +1478,12 @@ async function main() {
     const overrideFilename = `${overrideFileToken}.txt`;
     const overrideFileContent = `file helper used AI_HELPER_FILE_PATH ${overrideFileToken}`;
     const overrideUserCountBefore = await page.evaluate("document.querySelectorAll('[data-message-author-role=\"user\"]').length");
-    await page.evaluate(`(() => {
-      appendAssistantToolCall([
-        "ai-helper-file-start:file-path-override-e2e",
-        ${JSON.stringify(overrideFilename)},
-        ${JSON.stringify(overrideFileContent)},
-        "ai-helper-file-end"
-      ].join("\\n"), "text");
-      return true;
-    })()`);
+    await appendLiveAssistantHelper(page, [
+      "ai-helper-file-start:file-path-override-e2e",
+      overrideFilename,
+      overrideFileContent,
+      "ai-helper-file-end"
+    ].join("\n"));
     const overrideFileText = await waitForEvaluateValue(page, `(() => {
       const text = document.body.innerText || "";
       return text.includes("File write result:") &&
@@ -1839,23 +1801,34 @@ async function runSkillE2E(page, debugPort, {
     `memory-entry:${memoryEntry}`,
     endMarker
   ].join("\n");
-  const splitAckDom = await page.evaluate(`(() => {
+  const splitAckDom = await page.evaluate(`(async () => {
     const canonical = ${JSON.stringify(canonicalSplitAck)};
     const version = ${JSON.stringify(latestCatalogVersion)};
     const token = "catalog-version:" + version;
     const index = canonical.indexOf(token);
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.setAttribute("aria-label", "Stop generating");
+    stop.textContent = "Stop generating";
+    document.querySelector("main").appendChild(stop);
+    await new Promise((resolve) => setTimeout(resolve, 80));
     const article = document.createElement("article");
     article.className = "message";
     article.dataset.messageAuthorRole = "assistant";
     article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
     const code = article.querySelector("code");
+    code.textContent = canonical.split("\\n").slice(0, 2).join("\\n");
+    document.getElementById("thread").appendChild(article);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    code.textContent = "";
     code.appendChild(document.createTextNode(canonical.slice(0, index) + "catalog-version:"));
     const splitValue = document.createElement("span");
     splitValue.style.display = "block";
     splitValue.textContent = version;
     code.appendChild(splitValue);
     code.appendChild(document.createTextNode(canonical.slice(index + token.length)));
-    document.getElementById("thread").appendChild(article);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    stop.remove();
     return { innerText: code.innerText, textContent: code.textContent };
   })()`);
   assert.equal(splitAckDom.textContent, canonicalSplitAck, "The simulated host code DOM must preserve the canonical Skill ACK in textContent.");
@@ -1881,18 +1854,41 @@ async function runSkillE2E(page, debugPort, {
     weakInput.focus();
     weakInput.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     weakInput.dispatchEvent(new Event("input", { bubbles: true }));
-    appendAssistantToolCall(${JSON.stringify([
-      `${startMarker}:true-malformed-numeric-e2e`,
-      "cmd: list",
-      "2",
-      endMarker
-    ].join("\n"))}, "text");
     return true;
   })()`);
-  await waitForEvaluate(page, `(() => {
-    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
-    return /Skill protocol response is cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
-  })()`, "malformed Skill response to remain queued while the composer is absent");
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:true-malformed-numeric-e2e`,
+    "cmd: list",
+    "2",
+    endMarker
+  ]);
+  try {
+    await waitForEvaluate(page, `(() => {
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      return /Skill protocol response is cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
+    })()`, "malformed Skill response to remain queued while the composer is absent");
+  } catch (error) {
+    const diagnostics = await page.evaluateAcrossContexts(`(() => {
+      if (typeof assistantGenerationEpoch === "undefined") return null;
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      const thread = getConversationRoot();
+      const candidates = extractShellCallCandidates(thread);
+      const latest = candidates.at(-1);
+      return {
+        contentWorld: true,
+        panel: panel?.innerText || "",
+        settled: initialThreadSettled,
+        pending: Array.from(pendingHelperDeliveries.values()).map((entry) => ({ kind: entry.kind, phase: entry.phase })),
+        epoch: Boolean(assistantGenerationEpoch),
+        bound: assistantGenerationEpoch?.responseMessageRoot === latest?.node,
+        live: latest ? isLiveGeneratedHelperCandidate(latest) : false,
+        baseline: latest ? isBaselineIgnoredHelperCandidate(latest) : false,
+        role: latest ? getMessageAuthorRole(latest.node) : "",
+        candidateCount: candidates.length
+      };
+    })()`);
+    throw new Error(`${error.message}\nmalformed diagnostics=${JSON.stringify(diagnostics)}`);
+  }
   assert.equal(await pageUserMessageCount(page), beforeMalformedRecovery,
     "A queued malformed Skill response must not fabricate submission proof while no composer exists.");
   assert.equal(await page.evaluate("document.activeElement?.id"), "command",
@@ -2198,7 +2194,14 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       stop.textContent = "Stop generating";
       document.querySelector("main").appendChild(stop);
       await new Promise((resolve) => setTimeout(resolve, 80));
-      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
+      const article = document.createElement("article");
+      article.className = "message";
+      article.dataset.messageAuthorRole = "assistant";
+      article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      article.querySelector("code").textContent = "ai-helper-skill-start:new-chat-live-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(article);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      article.querySelector("code").textContent = ${JSON.stringify(helper)};
       await new Promise((resolve) => setTimeout(resolve, 80));
       stop.remove();
       return true;
@@ -2210,6 +2213,73 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     })()`, "new-chat live Skill load response on its isolated page");
     assert.match(reply, /revision 2/);
     await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "atomic-current-response-load", async (page, nonce) => {
+    const helper = makeLoad(`atomic-current-${nonce}`);
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill from one atomic assistant response batch.");
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.setAttribute("aria-label", "応答を生成中");
+      stop.textContent = "応答を生成中";
+      const article = document.createElement("article");
+      article.className = "message";
+      article.dataset.messageAuthorRole = "assistant";
+      article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      article.querySelector("code").textContent = ${JSON.stringify(helper)};
+      document.querySelector("main").appendChild(stop);
+      document.getElementById("thread").appendChild(article);
+      queueMicrotask(() => stop.remove());
+      return true;
+    })()`);
+    const reply = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "atomic same-batch Skill load response on its isolated page");
+    assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "historical-partial-during-generation-negative", async (page, nonce) => {
+    const helper = makeLoad(`historical-partial-${nonce}`);
+    await page.evaluate(`(async () => {
+      document.getElementById("thread").innerHTML = "";
+      const history = document.createElement("article");
+      history.className = "message";
+      history.dataset.messageAuthorRole = "assistant";
+      history.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      history.querySelector("code").textContent = "ai-helper-skill-start:historical-partial-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(history);
+      appendMessage("user", "Generate an unrelated ordinary response now.");
+      const current = document.createElement("article");
+      current.className = "message";
+      current.dataset.messageAuthorRole = "assistant";
+      current.textContent = "This current response contains no helper.";
+      document.getElementById("thread").appendChild(current);
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.textContent = "Generating response";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      history.querySelector("code").textContent = ${JSON.stringify(helper)};
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      stop.remove();
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2800))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "A historical partial helper before the current user turn must not borrow unrelated generation evidence.");
+    const recoveryVisible = await page.evaluate(`(() => {
+      const recovery = document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]');
+      return recovery && !recovery.hidden;
+    })()`);
+    assert.equal(recoveryVisible, true,
+      "The historical helper must remain available only through explicit Process Skill recovery.");
   });
 
   await withFreshSkillCasePage(debugPort, "route-completion-live-load", async (page, nonce) => {
@@ -2243,24 +2313,98 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
   });
 
+  await withFreshSkillCasePage(debugPort, "slow-route-carried-root-load", async (page, nonce) => {
+    const helper = makeLoad(`slow-route-${nonce}`);
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill after this chat receives its permanent URL slowly.");
+      const article = document.createElement("article");
+      article.id = "slow-route-assistant";
+      article.className = "message";
+      article.dataset.messageAuthorRole = "assistant";
+      article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      article.querySelector("code").textContent = "ai-helper-skill-start:slow-route-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(article);
+      const stop = document.createElement("button");
+      stop.id = "slow-route-stop";
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.textContent = "Generating response";
+      document.querySelector("main").appendChild(stop);
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 120))");
+    await page.evaluate(`history.pushState({}, "", "/tmux-test-page.html?skill-case=slow-route&route=${nonce}"); true`);
+    await new Promise((resolve) => setTimeout(resolve, 3400));
+    await page.evaluate(`(() => {
+      document.querySelector("#slow-route-assistant code").textContent = ${JSON.stringify(helper)};
+      document.getElementById("slow-route-stop")?.remove();
+      return true;
+    })()`);
+    const reply = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "slow route-carried Skill completion response");
+    assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "old-route-stop-new-root-negative", async (page, nonce) => {
+    const helper = makeLoad(`old-route-new-root-${nonce}`);
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Begin the provisional response.");
+      const oldAssistant = document.createElement("article");
+      oldAssistant.className = "message";
+      oldAssistant.dataset.messageAuthorRole = "assistant";
+      oldAssistant.textContent = "ai-helper-skill-start:old-route-incomplete-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(oldAssistant);
+      const stop = document.createElement("button");
+      stop.id = "retained-old-route-stop";
+      stop.type = "button";
+      stop.setAttribute("data-ai-chat-shell-generation-control", "true");
+      stop.textContent = "Generating response";
+      document.querySelector("main").appendChild(stop);
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 120))");
+    await page.evaluate(`(async () => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=old-route-new-root&route=${nonce}");
+      appendMessage("user", "This is a different current response root.");
+      const replacement = document.createElement("article");
+      replacement.className = "message";
+      replacement.dataset.messageAuthorRole = "assistant";
+      replacement.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      replacement.querySelector("code").textContent = "ai-helper-skill-start:old-route-new-root-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(replacement);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      replacement.querySelector("code").textContent = ${JSON.stringify(helper)};
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2800))");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "A Stop retained from the old route must not authorize a new response root.");
+    const recoveryVisible = await page.evaluate(`(() => {
+      const recovery = document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]');
+      return recovery && !recovery.hidden;
+    })()`);
+    assert.equal(recoveryVisible, true);
+    await page.evaluate("document.getElementById('retained-old-route-stop')?.remove(); true");
+  });
+
   await withFreshSkillCasePage(debugPort, "pending-load-route-recovery", async (page, nonce) => {
     const helper = makeLoad(`pending-route-${nonce}`);
     await page.evaluate(`(async () => {
       history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load&route=${nonce}");
       document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill while the composer is temporarily unavailable.");
       const form = document.getElementById("composerForm");
       window.__heldPendingSkillForm = form;
       form.remove();
-      const stop = document.createElement("button");
-      stop.id = "pending-route-stop-generating";
-      stop.type = "button";
-      stop.setAttribute("aria-label", "Stop generating");
-      stop.textContent = "Stop generating";
-      document.querySelector("main").appendChild(stop);
       await new Promise((resolve) => setTimeout(resolve, 80));
-      appendAssistantToolCall(${JSON.stringify(helper)}, "text");
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      stop.remove();
+      await appendLiveAssistantToolCall(${JSON.stringify(helper)}, "text");
       return true;
     })()`);
     await waitForEvaluate(page, `(() => {
@@ -2270,8 +2414,6 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     assert.equal(await countSkillLoadReplies(page), 0);
     await page.evaluate(`(() => {
       history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load-restored&route=${nonce}");
-      document.getElementById("thread").innerHTML = "";
-      appendMessage("user", "Continue this new chat with the already completed local Skill load result.");
       document.querySelector("main").appendChild(window.__heldPendingSkillForm);
       delete window.__heldPendingSkillForm;
       return true;
@@ -2280,8 +2422,125 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
         .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
       return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
-    })()`, "queued Skill load result to recover exactly once after a new-chat route");
+    })()`, "queued Skill load result to recover exactly once after a proven retained-root route assignment");
     assert.match(reply, /revision 2/);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  });
+
+  await withFreshSkillCasePage(debugPort, "pending-load-cross-chat-negative", async (page, nonce) => {
+    const helper = makeLoad(`pending-cross-chat-${nonce}`);
+    await page.evaluate(`(async () => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-cross-chat-a&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "Load the E2E Skill in chat A while its composer is unavailable.");
+      const form = document.getElementById("composerForm");
+      window.__heldCrossChatSkillForm = form;
+      form.remove();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await appendLiveAssistantToolCall(${JSON.stringify(helper)}, "text");
+      return true;
+    })()`);
+    await waitForEvaluate(page, `(() => {
+      const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+      return /result cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
+    })()`, "chat A Skill result to remain queued without a composer");
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-cross-chat-b&route=${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "This is unrelated chat B and must not receive chat A local Skill content.");
+      document.querySelector("main").appendChild(window.__heldCrossChatSkillForm);
+      delete window.__heldCrossChatSkillForm;
+      return true;
+    })()`);
+    await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() =>
+        typeof pendingHelperDeliveries === "undefined"
+          ? null
+          : Array.from(pendingHelperDeliveries.values()).filter((entry) => entry.kind === "skill-load").length
+      )()`);
+      return worlds.some((entry) => entry.value === 0) ? true : undefined;
+    }, "chat A queued Skill result to be discarded after chat B settles", 12_000);
+    const state = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") return null;
+      return {
+        contentWorld: true,
+        pending: Array.from(pendingHelperDeliveries.values()).filter((entry) => entry.kind === "skill-load").length,
+        composer: document.getElementById("composer")?.innerText || ""
+      };
+    })()`);
+    const content = state.find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(content, { contentWorld: true, pending: 0, composer: "" },
+      "A queued local Skill result from chat A must be discarded before chat B composer delivery.");
+    assert.equal(await countSkillLoadReplies(page), 0,
+      "Unrelated chat B must receive no Skill load result from chat A.");
+  });
+
+  await withFreshSkillCasePage(debugPort, "late-history-manual-recovery", async (page, nonce) => {
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      return true;
+    })()`);
+    await waitForIsolatedEmptySkillLifecycle(page, "late history page to finish its empty initial baseline");
+
+    const helper = makeLoad(`late-history-${nonce}`);
+    await page.evaluate(`(async () => {
+      appendMessage("user", "This user and assistant pair belongs to late-hydrated history.");
+      const article = document.createElement("article");
+      article.className = "message";
+      article.dataset.messageAuthorRole = "assistant";
+      article.innerHTML = '<div class="role">Assistant</div><pre><code class="language-text"></code></pre>';
+      article.querySelector("code").textContent = "ai-helper-skill-start:late-history-${nonce}\\ncmd: load";
+      document.getElementById("thread").appendChild(article);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      article.querySelector("code").textContent = ${JSON.stringify(helper)};
+      return true;
+    })()`);
+    const settled = await waitForValue(async () => {
+      const worlds = await page.evaluateAcrossContexts(`(() => {
+        if (typeof pendingHelperDeliveries === "undefined") return null;
+        const thread = getConversationRoot();
+        const candidates = extractShellCallCandidates(thread);
+        const skill = getLastEligibleSkillCandidate(candidates, thread);
+        const semanticKey = skill ? buildSemanticCallKey(skill.call) : "";
+        const replies = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+          .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length;
+        return {
+          contentWorld: true,
+          replies,
+          baselineIgnored: Boolean(skill && isBaselineIgnoredHelperCandidate(skill, semanticKey)),
+          skillHelperInFlight,
+          pendingLoads: Array.from(pendingHelperDeliveries.values()).filter((entry) => entry.kind === "skill-load").length,
+          chainCallCount,
+          recoveryVisible: document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.hidden === false,
+          composerText: document.getElementById("composer")?.innerText || document.getElementById("composer")?.textContent || ""
+        };
+      })()`);
+      const content = worlds.find((entry) => entry.value?.contentWorld)?.value;
+      return content && !content.skillHelperInFlight && (content.baselineIgnored || content.replies > 0)
+        ? content
+        : undefined;
+    }, "late history Skill to reach an inert baseline or expose an erroneous automatic dispatch");
+    assert.deepEqual(
+      {
+        replies: settled.replies,
+        baselineIgnored: settled.baselineIgnored,
+        pendingLoads: settled.pendingLoads,
+        chainCallCount: settled.chainCallCount,
+        recoveryVisible: settled.recoveryVisible,
+        composerText: settled.composerText
+      },
+      {
+        replies: 0,
+        baselineIgnored: true,
+        pendingLoads: 0,
+        chainCallCount: 0,
+        recoveryVisible: true,
+        composerText: ""
+      },
+      "A late hydrated historical Skill must not auto-load or write the composer."
+    );
+    await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-recovery"]')?.click(); true`);
+    await waitForEvaluate(page, `(${countSkillLoadRepliesExpression()})() === 1`, "late history manual Skill recovery response");
     await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
   });
 
@@ -2360,7 +2619,6 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       document.querySelector("main").appendChild(stop);
       await new Promise((resolve) => setTimeout(resolve, 80));
       history.pushState({}, "", "/tmux-test-page.html?skill-case=old-route-stop&route=${nonce}");
-      stop.remove();
       document.getElementById("thread").innerHTML = "";
       appendAssistantToolCall(${JSON.stringify(helper)}, "text");
       return true;
@@ -2372,7 +2630,8 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     })()`, "old-route Stop removal not to prove generation in the new lifecycle");
     await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
     assert.equal(await countSkillLoadReplies(page), 0,
-      "A Stop control removed from the previous route must not auto-dispatch new-route history.");
+      "A Stop control retained from the previous route must not auto-dispatch new-route history.");
+    await page.evaluate(`document.getElementById("old-route-stop-generating")?.remove(); true`);
   });
 
   await withFreshSkillCasePage(debugPort, "user-skill-load-negative", async (page, nonce) => {
@@ -2399,6 +2658,26 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     assert.equal(state.recoveryHidden, true, JSON.stringify(state));
     assert.match(state.debug, /kind=skill/);
   });
+}
+
+async function waitForIsolatedEmptySkillLifecycle(page, description) {
+  await waitForValue(async () => {
+    const worlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof initialThreadSettled === "undefined") return null;
+      const thread = getConversationRoot();
+      const currentThreadText = normalizeText(thread?.innerText || thread?.textContent || "");
+      return {
+        contentWorld: true,
+        settled: initialThreadSettled === true &&
+          extractShellCallCandidates(thread).length === 0 &&
+          currentThreadText === lastThreadText &&
+          Date.now() - lastThreadTextAt >= 1200 &&
+          !assistantGenerationObservedForLifecycle &&
+          !assistantGenerationEpoch
+      };
+    })()`);
+    return worlds.find((entry) => entry.value?.contentWorld)?.value?.settled || undefined;
+  }, description);
 }
 
 async function withFreshSkillCasePage(debugPort, caseName, task) {
@@ -2507,7 +2786,11 @@ function buildE2eSkillSource({ revision }) {
 }
 
 async function appendAssistantSkillHelper(page, lines) {
-  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(lines.join("\n"))}, "text"); true`);
+  return appendLiveAssistantHelper(page, lines.join("\n"));
+}
+
+async function appendLiveAssistantHelper(page, complete) {
+  await page.evaluate(`appendLiveAssistantToolCall(${JSON.stringify(String(complete || ""))}, "text")`);
 }
 
 function pageUserMessageCount(page) {

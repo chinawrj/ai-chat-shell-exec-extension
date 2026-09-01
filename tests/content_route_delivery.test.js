@@ -883,6 +883,394 @@ async function testChangedOrDeletedComposerNeverRetriesSend() {
   }
 }
 
+async function testLaterHelperSurvivesEarlierCancellationProofWait() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.setStatus = () => {};
+  context.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  const oldEntry = await context.rememberPendingHelperDelivery(
+    "cancel-old",
+    createShellCall(context, "printf old-cancelled-result"),
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "1010101010101010",
+      exitCode: 0,
+      stdout: "old-cancelled-result"
+    },
+    "old cancelled result",
+    { autoSend: true }
+  );
+  oldEntry.phase = "inserted";
+  const secondOldEntry = await context.rememberPendingHelperDelivery(
+    "cancel-replaced",
+    createShellCall(context, "printf second-old-result"),
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "3030303030303030",
+      exitCode: 0,
+      stdout: "second-old-result"
+    },
+    "second old result",
+    { autoSend: true }
+  );
+
+  let releaseProofWait;
+  context.__proofWait = new Promise((resolve) => {
+    releaseProofWait = resolve;
+  });
+  context.__proofWaitStarted = false;
+  vm.runInContext(`
+    waitForPendingHelperSubmissionProof = async () => {
+      __proofWaitStarted = true;
+      return __proofWait;
+    };
+  `, context);
+
+  const cancellation = context.cancelPendingHelperDeliveryAfterComposerRemoval(oldEntry);
+  await Promise.resolve();
+  assert.equal(context.__proofWaitStarted, true, "The old cancellation must be waiting for submission proof.");
+
+  const replacementEntry = await context.rememberPendingHelperDelivery(
+    "cancel-replaced",
+    createShellCall(context, "printf replacement-delivery"),
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "4040404040404040",
+      exitCode: 0,
+      stdout: "replacement-delivery"
+    },
+    "replacement delivery",
+    { autoSend: true }
+  );
+  assert.notEqual(replacementEntry, secondOldEntry, "The same call id must now own a distinct replacement entry.");
+  const newEntry = await context.rememberPendingHelperDelivery(
+    "cancel-new",
+    createShellCall(context, "printf later-delivery"),
+    {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "2020202020202020",
+      exitCode: 0,
+      stdout: "later-delivery"
+    },
+    "later delivery",
+    { autoSend: true }
+  );
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 3);
+
+  releaseProofWait(false);
+  assert.equal(await cancellation, true);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('cancel-old')", context),
+    undefined,
+    "The batch owned when cancellation began must be removed."
+  );
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('cancel-new')", context),
+    newEntry,
+    "A genuinely later helper must remain eligible for composer delivery."
+  );
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('cancel-replaced')", context),
+    replacementEntry,
+    "Identity-checked cleanup must preserve a same-call-id replacement."
+  );
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 2);
+}
+
+async function testLaterHelperSurvivesDelayedEmptyComposerCancellation() {
+  const context = loadContentContext();
+  await settleBootstrap();
+  context.setStatus = () => {};
+  context.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+
+  const oldEntry = await context.rememberPendingHelperDelivery(
+    "delayed-cancel-old",
+    createShellCall(context, "printf old-empty-composer"),
+    { ok: true, executionId: "5050505050505050" },
+    "old empty composer result",
+    { autoSend: true }
+  );
+  const queuedBeforeDeletion = await context.rememberPendingHelperDelivery(
+    "delayed-cancel-queued-before",
+    createShellCall(context, "printf queued-before-deletion"),
+    { ok: true, executionId: "6060606060606060" },
+    "queued before deletion",
+    { autoSend: true }
+  );
+  context.HTMLTextAreaElement = context.Element;
+  const emptiedComposer = new context.Element();
+  emptiedComposer.value = "";
+  emptiedComposer.disabled = false;
+  emptiedComposer.readOnly = false;
+  oldEntry.phase = "inserted";
+  oldEntry.composerElement = emptiedComposer;
+  oldEntry.pendingTrustedMutation = {
+    type: "beforeinput",
+    inputType: "insertParagraph",
+    observedAt: Date.now()
+  };
+  context.recordTrustedPendingHelperComposerMutation({
+    isTrusted: true,
+    type: "input",
+    inputType: "insertParagraph",
+    target: emptiedComposer
+  });
+  await Promise.resolve();
+  assert.equal(oldEntry.phase, "submitted-unconfirmed");
+  assert.equal(
+    oldEntry.cancellationBatchSequence,
+    queuedBeforeDeletion.creationSequence,
+    "The real trusted-empty caller must freeze the batch before any later helper is created."
+  );
+
+  const laterEntry = await context.rememberPendingHelperDelivery(
+    "delayed-cancel-later",
+    createShellCall(context, "printf later-after-empty"),
+    { ok: true, executionId: "7070707070707070" },
+    "later helper result now in composer",
+    { autoSend: true }
+  );
+  const composer = {
+    innerText: laterEntry.reply,
+    textContent: laterEntry.reply,
+    isConnected: true
+  };
+  context.findReplyInput = async () => composer;
+  context.waitForPendingHelperSubmissionProof = async () => false;
+
+  assert.equal(
+    await context.retrySubmittedUnconfirmedPendingHelperDelivery(oldEntry, { autoSend: true }),
+    true,
+    "The old empty-composer entry should be classified as cancelled once unrelated later text appears."
+  );
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('delayed-cancel-old')", context), undefined);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('delayed-cancel-queued-before')", context),
+    undefined,
+    "Entries queued before composer ownership was lost belong to the cancelled batch."
+  );
+  assert.ok(queuedBeforeDeletion.creationSequence <= oldEntry.cancellationBatchSequence);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('delayed-cancel-later')", context),
+    laterEntry,
+    "A helper created after the composer first became empty must survive delayed cancellation recognition."
+  );
+  assert.ok(laterEntry.creationSequence > oldEntry.cancellationBatchSequence);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+}
+
+async function testCancellationBoundarySurvivesReloadBeforeLaterHelper() {
+  const first = loadContentContext();
+  await settleBootstrap();
+  first.setStatus = () => {};
+  first.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", first);
+
+  const oldEntry = await first.rememberPendingHelperDelivery(
+    "reload-boundary-old",
+    createShellCall(first, "printf reload-old"),
+    { ok: true, executionId: "8080808080808080" },
+    "reload old result",
+    { autoSend: true }
+  );
+  const queuedBefore = await first.rememberPendingHelperDelivery(
+    "reload-boundary-before",
+    createShellCall(first, "printf reload-before"),
+    { ok: true, executionId: "9090909090909090" },
+    "reload queued before ownership loss",
+    { autoSend: true }
+  );
+  first.HTMLTextAreaElement = first.Element;
+  const emptiedComposer = new first.Element();
+  emptiedComposer.value = "";
+  emptiedComposer.disabled = false;
+  emptiedComposer.readOnly = false;
+  oldEntry.phase = "inserted";
+  oldEntry.composerElement = emptiedComposer;
+  oldEntry.pendingTrustedMutation = {
+    type: "beforeinput",
+    inputType: "insertLineBreak",
+    observedAt: Date.now()
+  };
+  first.recordTrustedPendingHelperComposerMutation({
+    isTrusted: true,
+    type: "input",
+    inputType: "insertLineBreak",
+    target: emptiedComposer
+  });
+  await Promise.resolve();
+  const firstStorageKey = first.pendingHelperDeliveryStorageKey();
+  await vm.runInContext("pendingHelperDeliveryStorageTail", first);
+  assert.ok(
+    first.__localStore[firstStorageKey],
+    "The production ownership-loss path must enqueue its own durable snapshot without a test-only persist call."
+  );
+  const storedSnapshot = structuredClone(first.__localStore[firstStorageKey]);
+  assert.equal(
+    storedSnapshot.entries.find((entry) => entry.callId === oldEntry.callId)?.cancellationBatchSequence,
+    queuedBefore.creationSequence,
+    "The first ownership-loss boundary must be present in durable pending state before reload."
+  );
+
+  const restored = loadContentContext();
+  await settleBootstrap();
+  restored.setStatus = () => {};
+  restored.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", restored);
+  const restoredStorageKey = restored.pendingHelperDeliveryStorageKey();
+  restored.__localStore[restoredStorageKey] = storedSnapshot;
+  await restored.loadPendingHelperDeliveriesForCurrentPage();
+  const restoredOld = vm.runInContext("pendingHelperDeliveries.get('reload-boundary-old')", restored);
+  assert.ok(restoredOld?.restored);
+  assert.equal(restoredOld.cancellationBatchSequence, queuedBefore.creationSequence);
+
+  const laterEntry = await restored.rememberPendingHelperDelivery(
+    "reload-boundary-later",
+    createShellCall(restored, "printf reload-later"),
+    { ok: true, executionId: "a0a0a0a0a0a0a0a0" },
+    "reload later helper result",
+    { autoSend: true }
+  );
+  const composer = {
+    innerText: laterEntry.reply,
+    textContent: laterEntry.reply,
+    isConnected: true
+  };
+  restored.findReplyInput = async () => composer;
+  restored.waitForPendingHelperSubmissionProof = async () => false;
+  assert.equal(
+    await restored.retrySubmittedUnconfirmedPendingHelperDelivery(restoredOld, { autoSend: true }),
+    true
+  );
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('reload-boundary-old')", restored), undefined);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('reload-boundary-before')", restored), undefined);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('reload-boundary-later')", restored),
+    laterEntry,
+    "Reload must not erase the durable cancellation boundary before a later helper is created."
+  );
+  assert.ok(laterEntry.creationSequence > restoredOld.cancellationBatchSequence);
+}
+
+async function testNonemptyCancellationBoundaryAutoPersistsBeforeProofWait() {
+  const first = loadContentContext();
+  await settleBootstrap();
+  first.setStatus = () => {};
+  first.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", first);
+
+  const oldEntry = await first.rememberPendingHelperDelivery(
+    "nonempty-boundary-old",
+    createShellCall(first, "printf nonempty-old"),
+    { ok: true, executionId: "b0b0b0b0b0b0b0b0" },
+    "nonempty old result",
+    { autoSend: true }
+  );
+  const queuedBefore = await first.rememberPendingHelperDelivery(
+    "nonempty-boundary-before",
+    createShellCall(first, "printf nonempty-before"),
+    { ok: true, executionId: "c0c0c0c0c0c0c0c0" },
+    "nonempty queued before ownership loss",
+    { autoSend: true }
+  );
+  first.HTMLTextAreaElement = first.Element;
+  const replacedComposer = new first.Element();
+  replacedComposer.value = "user replacement draft";
+  replacedComposer.disabled = false;
+  replacedComposer.readOnly = false;
+  oldEntry.phase = "inserted";
+  oldEntry.composerElement = replacedComposer;
+  oldEntry.pendingTrustedMutation = {
+    type: "beforeinput",
+    inputType: "insertText",
+    observedAt: Date.now()
+  };
+
+  let releaseProofWait;
+  first.__nonemptyProofWait = new Promise((resolve) => {
+    releaseProofWait = resolve;
+  });
+  first.__nonemptyProofWaitStarted = false;
+  vm.runInContext(`
+    waitForPendingHelperSubmissionProof = async () => {
+      __nonemptyProofWaitStarted = true;
+      return __nonemptyProofWait;
+    };
+  `, first);
+
+  first.recordTrustedPendingHelperComposerMutation({
+    isTrusted: true,
+    type: "input",
+    inputType: "insertText",
+    target: replacedComposer
+  });
+  await Promise.resolve();
+  assert.equal(
+    first.__nonemptyProofWaitStarted,
+    true,
+    "The real nonempty trusted-replacement path must wait for submission proof after freezing its batch."
+  );
+
+  const firstStorageKey = first.pendingHelperDeliveryStorageKey();
+  await vm.runInContext("pendingHelperDeliveryStorageTail", first);
+  const storedSnapshot = structuredClone(first.__localStore[firstStorageKey]);
+  assert.equal(
+    storedSnapshot.entries.find((entry) => entry.callId === oldEntry.callId)?.cancellationBatchSequence,
+    queuedBefore.creationSequence,
+    "Cancellation-boundary persistence itself must snapshot the nonempty replacement before proof resolution."
+  );
+
+  const restored = loadContentContext();
+  await settleBootstrap();
+  restored.setStatus = () => {};
+  restored.schedulePendingHelperDeliveryRetry = () => {};
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", restored);
+  const restoredStorageKey = restored.pendingHelperDeliveryStorageKey();
+  restored.__localStore[restoredStorageKey] = storedSnapshot;
+  await restored.loadPendingHelperDeliveriesForCurrentPage();
+  const restoredOld = vm.runInContext("pendingHelperDeliveries.get('nonempty-boundary-old')", restored);
+  assert.ok(restoredOld?.restored);
+  assert.equal(restoredOld.cancellationBatchSequence, queuedBefore.creationSequence);
+
+  const laterEntry = await restored.rememberPendingHelperDelivery(
+    "nonempty-boundary-later",
+    createShellCall(restored, "printf nonempty-later"),
+    { ok: true, executionId: "d0d0d0d0d0d0d0d0" },
+    "nonempty later helper result",
+    { autoSend: true }
+  );
+  restored.waitForPendingHelperSubmissionProof = async () => false;
+  assert.equal(await restored.cancelPendingHelperDeliveryAfterComposerRemoval(restoredOld), true);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('nonempty-boundary-old')", restored), undefined);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('nonempty-boundary-before')", restored), undefined);
+  assert.equal(
+    vm.runInContext("pendingHelperDeliveries.get('nonempty-boundary-later')", restored),
+    laterEntry,
+    "A later helper must survive restoration of the automatically persisted nonempty cancellation boundary."
+  );
+  assert.ok(laterEntry.creationSequence > restoredOld.cancellationBatchSequence);
+
+  releaseProofWait(false);
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 async function testDelayedSubmissionProofAcrossRetryFinalizesOnce() {
   const context = loadContentContext();
   await settleBootstrap();
@@ -1316,6 +1704,10 @@ async function runTests() {
     ["rejected feedback one-write", testRejectedFeedbackUsesOneWriteSendOnlyRetry],
     ["same lifecycle send-only retry", testSameLifecycleRetriesExactOwnedComposerWithoutRewrite],
     ["changed/deleted composer cancellation", testChangedOrDeletedComposerNeverRetriesSend],
+    ["later helper survives earlier cancellation", testLaterHelperSurvivesEarlierCancellationProofWait],
+    ["later helper survives delayed empty-composer cancellation", testLaterHelperSurvivesDelayedEmptyComposerCancellation],
+    ["cancellation boundary survives reload", testCancellationBoundarySurvivesReloadBeforeLaterHelper],
+    ["nonempty cancellation boundary auto-persists before proof wait", testNonemptyCancellationBoundaryAutoPersistsBeforeProofWait],
     ["delayed proof across retry", testDelayedSubmissionProofAcrossRetryFinalizesOnce],
     ["missing proof is not completion", testMissingSubmissionProofNeverReportsCompleted],
     ["receipt pending status", testReceiptPendingStatusKeepsCompletionAndDoesNotResend],
