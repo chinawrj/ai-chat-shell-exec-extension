@@ -38,6 +38,7 @@ async function main() {
   await testSuccessfulUninstallCommitsAcrossSkillIdentityChanges();
   await testFailedUninstallCannotPreserveAChangedSkillIdentity();
   await testStateRefreshForAddDeleteModifyAndExternalJsonChanges();
+  await testInvalidInventoryDoesNotEraseInstalledReceipts();
 }
 
 async function testDefaultInstallSuccessAndInstalledOnlyCatalog() {
@@ -92,6 +93,14 @@ async function testDefaultInstallSuccessAndInstalledOnlyCatalog() {
   assert.equal(runs, 1);
   assert.equal(installed.catalogSha, initialSha, "Install status does not invent a second effective SHA.");
   assert.equal(installed.version, initialVersion + 1, "An installed-set change must advance the local version.");
+
+  const mixedManagement = service.manage();
+  assert.equal(mixedManagement.skills.length, mixedManagement.discoveredSkillCount,
+    "View Skills management data must contain one row for every successfully discovered Skill.");
+  assert.deepEqual(mixedManagement.skills.map((entry) => [entry.id, entry.installed]), [
+    ["alpha", true],
+    ["beta", false]
+  ], "Installed is row metadata and must never filter uninstalled Skills out of View Skills.");
 
   const aiList = service.list();
   assert.equal(aiList.skillCount, 1);
@@ -807,6 +816,121 @@ async function testStateRefreshForAddDeleteModifyAndExternalJsonChanges() {
   assert.equal(repaired.skillCount, 0);
   assert.equal(readJson(statePath).schemaVersion, 2);
   assert.equal(readJson(statePath).skills.alpha.installed, false);
+}
+
+async function testInvalidInventoryDoesNotEraseInstalledReceipts() {
+  const fixture = makeFixture("skill-install-invalid-inventory-");
+  const skillPath = writeSkill(fixture.root, "durable", "Durable installed Skill", "body");
+  writeInstaller(path.dirname(skillPath), "exit 0");
+  const service = makeService(fixture, async () => ({
+    code: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: ""
+  }));
+  const initial = service.manage();
+  const record = initial.skills[0];
+  const installed = await service.install({
+    skillId: record.id,
+    skillSha: record.sha,
+    installSha: record.installSha,
+    catalogSha: initial.catalogSha
+  });
+  assert.equal(installed.ok, true, JSON.stringify(installed));
+  const installedVersion = installed.version;
+  const installStatePath = path.join(fixture.stateDir, SKILL_INSTALL_STATE_FILE);
+  const catalogStatePath = path.join(fixture.stateDir, "skill-catalog-state.json");
+  const installStateBefore = fs.readFileSync(installStatePath, "utf8");
+  const catalogStateBefore = fs.readFileSync(catalogStatePath, "utf8");
+
+  const malformedDir = path.join(fixture.root, "malformed");
+  fs.mkdirSync(malformedDir);
+  fs.writeFileSync(path.join(malformedDir, "SKILL.md"), "---\nname: malformed\n---\nbody\n");
+  const partial = service.manage();
+  assert.equal(partial.ok, false);
+  assert.equal(partial.skills.find((skill) => skill.id === "durable")?.installed, true,
+    "A valid installed row may remain visible read-only while another Skill makes the inventory invalid.");
+  assert.equal(fs.readFileSync(installStatePath, "utf8"), installStateBefore,
+    "A partial invalid scan must not rewrite authenticated installation receipts.");
+  assert.equal(fs.readFileSync(catalogStatePath, "utf8"), catalogStateBefore,
+    "A partial invalid scan must not replace the last authoritative catalog state.");
+  fs.rmSync(malformedDir, { recursive: true, force: true });
+  let recovered = service.manage();
+  assert.equal(recovered.skills.find((skill) => skill.id === "durable")?.installed, true);
+  assert.equal(recovered.version, installedVersion,
+    "Recovery to the exact last authoritative inventory must not invent a catalog version.");
+
+  const offlineRoot = `${fixture.root}-offline`;
+  fs.renameSync(fixture.root, offlineRoot);
+  try {
+    const unavailable = service.manage();
+    assert.equal(unavailable.ok, false);
+    assert.ok(unavailable.errors.some((error) => error.code === "skill-root-missing"));
+    assert.deepEqual(unavailable.skills, []);
+    assert.equal(fs.readFileSync(installStatePath, "utf8"), installStateBefore,
+      "A temporarily unavailable explicit root must not erase installed receipts.");
+    assert.equal(fs.readFileSync(catalogStatePath, "utf8"), catalogStateBefore,
+      "A temporarily unavailable explicit root must not replace the last authoritative catalog state.");
+  } finally {
+    fs.renameSync(offlineRoot, fixture.root);
+  }
+  recovered = service.manage();
+  assert.equal(recovered.skills.find((skill) => skill.id === "durable")?.installed, true,
+    "View Skills must recover the installed row when the configured root returns.");
+  assert.equal(recovered.version, installedVersion);
+
+  const defaultHome = makeTempDir("skill-install-default-home-");
+  const defaultRoot = path.join(defaultHome, ".claude", "skills");
+  const defaultStateDir = makeTempDir("skill-install-default-state-");
+  const defaultSkillPath = writeSkill(defaultRoot, "default-durable", "Default-root installed Skill", "body");
+  writeInstaller(path.dirname(defaultSkillPath), "exit 0");
+  const defaultService = new SkillCatalogService({
+    stateDir: defaultStateDir,
+    env: {},
+    cwd: defaultHome,
+    homeDir: defaultHome,
+    cacheMs: 0,
+    runInstallScript: async () => ({
+      code: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: ""
+    })
+  });
+  const defaultInitial = defaultService.manage();
+  const defaultRecord = defaultInitial.skills[0];
+  const defaultInstalled = await defaultService.install({
+    skillId: defaultRecord.id,
+    skillSha: defaultRecord.sha,
+    installSha: defaultRecord.installSha,
+    catalogSha: defaultInitial.catalogSha
+  });
+  assert.equal(defaultInstalled.ok, true, JSON.stringify(defaultInstalled));
+  const defaultInstalledVersion = defaultInstalled.version;
+  const defaultInstallStatePath = path.join(defaultStateDir, SKILL_INSTALL_STATE_FILE);
+  const defaultCatalogStatePath = path.join(defaultStateDir, "skill-catalog-state.json");
+  const defaultInstallStateBefore = fs.readFileSync(defaultInstallStatePath, "utf8");
+  const defaultCatalogStateBefore = fs.readFileSync(defaultCatalogStatePath, "utf8");
+  const offlineDefaultRoot = `${defaultRoot}-offline`;
+  fs.renameSync(defaultRoot, offlineDefaultRoot);
+  try {
+    const unavailableDefault = defaultService.manage();
+    assert.equal(unavailableDefault.ok, false,
+      "A default root that previously contained persisted Skills must fail closed while missing.");
+    assert.ok(unavailableDefault.errors.some((error) => error.code === "skill-root-missing"));
+    assert.equal(fs.readFileSync(defaultInstallStatePath, "utf8"), defaultInstallStateBefore,
+      "A temporarily missing populated default root must not erase authenticated installation receipts.");
+    assert.equal(fs.readFileSync(defaultCatalogStatePath, "utf8"), defaultCatalogStateBefore,
+      "A temporarily missing populated default root must not advance or replace catalog state.");
+  } finally {
+    fs.renameSync(offlineDefaultRoot, defaultRoot);
+  }
+  const defaultRecovered = defaultService.manage();
+  assert.equal(defaultRecovered.skills.find((skill) => skill.id === "default-durable")?.installed, true);
+  assert.equal(defaultRecovered.version, defaultInstalledVersion,
+    "Restoring the same default-root inventory must restore installation without a false version change.");
 }
 
 function makeFixture(prefix) {

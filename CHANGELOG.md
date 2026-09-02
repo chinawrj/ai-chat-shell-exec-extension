@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-09-02
+
+- Makes `View Skills` a complete local management inventory: every successfully discovered Skill is rendered exactly once, and `installed` is only per-row state rather than a list filter. The smaller AI/composer catalog-size bound may still fail closed without blanking the local management rows.
+- Prevents partial or invalid scans, including temporarily missing explicit roots or a previously populated default root, from destructively reconciling authenticated installation receipts or replacing the last authoritative catalog state. A never-created default root stays healthy and empty; exact recovery restores installed rows without inventing a version.
+- Keeps already-open `View Skills` dialogs current across tabs using version/SHA/count-triggered single-flight refresh, while accepting legitimate version repair, rejecting truly superseded responses, preserving rows on resolved/rejected refresh failure, deferring to local lifecycle operations that start before or during polling, and never writing to the AI composer.
+- Adds focused mixed installed/uninstalled, oversized-catalog, invalid/partial inventory, explicit/default missing-root recovery, version-repair/stale/failed/closed/lifecycle-race dialog, and real Chrome install/uninstall/reinstall cross-tab regressions.
+
 ## [0.11.11] - 2026-09-02
 
 - Adds `AI_CHAT_SHELL_ENV_FILE`, a strict data-only environment declaration file freshly read before each ai-helper shell command and trusted Skill lifecycle script. Values are never sourced, command-expanded, logged, copied into ledgers/protocol replies, or added to unrelated helper/server environments; shell injection reuses the existing private transient tmux runner script lifecycle.

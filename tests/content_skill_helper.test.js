@@ -29,6 +29,7 @@ awaitTestCanonicalSkillDomFallback()
   .then(() => awaitTestExplicitUserAndProvenanceRejection())
   .then(() => testSkillInstallActionIsExplicitAndSingleFlight())
   .then(() => testSkillUninstallActionIsExplicitAndSingleFlight())
+  .then(() => testOpenSkillDialogRefreshLifecycle())
   .then(() => console.log("content Skill helper tests passed"));
 
 function testValidSkillHelpers() {
@@ -1108,6 +1109,190 @@ function createSkillUninstallUi(skillId) {
     }
   };
   return ui;
+}
+
+async function testOpenSkillDialogRefreshLifecycle() {
+  const originalGetElementById = context.document.getElementById;
+  const originalSendMessage = context.chrome.runtime.sendMessage;
+  const originalShowDialog = context.showSkillCatalogDialog;
+  const originalSetStatus = context.setStatus;
+  const sha1 = "1".repeat(64);
+  const sha2 = "2".repeat(64);
+  const sha3 = "3".repeat(64);
+  let overlay = createSkillCatalogRefreshOverlay({ ok: true, version: 1, catalogSha: sha1, skillCount: 0, discoveredSkillCount: 1 });
+  const shown = [];
+  const messages = [];
+  let status = "";
+  try {
+    vm.runInContext(`
+      extensionActive = true;
+      pageLifecycleGeneration = 61;
+      skillCatalogDialogRefreshInFlight = false;
+      skillCatalogDialogRefreshPending = false;
+      skillInstallInFlight.clear();
+      skillUninstallInFlight.clear();
+    `, context);
+    context.document.getElementById = (id) => id === "ai-chat-shell-exec-skill-dialog" ? overlay : null;
+    context.showSkillCatalogDialog = (response) => {
+      shown.push(response);
+      overlay.dataset.skillCatalogSnapshot = context.skillCatalogSnapshotKey(response);
+      overlay.dataset.skillCatalogVersion = String(Number(response.version || 0));
+    };
+    context.setStatus = (value) => { status = String(value); };
+
+    const installedState = {
+      ok: true,
+      type: "skill-state",
+      version: 2,
+      catalogSha: sha2,
+      skillCount: 1,
+      discoveredSkillCount: 1
+    };
+    vm.runInContext(`skillPanelState = ${JSON.stringify(installedState)}`, context);
+    let releaseList;
+    const listGate = new Promise((resolve) => { releaseList = resolve; });
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return listGate;
+    };
+    const first = context.refreshOpenSkillCatalogDialogIfStale();
+    await Promise.resolve();
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), false,
+      "A second poll while a fresh management list is in flight must join the single-flight refresh.");
+    assert.deepEqual(messages, ["skill-management-list"]);
+    releaseList({
+      ...installedState,
+      type: "skill-management-list",
+      skills: [{ id: "example", name: "Example", description: "Installed", sha: "a".repeat(64), installed: true }]
+    });
+    assert.equal(await first, true);
+    await Promise.resolve();
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].skills[0].installed, true,
+      "Another tab's installation must refresh an already-open View Skills dialog.");
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), false);
+    assert.equal(messages.length, 1, "An unchanged poll must not refetch or rerender the dialog.");
+
+    const repairedState = { ...installedState, version: 1, catalogSha: sha3 };
+    vm.runInContext(`skillPanelState = ${JSON.stringify(repairedState)}`, context);
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return { ...repairedState, type: "skill-management-list", skills: [] };
+    };
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), true,
+      "A fresh catalog-state repair may legitimately reset the version to 1 and must refresh an open dialog.");
+    assert.equal(shown.length, 2);
+
+    const requestedState = { ...installedState, version: 3, catalogSha: "3".repeat(64) };
+    let releaseStaleList;
+    const staleListGate = new Promise((resolve) => { releaseStaleList = resolve; });
+    vm.runInContext(`skillPanelState = ${JSON.stringify(requestedState)}`, context);
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return staleListGate;
+    };
+    const staleRefresh = context.refreshOpenSkillCatalogDialogIfStale();
+    await Promise.resolve();
+    vm.runInContext(`skillPanelState = ${JSON.stringify({ ...installedState, version: 4, catalogSha: "4".repeat(64) })}`, context);
+    releaseStaleList({ ...requestedState, type: "skill-management-list", skills: [] });
+    assert.equal(await staleRefresh, false,
+      "A management response superseded by a newer status poll must not roll the dialog back.");
+    assert.equal(shown.length, 2);
+
+    const feedback = overlay.feedback;
+    vm.runInContext(`skillPanelState = ${JSON.stringify({ ...installedState, version: 5, catalogSha: "5".repeat(64) })}`, context);
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return { ok: false, error: "management response unavailable" };
+    };
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), false);
+    assert.equal(shown.length, 2,
+      "A resolved background failure without management rows must keep the previously rendered inventory.");
+    assert.equal(feedback.hidden, false);
+    assert.match(feedback.textContent, /management response unavailable/i);
+
+    feedback.hidden = true;
+    feedback.textContent = "";
+    vm.runInContext(`skillPanelState = ${JSON.stringify({ ...installedState, version: 6, catalogSha: "6".repeat(64) })}`, context);
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      throw new Error("management temporarily offline");
+    };
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), false);
+    assert.equal(shown.length, 2, "A rejected refresh must keep the previously rendered rows.");
+    assert.equal(feedback.hidden, false);
+    assert.match(feedback.textContent, /keeping the previous list/i);
+    assert.match(status, /refresh failed/i);
+
+    vm.runInContext(`skillPanelState = ${JSON.stringify({ ...installedState, version: 7, catalogSha: "7".repeat(64) })}`, context);
+    let releaseLifecycleRace;
+    const lifecycleRaceGate = new Promise((resolve) => { releaseLifecycleRace = resolve; });
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return lifecycleRaceGate;
+    };
+    const lifecycleRace = context.refreshOpenSkillCatalogDialogIfStale();
+    await Promise.resolve();
+    vm.runInContext(`skillInstallInFlight.add("example")`, context);
+    releaseLifecycleRace({ ...installedState, version: 7, catalogSha: "7".repeat(64), skills: [] });
+    assert.equal(await lifecycleRace, false);
+    assert.equal(shown.length, 2,
+      "A local lifecycle that starts after polling began must retain dialog ownership when the poll resolves.");
+    vm.runInContext(`skillInstallInFlight.clear()`, context);
+
+    vm.runInContext(`skillPanelState = ${JSON.stringify({ ...installedState, version: 8, catalogSha: "8".repeat(64) })}`, context);
+    let releaseClosedList;
+    const closedGate = new Promise((resolve) => { releaseClosedList = resolve; });
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push(message.type);
+      return closedGate;
+    };
+    const closedRefresh = context.refreshOpenSkillCatalogDialogIfStale();
+    await Promise.resolve();
+    overlay = null;
+    releaseClosedList({ ...installedState, version: 8, catalogSha: "8".repeat(64), skills: [] });
+    assert.equal(await closedRefresh, false);
+    assert.equal(shown.length, 2, "Closing View Skills must invalidate an in-flight refresh response.");
+
+    overlay = createSkillCatalogRefreshOverlay(installedState);
+    const lifecycleState = { ...installedState, version: 9, catalogSha: "9".repeat(64) };
+    vm.runInContext(`skillPanelState = ${JSON.stringify(lifecycleState)}; skillInstallInFlight.add("example")`, context);
+    const beforeBlocked = messages.length;
+    assert.equal(await context.refreshOpenSkillCatalogDialogIfStale(), false);
+    assert.equal(messages.length, beforeBlocked,
+      "A local lifecycle action must keep ownership of its dialog instead of being redrawn by polling.");
+  } finally {
+    context.document.getElementById = originalGetElementById;
+    context.chrome.runtime.sendMessage = originalSendMessage;
+    context.showSkillCatalogDialog = originalShowDialog;
+    context.setStatus = originalSetStatus;
+    vm.runInContext(`
+      extensionActive = false;
+      skillPanelState = null;
+      skillCatalogDialogRefreshInFlight = false;
+      skillCatalogDialogRefreshPending = false;
+      skillInstallInFlight.clear();
+      skillUninstallInFlight.clear();
+    `, context);
+  }
+}
+
+function createSkillCatalogRefreshOverlay(response) {
+  const feedback = {
+    hidden: true,
+    textContent: "",
+    setAttribute() {}
+  };
+  return {
+    dataset: {
+      skillCatalogSnapshot: context.skillCatalogSnapshotKey(response),
+      skillCatalogVersion: String(Number(response.version || 0))
+    },
+    feedback,
+    querySelector(selector) {
+      return selector === "[data-skill-catalog-refresh-status]" ? feedback : null;
+    }
+  };
 }
 
 function testSkillStatusActionRouting() {

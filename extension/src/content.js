@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.11";
+const CONTENT_SCRIPT_VERSION = "0.11.12";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -169,6 +169,8 @@ let panelShellHelperActive = false;
 let skillPanelState = null;
 let skillStatePollTimer = 0;
 let skillStatePollInFlight = false;
+let skillCatalogDialogRefreshInFlight = false;
+let skillCatalogDialogRefreshPending = false;
 let skillHelperInFlight = false;
 let skillRecoveryInFlight = false;
 let lastOwnedSkillSyncRecoveryStatus = "none";
@@ -9622,6 +9624,7 @@ async function refreshSkillState({ quiet = false } = {}) {
       error: "Skill state response is unavailable."
     };
     updateSkillPanelState();
+    refreshOpenSkillCatalogDialogIfStale().catch(() => {});
     if (!quiet && skillPanelState.ok !== true) {
       setStatus(`Skill catalog unavailable: ${summarizeCommand(skillPanelState.error || firstSkillUiError(skillPanelState) || "unknown error")}`, "error");
     }
@@ -9803,6 +9806,87 @@ async function viewSkillCatalog() {
   return true;
 }
 
+function skillCatalogSnapshotKey(value = {}) {
+  return [
+    value?.ok === true ? "ok" : "error",
+    Number(value?.version || 0),
+    String(value?.catalogSha || ""),
+    Number(value?.skillCount || 0),
+    Number(value?.discoveredSkillCount || 0)
+  ].join(":");
+}
+
+function showSkillCatalogRefreshError(overlay, message) {
+  const feedback = overlay?.querySelector?.("[data-skill-catalog-refresh-status]");
+  if (!feedback) {
+    return;
+  }
+  feedback.hidden = false;
+  feedback.textContent = `Catalog refresh failed; keeping the previous list. ${summarizeCommand(message || "Unknown error")}`;
+  feedback.setAttribute("role", "alert");
+}
+
+async function refreshOpenSkillCatalogDialogIfStale() {
+  const overlay = document.getElementById(SKILL_CATALOG_DIALOG_ID);
+  if (!extensionActive || !overlay ||
+      skillInstallInFlight.size > 0 || skillUninstallInFlight.size > 0) {
+    return false;
+  }
+  const targetKey = skillCatalogSnapshotKey(skillPanelState);
+  if (!skillPanelState || overlay.dataset.skillCatalogSnapshot === targetKey) {
+    return false;
+  }
+  if (skillCatalogDialogRefreshInFlight) {
+    skillCatalogDialogRefreshPending = true;
+    return false;
+  }
+  skillCatalogDialogRefreshInFlight = true;
+  skillCatalogDialogRefreshPending = false;
+  const pageGeneration = pageLifecycleGeneration;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "skill-management-list" });
+    if (!extensionActive || pageGeneration !== pageLifecycleGeneration ||
+        document.getElementById(SKILL_CATALOG_DIALOG_ID) !== overlay) {
+      return false;
+    }
+    if (skillInstallInFlight.size > 0 || skillUninstallInFlight.size > 0) {
+      return false;
+    }
+    if (!response || typeof response !== "object" || !Array.isArray(response.skills)) {
+      const message = response?.error || firstSkillUiError(response) || "Skill management response is unavailable.";
+      showSkillCatalogRefreshError(overlay, message);
+      setStatus(`Skill catalog refresh failed: ${summarizeCommand(message)}`, "error");
+      return false;
+    }
+    const responseKey = skillCatalogSnapshotKey(response);
+    const latestKey = skillCatalogSnapshotKey(skillPanelState);
+    // The management request starts after targetKey was observed. It is newer
+    // than that snapshot even if catalog-state repair legitimately reset the
+    // version to 1. If another status poll landed while the request was in
+    // flight, accept only an exact match for that newer status.
+    if ((latestKey !== targetKey && responseKey !== latestKey) ||
+        responseKey === overlay.dataset.skillCatalogSnapshot) {
+      return false;
+    }
+    showSkillCatalogDialog(response);
+    return true;
+  } catch (error) {
+    if (extensionActive && pageGeneration === pageLifecycleGeneration &&
+        document.getElementById(SKILL_CATALOG_DIALOG_ID) === overlay) {
+      showSkillCatalogRefreshError(overlay, error?.message || String(error));
+      setStatus(`Skill catalog refresh failed: ${summarizeCommand(error?.message || String(error))}`, "error");
+    }
+    return false;
+  } finally {
+    skillCatalogDialogRefreshInFlight = false;
+    if (skillCatalogDialogRefreshPending && extensionActive &&
+        document.getElementById(SKILL_CATALOG_DIALOG_ID)) {
+      skillCatalogDialogRefreshPending = false;
+      Promise.resolve().then(() => refreshOpenSkillCatalogDialogIfStale().catch(() => {}));
+    }
+  }
+}
+
 async function rescanSkillCatalog() {
   const response = await chrome.runtime.sendMessage({ type: "skill-catalog-rescan" });
   await refreshSkillState({ quiet: true });
@@ -9825,6 +9909,8 @@ function showSkillCatalogDialog(response = {}, options = {}) {
     overlay,
     pageGeneration: pageLifecycleGeneration
   };
+  overlay.dataset.skillCatalogSnapshot = skillCatalogSnapshotKey(response);
+  overlay.dataset.skillCatalogVersion = String(Number(response?.version || 0));
   overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(2,6,23,.68);font:13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#e5e7eb";
   const dialog = document.createElement("section");
   dialog.setAttribute("role", "dialog");
@@ -9853,6 +9939,12 @@ function showSkillCatalogDialog(response = {}, options = {}) {
   ].join("\n");
   summary.style.cssText = "margin-bottom:12px;padding:8px;border-radius:7px;background:#1f2937;white-space:pre-wrap;word-break:break-word;font:11px ui-monospace,SFMono-Regular,Menlo,monospace";
   dialog.appendChild(summary);
+
+  const refreshStatus = document.createElement("div");
+  refreshStatus.dataset.skillCatalogRefreshStatus = "true";
+  refreshStatus.hidden = true;
+  refreshStatus.style.cssText = "margin-bottom:12px;padding:8px;border-radius:7px;background:#4c1d2a;color:#fecdd3;font-size:12px;line-height:1.35";
+  dialog.appendChild(refreshStatus);
 
   const skills = Array.isArray(response.skills) ? response.skills : [];
   for (const skill of skills) {

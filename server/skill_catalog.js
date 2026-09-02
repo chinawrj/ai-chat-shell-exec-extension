@@ -83,7 +83,11 @@ class SkillCatalogService {
     return {
       ...catalogPublicStatus(catalog),
       type: "skill-management-list",
-      skills: catalog.catalogMetadataTooLarge ? [] : catalog.skills.map(publicManagedSkillRecord)
+      // The 350k catalog bound protects AI/composer protocol replies. This is
+      // a local extension management surface whose rows are already bounded by
+      // file count and per-field limits, so keep them visible for diagnosis and
+      // recovery even when the AI catalog must fail closed.
+      skills: catalog.skills.map(publicManagedSkillRecord)
     };
   }
 
@@ -513,9 +517,16 @@ class SkillCatalogService {
       homeDir: this.homeDir
     });
     const scan = scanSkillRoots(rootsConfig);
+    const catalogSha = aggregateSkillShas(scan.observedShas);
+    // A partial or otherwise invalid inventory cannot prove that an installed
+    // Skill was deleted. Project the last authenticated receipts onto the
+    // visible records for diagnostics, but do not let a transient root/scan
+    // failure destructively reconcile persistent installation state.
     let installState;
     try {
-      installState = reconcileSkillInstallState(this.stateDir, scan.skills);
+      installState = reconcileSkillInstallState(this.stateDir, scan.skills, {
+        write: false
+      });
     } catch (error) {
       scan.errors.push({
         code: "skill-install-state-unavailable",
@@ -523,26 +534,36 @@ class SkillCatalogService {
       });
       installState = emptySkillInstallState();
     }
+    // A never-created default ~/.claude/skills directory is a healthy empty
+    // catalog. Once that implicit root has produced persisted Skill identities,
+    // however, its disappearance is ambiguous and must be treated as a partial
+    // scan rather than authoritative deletion. An explicit empty directory is
+    // still the supported way to remove every Skill deliberately.
+    if (rootsConfig.explicitlyConfigured !== true && installState.previousSkillCount > 0) {
+      const missingDefaultRoots = scan.warnings.filter((warning) => warning.code === "skill-root-missing");
+      if (missingDefaultRoots.length > 0) {
+        scan.warnings = scan.warnings.filter((warning) => warning.code !== "skill-root-missing");
+        scan.errors.push(...missingDefaultRoots);
+      }
+    }
     for (const skill of scan.skills) {
       const record = installState.skills[skill.id];
       skill.installed = Boolean(record?.installed === true && record.sha === skill.sha &&
         record.installSha === String(skill.installSha || ""));
     }
     const installedSkillIds = scan.skills.filter((skill) => skill.installed).map((skill) => skill.id);
-    const catalogSha = aggregateSkillShas(scan.observedShas);
     const previousState = loadCatalogState(this.stateDir);
-    const changed = previousState.catalogSha !== catalogSha ||
+    const candidateChanged = scan.errors.length === 0 && (
+      previousState.catalogSha !== catalogSha ||
       installState.stateChanged === true ||
-      !sameStringArray(previousState.installedSkillIds, installedSkillIds);
-    const version = changed
+      !sameStringArray(previousState.installedSkillIds, installedSkillIds)
+    );
+    const candidateVersion = candidateChanged
       ? Math.max(0, Number(previousState.version || 0)) + 1
       : Math.max(1, Number(previousState.version || 1));
-    const updatedAt = changed || !previousState.updatedAt
-      ? new Date().toISOString()
-      : String(previousState.updatedAt);
     const catalogMetadataChars = JSON.stringify({
       catalogSha,
-      version,
+      version: candidateVersion,
       skills: scan.skills.map(publicCatalogSkillRecord)
     }, null, 2).length;
     const catalogMetadataTooLarge = catalogMetadataChars > MAX_SKILL_CATALOG_JSON_CHARS;
@@ -552,7 +573,30 @@ class SkillCatalogService {
         message: `Serialized Skill catalog metadata exceeds ${MAX_SKILL_CATALOG_JSON_CHARS} characters.`
       });
     }
-    if (changed || previousState.stateVersion !== SKILL_CATALOG_STATE_VERSION) {
+    let catalogStateAuthoritative = scan.errors.length === 0;
+    if (catalogStateAuthoritative && installState.stateChanged === true) {
+      try {
+        saveSkillInstallState(this.stateDir, {
+          schemaVersion: installState.schemaVersion,
+          updatedAt: installState.updatedAt,
+          skills: installState.skills
+        });
+      } catch (_error) {
+        scan.errors.push({
+          code: "skill-install-state-unavailable",
+          message: "The local Skill installation state could not be read or saved."
+        });
+        catalogStateAuthoritative = false;
+      }
+    }
+    const changed = catalogStateAuthoritative && candidateChanged;
+    const version = changed
+      ? candidateVersion
+      : Math.max(1, Number(previousState.version || 1));
+    const updatedAt = changed || !previousState.updatedAt
+      ? new Date().toISOString()
+      : String(previousState.updatedAt);
+    if (catalogStateAuthoritative && (changed || previousState.stateVersion !== SKILL_CATALOG_STATE_VERSION)) {
       saveCatalogState(this.stateDir, {
         stateVersion: SKILL_CATALOG_STATE_VERSION,
         version,
@@ -1499,8 +1543,9 @@ function loadSkillInstallState(stateDir) {
   }
 }
 
-function reconcileSkillInstallState(stateDir, skills) {
+function reconcileSkillInstallState(stateDir, skills, { write = true } = {}) {
   const previous = loadSkillInstallState(stateDir);
+  const previousSkillCount = Object.keys(previous.skills).length;
   let receiptKey = null;
   if (Object.entries(previous.skills).some(([, record]) => record.installed === true)) {
     try {
@@ -1530,10 +1575,10 @@ function reconcileSkillInstallState(stateDir, skills) {
     updatedAt: changed || !previous.updatedAt ? new Date().toISOString() : previous.updatedAt,
     skills: nextSkills
   };
-  if (changed) {
+  if (changed && write) {
     saveSkillInstallState(stateDir, next);
   }
-  return { ...next, stateChanged: changed };
+  return { ...next, stateChanged: changed, previousSkillCount };
 }
 
 function markSkillInstalled(stateDir, skill) {

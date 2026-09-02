@@ -45,7 +45,7 @@ async function main() {
   testSymlinkAndRootContainmentProtection();
   testFileSizeEncodingDepthAndCountBoundaries();
   testScanWorkAndDiagnosticBoundaries();
-  testTotalSizeAndSerializedMetadataBoundaries();
+  await testTotalSizeAndSerializedMetadataBoundaries();
   await testDescriptionAndExpandedLoadBoundaries();
   await testFormattedSkillLoadReplyBoundaries();
   testEnvironmentExpansionIsAllowlistedAndSinglePass();
@@ -521,7 +521,7 @@ function testScanWorkAndDiagnosticBoundaries() {
   );
 }
 
-function testTotalSizeAndSerializedMetadataBoundaries() {
+async function testTotalSizeAndSerializedMetadataBoundaries() {
   const exactTotalRoot = makeTempDir("skill-total-exact-root-");
   writeSkillsWithExactTotalBytes(exactTotalRoot, MAX_SKILL_TOTAL_BYTES);
   const exactTotal = createService(exactTotalRoot, "skill-total-exact-state-").manage();
@@ -547,15 +547,25 @@ function testTotalSizeAndSerializedMetadataBoundaries() {
   assert.equal(plainList.skills.length, 500, "A near-limit catalog must be returned completely.");
 
   const escapedMetadataRoot = makeTempDir("skill-metadata-escaped-root-");
-  writeManySkillsWithDescription(escapedMetadataRoot, 500, "\\".repeat(MAX_SKILL_DESCRIPTION_CHARS));
+  writeManySkillsWithDescription(escapedMetadataRoot, 1, "\\".repeat(MAX_SKILL_DESCRIPTION_CHARS));
   const escapedService = createService(escapedMetadataRoot, "skill-metadata-escaped-state-");
+  const installedBeforeOversize = await installSkillForTest(escapedService, "metadata-000");
+  assert.equal(installedBeforeOversize.skills[0].id, "metadata-000");
+  writeManySkillsWithDescription(escapedMetadataRoot, 499, "\\".repeat(MAX_SKILL_DESCRIPTION_CHARS), 1);
   const escapedInternal = escapedService.scan({ force: true });
   const escapedActualChars = serializedPublicCatalogChars(escapedInternal);
   assert.equal(escapedInternal.catalogMetadataChars, escapedActualChars);
   assert.ok(escapedActualChars > MAX_SKILL_CATALOG_JSON_CHARS, "JSON escaping must count toward the serialized catalog limit.");
   const escapedList = escapedService.manage();
   assert.equal(escapedList.ok, false);
-  assert.deepEqual(escapedList.skills, [], "An oversized metadata catalog must never expose a partial list.");
+  assert.equal(escapedList.skills.length, 500,
+    "The bounded local management catalog must keep every row visible even when the AI catalog is oversized.");
+  assert.equal(escapedList.skills.find((skill) => skill.id === "metadata-000")?.installed, true,
+    "View Skills must retain an authenticated installed row when only the AI catalog payload is oversized.");
+  assert.ok(escapedList.skills.filter((skill) => skill.id !== "metadata-000").every((skill) => skill.installed === false),
+    "Local management visibility must not fabricate installation for other rows.");
+  assert.deepEqual(escapedService.list().skills, [],
+    "An oversized AI catalog must still fail closed instead of entering a composer reply.");
   assert.ok(escapedList.errors.some((error) => error.code === "skill-catalog-metadata-too-large"));
 }
 
@@ -889,8 +899,8 @@ function writeManySkills(root, count) {
   }
 }
 
-function writeManySkillsWithDescription(root, count, description) {
-  for (let index = 0; index < count; index += 1) {
+function writeManySkillsWithDescription(root, count, description, startIndex = 0) {
+  for (let index = startIndex; index < startIndex + count; index += 1) {
     const suffix = String(index).padStart(3, "0");
     writeSkill(root, `metadata-${suffix}`, {
       name: `metadata-${suffix}`,

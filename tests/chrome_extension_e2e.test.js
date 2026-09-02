@@ -344,7 +344,7 @@ async function main() {
   }
 
   if (managedShellServer) {
-    await runEmptySkillCatalogE2E(page, {
+    await runEmptySkillCatalogE2E(page, debugPort, {
       skillPath,
       skillInstallPath,
       skillUninstallPath,
@@ -1608,7 +1608,7 @@ async function runChatGptHostContractE2E(page) {
     "A later live generation must not revive the startup historical helper.");
 }
 
-async function runEmptySkillCatalogE2E(page, {
+async function runEmptySkillCatalogE2E(page, debugPort, {
   skillPath,
   skillInstallPath,
   skillUninstallPath,
@@ -1718,22 +1718,53 @@ async function runEmptySkillCatalogE2E(page, {
   })()`, "adding the first Skill after an empty ACK to require synchronization");
   const statePath = path.join(shellStateDir, "skill-install-state.json");
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, false);
+  const managementPage = await openChromePage(
+    debugPort,
+    `${TEST_PAGE_URL}?view-skills-cross-tab=${Date.now()}`
+  );
+  cleanup.push(() => managementPage.close());
+  await managementPage.send("Page.enable");
+  await managementPage.send("Runtime.enable");
+  await waitForEvaluate(managementPage, "document.readyState === 'complete'", "cross-tab View Skills page load");
+  await waitForEvaluate(managementPage, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`,
+    "cross-tab View Skills extension panel");
+  await waitForEvaluate(managementPage, `(() => {
+    const detail = document.getElementById("ai-chat-shell-exec-skill-detail");
+    return /Installed: 0/.test(detail?.innerText || detail?.textContent || "") &&
+      /Discovered: 1/.test(detail?.innerText || detail?.textContent || "");
+  })()`, "cross-tab View Skills initial uninstalled state");
+  const managementUserCount = await pageUserMessageCount(managementPage);
+  await managementPage.evaluate(`document.querySelector('[data-shell-tool-action="skill-view"]')?.click(); true`);
+  await waitForEvaluate(managementPage, `Boolean(document.querySelector(
+    '#ai-chat-shell-exec-skill-dialog [data-skill-id="e2e-skill"] [data-skill-install]'
+  ))`, "cross-tab View Skills initial Install action");
   const beforeInstall = await pageUserMessageCount(page);
   await installSkillThroughDialog(page, "e2e-skill");
   await assertUserMessageCountStable(page, beforeInstall, "Installing a local Skill must not write or auto-sync the AI composer");
   assert.equal(fs.readFileSync(skillInstallRunPath, "utf8"), "run\n", "A double-click must execute install.sh exactly once.");
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, true);
+  await waitForEvaluate(managementPage, `Boolean(document.querySelector(
+    '#ai-chat-shell-exec-skill-dialog [data-skill-id="e2e-skill"] [data-skill-uninstall]'
+  ))`, "cross-tab View Skills to refresh to installed without reopening");
   const beforeUninstall = await pageUserMessageCount(page);
   await uninstallSkillThroughDialog(page, "e2e-skill");
   await assertUserMessageCountStable(page, beforeUninstall, "Uninstalling a local Skill must not write to the AI composer");
   assert.equal(fs.readFileSync(skillUninstallRunPath, "utf8"), "run\n", "A double-click must execute uninstall.sh exactly once.");
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, false);
+  await waitForEvaluate(managementPage, `Boolean(document.querySelector(
+    '#ai-chat-shell-exec-skill-dialog [data-skill-id="e2e-skill"] [data-skill-install]'
+  ))`, "cross-tab View Skills to refresh to uninstalled without reopening");
 
   const beforeReinstall = await pageUserMessageCount(page);
   await installSkillThroughDialog(page, "e2e-skill");
   await assertUserMessageCountStable(page, beforeReinstall, "Reinstalling after uninstall must remain local");
   assert.equal(fs.readFileSync(skillInstallRunPath, "utf8"), "run\nrun\n");
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).skills["e2e-skill"].installed, true);
+  await waitForEvaluate(managementPage, `Boolean(document.querySelector(
+    '#ai-chat-shell-exec-skill-dialog [data-skill-id="e2e-skill"] [data-skill-uninstall]'
+  ))`, "cross-tab View Skills to refresh after reinstall");
+  await assertUserMessageCountStable(managementPage, managementUserCount,
+    "Cross-tab View Skills refreshes must remain local and never write to the AI composer");
 }
 
 async function runSkillE2E(page, debugPort, {
