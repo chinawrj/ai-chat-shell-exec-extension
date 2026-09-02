@@ -37,8 +37,10 @@ const SKILL_CATALOG_DIALOG_ID = "ai-chat-shell-exec-skill-dialog";
 const SKILL_MEMORY_ENTRY = "AI_CHAT_SHELL_SKILLS_CATALOG";
 const SKILL_ACK_PREFIX = "skillCatalogAck:v1:";
 const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
+const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
+const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.10";
+const CONTENT_SCRIPT_VERSION = "0.11.11";
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -158,6 +160,11 @@ let shellRunStatusPollInFlight = false;
 let panelForceRunAvailable = false;
 let panelSkillHelperActionable = false;
 let panelLatestManualActionKind = "";
+let panelDetectedManualHelperKey = "";
+let panelForceRunIdleAccumulatedMs = 0;
+let panelForceRunIdleStartedAt = 0;
+let panelForceRunIdleReady = false;
+let panelForceRunIdleTimer = 0;
 let panelShellHelperActive = false;
 let skillPanelState = null;
 let skillStatePollTimer = 0;
@@ -166,6 +173,7 @@ let skillHelperInFlight = false;
 let skillRecoveryInFlight = false;
 let lastOwnedSkillSyncRecoveryStatus = "none";
 const skillInstallInFlight = new Set();
+const skillUninstallInFlight = new Set();
 const skillInstallErrors = new Map();
 
 bootstrapActivation().catch(() => {});
@@ -244,6 +252,7 @@ function deactivateExtension() {
   panelForceRunAvailable = false;
   panelSkillHelperActionable = false;
   panelLatestManualActionKind = "";
+  resetPanelForceRunIdleState({ clearCandidate: true });
   lastOwnedSkillSyncRecoveryStatus = "none";
   committedOwnedSkillSyncSemanticKeys.clear();
   panelShellHelperActive = false;
@@ -291,6 +300,11 @@ function observeThread() {
   }
 
   rememberKnownRenderedHelperSemantics();
+  // The extension can be reloaded while ChatGPT is already generating. Take
+  // the historical snapshot immediately, before the first observer mutation,
+  // so the eventual Stop -> Send morph cannot lend this lifecycle to a helper
+  // that was already rendered when the content script started.
+  initializeAssistantGenerationEpochFromVisibleControls();
 
   threadObserver = new MutationObserver((records) => {
     const pageRecords = Array.from(records || []).filter((record) => !isShellToolPanelMutation(record));
@@ -327,7 +341,10 @@ function observeThread() {
     childList: true,
     subtree: true,
     characterData: true,
-    characterDataOldValue: true
+    characterDataOldValue: true,
+    attributes: true,
+    attributeOldValue: true,
+    attributeFilter: ["aria-label", "data-testid"]
   });
 }
 
@@ -418,6 +435,8 @@ function installPageEventListeners() {
   document.addEventListener("pointerdown", handleBindingPointerDown, true);
   document.addEventListener("click", handleBindingClick, true);
   document.addEventListener("dragstart", handleBindingDragStart, true);
+  document.addEventListener("visibilitychange", handleForceRunIdleWake);
+  window.addEventListener("focus", handleForceRunIdleWake);
   if (isLocalManualTestPage()) {
     window.addEventListener("message", handleManualTmuxListRequest);
     window.addEventListener("message", handleManualAgentRequest);
@@ -437,9 +456,15 @@ function removePageEventListeners() {
   document.removeEventListener("pointerdown", handleBindingPointerDown, true);
   document.removeEventListener("click", handleBindingClick, true);
   document.removeEventListener("dragstart", handleBindingDragStart, true);
+  document.removeEventListener("visibilitychange", handleForceRunIdleWake);
+  window.removeEventListener("focus", handleForceRunIdleWake);
   window.removeEventListener("message", handleManualTmuxListRequest);
   window.removeEventListener("message", handleManualAgentRequest);
   pageEventListenersInstalled = false;
+}
+
+function handleForceRunIdleWake() {
+  updateContextualPanelActions();
 }
 
 async function handleManualTmuxListRequest(event) {
@@ -753,14 +778,8 @@ async function scanForShellCall(options = {}) {
     const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, conversationRoot);
     const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, conversationRoot);
     const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, conversationRoot);
-    panelLatestManualActionKind = getLatestManualActionKind(
-      allCandidates,
-      runnableCandidate,
-      actionableSkillCandidate,
-      skillBoundaryCandidate
-    );
-    setPanelForceRunAvailable(Boolean(runnableCandidate));
-    setPanelSkillHelperActionable(Boolean(actionableSkillCandidate));
+    panelSkillHelperActionable = Boolean(actionableSkillCandidate);
+    setPanelDetectedManualHelper(allCandidates, runnableCandidate, skillBoundaryCandidate);
     updateDetectedHelperDebug(getLastShellCallCandidate(conversationRoot), allCandidates);
   } catch (_unused) {
     // Detection runs on a partially-rendered DOM during streaming; never
@@ -781,6 +800,7 @@ async function scanForShellCall(options = {}) {
   }
 
   if (!force && isAssistantGenerating()) {
+    initializeAssistantGenerationEpochFromVisibleControls();
     assistantGenerationObservedForLifecycle = true;
     scheduleScan();
     return;
@@ -806,11 +826,11 @@ async function scanForShellCall(options = {}) {
     const latestActionKind = getLatestManualActionKind(
       allCandidates,
       candidate,
-      getLastActionableSkillCandidate(allCandidates, thread),
+      skillBoundaryCandidate,
       skillBoundaryCandidate
     );
     if (latestActionKind !== "force" ||
-        (expectedForceCandidate && !isRenderedHelperCandidateSnapshotCurrent(expectedForceCandidate, candidate))) {
+        (expectedForceCandidate && !isSemanticHelperCandidateSnapshotCurrent(expectedForceCandidate, candidate))) {
       clearPendingForceRun();
       setStatus("Force run cancelled because the latest helper changed", "idle");
       return;
@@ -842,6 +862,19 @@ async function scanForShellCall(options = {}) {
     setStatus("Helper detected; waiting for the pending agent message to leave the composer", "running");
     scheduleScan();
     return;
+  }
+
+  if (!force) {
+    // ChatGPT can finish its first response and perform the / -> /uc route
+    // assignment before the observer ever sees the final helper root. The
+    // exact composer Stop transition still proves this lifecycle, while the
+    // final authored-turn checks below bind that proof to only the newest
+    // assistant markdown subtree.
+    for (const currentCandidate of allCandidates.filter(
+      isChatGptCurrentLifecycleCompletedHelperCandidate
+    )) {
+      markCurrentLifecycleCompletedHelperCandidate(currentCandidate);
+    }
   }
 
   if (!candidate && !hasDrawioCandidate && !hasSkillCandidate) {
@@ -1114,6 +1147,12 @@ function beginPageLifecycle(options = {}) {
   routeHandoffPreviousPageIdentity = options.routeTransition === true
     ? String(options.previousPageIdentity || "")
     : "";
+  const preservesChatGptNewConversationGeneration = options.routeTransition === true &&
+    isChatGptNewConversationRouteAssignment(
+      options.previousPageIdentity,
+      getCurrentPageIdentity(),
+      assistantGenerationEpoch
+    );
   cancelPendingHelperDeliveryRetry();
   pendingHelperDeliveries = new Map();
   locallyPresentedHelperExecutions = new Map();
@@ -1124,7 +1163,8 @@ function beginPageLifecycle(options = {}) {
   activeCallId = "";
   activeCallToken = null;
   initialThreadSettled = false;
-  staleRouteGenerationControls = options.routeTransition === true
+  staleRouteGenerationControls = options.routeTransition === true &&
+      !preservesChatGptNewConversationGeneration
     ? new WeakSet(getAssistantGenerationControls())
     : new WeakSet();
   if (options.routeTransition === true && assistantGenerationEpoch &&
@@ -1135,7 +1175,7 @@ function beginPageLifecycle(options = {}) {
     assistantGenerationEpoch.routeCarryResponsePrefix = getGenerationRouteText(
       assistantGenerationEpoch.responseMessageRoot
     );
-    assistantGenerationEpoch.routeCarryOnly = true;
+    assistantGenerationEpoch.routeCarryOnly = !preservesChatGptNewConversationGeneration;
     assistantGenerationObservedForLifecycle = true;
   } else {
     assistantGenerationObservedForLifecycle = false;
@@ -1155,6 +1195,7 @@ function beginPageLifecycle(options = {}) {
   panelForceRunAvailable = false;
   panelSkillHelperActionable = false;
   panelLatestManualActionKind = "";
+  resetPanelForceRunIdleState({ clearCandidate: true });
   lastOwnedSkillSyncRecoveryStatus = "none";
   committedOwnedSkillSyncSemanticKeys.clear();
   updateContextualPanelActions();
@@ -1214,6 +1255,27 @@ function beginPageLifecycle(options = {}) {
     if (routeHandoffEntries.length > 0) {
       schedulePendingHelperDeliveryRetry(0);
     }
+  }
+}
+
+function isChatGptNewConversationRouteAssignment(previousIdentity, nextIdentity, epoch) {
+  if (location.hostname !== "chatgpt.com" ||
+      !(epoch?.userAnchor instanceof Element) ||
+      epoch.userAnchor.isConnected !== true ||
+      epoch.responseMessageRoot ||
+      assistantGenerationObservedForLifecycle !== true ||
+      getLastExplicitUserMessageRoot(getConversationRoot()) !== epoch.userAnchor) {
+    return false;
+  }
+  try {
+    const previous = new URL(String(previousIdentity || ""));
+    const next = new URL(String(nextIdentity || ""));
+    return previous.origin === "https://chatgpt.com" &&
+      next.origin === previous.origin &&
+      previous.pathname === "/" &&
+      /^\/(?:c|uc)\/[^/]+/.test(next.pathname);
+  } catch (_unused) {
+    return false;
   }
 }
 
@@ -2000,7 +2062,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       };
       entry.skillRouteHandoffPending = false;
       entry.updatedAt = Date.now();
-      if (!isStoredSkillOriginProofCurrent(entry.skillOriginProof)) {
+      if (!isStoredSkillOriginProofCurrent(entry.skillOriginProof, entry.reply)) {
         entry.volatileStaleHandler?.();
         await discardStaleSkillPendingDelivery(entry);
         return false;
@@ -2019,7 +2081,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       entry.restored === true &&
       ["skill-list", "skill-load", "skill-error"].includes(entry.kind);
     if (restoredSkillReplyNeedsOrigin &&
-        (!entry.skillOriginProof || !isStoredSkillOriginProofCurrent(entry.skillOriginProof))) {
+        (!entry.skillOriginProof || !isStoredSkillOriginProofCurrent(entry.skillOriginProof, entry.reply))) {
       if (!initialThreadSettled) {
         setPendingHelperDeliveryStatus(entry);
         schedulePendingHelperDeliveryRetry();
@@ -2145,9 +2207,11 @@ function isPendingSkillDeliveryOriginCurrent(entry) {
     return false;
   }
   if (typeof entry.volatileLifecycleGuard === "function") {
-    return entry.volatileLifecycleGuard() === true;
+    if (entry.volatileLifecycleGuard() === true) {
+      return true;
+    }
   }
-  return isStoredSkillOriginProofCurrent(entry.skillOriginProof);
+  return isStoredSkillOriginProofCurrent(entry.skillOriginProof, entry.reply);
 }
 
 async function discardStaleSkillPendingDelivery(entry) {
@@ -2319,7 +2383,8 @@ function createSkillDispatchContext(candidate) {
     renderedHelperKey: buildRenderedHelperKey(candidate, semanticCallKey),
     semanticCallKey,
     source: candidate?.source || "",
-    blockIndex: candidate?.blockIndex ?? candidate?.index ?? ""
+    blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
+    chatGptTurnProof: createChatGptSkillDispatchTurnProof(candidate)
   };
 }
 
@@ -2332,7 +2397,12 @@ function isSkillDispatchContextCurrent(context) {
   // response may be delivered.
   refreshPageLifecycle();
   const currentPageIdentity = getCurrentPageIdentity();
-  const retainedCandidate = findRetainedSkillDispatchCandidate(context);
+  let retainedCandidate = findRetainedSkillDispatchCandidate(context);
+  if (!retainedCandidate &&
+      context.pageIdentity === currentPageIdentity &&
+      context.generation === pageLifecycleGeneration) {
+    retainedCandidate = rebindChatGptSkillDispatchCandidate(context);
+  }
   if (!retainedCandidate) {
     return false;
   }
@@ -2367,6 +2437,97 @@ function isSkillDispatchContextCurrent(context) {
   context.renderGeneration = getHelperRenderRootGeneration(context.renderRoot);
   context.renderedHelperKey = buildRenderedHelperKey(retainedCandidate, context.semanticCallKey);
   return true;
+}
+
+function createChatGptSkillDispatchTurnProof(candidate) {
+  if (location.hostname !== "chatgpt.com" || !isSkillHelperCall(candidate?.call)) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getChatGptMessageRoot(renderRoot, "assistant");
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const assistantContent = getChatGptAssistantContentRoot(messageRoot);
+  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
+  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      !(userCopy instanceof Element) ||
+      !(assistantContent instanceof Element) ||
+      !userRootIdentity ||
+      !assistantRootIdentity ||
+      userIndex < 0 ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1 ||
+      !userText) {
+    return null;
+  }
+  return {
+    userRootIdentity,
+    assistantRootIdentity,
+    userTextHash: stableHash(userText),
+    userTextLength: userText.length
+  };
+}
+
+function rebindChatGptSkillDispatchCandidate(context) {
+  const proof = context?.chatGptTurnProof;
+  if (location.hostname !== "chatgpt.com" || !proof) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "user" &&
+    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  );
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  );
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  if (!(userRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userCopy instanceof Element) ||
+      stableHash(userText) !== proof.userTextHash ||
+      userText.length !== Number(proof.userTextLength) ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1) {
+    return null;
+  }
+  let matches = [];
+  try {
+    matches = extractShellCallCandidates(conversationRoot).filter((candidate) =>
+      isSkillHelperCall(candidate.call) &&
+      getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot &&
+      getChatGptAssistantContentRoot(getCandidateRenderRoot(candidate)) instanceof Element &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey &&
+      isExactWholeSkillEnvelope(getCandidateRenderRoot(candidate), candidate.call)
+    );
+  } catch (_unused) {
+    return null;
+  }
+  if (matches.length !== 1) {
+    return null;
+  }
+  const candidate = matches[0];
+  const renderRoot = getCandidateRenderRoot(candidate);
+  context.renderRoot = renderRoot;
+  context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+  context.source = candidate.source || "";
+  context.blockIndex = candidate.blockIndex ?? candidate.index ?? "";
+  context.renderedHelperKey = buildRenderedHelperKey(candidate, context.semanticCallKey);
+  return candidate;
 }
 
 function findRetainedSkillDispatchCandidate(context) {
@@ -2422,7 +2583,11 @@ function releaseStaleSkillDispatchForRecovery(context) {
 
 function createStoredSkillOriginProof(context) {
   const conversationRoot = getConversationRoot();
-  const transcript = normalizeText(
+  const chatGptSnapshot = getChatGptSkillOriginTurnSnapshot(
+    context?.chatGptTurnProof,
+    context?.semanticCallKey
+  );
+  const transcript = chatGptSnapshot?.text || normalizeText(
     conversationRoot?.innerText || conversationRoot?.textContent || ""
   );
   return context ? {
@@ -2431,16 +2596,28 @@ function createStoredSkillOriginProof(context) {
     source: String(context.source || ""),
     blockIndex: context.blockIndex ?? "",
     transcriptHash: stableHash(transcript),
-    transcriptLength: transcript.length
+    transcriptLength: transcript.length,
+    transcriptScope: chatGptSnapshot ? "chatgpt-authored-turn-v1" : "conversation-v1",
+    chatGptTurnProof: chatGptSnapshot ? context.chatGptTurnProof : null
   } : null;
 }
 
-function isStoredSkillOriginProofCurrent(proof) {
+function isStoredSkillOriginProofCurrent(proof, allowedNextUserReply = "") {
   if (!proof || proof.pageIdentity !== getCurrentPageIdentity()) {
     return false;
   }
   const conversationRoot = getConversationRoot();
-  const transcript = normalizeText(
+  const chatGptSnapshot = proof.transcriptScope === "chatgpt-authored-turn-v1"
+    ? getChatGptSkillOriginTurnSnapshot(
+      proof.chatGptTurnProof,
+      proof.semanticCallKey,
+      allowedNextUserReply
+    )
+    : null;
+  if (proof.transcriptScope === "chatgpt-authored-turn-v1" && !chatGptSnapshot) {
+    return false;
+  }
+  const transcript = chatGptSnapshot?.text || normalizeText(
     conversationRoot?.innerText || conversationRoot?.textContent || ""
   );
   if (!proof.transcriptHash ||
@@ -2464,6 +2641,77 @@ function isStoredSkillOriginProofCurrent(proof) {
     (candidate.source || "") === proof.source &&
     (candidate.blockIndex ?? candidate.index ?? "") === proof.blockIndex
   );
+}
+
+function getChatGptSkillOriginTurnSnapshot(turnProof, semanticCallKey, allowedNextUserReply = "") {
+  if (location.hostname !== "chatgpt.com" || !turnProof || !semanticCallKey) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "user" &&
+    getSubmittedMessageRootIdentity(root) === turnProof.userRootIdentity
+  );
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === turnProof.assistantRootIdentity
+  );
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const assistantContent = getChatGptAssistantContentRoot(messageRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  const assistantText = normalizeCommand(
+    assistantContent?.innerText || assistantContent?.textContent || ""
+  );
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  if (!(conversationRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userCopy instanceof Element) ||
+      !(assistantContent instanceof Element) ||
+      stableHash(userText) !== turnProof.userTextHash ||
+      userText.length !== Number(turnProof.userTextLength) ||
+      userIndex < 0 ||
+      responseIndex !== userIndex + 1) {
+    return null;
+  }
+  let matchingCandidates = [];
+  try {
+    matchingCandidates = extractShellCallCandidates(conversationRoot).filter((candidate) =>
+      isSkillHelperCall(candidate.call) &&
+      getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot &&
+      buildSemanticCallKey(candidate.call) === semanticCallKey &&
+      isExactWholeSkillEnvelope(getCandidateRenderRoot(candidate), candidate.call)
+    );
+  } catch (_unused) {
+    return null;
+  }
+  if (matchingCandidates.length !== 1) {
+    return null;
+  }
+  const originalTurnCurrent = responseIndex === authoredRoots.length - 1 &&
+    getLastExplicitUserMessageRoot(conversationRoot) === userRoot;
+  let submittedReplyCurrent = false;
+  if (!originalTurnCurrent && allowedNextUserReply) {
+    const submittedRoot = authoredRoots[responseIndex + 1];
+    submittedReplyCurrent = submittedRoot instanceof Element &&
+      getMessageAuthorRole(submittedRoot) === "user" &&
+      submittedUserMessageRootMatches(submittedRoot, allowedNextUserReply) &&
+      getLastExplicitUserMessageRoot(conversationRoot) === submittedRoot &&
+      authoredRoots.slice(responseIndex + 2)
+        .every((root) => getMessageAuthorRole(root) === "assistant");
+  }
+  if (!originalTurnCurrent && !submittedReplyCurrent) {
+    return null;
+  }
+  const text = [
+    turnProof.userRootIdentity,
+    turnProof.assistantRootIdentity,
+    `${userText.length}:${userText}`,
+    `${assistantText.length}:${assistantText}`
+  ].join("\n");
+  return { text };
 }
 
 function buildRenderedHelperKey(candidate, semanticCallKey, pageIdentity = getCurrentPageIdentity()) {
@@ -2673,28 +2921,124 @@ function getAssistantGenerationControls() {
 }
 
 function isAssistantGenerationControl(button) {
-  if (getExplicitMessageContainer(button) || isInsideShellToolPanel(button)) {
+  if (!isEligibleAssistantGenerationControlLocation(button)) {
     // Helper text and debug/status surfaces are untrusted page content. A host
     // generation control must live outside authored messages and our panel.
     return false;
   }
+  if (location.hostname === "chatgpt.com" &&
+      !isChatGptComposerGenerationControlLocation(button)) {
+    // Current ChatGPT reuses the composer submit actuator for Send/Stop.
+    // An identically labelled button elsewhere on the page is not generation
+    // evidence and must not revive a completed helper from conversation history.
+    return false;
+  }
   const testId = String(button?.getAttribute?.("data-testid") || "").trim().toLowerCase();
-  if (["stop-button", "stop-response-button", "stop-generating-button", "stop-streaming-button"].includes(testId)) {
+  if (isAssistantGenerationControlAttribute("data-testid", testId)) {
     return true;
   }
   if (isLocalManualTestPage() &&
       button?.getAttribute?.("data-ai-chat-shell-generation-control") === "true") {
     return true;
   }
-  const supportedLabels = [
-    "stop streaming",
-    "stop generating",
-    "stop response",
-    "stop answering"
-  ];
   return [button?.getAttribute?.("aria-label"), button?.textContent]
     .map((value) => normalizeText(value || "").toLowerCase())
-    .some((label) => supportedLabels.includes(label));
+    .some((label) => isAssistantGenerationControlAttribute("aria-label", label));
+}
+
+function isEligibleAssistantGenerationControlLocation(button) {
+  return button instanceof Element &&
+    !getExplicitMessageContainer(button) &&
+    !isInsideShellToolPanel(button);
+}
+
+function isAssistantGenerationControlAttribute(name, value) {
+  const normalized = normalizeText(value || "").trim().toLowerCase();
+  if (name === "data-testid") {
+    return ["stop-button", "stop-response-button", "stop-generating-button", "stop-streaming-button"]
+      .includes(normalized);
+  }
+  if (name === "aria-label") {
+    return ["stop streaming", "stop generating", "stop response", "stop answering"]
+      .includes(normalized);
+  }
+  return false;
+}
+
+function collectAssistantGenerationAttributeControls(records = [], direction = "added") {
+  const controls = [];
+  for (const record of Array.from(records || [])) {
+    if (record?.type !== "attributes" ||
+        !["aria-label", "data-testid"].includes(record.attributeName) ||
+        !(record.target instanceof Element) ||
+        !isEligibleAssistantGenerationControlLocation(record.target)) {
+      continue;
+    }
+    if (location.hostname === "chatgpt.com" &&
+        !isChatGptComposerGenerationAttributeTransition(record, direction)) {
+      continue;
+    }
+    const wasControl = isAssistantGenerationControlAttribute(record.attributeName, record.oldValue);
+    const isControl = isAssistantGenerationControl(record.target);
+    if ((direction === "added" && isControl && !wasControl) ||
+        (direction === "removed" && wasControl && !isControl)) {
+      controls.push(record.target);
+    }
+  }
+  return controls;
+}
+
+function isChatGptComposerGenerationAttributeTransition(record, direction) {
+  const control = record?.target;
+  if (!(control instanceof Element) || !isEligibleAssistantGenerationControlLocation(control)) {
+    return false;
+  }
+  if (!isChatGptComposerGenerationControlLocation(control)) {
+    return false;
+  }
+  const oldValue = normalizeText(record.oldValue || "").trim().toLowerCase();
+  const newValue = normalizeText(control.getAttribute?.(record.attributeName) || "").trim().toLowerCase();
+  if (record.attributeName === "aria-label") {
+    return direction === "added"
+      ? oldValue === "send message" && newValue === "stop generating"
+      : oldValue === "stop generating" && newValue === "send message";
+  }
+  if (record.attributeName === "data-testid") {
+    const sendIds = new Set(["send-button", "composer-send-button"]);
+    const stopIds = new Set(["stop-button", "stop-response-button", "stop-generating-button", "stop-streaming-button"]);
+    return direction === "added"
+      ? sendIds.has(oldValue) && stopIds.has(newValue)
+      : stopIds.has(oldValue) && sendIds.has(newValue);
+  }
+  return false;
+}
+
+function isChatGptComposerGenerationControlLocation(control) {
+  const form = control.closest?.("form");
+  return form instanceof Element &&
+    Array.from(form.querySelectorAll?.('textarea, [contenteditable="true"], [role="textbox"]') || [])
+      .some((candidate) => candidate instanceof Element &&
+        candidate !== control && isVisibleElement(candidate) && !isInsideShellToolPanel(candidate));
+}
+
+function initializeAssistantGenerationEpochFromVisibleControls() {
+  if (assistantGenerationEpoch) {
+    return true;
+  }
+  const visibleControls = getAssistantGenerationControls()
+    .filter((control) => !staleRouteGenerationControls.has(control));
+  if (visibleControls.length === 0) {
+    return false;
+  }
+  assistantGenerationEpoch = createAssistantGenerationEpoch();
+  for (const control of visibleControls) {
+    assistantGenerationEpoch.generationControls.add(control);
+    assistantGenerationEpoch.generationControlRefs.add(control);
+  }
+  captureAssistantGenerationHistoricalSemantics([]);
+  assistantGenerationObservedForLifecycle = true;
+  assistantGenerationEvidenceUntil = Math.max(assistantGenerationEvidenceUntil, Date.now() + 3000);
+  return true;
 }
 
 function observeAssistantGenerationEvidence(records = [], options = {}) {
@@ -2708,8 +3052,24 @@ function observeAssistantGenerationEvidence(records = [], options = {}) {
   }
   const visibleControls = getAssistantGenerationControls();
   const visibleControl = visibleControls.some((control) => !staleRouteGenerationControls.has(control));
-  const addedControls = collectAssistantGenerationControls(records, "addedNodes");
-  const allRemovedControls = collectAssistantGenerationControls(records, "removedNodes");
+  const addedAttributeControls = collectAssistantGenerationAttributeControls(records, "added");
+  const removedAttributeControls = collectAssistantGenerationAttributeControls(records, "removed");
+  const addedControls = [
+    ...collectAssistantGenerationControls(records, "addedNodes"),
+    ...addedAttributeControls
+  ];
+  const allRemovedControls = [
+    ...collectAssistantGenerationControls(records, "removedNodes"),
+    ...removedAttributeControls
+  ];
+  if (location.hostname === "chatgpt.com" && removedAttributeControls.length > 0) {
+    // The current lightweight ChatGPT reuses one submit button. Its exact
+    // Stop -> Send aria-label transition is the only completion mutation in
+    // some short responses, including the first response after route
+    // assignment, so retain a bounded proof even when no Stop node is removed.
+    assistantGenerationObservedForLifecycle = true;
+    assistantGenerationEvidenceUntil = Date.now() + CHATGPT_COMPLETED_HELPER_EVIDENCE_MS;
+  }
   const removedControls = options.allowRemovedControls !== false ? allRemovedControls : [];
   const addedControl = addedControls.some((control) => !staleRouteGenerationControls.has(control));
   const removedControl = removedControls.some((control) => !staleRouteGenerationControls.has(control));
@@ -2719,7 +3079,8 @@ function observeAssistantGenerationEvidence(records = [], options = {}) {
     !staleRouteGenerationControls.has(control) &&
     assistantGenerationEpoch?.generationControls?.has(control) !== true
   );
-  const canStartEpoch = freshAddedControl;
+  const canStartEpoch = freshAddedControl ||
+    (!assistantGenerationEpoch && assistantGenerationObservedForLifecycle && visibleControl);
   if ((assistantGenerationEpoch && Date.now() <= assistantGenerationEvidenceUntil &&
       (visibleControl || changedControls)) || canStartEpoch) {
     let createdEpoch = false;
@@ -2746,7 +3107,10 @@ function observeAssistantGenerationEvidence(records = [], options = {}) {
     }
     bindAssistantGenerationResponseRoot(responseRoots);
     assistantGenerationObservedForLifecycle = true;
-    assistantGenerationEvidenceUntil = Date.now() + 3000;
+    assistantGenerationEvidenceUntil = Math.max(
+      assistantGenerationEvidenceUntil,
+      Date.now() + 3000
+    );
   }
   const carriedRootTouched = assistantGenerationEpoch?.routeCarryOnly === true &&
     assistantGenerationEpoch.responseMessageRoot instanceof Element &&
@@ -2790,6 +3154,9 @@ function createAssistantGenerationEpoch() {
     userAnchor: getLastExplicitUserMessageRoot(getConversationRoot()),
     responseMessageRoot: null,
     historicalSemantics: new WeakMap(),
+    historicalResponseIdentity: "",
+    historicalResponseSemantics: new Set(),
+    historicalResponseSemanticsByRoot: new WeakMap(),
     generationControls: new WeakSet(),
     generationControlRefs: new Set(),
     routeCarryOnly: false,
@@ -2811,6 +3178,8 @@ function getExplicitMessageRoots(conversationRoot) {
   const selector = [
     "[data-message-author-role]",
     "[data-author-role]",
+    'li[data-message-role="user"]',
+    'li[data-message-role="assistant"]',
     '.fai-UserMessage[role="article"]',
     '.fai-AssistantMessage[role="article"]',
     '.fai-CopilotMessage[role="article"]'
@@ -2819,6 +3188,9 @@ function getExplicitMessageRoots(conversationRoot) {
     .filter((root, index, all) =>
       root instanceof Element &&
       all.indexOf(root) === index &&
+      (location.hostname !== "chatgpt.com" ||
+        !getChatGptMessageRoot(root) ||
+        getChatGptMessageRoot(root) === root) &&
       (getMessageAuthorRole(root) === "user" || getMessageAuthorRole(root) === "assistant")
     );
 }
@@ -2830,9 +3202,15 @@ function getLastExplicitUserMessageRoot(conversationRoot) {
 }
 
 function getExplicitMessageContainer(node) {
+  const chatGptRoot = getChatGptMessageRoot(node);
+  if (chatGptRoot) {
+    return chatGptRoot;
+  }
   return node?.closest?.([
     "[data-message-author-role]",
     "[data-author-role]",
+    'li[data-message-role="user"]',
+    'li[data-message-role="assistant"]',
     '.fai-UserMessage[role="article"]',
     '.fai-AssistantMessage[role="article"]',
     '.fai-CopilotMessage[role="article"]'
@@ -2887,6 +3265,8 @@ function collectCurrentAssistantResponseRoots(records = []) {
     for (const descendant of Array.from(element.querySelectorAll?.([
       "[data-message-author-role]",
       "[data-author-role]",
+      'li[data-message-role="user"]',
+      'li[data-message-role="assistant"]',
       '.fai-UserMessage[role="article"]',
       '.fai-AssistantMessage[role="article"]',
       '.fai-CopilotMessage[role="article"]'
@@ -3013,7 +3393,30 @@ function captureAssistantGenerationHistoricalSemantics(records = []) {
   // remains eligible for live-generation attribution.
   try {
     for (const candidate of extractShellCallCandidates(getConversationRoot())) {
-      captureElement(getCandidateRenderRoot(candidate));
+      const renderRoot = getCandidateRenderRoot(candidate);
+      captureElement(renderRoot);
+      const messageRoot = getChatGptMessageRoot(renderRoot, "assistant");
+      if (location.hostname === "chatgpt.com" &&
+          messageRoot instanceof Element &&
+          isCurrentAssistantResponseRoot(messageRoot, epoch)) {
+        const semanticCallKey = buildSemanticCallKey(candidate.call);
+        if (knownRenderedHelperSemantics.get(renderRoot)?.has(semanticCallKey) !== true) {
+          // A complete helper that first appears in this observer batch is the
+          // live response, not startup history. Only lift a render-root proof
+          // into stable message ownership when it was known before the batch.
+          continue;
+        }
+        const rootSemantics = epoch.historicalResponseSemanticsByRoot.get(messageRoot) || new Set();
+        rootSemantics.add(semanticCallKey);
+        epoch.historicalResponseSemanticsByRoot.set(messageRoot, rootSemantics);
+        const messageIdentity = getSubmittedMessageRootIdentity(messageRoot);
+        if (!epoch.historicalResponseIdentity && messageIdentity) {
+          epoch.historicalResponseIdentity = messageIdentity;
+        }
+        if (messageIdentity && epoch.historicalResponseIdentity === messageIdentity) {
+          epoch.historicalResponseSemantics.add(semanticCallKey);
+        }
+      }
     }
   } catch (_unused) {
     // A partially rendered host DOM is expected while generation begins.
@@ -3047,7 +3450,13 @@ function markLiveGeneratedHelperCandidates(records = []) {
       continue;
     }
     const semanticCallKey = buildSemanticCallKey(candidate.call);
-    if (assistantGenerationEpoch?.historicalSemantics?.get(renderRoot)?.has(semanticCallKey) ||
+    if (isAssistantGenerationHistoricalCandidate(
+          assistantGenerationEpoch,
+          candidate,
+          renderRoot,
+          messageRoot,
+          semanticCallKey
+        ) ||
         knownRenderedHelperSemantics.get(renderRoot)?.has(semanticCallKey)) {
       // The same complete helper already existed before this generation batch.
       // Its epoch-start ownership survives a temporary empty redraw across
@@ -3064,6 +3473,97 @@ function markLiveGeneratedHelperCandidates(records = []) {
     // evidence and therefore keep the durable baseline marker.
     clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
   }
+}
+
+function isAssistantGenerationHistoricalCandidate(
+  epoch,
+  candidate,
+  renderRoot = getCandidateRenderRoot(candidate),
+  messageRoot = getChatGptMessageRoot(renderRoot, "assistant"),
+  semanticCallKey = buildSemanticCallKey(candidate.call)
+) {
+  if (epoch?.historicalSemantics?.get(renderRoot)?.has(semanticCallKey) === true) {
+    return true;
+  }
+  if (location.hostname !== "chatgpt.com" || !(messageRoot instanceof Element)) {
+    return false;
+  }
+  if (epoch?.historicalResponseSemanticsByRoot?.get(messageRoot)?.has(semanticCallKey) === true) {
+    return true;
+  }
+  const messageIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  return Boolean(messageIdentity) &&
+    Boolean(epoch?.historicalResponseIdentity) &&
+    messageIdentity === epoch.historicalResponseIdentity &&
+    epoch.historicalResponseSemantics?.has(semanticCallKey) === true;
+}
+
+function isChatGptCurrentLifecycleCompletedHelperCandidate(candidate) {
+  return getChatGptCurrentLifecycleCompletedHelperCandidateReason(candidate) === "eligible";
+}
+
+function getChatGptCurrentLifecycleCompletedHelperCandidateReason(candidate) {
+  if (location.hostname !== "chatgpt.com") {
+    return "other-host";
+  }
+  if (assistantGenerationObservedForLifecycle !== true) {
+    return "no-generation";
+  }
+  if (Date.now() > assistantGenerationEvidenceUntil) {
+    return "evidence-expired";
+  }
+  const epoch = assistantGenerationEpoch;
+  if (!epoch) {
+    return "missing-generation-epoch";
+  }
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getChatGptMessageRoot(renderRoot, "assistant");
+  const assistantContent = renderRoot?.matches?.('[data-assistant-markdown]') === true
+    ? renderRoot
+    : renderRoot?.closest?.('[data-assistant-markdown]');
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(assistantContent instanceof Element) ||
+      getChatGptMessageRoot(assistantContent, "assistant") !== messageRoot ||
+      getMessageAuthorRole(messageRoot) !== "assistant") {
+    return "untrusted-assistant-content";
+  }
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  if (!(userRoot instanceof Element) ||
+      epoch.userAnchor !== userRoot ||
+      userIndex < 0 ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1) {
+    return "not-latest-assistant-turn";
+  }
+  const semanticCallKey = buildSemanticCallKey(candidate.call);
+  return isAssistantGenerationHistoricalCandidate(
+    epoch,
+    candidate,
+    renderRoot,
+    messageRoot,
+    semanticCallKey
+  )
+    ? "known-before-generation"
+    : "eligible";
+}
+
+function markCurrentLifecycleCompletedHelperCandidate(candidate) {
+  if (!isChatGptCurrentLifecycleCompletedHelperCandidate(candidate)) {
+    return false;
+  }
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const semanticCallKey = buildSemanticCallKey(candidate.call);
+  const keys = liveGeneratedRenderedHelpers.get(renderRoot) || new Set();
+  keys.add(buildRenderedHelperKey(candidate, semanticCallKey));
+  liveGeneratedRenderedHelpers.set(renderRoot, keys);
+  clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
+  return true;
 }
 
 function trackAssistantGenerationHelperRoots(records = []) {
@@ -3196,6 +3696,94 @@ function getLatestManualActionKind(allCandidates, runnableCandidate, skillCandid
     return skillCandidate && skillCandidate === skillBoundaryCandidate ? "skill" : "";
   }
   return "force";
+}
+
+function setPanelDetectedManualHelper(allCandidates, runnableCandidate, skillCandidate) {
+  const kind = getLatestManualActionKind(
+    allCandidates,
+    runnableCandidate,
+    skillCandidate,
+    skillCandidate
+  );
+  const candidate = kind === "skill"
+    ? skillCandidate
+    : kind === "force"
+      ? runnableCandidate
+      : null;
+  const detectedKey = candidate
+    ? `${pageLifecycleGeneration}:${kind}:${buildSemanticCallKey(candidate.call)}`
+    : "";
+
+  panelForceRunAvailable = Boolean(candidate);
+  panelLatestManualActionKind = kind;
+  if (detectedKey !== panelDetectedManualHelperKey) {
+    resetPanelForceRunIdleState();
+    panelDetectedManualHelperKey = detectedKey;
+  }
+  updateContextualPanelActions();
+}
+
+function resetPanelForceRunIdleState(options = {}) {
+  if (panelForceRunIdleTimer) {
+    window.clearTimeout(panelForceRunIdleTimer);
+    panelForceRunIdleTimer = 0;
+  }
+  panelForceRunIdleAccumulatedMs = 0;
+  panelForceRunIdleStartedAt = 0;
+  panelForceRunIdleReady = false;
+  if (options.clearCandidate === true) {
+    panelDetectedManualHelperKey = "";
+  }
+}
+
+function isPanelForceRunExecutionActive() {
+  return Boolean(activeCallId) || skillHelperInFlight || skillRecoveryInFlight ||
+    forceRunInFlight || panelShellHelperActive;
+}
+
+function isPanelForceRunDispatchBusy() {
+  return isPanelForceRunExecutionActive() || pendingForceRunRequested;
+}
+
+function refreshPanelForceRunIdleClock(now = Date.now()) {
+  if (panelForceRunIdleTimer) {
+    window.clearTimeout(panelForceRunIdleTimer);
+    panelForceRunIdleTimer = 0;
+  }
+  if (!panelForceRunAvailable || !panelDetectedManualHelperKey) {
+    panelForceRunIdleAccumulatedMs = 0;
+    panelForceRunIdleStartedAt = 0;
+    panelForceRunIdleReady = false;
+    return false;
+  }
+  if (panelForceRunIdleReady) {
+    return true;
+  }
+  if (isPanelForceRunExecutionActive()) {
+    if (panelForceRunIdleStartedAt > 0) {
+      panelForceRunIdleAccumulatedMs = Math.min(
+        FORCE_RUN_IDLE_TIMEOUT_MS,
+        panelForceRunIdleAccumulatedMs + Math.max(0, now - panelForceRunIdleStartedAt)
+      );
+      panelForceRunIdleStartedAt = 0;
+    }
+    return false;
+  }
+  if (panelForceRunIdleStartedAt <= 0) {
+    panelForceRunIdleStartedAt = now;
+  }
+  const elapsed = panelForceRunIdleAccumulatedMs + Math.max(0, now - panelForceRunIdleStartedAt);
+  if (elapsed >= FORCE_RUN_IDLE_TIMEOUT_MS) {
+    panelForceRunIdleAccumulatedMs = FORCE_RUN_IDLE_TIMEOUT_MS;
+    panelForceRunIdleStartedAt = 0;
+    panelForceRunIdleReady = true;
+    return true;
+  }
+  panelForceRunIdleTimer = window.setTimeout(() => {
+    panelForceRunIdleTimer = 0;
+    updateContextualPanelActions();
+  }, Math.max(1, FORCE_RUN_IDLE_TIMEOUT_MS - elapsed));
+  return false;
 }
 
 function getLastEligibleSkillCandidate(allCandidates, root = null) {
@@ -3356,7 +3944,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
   const baselineRecovery = baselineIgnored && (
     options.allowBaselineRecovery === true || ownedSyncRecovery
   );
-  if ((handledReason || baselineIgnored) && !baselineRecovery) {
+  const forcedDetectedRecovery = options.forceDetected === true;
+  if ((handledReason || baselineIgnored) && !baselineRecovery && !forcedDetectedRecovery) {
     return false;
   }
   if (getMessageAuthorRole(candidate.node) === "user" || isM365SubmittedUserMessageNode(candidate.node)) {
@@ -4025,6 +4614,7 @@ function getBoundShellRoots(root) {
 function getTextScanRoots(root) {
   const selector = [
     '[data-message-author-role="assistant"]',
+    '[data-assistant-markdown]',
     "article",
     '[role="article"]',
     ".fai-AssistantMessage__content",
@@ -4039,6 +4629,18 @@ function getTextScanRoots(root) {
 
   const nodes = Array.from(root.querySelectorAll(selector))
     .filter((node) => {
+      const chatGptMessageRoot = getChatGptMessageRoot(node);
+      if (chatGptMessageRoot) {
+        const assistantContent = node?.closest?.('[data-assistant-markdown]');
+        if (getMessageAuthorRole(chatGptMessageRoot) !== "assistant" ||
+            !assistantContent ||
+            getChatGptMessageRoot(assistantContent) !== chatGptMessageRoot) {
+          // The lightweight ChatGPT turn may also contain sponsored or other
+          // host-owned UI. Only the exact assistant markdown subtree is
+          // authored model content; never scan sibling cards as helpers.
+          return false;
+        }
+      }
       const text = node.innerText || node.textContent || "";
       const maxChars = text.toLowerCase().includes(HELPER_DRAWIO_START)
         ? DRAWIO_HELPER_MAX_SCAN_CHARS
@@ -4069,6 +4671,10 @@ function containsToolLanguageHint(text) {
 }
 
 function closestMessageContainer(node) {
+  const chatGptRoot = getChatGptMessageRoot(node);
+  if (chatGptRoot) {
+    return chatGptRoot;
+  }
   return node.closest('[data-message-author-role], article, [role="article"], [data-testid], section, main > div') || node;
 }
 
@@ -4089,6 +4695,18 @@ function getMessageAuthorRole(node) {
   // skipped, so the heuristic has been removed. When `data-message-author-role`
   // / `data-author-role` are absent we report an unknown role and let the
   // caller decide.
+  if (location.hostname === "chatgpt.com") {
+    const chatGptRoot = getChatGptMessageRoot(node);
+    const chatGptRole = String(
+      chatGptRoot?.getAttribute?.("data-message-role") || ""
+    ).toLowerCase();
+    if (chatGptRole === "assistant" || chatGptRole === "user") {
+      // The canonical ChatGPT turn owns every descendant. A legacy role
+      // attribute or a nested fake message root inside its authored body must
+      // never override the outer turn's role.
+      return chatGptRole;
+    }
+  }
   const explicit = node?.closest?.('[data-message-author-role]')?.getAttribute?.("data-message-author-role") ||
     node?.closest?.('[data-author-role]')?.getAttribute?.("data-author-role") ||
     "";
@@ -4767,10 +5385,16 @@ function resetChainForNewHumanPrompt() {
 
 function getLastUserMessageText() {
   const explicit = Array.from(document.querySelectorAll(
-    '[data-message-author-role="user"], [data-author-role="user"], .fai-UserMessage[role="article"]'
+    '[data-message-author-role="user"], [data-author-role="user"], li[data-message-role="user"], .fai-UserMessage[role="article"]'
   )).filter(isSubmittedUserMessageNode);
   if (explicit.length > 0) {
     const last = explicit[explicit.length - 1];
+    if (isChatGptSubmittedUserMessageNode(last)) {
+      const copyRoot = getChatGptUserCopyRoot(last);
+      if (copyRoot) {
+        return normalizeCommand(copyRoot.innerText || copyRoot.textContent || "");
+      }
+    }
     return normalizeCommand(last.innerText || last.textContent || "");
   }
 
@@ -8039,7 +8663,7 @@ function getSubmittedMessageRootsMatching(text) {
     return [];
   }
   return Array.from(document.querySelectorAll(
-    '[data-message-author-role="user"], [data-author-role="user"], .fai-UserMessage[role="article"]'
+    '[data-message-author-role="user"], [data-author-role="user"], li[data-message-role="user"], .fai-UserMessage[role="article"]'
   ))
     .filter(isSubmittedUserMessageNode)
     .filter((node) => submittedUserMessageRootMatches(node, expected));
@@ -8057,6 +8681,9 @@ function submittedUserMessageRootMatches(node, text) {
     .filter(Boolean);
   if (isM365SubmittedUserMessageNode(node)) {
     return rawCandidates.some((candidate) => m365SubmittedMessageTextMatches(candidate, expected));
+  }
+  if (isChatGptSubmittedUserMessageNode(node)) {
+    return chatGptSubmittedMessageRootMatches(node, expected);
   }
   const candidates = rawCandidates
     .map((value) => normalizeCommand(value || ""))
@@ -8158,7 +8785,86 @@ function isSubmittedUserMessageNode(node) {
   if (dataRole === "user") {
     return true;
   }
-  return isM365SubmittedUserMessageNode(node);
+  return isM365SubmittedUserMessageNode(node) || isChatGptSubmittedUserMessageNode(node);
+}
+
+function isChatGptSubmittedUserMessageNode(node) {
+  return getChatGptMessageRoot(node, "user") instanceof Element;
+}
+
+function chatGptSubmittedMessageRootMatches(node, expectedText) {
+  const expected = normalizeCommand(expectedText);
+  if (!expected || !isChatGptSubmittedUserMessageNode(node)) {
+    return false;
+  }
+  const root = getChatGptMessageRoot(node, "user");
+  const copyRoot = getChatGptUserCopyRoot(root);
+  if (!copyRoot) {
+    // The current lightweight ChatGPT UI exposes one exact copy surface for
+    // the authored user payload. Do not fall back to the whole turn: it also
+    // contains the host-owned "You said:" heading and may gain unrelated UI.
+    return false;
+  }
+  const comparableExpected = normalizeComposerOwnershipText(expected);
+  return [copyRoot.innerText, copyRoot.textContent]
+    .map((value) => normalizeCommand(String(value || "").replace(/\r\n?/g, "\n")))
+    .filter(Boolean)
+    .some((candidate) => normalizeComposerOwnershipText(candidate) === comparableExpected);
+}
+
+function getChatGptUserCopyRoot(node) {
+  const root = getChatGptMessageRoot(node, "user");
+  if (!root) {
+    return null;
+  }
+  const copyRoots = Array.from(root.querySelectorAll?.('[data-user-message-copy]') || [])
+    .filter((copyRoot) => getNearestChatGptMessageRoleRoot(copyRoot) === root);
+  return copyRoots.length === 1 ? copyRoots[0] : null;
+}
+
+function getChatGptAssistantContentRoot(node) {
+  const root = getChatGptMessageRoot(node, "assistant");
+  if (!root) {
+    return null;
+  }
+  const contentRoots = Array.from(root.querySelectorAll?.('[data-assistant-markdown]') || [])
+    .filter((contentRoot) => getNearestChatGptMessageRoleRoot(contentRoot) === root);
+  return contentRoots.length === 1 ? contentRoots[0] : null;
+}
+
+function getNearestChatGptMessageRoleRoot(node) {
+  if (location.hostname !== "chatgpt.com" || !node) {
+    return null;
+  }
+  const selector = 'li[data-message-role="user"], li[data-message-role="assistant"]';
+  const root = node?.matches?.(selector) === true
+    ? node
+    : node?.closest?.(selector);
+  return root instanceof Element ? root : null;
+}
+
+function getChatGptMessageRoot(node, expectedRole = "") {
+  if (location.hostname !== "chatgpt.com" || !node) {
+    return null;
+  }
+  const selector = 'li[data-message-role="user"], li[data-message-role="assistant"]';
+  let root = getNearestChatGptMessageRoleRoot(node);
+  if (!(root instanceof Element)) {
+    return null;
+  }
+  // ChatGPT turns are siblings. If authored content includes message-looking
+  // markup, the outermost role root is the real host turn and owns every
+  // descendant; nested roots have no authority of their own.
+  for (let ancestor = root.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor.matches?.(selector) === true) {
+      root = ancestor;
+    }
+  }
+  const role = String(root.getAttribute?.("data-message-role") || "").toLowerCase();
+  if ((expectedRole === "user" || expectedRole === "assistant") && role !== expectedRole) {
+    return null;
+  }
+  return role === "user" || role === "assistant" ? root : null;
 }
 
 function isM365SubmittedUserMessageNode(node) {
@@ -8675,6 +9381,11 @@ function injectStatus() {
 
   const setupSection = createPanelSection("Setup & recovery", "setup-recovery");
   setupSection.body.appendChild(createPanelButtonGrid([
+    {
+      mode: "force",
+      label: "Force run",
+      title: "Force process the latest detected executable or Skill helper"
+    },
     { mode: "check", label: "Server Check" },
     { mode: "test", label: "Test" },
     { mode: "site", label: "Enable site" },
@@ -8804,7 +9515,7 @@ function injectStatus() {
     }
     event.preventDefault();
     event.stopPropagation();
-    handlePanelAction(button.dataset.shellToolAction);
+    handlePanelAction(button.dataset.shellToolAction, event);
   }, true);
 
   panel.addEventListener("change", (event) => {
@@ -9155,10 +9866,45 @@ function showSkillCatalogDialog(response = {}, options = {}) {
     const name = document.createElement("strong");
     name.textContent = String(skill.name || skill.id || "(unnamed)");
     name.style.cssText = "min-width:0;flex:1";
-    const action = document.createElement(skill.installed === true ? "span" : "button");
+    const canUninstall = skill.installed === true && skill.uninstallAvailable === true;
+    const action = document.createElement(skill.installed === true && !canUninstall ? "span" : "button");
     action.dataset.skillInstallAction = skillId;
     action.style.cssText = "flex:0 0 auto;min-width:84px;border:1px solid #64748b;border-radius:7px;padding:5px 9px;text-align:center;font-size:12px";
-    if (skill.installed === true) {
+    if (skillUninstallInFlight.has(skillId)) {
+      action.type = "button";
+      action.textContent = "Uninstalling…";
+      action.disabled = true;
+      action.setAttribute("aria-busy", "true");
+      action.setAttribute("aria-label", `Uninstalling ${skillLabel}`);
+      action.style.background = "#334155";
+      action.style.color = "#cbd5e1";
+    } else if (canUninstall) {
+      action.type = "button";
+      const retrying = skillInstallErrors.has(skillId);
+      action.textContent = retrying ? "Retry uninstall" : "Uninstall";
+      action.dataset.skillUninstall = skillId;
+      action.disabled = response.ok !== true;
+      action.setAttribute(
+        "aria-label",
+        response.ok === true
+          ? `${retrying ? "Retry uninstalling" : "Uninstall"} ${skillLabel}`
+          : `Uninstall unavailable for ${skillLabel} because the catalog is invalid`
+      );
+      action.style.background = response.ok === true ? "#7f1d1d" : "#334155";
+      action.style.color = response.ok === true ? "#fee2e2" : "#94a3b8";
+      action.style.cursor = response.ok === true ? "pointer" : "default";
+      if (response.ok === true) {
+        action.addEventListener("click", (event) => {
+          requestSkillUninstallFromPanel(event, skill, response.catalogSha, dialogContext).catch((error) => {
+            const message = summarizeCommand(error.message || String(error));
+            skillInstallErrors.set(skillId, message);
+            if (isCurrentSkillCatalogDialog(dialogContext)) {
+              updateSkillUninstallRowLocally(action, skill, { error: message });
+            }
+          });
+        });
+      }
+    } else if (skill.installed === true) {
       action.textContent = "✓ Installed";
       action.setAttribute("role", "status");
       action.setAttribute("aria-label", `${skillLabel} is installed`);
@@ -9232,6 +9978,11 @@ function showSkillCatalogDialog(response = {}, options = {}) {
       noInstallerDetail.textContent = "Installation unavailable: add a real, safe install.sh beside this SKILL.md.";
       noInstallerDetail.style.cssText = "margin-top:7px;color:#cbd5e1;font-size:12px;line-height:1.35";
       item.appendChild(noInstallerDetail);
+    } else if (skill.installed === true && skill.uninstallAvailable !== true) {
+      const noUninstallerDetail = document.createElement("div");
+      noUninstallerDetail.textContent = "Uninstallation unavailable: add a real, safe uninstall.sh beside this SKILL.md.";
+      noUninstallerDetail.style.cssText = "margin-top:7px;color:#cbd5e1;font-size:12px;line-height:1.35";
+      item.appendChild(noUninstallerDetail);
     }
     dialog.appendChild(item);
   }
@@ -9289,6 +10040,21 @@ async function requestSkillInstallFromPanel(event, skill, catalogSha, dialogCont
   return installSkillFromPanel(skill, catalogSha, dialogContext);
 }
 
+async function requestSkillUninstallFromPanel(event, skill, catalogSha, dialogContext) {
+  if (event?.isTrusted !== true || !isCurrentSkillCatalogDialog(dialogContext)) {
+    return false;
+  }
+  const skillId = String(skill?.id || "");
+  const skillName = String(skill?.name || skillId || "Skill");
+  if (!skillId || skillUninstallInFlight.has(skillId)) {
+    return false;
+  }
+  if (!window.confirm(`Uninstall local Skill "${skillName}" (id: ${skillId}) by running its uninstall.sh?`)) {
+    return false;
+  }
+  return uninstallSkillFromPanel(skill, catalogSha, dialogContext);
+}
+
 function updateSkillInstallRowLocally(action, skill, { installed = false, error = "", refreshPending = false } = {}) {
   if (!action?.isConnected) {
     return;
@@ -9328,6 +10094,50 @@ function updateSkillInstallRowLocally(action, skill, { installed = false, error 
   if (feedback) {
     feedback.hidden = false;
     feedback.textContent = error || "Skill installation failed.";
+    feedback.setAttribute("role", "alert");
+    feedback.style.color = "#fecdd3";
+  }
+}
+
+function updateSkillUninstallRowLocally(action, skill, { uninstalled = false, error = "", refreshPending = false } = {}) {
+  if (!action?.isConnected) {
+    return;
+  }
+  const skillId = String(skill?.id || "");
+  const skillLabel = String(skill?.name || skillId || "Skill");
+  action.removeAttribute?.("aria-busy");
+  const item = action.closest?.(`[data-skill-id="${skillId}"]`);
+  const feedback = item?.querySelector?.(`[data-skill-install-feedback="${skillId}"]`);
+  if (uninstalled) {
+    action.disabled = true;
+    action.textContent = "Uninstalled";
+    action.removeAttribute?.("data-skill-uninstall");
+    action.setAttribute("aria-label", `${skillLabel} is uninstalled${refreshPending ? "; catalog refresh pending" : ""}`);
+    action.style.background = "#334155";
+    action.style.borderColor = "#64748b";
+    action.style.color = "#cbd5e1";
+    action.style.cursor = "default";
+    if (feedback) {
+      feedback.hidden = false;
+      feedback.textContent = refreshPending
+        ? "Uninstalled successfully. The catalog refresh is temporarily unavailable; reopen Skills to refresh."
+        : "Uninstalled successfully. Refreshing the local catalog…";
+      feedback.setAttribute("role", "status");
+      feedback.style.color = "#d1fae5";
+    }
+    return;
+  }
+  action.disabled = false;
+  action.textContent = "Retry uninstall";
+  action.dataset.skillUninstall = skillId;
+  action.setAttribute("aria-label", `Retry uninstalling ${skillLabel}`);
+  action.style.background = "#7f1d1d";
+  action.style.borderColor = "#64748b";
+  action.style.color = "#fee2e2";
+  action.style.cursor = "pointer";
+  if (feedback) {
+    feedback.hidden = false;
+    feedback.textContent = error || "Skill uninstallation failed.";
     feedback.setAttribute("role", "alert");
     feedback.style.color = "#fecdd3";
   }
@@ -9413,15 +10223,90 @@ async function installSkillFromPanel(skill, catalogSha, dialogContext = null) {
   }
 }
 
+async function uninstallSkillFromPanel(skill, catalogSha, dialogContext = null) {
+  const skillId = String(skill?.id || "");
+  if (!skillId || skillUninstallInFlight.has(skillId)) {
+    return false;
+  }
+  skillUninstallInFlight.add(skillId);
+  skillInstallErrors.delete(skillId);
+  const currentButton = document.querySelector(`#${SKILL_CATALOG_DIALOG_ID} [data-skill-uninstall="${skillId}"]`);
+  if (currentButton) {
+    currentButton.disabled = true;
+    currentButton.textContent = "Uninstalling…";
+    currentButton.setAttribute("aria-busy", "true");
+    currentButton.setAttribute("aria-label", `Uninstalling ${String(skill?.name || skillId || "Skill")}`);
+  }
+  let uninstalled = false;
+  let uninstallError = "";
+  let uninstallFailureToken = "";
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "skill-uninstall",
+      skillId,
+      skillName: String(skill?.name || skillId || "Skill"),
+      skillSha: String(skill?.sha || ""),
+      uninstallSha: String(skill?.uninstallSha || ""),
+      catalogSha: String(catalogSha || "")
+    });
+    if (response?.ok !== true) {
+      uninstallError = summarizeCommand(response?.error || "Skill uninstallation failed.");
+      uninstallFailureToken = String(response?.installFailureToken || "");
+      skillInstallErrors.set(skillId, uninstallError);
+      updateSkillUninstallRowLocally(currentButton, skill, { error: uninstallError });
+      setStatus(`Skill ${skillId} uninstall failed: ${uninstallError}`, "error");
+      return false;
+    }
+    uninstalled = true;
+    skillInstallErrors.delete(skillId);
+    updateSkillUninstallRowLocally(currentButton, skill, { uninstalled: true });
+    await refreshSkillState({ quiet: true }).catch(() => null);
+    setStatus(`Uninstalled Skill ${skillId}; synchronize Skills v${Number(response.version || skillPanelState?.version || 0)} when ready`, "ok");
+    return true;
+  } catch (error) {
+    uninstallError = summarizeCommand(error?.message || String(error) || "Skill uninstallation transport failed.");
+    skillInstallErrors.set(skillId, uninstallError);
+    updateSkillUninstallRowLocally(currentButton, skill, { error: uninstallError });
+    setStatus(`Skill ${skillId} uninstall failed: ${uninstallError}`, "error");
+    return false;
+  } finally {
+    skillUninstallInFlight.delete(skillId);
+    if (isCurrentSkillCatalogDialog(dialogContext)) {
+      const latest = await chrome.runtime.sendMessage({ type: "skill-management-list" }).catch(() => null);
+      if (isCurrentSkillCatalogDialog(dialogContext)) {
+        if (latest) {
+          showSkillCatalogDialog(latest, { focusSkillId: skillId });
+        } else {
+          updateSkillUninstallRowLocally(currentButton, skill, uninstalled
+            ? { uninstalled: true, refreshPending: true }
+            : { error: uninstallError || "Skill uninstallation failed and the catalog could not be refreshed." });
+        }
+      }
+    }
+    const samePageLifecycle = extensionActive && (
+      !dialogContext || dialogContext.pageGeneration === pageLifecycleGeneration
+    );
+    if (uninstallFailureToken && samePageLifecycle) {
+      const popup = await chrome.runtime.sendMessage({
+        type: "skill-install-failure-show",
+        token: uninstallFailureToken
+      }).catch(() => null);
+      if (popup?.ok !== true) {
+        setStatus(`Skill ${skillId} uninstall failed; local error details could not be opened`, "error");
+      }
+    } else if (uninstallFailureToken) {
+      await chrome.runtime.sendMessage({
+        type: "skill-install-failure-discard",
+        token: uninstallFailureToken
+      }).catch(() => null);
+    }
+  }
+}
+
 function firstSkillUiError(response) {
   return Array.isArray(response?.errors) && response.errors.length > 0
     ? String(response.errors[0]?.message || response.errors[0] || "")
     : "";
-}
-
-function setPanelForceRunAvailable(available) {
-  panelForceRunAvailable = available === true;
-  updateContextualPanelActions();
 }
 
 function setPanelSkillHelperActionable(available) {
@@ -9440,8 +10325,9 @@ function updateContextualPanelActions() {
   const skillRecovery = actions.querySelector('[data-shell-tool-action="skill-recovery"]');
   const stop = actions.querySelector('[data-shell-tool-action="stop-helper"]');
   const more = actions.querySelector('[data-shell-tool-action="more"]');
-  const backendBusy = Boolean(activeCallId) || skillHelperInFlight || skillRecoveryInFlight ||
-    pendingForceRunRequested || forceRunInFlight;
+  const advancedForce = document.getElementById(ADVANCED_CONTROLS_ID)
+    ?.querySelector?.('[data-shell-tool-action="force"]');
+  const backendBusy = isPanelForceRunDispatchBusy();
   const deliveryBusy = pendingHelperDeliveries.size > 0;
   const agentComposerBusy = Boolean(
     pendingAgentDelivery &&
@@ -9449,22 +10335,38 @@ function updateContextualPanelActions() {
     pendingAgentDelivery.cancelled !== true
   );
   const assistantBusy = isAssistantGenerating();
+  const idleForceReady = refreshPanelForceRunIdleClock();
   const showCheck = !backendBusy && !panelShellHelperActive && panel.dataset.state === "error";
-  const showForce = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&
-    !panelShellHelperActive && panelForceRunAvailable && panelLatestManualActionKind === "force";
+  const showForce = !backendBusy && panelForceRunAvailable && idleForceReady;
   const showSkillRecovery = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&
-    !panelShellHelperActive && panelSkillHelperActionable && panelLatestManualActionKind === "skill";
+    !panelShellHelperActive && !idleForceReady && panelSkillHelperActionable &&
+    panelLatestManualActionKind === "skill";
   if (check) {
     check.hidden = !showCheck;
   }
   if (force) {
     force.hidden = !showForce;
+    force.disabled = backendBusy || !panelForceRunAvailable;
+    force.title = panelLatestManualActionKind === "skill"
+      ? "Force process the latest detected Skill helper"
+      : "Force run the latest detected executable helper (bypass the server dedup ledger)";
   }
   if (skillRecovery) {
     skillRecovery.hidden = !showSkillRecovery;
   }
   if (stop) {
     stop.hidden = !panelShellHelperActive || Boolean(activeShellRunNotice);
+  }
+  if (advancedForce) {
+    advancedForce.hidden = false;
+    advancedForce.disabled = backendBusy || !panelForceRunAvailable;
+    advancedForce.title = backendBusy
+      ? "Force run is unavailable while a helper operation is running"
+      : panelForceRunAvailable
+        ? panelLatestManualActionKind === "skill"
+          ? "Force process the latest detected Skill helper"
+          : "Force run the latest detected executable helper (bypass the server dedup ledger)"
+        : "No executable or Skill helper is currently detected";
   }
   const visibleActions = [check, force, skillRecovery, stop, more].filter((button) => button && !button.hidden);
   actions.style.gridTemplateColumns = visibleActions
@@ -9855,12 +10757,15 @@ function updateVersionTooltip(background) {
 }
 
 function setForceButtonHighlight(highlight) {
-  const button = document.querySelector(`#${STATUS_ID} [data-shell-tool-action="force"]`);
-  if (!(button instanceof HTMLElement)) {
-    return;
+  for (const button of document.querySelectorAll(
+    `#${STATUS_ID} [data-shell-tool-action="force"]`
+  )) {
+    if (!(button instanceof HTMLElement)) {
+      continue;
+    }
+    button.style.background = highlight ? "#b45309" : "#78350f";
+    button.style.color = "#fde68a";
   }
-  button.style.background = highlight ? "#b45309" : "#78350f";
-  button.style.color = "#fde68a";
 }
 
 function rememberSuppressedCallStatus(status) {
@@ -9895,6 +10800,9 @@ function updateDetectedHelperDebug(candidate, allCandidates) {
   const lifecycleSummary = `scanGate: baseline=${initialThreadSettled ? "settled" : "pending"}` +
     ` generationObserved=${assistantGenerationObservedForLifecycle ? "yes" : "no"}` +
     ` skillLive=${latestSkillCandidate && isLiveGeneratedHelperCandidate(latestSkillCandidate) ? "yes" : "no"}` +
+    ` chatGptLifecycle=${latestSkillCandidate
+      ? getChatGptCurrentLifecycleCompletedHelperCandidateReason(latestSkillCandidate)
+      : "none"}` +
     ` skillSyncRecovery=${ownedSyncRecoverySummary}` +
     ` skillInFlight=${skillHelperInFlight ? "yes" : "no"}` +
     ` skillAction=${panelSkillHelperActionable ? "available" : "none"}`;
@@ -9978,7 +10886,7 @@ function isSuppressionStatusText(text) {
     message.startsWith("Server confirmed duplicate board command");
 }
 
-function handlePanelAction(action) {
+function handlePanelAction(action, event = null) {
   if (action === "more") {
     toggleAdvancedPanel();
     return;
@@ -10029,6 +10937,10 @@ function handlePanelAction(action) {
   }
 
   if (action === "skill-recovery") {
+    if (event?.isTrusted !== true) {
+      setStatus("Process Skill requires a trusted user click", "idle");
+      return;
+    }
     processLatestSkillRecovery().catch((error) => {
       setStatus(`Skill recovery failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
@@ -10071,7 +10983,11 @@ function handlePanelAction(action) {
   }
 
   if (action === "force") {
-    forceRunLatestShellCall().catch((error) => {
+    if (event?.isTrusted !== true) {
+      setStatus("Force run requires a trusted user click", "idle");
+      return;
+    }
+    forceRunLatestDetectedHelper().catch((error) => {
       setStatus(`Force run failed: ${summarizeCommand(error.message || String(error))}`, "error");
     });
     return;
@@ -10440,29 +11356,49 @@ async function registerTmuxAiSlaveFromPanel() {
   return response;
 }
 
+async function forceRunLatestDetectedHelper() {
+  if (isPanelForceRunDispatchBusy() || refreshPageLifecycle()) {
+    return false;
+  }
+  const thread = getConversationRoot();
+  const allCandidates = extractShellCallCandidates(thread);
+  const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
+  const skillCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
+  const actionKind = getLatestManualActionKind(
+    allCandidates,
+    runnableCandidate,
+    skillCandidate,
+    skillCandidate
+  );
+  if (actionKind === "skill") {
+    return processLatestSkillRecovery({ forceDetected: true });
+  }
+  if (actionKind === "force") {
+    return forceRunLatestShellCall();
+  }
+  setStatus("No executable or Skill helper is currently detected", "idle");
+  return false;
+}
+
 async function forceRunLatestShellCall() {
-  if (Boolean(activeCallId) || pendingForceRunRequested || forceRunInFlight ||
-      skillHelperInFlight || skillRecoveryInFlight ||
-      pendingHelperDeliveries.size > 0 || hasPendingAgentComposerDelivery() ||
-      panelShellHelperActive || isAssistantGenerating()) {
-    return;
+  if (isPanelForceRunDispatchBusy()) {
+    return false;
   }
   if (refreshPageLifecycle()) {
-    return;
+    return false;
   }
   const thread = getConversationRoot();
   const allCandidates = extractShellCallCandidates(thread);
   const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
   const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
-  const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
   if (!runnableCandidate || getLatestManualActionKind(
     allCandidates,
     runnableCandidate,
-    actionableSkillCandidate,
+    skillBoundaryCandidate,
     skillBoundaryCandidate
   ) !== "force") {
     setStatus("Force run cancelled because the latest helper is not executable", "idle");
-    return;
+    return false;
   }
   const forceCandidateSnapshot = createRenderedHelperCandidateSnapshot(runnableCandidate);
   forceRunInFlight = true;
@@ -10475,6 +11411,7 @@ async function forceRunLatestShellCall() {
     if (!pendingForceRunRequested) {
       setForceButtonHighlight(false);
     }
+    return true;
   } finally {
     forceRunInFlight = false;
     updateContextualPanelActions();
@@ -10490,14 +11427,18 @@ function hasPendingAgentComposerDelivery() {
 }
 
 function isSkillRecoveryBlocked(options = {}) {
-  return (options.ignoreRecovery !== true && skillRecoveryInFlight) ||
+  const operationBusy = (options.ignoreRecovery !== true && skillRecoveryInFlight) ||
     skillHelperInFlight ||
     Boolean(activeCallId) ||
-    pendingHelperDeliveries.size > 0 ||
-    hasPendingAgentComposerDelivery() ||
     panelShellHelperActive ||
     pendingForceRunRequested ||
-    forceRunInFlight ||
+    forceRunInFlight;
+  if (options.explicitForce === true) {
+    return operationBusy;
+  }
+  return operationBusy ||
+    pendingHelperDeliveries.size > 0 ||
+    hasPendingAgentComposerDelivery() ||
     isAssistantGenerating();
 }
 
@@ -10526,6 +11467,13 @@ function isRenderedHelperCandidateSnapshotCurrent(snapshot, candidate) {
     (candidate.blockIndex ?? candidate.index ?? "") === snapshot?.blockIndex;
 }
 
+function isSemanticHelperCandidateSnapshotCurrent(snapshot, candidate) {
+  return Boolean(candidate) &&
+    snapshot?.pageIdentity === getCurrentPageIdentity() &&
+    snapshot?.generation === pageLifecycleGeneration &&
+    snapshot?.semanticCallKey === buildSemanticCallKey(candidate.call);
+}
+
 function isForceRunCandidateSnapshotCurrent(snapshot) {
   if (!snapshot) {
     return false;
@@ -10539,14 +11487,13 @@ function isForceRunCandidateSnapshotCurrent(snapshot) {
   const allCandidates = extractShellCallCandidates(thread);
   const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
   const skillBoundaryCandidate = getLastEligibleSkillCandidate(allCandidates, thread);
-  const actionableSkillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
   return getLatestManualActionKind(
     allCandidates,
     runnableCandidate,
-    actionableSkillCandidate,
+    skillBoundaryCandidate,
     skillBoundaryCandidate
   ) === "force" &&
-    isRenderedHelperCandidateSnapshotCurrent(snapshot, runnableCandidate);
+    isSemanticHelperCandidateSnapshotCurrent(snapshot, runnableCandidate);
 }
 
 function createSkillRecoveryCandidateSnapshot(candidate) {
@@ -10557,16 +11504,24 @@ function isSkillRecoveryCandidateSnapshotCurrent(snapshot, candidate) {
   return isRenderedHelperCandidateSnapshotCurrent(snapshot, candidate);
 }
 
-async function processLatestSkillRecovery() {
-  if (refreshPageLifecycle() || isSkillRecoveryBlocked()) {
+async function processLatestSkillRecovery(options = {}) {
+  const forceDetected = options.forceDetected === true;
+  if (refreshPageLifecycle() || isSkillRecoveryBlocked({ explicitForce: forceDetected })) {
     return false;
   }
   const initialThread = getConversationRoot();
   const initialCandidates = extractShellCallCandidates(initialThread);
-  const initialSkillCandidate = getLastActionableSkillCandidate(initialCandidates, initialThread);
+  const initialSkillCandidate = forceDetected
+    ? getLastEligibleSkillCandidate(initialCandidates, initialThread)
+    : getLastActionableSkillCandidate(initialCandidates, initialThread);
   const initialRunnableCandidate = getLastForceEligibleRunnableCandidate(initialCandidates, initialThread);
   if (!initialSkillCandidate ||
-      getLatestManualActionKind(initialCandidates, initialRunnableCandidate, initialSkillCandidate) !== "skill") {
+      getLatestManualActionKind(
+        initialCandidates,
+        initialRunnableCandidate,
+        initialSkillCandidate,
+        initialSkillCandidate
+      ) !== "skill") {
     return false;
   }
   const candidateSnapshot = createSkillRecoveryCandidateSnapshot(initialSkillCandidate);
@@ -10579,12 +11534,12 @@ async function processLatestSkillRecovery() {
   try {
     await loadPendingHelperDeliveriesForCurrentPage();
     if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
-        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+        isSkillRecoveryBlocked({ ignoreRecovery: true, explicitForce: forceDetected })) {
       return false;
     }
     const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "maxChainCalls"]);
     if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
-        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+        isSkillRecoveryBlocked({ ignoreRecovery: true, explicitForce: forceDetected })) {
       return false;
     }
     if (settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
@@ -10592,19 +11547,32 @@ async function processLatestSkillRecovery() {
     }
     const thread = getConversationRoot();
     const allCandidates = extractShellCallCandidates(thread);
-    const skillCandidate = getLastActionableSkillCandidate(allCandidates, thread);
+    const skillCandidate = forceDetected
+      ? getLastEligibleSkillCandidate(allCandidates, thread)
+      : getLastActionableSkillCandidate(allCandidates, thread);
     const runnableCandidate = getLastForceEligibleRunnableCandidate(allCandidates, thread);
-    if (!isSkillRecoveryCandidateSnapshotCurrent(candidateSnapshot, skillCandidate) ||
-        getLatestManualActionKind(allCandidates, runnableCandidate, skillCandidate) !== "skill") {
+    const candidateIsCurrent = forceDetected
+      ? isSemanticHelperCandidateSnapshotCurrent(candidateSnapshot, skillCandidate)
+      : isSkillRecoveryCandidateSnapshotCurrent(candidateSnapshot, skillCandidate);
+    if (!candidateIsCurrent ||
+        getLatestManualActionKind(
+          allCandidates,
+          runnableCandidate,
+          skillCandidate,
+          skillCandidate
+        ) !== "skill") {
       setStatus("No recoverable Skill helper found on this page", "idle");
       return false;
     }
     if (!isPageLifecycleSnapshotCurrent(lifecycleSnapshot) ||
-        isSkillRecoveryBlocked({ ignoreRecovery: true })) {
+        isSkillRecoveryBlocked({ ignoreRecovery: true, explicitForce: forceDetected })) {
       return false;
     }
     setStatus("Processing the latest Skill helper once", "running");
-    return processLatestSkillCandidate(allCandidates, settings, { allowBaselineRecovery: true });
+    return processLatestSkillCandidate(allCandidates, settings, {
+      allowBaselineRecovery: true,
+      forceDetected
+    });
   } finally {
     skillRecoveryInFlight = false;
     updateContextualPanelActions();

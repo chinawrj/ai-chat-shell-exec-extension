@@ -7,6 +7,10 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { SkillCatalogService } = require(path.join(__dirname, "skill_catalog"));
+const {
+  buildShellEnvironmentExports,
+  loadExecutionEnvironment
+} = require(path.join(__dirname, "execution_env"));
 
 const HOST = "127.0.0.1";
 const PORT = 17371;
@@ -20,9 +24,9 @@ const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
 const COMMAND_ECHO_MAX_CHARS = 8000;
 const COMMAND_PREVIEW_CHARS = 512;
 const ROOT_DIR = path.join(__dirname, "..");
-const SERVER_PROTOCOL_VERSION = 11;
+const SERVER_PROTOCOL_VERSION = 12;
 const HELPER_PROTOCOL_VERSION = 4;
-const SKILL_PROTOCOL_VERSION = 4;
+const SKILL_PROTOCOL_VERSION = 5;
 const DEFAULT_STATE_DIR = getDefaultStateDir();
 const STATE_DIR = resolveStateDir(process.env.AI_CHAT_SHELL_STATE_DIR || DEFAULT_STATE_DIR);
 const TMUX_SCRIPT_DIR = path.join(STATE_DIR, "tmux-runs");
@@ -547,6 +551,15 @@ async function handleMessageText(text, context = {}) {
     }));
   }
 
+  if (message.type === "skill-uninstall") {
+    return handleSkillCatalogOperation("skill-uninstall", () => skillCatalogService.uninstall({
+      skillId: message.skillId,
+      skillSha: message.skillSha,
+      uninstallSha: message.uninstallSha,
+      catalogSha: message.catalogSha
+    }));
+  }
+
   if (message.type === "run-board") {
     return handleRunBoardMessage(message);
   }
@@ -611,12 +624,14 @@ async function handleMessageText(text, context = {}) {
         ledgerKey: reservation.ledgerKey
       });
       const cwd = resolveCwd(message.cwd, currentPane.currentPath);
+      const executionEnvironment = loadExecutionEnvironment({ env: process.env, cwd: ROOT_DIR });
       claim = adjudicateReservedServerShellCall(reservation.ledgerKey, {
         cmd,
         agentId: config.agentId || "",
         cwd,
         target: currentPane.id,
         executionTarget: buildTmuxPaneExecutionTarget(currentPane),
+        executionEnvSha: executionEnvironment.sha,
         timeoutMs,
         maxOutputChars,
         seq: message.seq,
@@ -655,7 +670,8 @@ async function handleMessageText(text, context = {}) {
         onProgress: typeof context.emit === "function" ? context.emit : null,
         executionId: claim.attemptId,
         callKey,
-        agentId: config.agentId || ""
+        agentId: config.agentId || "",
+        executionEnvironment
       });
       console.log(`[done] exitCode=${result.exitCode} durationMs=${Date.now() - started} timedOut=${result.timedOut}`);
 
@@ -2998,11 +3014,16 @@ function buildServerExecutionKey(payload = {}) {
   if (!executionTarget) {
     return "";
   }
-  return hashText([
+  const parts = [
     executionTarget,
     String(payload.cmd || "").trim(),
     String(payload.cwd || "").trim()
-  ].join("\n"));
+  ];
+  const executionEnvSha = String(payload.executionEnvSha || "").trim().toLowerCase();
+  if (executionEnvSha) {
+    parts.push(`execution-env:${executionEnvSha}`);
+  }
+  return hashText(parts.join("\n"));
 }
 
 function isConfirmedTmuxExecution(result = {}) {
@@ -3950,7 +3971,8 @@ async function runTmuxShell({
   onProgress = null,
   executionId = "",
   callKey = "",
-  agentId = ""
+  agentId = "",
+  executionEnvironment = null
 }) {
   const runId = crypto.randomBytes(8).toString("hex");
   const startMarker = `__AI_CHAT_SHELL_EXEC_START_${runId}__`;
@@ -3970,7 +3992,8 @@ async function runTmuxShell({
     pidPath,
     statusPath,
     executedPath,
-    interruptedPath
+    interruptedPath,
+    executionEnvironment
   }), { mode: 0o700 });
   fs.writeFileSync(launcherPath, buildTmuxRunLauncherScript({
     scriptPath,
@@ -5127,7 +5150,18 @@ function parseVisionDoneFromText(text, donePrefix) {
   };
 }
 
-function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, statusPath, executedPath, interruptedPath }) {
+function buildTmuxRunScript({
+  cmd,
+  cwd,
+  startMarker,
+  doneMarker,
+  pidPath,
+  statusPath,
+  executedPath,
+  interruptedPath,
+  executionEnvironment = null
+}) {
+  const environmentExports = buildShellEnvironmentExports(executionEnvironment);
   return [
     `#!${SHELL_RUNNER}`,
     "set +e",
@@ -5147,6 +5181,7 @@ function buildTmuxRunScript({ cmd, cwd, startMarker, doneMarker, pidPath, status
     `printf '%s\\n' \"$$\" > ${shellQuote(pidPath)}`,
     "(",
     cwd ? `  cd -- ${shellQuote(cwd)} || exit $?` : "",
+    ...environmentExports.map((line) => `  ${line}`),
     executedPath ? `  printf '1\\n' > ${shellQuote(executedPath)}` : "",
     cmd,
     ")",

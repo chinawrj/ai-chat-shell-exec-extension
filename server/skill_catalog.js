@@ -5,9 +5,14 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { StringDecoder } = require("node:string_decoder");
 const { TextDecoder } = require("node:util");
+const {
+  loadExecutionEnvironment,
+  mergeExecutionEnvironment
+} = require("./execution_env");
 
 const SKILL_FILE_NAME = "SKILL.md";
 const SKILL_INSTALL_SCRIPT_NAME = "install.sh";
+const SKILL_UNINSTALL_SCRIPT_NAME = "uninstall.sh";
 const SKILL_CATALOG_STATE_VERSION = 2;
 const SKILL_CATALOG_STATE_FILE = "skill-catalog-state.json";
 const SKILL_INSTALL_STATE_VERSION = 2;
@@ -100,6 +105,17 @@ class SkillCatalogService {
     return task;
   }
 
+  uninstall({ skillId, skillSha, uninstallSha, catalogSha } = {}) {
+    const task = this.installTail.catch(() => {}).then(() => this.uninstallUnlocked({
+      skillId,
+      skillSha,
+      uninstallSha,
+      catalogSha
+    }));
+    this.installTail = task.catch(() => {});
+    return task;
+  }
+
   async installUnlocked({ skillId, skillSha, installSha, catalogSha } = {}) {
     let catalog = this.scan({ force: true });
     const requestedSkillId = String(skillId || "").trim();
@@ -163,7 +179,10 @@ class SkillCatalogService {
       result = await this.runInstallScript({
         scriptPath: snapshot.scriptPath,
         skillDir: path.dirname(skill.filePath),
-        env: buildSkillInstallEnvironment(this.env),
+        env: buildSkillInstallEnvironment(
+          this.env,
+          loadExecutionEnvironment({ env: this.env, cwd: this.cwd })
+        ),
         idleTimeoutMs: SKILL_INSTALL_IDLE_TIMEOUT_MS,
         maxOutputChars: MAX_SKILL_INSTALL_OUTPUT_CHARS
       });
@@ -239,6 +258,151 @@ class SkillCatalogService {
       version: installedCatalog.version,
       skill: publicManagedSkillRecord(installedSkill),
       alreadyInstalled: false,
+      exitCode: 0,
+      durationMs: Date.now() - startedAt
+    };
+  }
+
+  async uninstallUnlocked({ skillId, skillSha, uninstallSha, catalogSha } = {}) {
+    let catalog = this.scan({ force: true });
+    const requestedSkillId = String(skillId || "").trim();
+    const requestedSkillSha = String(skillSha || "").trim().toLowerCase();
+    const requestedUninstallSha = String(uninstallSha || "").trim().toLowerCase();
+    const requestedCatalogSha = String(catalogSha || "").trim().toLowerCase();
+    if (!SKILL_ID_PATTERN.test(requestedSkillId)) {
+      return skillError(catalog, "invalid-skill-id", "Skill uninstallation requires a valid skill-id from the current local list.", {}, "skill-uninstall");
+    }
+    if (!/^[a-f0-9]{64}$/.test(requestedSkillSha)) {
+      return skillError(catalog, "invalid-skill-sha", "Skill uninstallation requires the full current skill SHA.", {}, "skill-uninstall");
+    }
+    if (!/^[a-f0-9]{64}$/.test(requestedCatalogSha)) {
+      return skillError(catalog, "invalid-catalog-sha", "Skill uninstallation requires the full current catalog SHA.", {}, "skill-uninstall");
+    }
+    if (catalog.ok !== true) {
+      return skillError(catalog, "catalog-invalid", "The local Skill catalog has validation errors. Rescan after fixing them.", {}, "skill-uninstall");
+    }
+    if (requestedCatalogSha !== catalog.catalogSha) {
+      return skillError(catalog, "stale-catalog", "The local Skill catalog changed before uninstallation. Reopen the Skill list and retry.", {}, "skill-uninstall");
+    }
+    const skill = catalog.skills.find((record) => record.id === requestedSkillId);
+    if (!skill) {
+      return skillError(catalog, "skill-not-found", `Skill ${requestedSkillId} is not present in the current local list.`, {}, "skill-uninstall");
+    }
+    if (requestedSkillSha !== skill.sha) {
+      return skillError(catalog, "stale-skill", `Skill ${requestedSkillId} changed before uninstallation. Reopen the Skill list and retry.`, {}, "skill-uninstall");
+    }
+    if (skill.installed !== true) {
+      return {
+        ok: true,
+        type: "skill-uninstall",
+        catalogSha: catalog.catalogSha,
+        version: catalog.version,
+        skill: publicManagedSkillRecord(skill),
+        alreadyUninstalled: true,
+        exitCode: 0
+      };
+    }
+    if (skill.uninstallAvailable !== true || !skill.uninstallScriptPath) {
+      return skillError(catalog, "uninstall-script-unavailable", `Skill ${requestedSkillId} does not provide a safe ${SKILL_UNINSTALL_SCRIPT_NAME}.`, {}, "skill-uninstall");
+    }
+    if (!/^[a-f0-9]{64}$/.test(requestedUninstallSha)) {
+      return skillError(catalog, "invalid-uninstall-sha", "Skill uninstallation requires the full current uninstall.sh SHA.", {}, "skill-uninstall");
+    }
+    if (requestedUninstallSha !== skill.uninstallSha) {
+      return skillError(catalog, "stale-uninstaller", `Skill ${requestedSkillId} uninstaller changed before uninstallation. Reopen the Skill list and retry.`, {}, "skill-uninstall");
+    }
+
+    const startedAt = Date.now();
+    let result;
+    let snapshot = null;
+    try {
+      snapshot = createSkillLifecycleSnapshot({
+        stateDir: this.stateDir,
+        scriptPath: skill.uninstallScriptPath,
+        skillDir: path.dirname(skill.filePath),
+        rootPath: skill.rootPath,
+        scriptName: SKILL_UNINSTALL_SCRIPT_NAME,
+        expectedScriptSha: requestedUninstallSha,
+        snapshotPrefix: "skill-uninstall-run-"
+      });
+      result = await this.runInstallScript({
+        scriptPath: snapshot.scriptPath,
+        skillDir: path.dirname(skill.filePath),
+        env: buildSkillInstallEnvironment(
+          this.env,
+          loadExecutionEnvironment({ env: this.env, cwd: this.cwd })
+        ),
+        idleTimeoutMs: SKILL_INSTALL_IDLE_TIMEOUT_MS,
+        maxOutputChars: MAX_SKILL_INSTALL_OUTPUT_CHARS
+      });
+    } catch (error) {
+      console.error(`[skill-uninstall] ${requestedSkillId} launch failed: ${error.message || String(error)}`);
+      return skillError(catalog, "uninstaller-launch-failed", `Skill ${requestedSkillId} uninstaller could not be started. Check the shell server console.`, {
+        durationMs: Date.now() - startedAt
+      }, "skill-uninstall");
+    } finally {
+      snapshot?.cleanup();
+    }
+    const installerOutput = publicSkillInstallerOutput(result);
+    if (result?.idleTimedOut === true || result?.timedOut === true) {
+      console.error(`[skill-uninstall] ${requestedSkillId} produced no output for ${SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000} seconds`);
+      return skillError(catalog, "uninstaller-timeout", `Skill ${requestedSkillId} uninstaller produced no stdout or stderr for ${SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000} seconds.`, {
+        durationMs: Date.now() - startedAt,
+        idleTimeoutSeconds: SKILL_INSTALL_IDLE_TIMEOUT_MS / 1000,
+        installerOutput
+      }, "skill-uninstall");
+    }
+    const signal = String(result?.signal || "").slice(0, 64);
+    if (signal) {
+      console.error(`[skill-uninstall] ${requestedSkillId} terminated by signal ${signal}`);
+      return skillError(catalog, "uninstaller-signaled", `Skill ${requestedSkillId} uninstaller was terminated by signal ${signal}.`, {
+        exitCode: Number.isInteger(result?.code) ? result.code : null,
+        signal,
+        durationMs: Date.now() - startedAt,
+        installerOutput
+      }, "skill-uninstall");
+    }
+    if (result?.code !== 0) {
+      const exitCode = Number.isInteger(result?.code) ? result.code : null;
+      console.error(`[skill-uninstall] ${requestedSkillId} exited ${exitCode === null ? "without a valid exit code" : exitCode}`);
+      return skillError(catalog, "uninstaller-failed", `Skill ${requestedSkillId} uninstaller exited with code ${exitCode === null ? "unknown" : exitCode}.`, {
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        installerOutput
+      }, "skill-uninstall");
+    }
+
+    // A successful uninstaller is the transaction's commit point. Clear the
+    // exact installed record before any fresh scan can reconcile a concurrently
+    // changed SKILL.md/install.sh to "uninstalled" on our behalf. Otherwise the
+    // caller could receive a failure while management and the AI catalog had
+    // already lost the Skill. The immutable snapshot above proves which
+    // uninstaller actually ran; any new Skill identity remains uninstalled.
+    try {
+      markSkillUninstalled(this.stateDir, skill);
+    } catch (error) {
+      console.error(`[skill-uninstall] ${requestedSkillId} state write failed: ${error.message || String(error)}`);
+      return skillError(catalog, "uninstall-state-write-failed", `Skill ${requestedSkillId} uninstaller succeeded, but uninstalled state could not be saved.`, {
+        exitCode: 0,
+        durationMs: Date.now() - startedAt
+      }, "skill-uninstall");
+    }
+    this.current = null;
+    const uninstalledCatalog = this.scan({ force: true });
+    const uninstalledSkill = uninstalledCatalog.skills.find((record) => record.id === requestedSkillId);
+    if (uninstalledSkill?.installed === true) {
+      return skillError(uninstalledCatalog, "uninstall-state-unconfirmed", `Skill ${requestedSkillId} uninstalled state could not be confirmed.`, {
+        exitCode: 0,
+        durationMs: Date.now() - startedAt
+      }, "skill-uninstall");
+    }
+    return {
+      ok: true,
+      type: "skill-uninstall",
+      catalogSha: uninstalledCatalog.catalogSha,
+      version: uninstalledCatalog.version,
+      skill: publicManagedSkillRecord(uninstalledSkill || { ...skill, installed: false }),
+      alreadyUninstalled: false,
       exitCode: 0,
       durationMs: Date.now() - startedAt
     };
@@ -550,7 +714,7 @@ function scanSkillRoots(config) {
       rootPath: candidate.rootPath,
       relativePath: candidate.relativePath,
       rootIndex: candidate.rootIndex,
-      ...inspectSkillInstallScript(path.dirname(candidate.filePath), candidate.rootPath)
+      ...inspectSkillLifecycleScripts(path.dirname(candidate.filePath), candidate.rootPath)
     });
   }
 
@@ -701,26 +865,49 @@ function readSafeSkillFile(filePath, rootPath) {
   return fs.readFileSync(fileRealPath);
 }
 
+function inspectSkillLifecycleScripts(skillDir, rootPath) {
+  return {
+    ...inspectSkillLifecycleScript(skillDir, rootPath, SKILL_INSTALL_SCRIPT_NAME, "install"),
+    ...inspectSkillLifecycleScript(skillDir, rootPath, SKILL_UNINSTALL_SCRIPT_NAME, "uninstall")
+  };
+}
+
 function inspectSkillInstallScript(skillDir, rootPath) {
-  const scriptPath = path.join(skillDir, SKILL_INSTALL_SCRIPT_NAME);
+  return inspectSkillLifecycleScript(skillDir, rootPath, SKILL_INSTALL_SCRIPT_NAME, "install");
+}
+
+function inspectSkillLifecycleScript(skillDir, rootPath, scriptName, fieldPrefix) {
+  const scriptPath = path.join(skillDir, scriptName);
+  const availableField = `${fieldPrefix}Available`;
+  const pathField = `${fieldPrefix}ScriptPath`;
+  const shaField = `${fieldPrefix}Sha`;
   try {
-    const inspected = readSafeSkillInstallScript(scriptPath, skillDir, rootPath);
+    const inspected = readSafeSkillLifecycleScript(scriptPath, skillDir, rootPath, scriptName);
     return {
-      installAvailable: true,
-      installScriptPath: inspected.scriptPath,
-      installSha: inspected.installSha
+      [availableField]: true,
+      [pathField]: inspected.scriptPath,
+      [shaField]: inspected.scriptSha
     };
   } catch (_error) {
-    return { installAvailable: false, installScriptPath: "", installSha: "" };
+    return { [availableField]: false, [pathField]: "", [shaField]: "" };
   }
 }
 
 function readSafeSkillInstallScript(scriptPath, skillDir, rootPath) {
+  const inspected = readSafeSkillLifecycleScript(scriptPath, skillDir, rootPath, SKILL_INSTALL_SCRIPT_NAME);
+  return {
+    scriptPath: inspected.scriptPath,
+    content: inspected.content,
+    installSha: inspected.scriptSha
+  };
+}
+
+function readSafeSkillLifecycleScript(scriptPath, skillDir, rootPath, scriptName) {
   const rootRealPath = fs.realpathSync(rootPath);
   const skillDirRealPath = fs.realpathSync(skillDir);
   const relativeSkillDir = path.relative(rootRealPath, skillDirRealPath);
   if (relativeSkillDir.startsWith("..") || path.isAbsolute(relativeSkillDir)) {
-    throw new Error("Skill install directory escapes its configured root.");
+    throw new Error("Skill lifecycle directory escapes its configured root.");
   }
   const noFollow = Number(fs.constants.O_NOFOLLOW || 0);
   let fd;
@@ -728,28 +915,28 @@ function readSafeSkillInstallScript(scriptPath, skillDir, rootPath) {
     fd = fs.openSync(scriptPath, fs.constants.O_RDONLY | noFollow);
     const openedStat = fs.fstatSync(fd);
     if (!openedStat.isFile() || openedStat.size > MAX_SKILL_INSTALL_SCRIPT_BYTES) {
-      throw new Error("Skill install script must be a bounded regular file.");
+      throw new Error(`Skill ${scriptName} must be a bounded regular file.`);
     }
     const scriptRealPath = fs.realpathSync(scriptPath);
     const relativeScript = path.relative(skillDirRealPath, scriptRealPath);
     if (!relativeScript || relativeScript.startsWith("..") || path.isAbsolute(relativeScript)) {
-      throw new Error("Skill install script escapes its Skill directory.");
+      throw new Error(`Skill ${scriptName} escapes its Skill directory.`);
     }
     const currentStat = fs.statSync(scriptRealPath);
     if (!currentStat.isFile() || currentStat.dev !== openedStat.dev || currentStat.ino !== openedStat.ino) {
-      throw new Error("Skill install script changed while it was opened.");
+      throw new Error(`Skill ${scriptName} changed while it was opened.`);
     }
     const content = fs.readFileSync(fd);
     const finalStat = fs.fstatSync(fd);
     if (!finalStat.isFile() || finalStat.dev !== openedStat.dev || finalStat.ino !== openedStat.ino ||
         finalStat.size !== openedStat.size || content.length !== finalStat.size ||
         finalStat.size > MAX_SKILL_INSTALL_SCRIPT_BYTES) {
-      throw new Error("Skill install script changed while it was read.");
+      throw new Error(`Skill ${scriptName} changed while it was read.`);
     }
     return {
       scriptPath: scriptRealPath,
       content,
-      installSha: sha256(content)
+      scriptSha: sha256(content)
     };
   } finally {
     if (fd !== undefined) {
@@ -759,14 +946,34 @@ function readSafeSkillInstallScript(scriptPath, skillDir, rootPath) {
 }
 
 function createSkillInstallSnapshot({ stateDir, scriptPath, skillDir, rootPath, expectedInstallSha } = {}) {
-  const inspected = readSafeSkillInstallScript(scriptPath, skillDir, rootPath);
-  if (inspected.installSha !== expectedInstallSha) {
-    throw new Error("Skill install script changed before its execution snapshot was created.");
+  return createSkillLifecycleSnapshot({
+    stateDir,
+    scriptPath,
+    skillDir,
+    rootPath,
+    scriptName: SKILL_INSTALL_SCRIPT_NAME,
+    expectedScriptSha: expectedInstallSha,
+    snapshotPrefix: "skill-install-run-"
+  });
+}
+
+function createSkillLifecycleSnapshot({
+  stateDir,
+  scriptPath,
+  skillDir,
+  rootPath,
+  scriptName,
+  expectedScriptSha,
+  snapshotPrefix
+} = {}) {
+  const inspected = readSafeSkillLifecycleScript(scriptPath, skillDir, rootPath, scriptName);
+  if (inspected.scriptSha !== expectedScriptSha) {
+    throw new Error(`Skill ${scriptName} changed before its execution snapshot was created.`);
   }
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const snapshotDir = fs.mkdtempSync(path.join(stateDir, "skill-install-run-"));
+  const snapshotDir = fs.mkdtempSync(path.join(stateDir, snapshotPrefix));
   fs.chmodSync(snapshotDir, 0o700);
-  const snapshotPath = path.join(snapshotDir, SKILL_INSTALL_SCRIPT_NAME);
+  const snapshotPath = path.join(snapshotDir, scriptName);
   try {
     fs.writeFileSync(snapshotPath, inspected.content, { flag: "wx", mode: 0o400 });
     fs.chmodSync(snapshotPath, 0o400);
@@ -777,7 +984,8 @@ function createSkillInstallSnapshot({ stateDir, scriptPath, skillDir, rootPath, 
   let cleaned = false;
   return {
     scriptPath: snapshotPath,
-    installSha: inspected.installSha,
+    installSha: inspected.scriptSha,
+    scriptSha: inspected.scriptSha,
     cleanup() {
       if (cleaned) {
         return;
@@ -788,7 +996,7 @@ function createSkillInstallSnapshot({ stateDir, scriptPath, skillDir, rootPath, 
   };
 }
 
-function buildSkillInstallEnvironment(env = process.env) {
+function buildSkillInstallEnvironment(env = process.env, loadedEnvironment = null) {
   const result = {
     PATH: String(env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin")
   };
@@ -797,7 +1005,7 @@ function buildSkillInstallEnvironment(env = process.env) {
       result[name] = String(env[name]);
     }
   }
-  return result;
+  return mergeExecutionEnvironment(result, loadedEnvironment);
 }
 
 function runSkillInstallScript({
@@ -1357,6 +1565,31 @@ function markSkillInstalled(stateDir, skill) {
   return next;
 }
 
+function markSkillUninstalled(stateDir, skill) {
+  if (!SKILL_ID_PATTERN.test(String(skill?.id || "")) ||
+      !/^[a-f0-9]{64}$/.test(String(skill?.sha || ""))) {
+    throw new Error("Cannot record an uninstalled Skill without its exact current identity.");
+  }
+  const previous = loadSkillInstallState(stateDir);
+  const now = new Date().toISOString();
+  const next = {
+    schemaVersion: SKILL_INSTALL_STATE_VERSION,
+    updatedAt: now,
+    skills: {
+      ...previous.skills,
+      [skill.id]: {
+        sha: skill.sha,
+        installSha: String(skill.installSha || ""),
+        installed: false,
+        installedAt: "",
+        receipt: ""
+      }
+    }
+  };
+  saveSkillInstallState(stateDir, next);
+  return next;
+}
+
 function loadSkillInstallReceiptKey(stateDir, { create = false } = {}) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const keyPath = path.join(stateDir, SKILL_INSTALL_RECEIPT_KEY_FILE);
@@ -1535,7 +1768,9 @@ function publicManagedSkillRecord(skill) {
     ...publicCatalogSkillRecord(skill),
     installed: skill.installed === true,
     installAvailable: skill.installAvailable === true,
-    installSha: skill.installAvailable === true ? String(skill.installSha || "") : ""
+    installSha: skill.installAvailable === true ? String(skill.installSha || "") : "",
+    uninstallAvailable: skill.uninstallAvailable === true,
+    uninstallSha: skill.uninstallAvailable === true ? String(skill.uninstallSha || "") : ""
   };
 }
 
@@ -1576,6 +1811,7 @@ module.exports = {
   SKILL_CATALOG_CACHE_MS,
   SKILL_ID_PATTERN,
   SKILL_INSTALL_SCRIPT_NAME,
+  SKILL_UNINSTALL_SCRIPT_NAME,
   SKILL_INSTALL_STATE_FILE,
   SKILL_INSTALL_IDLE_TIMEOUT_MS,
   SKILL_ROOTS_RUNTIME_VARIABLE,
@@ -1584,12 +1820,14 @@ module.exports = {
   aggregateSkillShas,
   buildSkillInstallEnvironment,
   createSkillInstallSnapshot,
+  createSkillLifecycleSnapshot,
   expandSkillEnvironment,
   formatSkillLoadReplyForSizing,
   getConfiguredSkillRoots,
   getSkillEnvironmentAllowlist,
   getSkillRuntimeVariables,
   inspectSkillInstallScript,
+  inspectSkillLifecycleScripts,
   loadSkillInstallState,
   parseSkillFrontmatter,
   reconcileSkillInstallState,

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-09-02
+
+- Adds `AI_CHAT_SHELL_ENV_FILE`, a strict data-only environment declaration file freshly read before each ai-helper shell command and trusted Skill lifecycle script. Values are never sourced, command-expanded, logged, copied into ledgers/protocol replies, or added to unrelated helper/server environments; shell injection reuses the existing private transient tmux runner script lifecycle.
+- Binds shell duplicate authority to the exact environment-file content SHA, so a command completed under an old environment cannot suppress the same command after the file changes.
+- Adds a trusted-click Skill `uninstall.sh` lifecycle with exact Skill/catalog/uninstaller SHA validation, no-follow reads, immutable snapshots, one serialized install/uninstall queue, 600-second output-idle handling, failure diagnostics isolation, and fail-closed installed-state transitions.
+- Adds focused parser, safety, tmux, server protocol, background, content UI, result-page, and real unpacked-Chrome regressions for configured/absent/malformed environments plus install/uninstall success and failure.
+- Adapts ChatGPT authored-message and helper-generation ownership to the current exact DOM contract, including bounded first-route completion recovery without accepting nested, historical, sponsored, rewritten, or second-route helper copies.
+- Adds a nonce-bound sandboxed Draw.io `srcdoc` fallback for hosts whose `frame-src` CSP blocks the packaged extension iframe, while keeping XML on the channel-bound message path and retaining strict nonce/channel validation.
+- Adds a guaranteed 20-second semantic-idle Force run fallback for the latest detected executable or Skill helper. DOM redraws, repeated scans, assistant activity, and composer-delivery state cannot postpone it forever; only an actual helper/backend operation pauses the accumulated clock.
+- Keeps the Skills version/update chip in the panel header, adds a permanently discoverable Force run entry under More → Setup & recovery, and disables that entry only when no eligible helper exists or an operation is active.
+- Requires trusted browser input for both Force run and Process Skill; host-page `.click()` or synthetic events fail closed before executable or local Skill work.
+- Adds focused clock, redraw, lifecycle, dispatch, placement, positive/negative/boundary, and isolated real-Chrome regressions for Force run.
+- Bumps the shell server protocol to 12 and Skill protocol to 5; restart the foreground server and reload the unpacked extension after upgrading.
+
 ## [0.11.10] - 2026-09-01
 
 - Recognizes M365's current exact `.fai-CopilotMessage[role="article"]` assistant root throughout authored-message discovery and generation binding while retaining compatibility with the legacy `.fai-AssistantMessage` class.

@@ -28,6 +28,7 @@ awaitTestCanonicalSkillDomFallback()
   .then(() => awaitTestDurableForceSyncCleanup())
   .then(() => awaitTestExplicitUserAndProvenanceRejection())
   .then(() => testSkillInstallActionIsExplicitAndSingleFlight())
+  .then(() => testSkillUninstallActionIsExplicitAndSingleFlight())
   .then(() => console.log("content Skill helper tests passed"));
 
 function testValidSkillHelpers() {
@@ -936,6 +937,123 @@ async function testSkillInstallActionIsExplicitAndSingleFlight() {
   }
 }
 
+async function testSkillUninstallActionIsExplicitAndSingleFlight() {
+  const skill = {
+    id: "uninstall-test",
+    name: "uninstall-test",
+    description: "Uninstall test description",
+    sha: "d".repeat(64),
+    uninstallSha: "e".repeat(64),
+    installed: true,
+    uninstallAvailable: true
+  };
+  const originalQuerySelector = context.document.querySelector;
+  const originalGetElementById = context.document.getElementById;
+  const originalSendMessage = context.chrome.runtime.sendMessage;
+  const originalSetStatus = context.setStatus;
+  const originalShowDialog = context.showSkillCatalogDialog;
+  const originalRefreshState = context.refreshSkillState;
+  const originalConfirm = context.window.confirm;
+  let status = "";
+  let currentUi = null;
+  let shownDialogs = 0;
+  try {
+    vm.runInContext("extensionActive = true; pageLifecycleGeneration = 51; skillUninstallInFlight.clear(); skillInstallErrors.clear();", context);
+    context.document.querySelector = () => currentUi?.button || null;
+    context.document.getElementById = (id) => id === "ai-chat-shell-exec-skill-dialog" && currentUi?.overlay?.isConnected
+      ? currentUi.overlay
+      : null;
+    context.setStatus = (value) => { status = String(value); };
+    context.showSkillCatalogDialog = () => { shownDialogs += 1; };
+    context.refreshSkillState = async () => ({ ok: true });
+
+    currentUi = createSkillUninstallUi(skill.id);
+    let confirmValue = false;
+    let confirmCount = 0;
+    context.window.confirm = () => {
+      confirmCount += 1;
+      return confirmValue;
+    };
+    const messages = [];
+    let releaseUninstall;
+    const uninstallGate = new Promise((resolve) => { releaseUninstall = resolve; });
+    context.chrome.runtime.sendMessage = async (message) => {
+      messages.push({ ...message });
+      if (message.type === "skill-uninstall") {
+        await uninstallGate;
+        return { ok: true, type: "skill-uninstall", version: 12, skill: { ...skill, installed: false } };
+      }
+      assert.equal(message.type, "skill-management-list");
+      return { ok: true, type: "skill-management-list", version: 12, skills: [{ ...skill, installed: false }] };
+    };
+    const dialogContext = { overlay: currentUi.overlay, pageGeneration: 51 };
+    assert.equal(await context.requestSkillUninstallFromPanel({ isTrusted: false }, skill, catalogSha, dialogContext), false);
+    assert.equal(confirmCount, 0);
+    assert.equal(await context.requestSkillUninstallFromPanel({ isTrusted: true }, skill, catalogSha, dialogContext), false);
+    assert.equal(confirmCount, 1);
+    assert.equal(messages.length, 0, "Cancelling the native uninstall confirmation must not contact the server.");
+
+    confirmValue = true;
+    const first = context.requestSkillUninstallFromPanel({ isTrusted: true }, skill, catalogSha, dialogContext);
+    const second = await context.requestSkillUninstallFromPanel({ isTrusted: true }, skill, catalogSha, dialogContext);
+    assert.equal(second, false, "A second click while uninstallation is running must no-op.");
+    assert.equal(messages.filter((message) => message.type === "skill-uninstall").length, 1);
+    assert.equal(currentUi.button.textContent, "Uninstalling…");
+    assert.equal(currentUi.button.disabled, true);
+    releaseUninstall();
+    assert.equal(await first, true);
+    assert.deepEqual(messages.find((message) => message.type === "skill-uninstall"), {
+      type: "skill-uninstall",
+      skillId: skill.id,
+      skillName: skill.name,
+      skillSha: skill.sha,
+      uninstallSha: skill.uninstallSha,
+      catalogSha
+    });
+    assert.match(status, /Uninstalled Skill uninstall-test/i);
+    assert.equal(shownDialogs, 1);
+
+    currentUi = createSkillUninstallUi(skill.id);
+    const failedMessages = [];
+    context.chrome.runtime.sendMessage = async (message) => {
+      failedMessages.push({ ...message });
+      if (message.type === "skill-uninstall") {
+        return {
+          ok: false,
+          errorCode: "uninstaller-failed",
+          error: "Uninstaller exited with code 19.",
+          installFailureToken: "f".repeat(32)
+        };
+      }
+      if (message.type === "skill-install-failure-show") {
+        return { ok: true, shown: true };
+      }
+      throw new Error("list offline");
+    };
+    assert.equal(await context.uninstallSkillFromPanel(skill, catalogSha, {
+      overlay: currentUi.overlay,
+      pageGeneration: 51
+    }), false);
+    assert.equal(currentUi.button.textContent, "Retry uninstall");
+    assert.equal(currentUi.button.disabled, false);
+    assert.match(currentUi.feedback.textContent, /code 19/);
+    assert.match(status, /uninstall failed/i);
+    assert.deepEqual(failedMessages.find((message) => message.type === "skill-install-failure-show"), {
+      type: "skill-install-failure-show",
+      token: "f".repeat(32)
+    });
+  } finally {
+    context.document.querySelector = originalQuerySelector;
+    context.document.getElementById = originalGetElementById;
+    context.chrome.runtime.sendMessage = originalSendMessage;
+    context.setStatus = originalSetStatus;
+    context.showSkillCatalogDialog = originalShowDialog;
+    context.refreshSkillState = originalRefreshState;
+    context.window.confirm = originalConfirm;
+    vm.runInContext("skillUninstallInFlight.clear(); skillInstallErrors.clear();", context);
+  }
+}
+
 function createSkillInstallUi(skillId) {
   const feedback = {
     attributes: {},
@@ -976,6 +1094,20 @@ function createSkillInstallUi(skillId) {
     feedback,
     overlay: { isConnected: true }
   };
+}
+
+function createSkillUninstallUi(skillId) {
+  const ui = createSkillInstallUi(skillId);
+  ui.button.dataset = { skillUninstall: skillId };
+  ui.button.textContent = "Uninstall";
+  const originalRemoveAttribute = ui.button.removeAttribute;
+  ui.button.removeAttribute = function removeAttribute(name) {
+    originalRemoveAttribute.call(this, name);
+    if (name === "data-skill-uninstall") {
+      delete this.dataset.skillUninstall;
+    }
+  };
+  return ui;
 }
 
 function testSkillStatusActionRouting() {

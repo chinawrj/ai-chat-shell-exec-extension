@@ -31,6 +31,11 @@ assert.match(commonActions, /action\.mode === "check"\) \{\s*button\.hidden = tr
 assert.match(commonActions, /action\.mode === "force"\) \{\s*button\.hidden = true;/);
 assert.match(commonActions, /action\.mode === "skill-recovery"\) \{\s*button\.hidden = true;/);
 assert.match(commonActions, /action\.mode === "stop-helper"\) \{\s*button\.hidden = true;/);
+assert.ok(
+  source.indexOf("statusRow.appendChild(skillStatusAction);") <
+    source.indexOf('actions.dataset.shellPanelGroup = "common";'),
+  "The Skills version/update chip must remain in the header and must not be replaced by Force run."
+);
 for (const advancedOnlyAction of [
   "test",
   "reset-tmux",
@@ -82,17 +87,23 @@ assert.match(source, /button\.setAttribute\("aria-expanded", expanded \? "true" 
 assert.match(source, /advancedControls\.hidden = !expanded/);
 
 assert.match(source, /button\.disabled = !panelShellHelperActive;/);
-assert.match(source, /const backendBusy = Boolean\(activeCallId\) \|\| skillHelperInFlight \|\| skillRecoveryInFlight \|\|\s*pendingForceRunRequested \|\| forceRunInFlight;/);
+assert.match(source, /const backendBusy = isPanelForceRunDispatchBusy\(\);/);
 assert.match(source, /const deliveryBusy = pendingHelperDeliveries\.size > 0;/);
 assert.match(source, /const showCheck = !backendBusy && !panelShellHelperActive && panel\.dataset\.state === "error";/);
-assert.match(source, /const showForce = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&[\s\S]*panelLatestManualActionKind === "force";/);
-assert.match(source, /const showSkillRecovery = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&[\s\S]*panelLatestManualActionKind === "skill";/);
+assert.match(source, /const idleForceReady = refreshPanelForceRunIdleClock\(\);/);
+assert.match(source, /const showForce = !backendBusy && panelForceRunAvailable && idleForceReady;/);
+assert.match(source, /const showSkillRecovery = !backendBusy && !deliveryBusy && !agentComposerBusy && !assistantBusy &&[\s\S]*!idleForceReady && panelSkillHelperActionable &&[\s\S]*panelLatestManualActionKind === "skill";/);
 assert.match(source, /activeCallToken = null;\s*updateContextualPanelActions\(\);/);
 assert.match(source, /stop\.hidden = !panelShellHelperActive \|\| Boolean\(activeShellRunNotice\);/);
-assert.match(source, /setPanelForceRunAvailable\(Boolean\(runnableCandidate\)\)/);
-assert.match(source, /setPanelSkillHelperActionable\(Boolean\(actionableSkillCandidate\)\)/);
+assert.match(source, /panelSkillHelperActionable = Boolean\(actionableSkillCandidate\);\s*setPanelDetectedManualHelper\(allCandidates, runnableCandidate, skillBoundaryCandidate\);/);
 assert.match(source, /Process the latest detected Skill helper through the validated Skill protocol/);
-assert.match(source, /createPanelSection\("Setup & recovery", "setup-recovery"\)[\s\S]*?mode: "check", label: "Server Check"/);
+const setupSection = source.match(/const setupSection = createPanelSection\("Setup & recovery", "setup-recovery"\);[\s\S]*?advancedControls\.appendChild\(setupSection\.section\);/)?.[0] || "";
+assert.ok(setupSection, "Setup & recovery group must exist.");
+assert.match(setupSection, /mode: "force",\s*label: "Force run"/);
+assert.match(setupSection, /mode: "check", label: "Server Check"/);
+assert.match(source, /advancedForce\.hidden = false;/);
+assert.match(source, /advancedForce\.disabled = backendBusy \|\| !panelForceRunAvailable;/);
+assert.match(source, /No executable or Skill helper is currently detected/);
 assert.match(source, /choose Continue waiting or Stop helper/);
 const awaitingUserControls = source.match(/shellRunControl\.innerHTML = \[[\s\S]*?\]\.join\(""\);/)?.[0] || "";
 assert.ok(awaitingUserControls, "Output-idle decision controls must exist.");
@@ -138,6 +149,15 @@ assert.match(source, /dialogContext\?\.pageGeneration === pageLifecycleGeneratio
 assert.match(source, /dialogContext\?\.overlay\?\.isConnected/);
 assert.match(source, /updateSkillInstallRowLocally/);
 assert.match(source, /type: "skill-install"/);
+assert.match(source, /type: "skill-uninstall"/);
+assert.match(source, /window\.confirm\(`Uninstall local Skill "\$\{skillName\}" \(id: \$\{skillId\}\)/);
+assert.match(source, /uninstallSha: String\(skill\?\.uninstallSha \|\| ""\)/);
+assert.match(source, /skillUninstallInFlight\.has\(skillId\)/, "Double-clicks must be rejected before the uninstall message is sent.");
+assert.doesNotMatch(
+  source.match(/async function uninstallSkillFromPanel[\s\S]*?\n\}/)?.[0] || "",
+  /rememberPendingHelperDelivery|attemptPendingHelperDelivery|startSkillSync/,
+  "A local Uninstall click must not write or auto-sync the AI composer."
+);
 assert.match(source, /installSha: String\(skill\?\.installSha \|\| ""\)/);
 assert.match(source, /skillInstallInFlight\.has\(skillId\)/, "Double-clicks must be rejected before the install message is sent.");
 assert.doesNotMatch(

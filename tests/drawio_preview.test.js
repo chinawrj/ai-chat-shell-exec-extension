@@ -120,6 +120,46 @@ assert.equal(preview.isLikelyCompleteDrawioXml("<mxfile><diagram>"), false);
 assert.equal(preview.hashDrawioXml(valid), preview.hashDrawioXml(valid));
 assert.notEqual(preview.hashDrawioXml(valid), preview.hashDrawioXml(valid.replace("System", "Other")));
 
+const cspNonce = "nonceValue_1234567890-ABCD";
+assert.equal(
+  preview.extractCspScriptNonce(`default-src 'self'; script-src 'nonce-${cspNonce}' 'self'; frame-src 'self'`),
+  cspNonce,
+  "A nonce from the enforcing script-src directive must be available to a CSP-compatible sandbox srcdoc."
+);
+assert.equal(preview.extractCspScriptNonce(`default-src 'nonce-${cspNonce}'; script-src 'self'`), "",
+  "A nonce outside script-src must not authorize viewer scripts.");
+assert.equal(preview.extractCspScriptNonce(`script-src 'nonce-${cspNonce}'; script-src-elem 'self'`), "",
+  "An explicit script-src-elem directive without a nonce must override script-src for viewer elements.");
+assert.equal(preview.extractCspScriptNonce(`script-src 'self'; script-src-elem 'nonce-${cspNonce}'`), cspNonce,
+  "An explicit script-src-elem nonce must authorize the packaged viewer elements regardless of directive order.");
+assert.equal(preview.extractCspScriptNonce("script-src 'nonce-short' 'self'"), "",
+  "Malformed or implausibly short nonce values must fail closed.");
+const cspSrcdoc = preview.buildViewerSrcdoc({
+  nonce: cspNonce,
+  channel: "artifact:4-2:123-456",
+  resourceUrls: {
+    css: "chrome-extension://test/drawio/viewer.css",
+    renderer: "chrome-extension://test/vendor/drawio/viewer-static.min.js",
+    viewer: "chrome-extension://test/drawio/viewer.js"
+  }
+});
+assert.match(cspSrcdoc, new RegExp(`meta name="ai-chat-drawio-channel" content="artifact:4-2:123-456"`));
+assert.equal((cspSrcdoc.match(new RegExp(`nonce="${cspNonce}"`, "g")) || []).length, 3,
+  "The packaged stylesheet and both packaged scripts must carry the exact host-authorized nonce.");
+assert.match(cspSrcdoc, /chrome-extension:\/\/test\/vendor\/drawio\/viewer-static\.min\.js/);
+assert.throws(() => preview.buildViewerSrcdoc({
+  nonce: `${cspNonce}\" onload=\"evil`,
+  channel: "safe",
+  resourceUrls: { css: "x", renderer: "y", viewer: "z" }
+}), /valid host CSP nonce/,
+"A nonce that could escape its HTML attribute must be rejected.");
+assert.throws(() => preview.buildViewerSrcdoc({
+  nonce: cspNonce,
+  channel: `safe\"><script>evil</script>`,
+  resourceUrls: { css: "x", renderer: "y", viewer: "z" }
+}), /channel is invalid/,
+"A channel that could alter the fixed srcdoc must be rejected.");
+
 fakeDocument.setHidden(true);
 let watchdogFirings = 0;
 const hiddenWatchdog = preview.createVisibleTimeWatchdog(7000, () => { watchdogFirings += 1; });
@@ -163,14 +203,34 @@ assert.deepEqual(retryEvents, [{ phase: "accept", attempt: 1, nextAttempt: 2 }])
 assert.equal(retryPolicy.getState().attempt, 2, "A first acceptance timeout must create exactly one fresh attempt.");
 retryPolicy.awaitAcceptance();
 advanceFakeTime(7000);
-assert.equal(retryPolicy.getState().phase, "awaiting-accept",
-  "The final attempt must keep waiting instead of turning a slow synchronous render into an error.");
-assert.deepEqual(retryFailures, []);
-assert.equal(retryPolicy.accept(), true);
+assert.equal(retryPolicy.getState().phase, "failed",
+  "A final frame that never acknowledges render start must fail instead of staging forever.");
+assert.equal(retryFailures.length, 1);
+assert.match(retryFailures[0], /did not accept.*2 attempts/i);
+assert.equal(retryPolicy.accept(), false,
+  "A late message after the bounded pre-render failure must not reclaim the discarded frame.");
 advanceFakeTime(60000);
-assert.deepEqual(retryFailures, [], "Once the viewer acknowledges render start, the parent must never time out a slow render.");
-assert.equal(retryPolicy.getState().phase, "rendering");
+assert.equal(retryFailures.length, 1, "The final pre-render timeout must report exactly one error.");
 retryPolicy.cancel();
+
+const acknowledgedFailures = [];
+const acknowledgedPolicy = preview.createRenderAttemptWatchdog({
+  maxAttempts: 1,
+  startupTimeoutMs: 7000,
+  acceptTimeoutMs: 7000,
+  createWatchdog: preview.createVisibleTimeWatchdog,
+  onFailure(message) {
+    acknowledgedFailures.push(message);
+  }
+});
+acknowledgedPolicy.beginAttempt();
+acknowledgedPolicy.awaitAcceptance();
+assert.equal(acknowledgedPolicy.accept(), true);
+advanceFakeTime(60000);
+assert.deepEqual(acknowledgedFailures, [],
+  "Once the viewer acknowledges render start, the parent must never time out a slow render.");
+assert.equal(acknowledgedPolicy.getState().phase, "rendering");
+acknowledgedPolicy.cancel();
 
 const finalFailures = [];
 let finalPolicy;
@@ -315,6 +375,12 @@ assert.match(previewSource, /stale renderer completion/);
 assert.match(previewSource, /superseded by a newer valid helper/);
 assert.match(previewSource, /console\.error\(`\[AI Chat Draw\.io\]/, "Preview failures must reach browser diagnostics.");
 assert.match(previewSource, /sandbox", "allow-scripts"/, "The renderer must run in an isolated sandbox without same-origin access.");
+assert.match(previewSource, /iframe\.srcdoc = buildViewerSrcdoc\(\{ nonce: embedStrategy\.nonce, channel \}\)/,
+  "A host CSP nonce must authorize a sandboxed srcdoc instead of a blocked chrome-extension frame navigation.");
+assert.match(previewSource, /iframe\.src = `\$\{chrome\.runtime\.getURL\("drawio\/viewer\.html"\)\}#channel=/,
+  "Hosts without a usable CSP nonce must retain the packaged extension-page fallback.");
+assert.match(previewSource, /iframe\.setAttribute\("referrerpolicy", "no-referrer"\)/,
+  "The CSP-compatible viewer must not disclose the chat route while loading packaged resources.");
 assert.doesNotMatch(previewSource, /innerHTML\s*=\s*(?:candidate|xml|artifact)/i, "Untrusted draw.io XML must not be injected into the host page.");
 assert.match(previewSource, /function close\(\)/);
 assert.match(previewSource, /function reopen\(\)/);
@@ -332,8 +398,8 @@ assert.match(viewerSource, /activeVisibleElapsedMs\(\) >= RENDER_OUTPUT_TIMEOUT_
   "The sandbox renderer must not count hidden-tab time as active render time.");
 assert.match(viewerSource, /const RENDER_OUTPUT_TIMEOUT_MS = 15000/);
 assert.ok(
-  viewerSource.indexOf('post("ai-chat-drawio-render-started"') > viewerSource.indexOf("GraphViewer.processElements()"),
-  "Render-start acknowledgement must prove that the potentially slow synchronous renderer returned."
+  viewerSource.indexOf('post("ai-chat-drawio-render-started"') < viewerSource.indexOf("GraphViewer.processElements()"),
+  "Render-start acknowledgement must prove request receipt before a slow synchronous renderer can outlive the parent handshake."
 );
 assert.ok(
   viewerSource.indexOf("if (settleRenderedSvg())") < viewerSource.indexOf("new MutationObserver"),
@@ -372,6 +438,14 @@ testViewerRuntimeBehavior()
   });
 
 async function testViewerRuntimeBehavior() {
+  const embedded = createViewerHarness("sync", { embeddedChannel: "srcdoc-channel" });
+  embedded.render();
+  assert.deepEqual(embedded.messageTypes(), [
+    "ai-chat-drawio-viewer-ready",
+    "ai-chat-drawio-render-started",
+    "ai-chat-drawio-rendered"
+  ], "The nonce-authorized srcdoc metadata channel must take precedence over a missing URL hash channel.");
+
   const synchronous = createViewerHarness("sync");
   synchronous.render();
   assert.deepEqual(synchronous.messageTypes(), [
@@ -414,8 +488,9 @@ async function testViewerRuntimeBehavior() {
   thrown.render();
   assert.deepEqual(thrown.messageTypes(), [
     "ai-chat-drawio-viewer-ready",
+    "ai-chat-drawio-render-started",
     "ai-chat-drawio-render-error"
-  ], "A synchronous renderer exception must report an exact error without falsely acknowledging render start.");
+  ], "A received render request must stop the parent handshake before a synchronous renderer exception reports its exact error.");
   assert.equal(thrown.observerStats().created, 0);
   assert.equal(thrown.activeIntervalCount(), 0);
 }
@@ -506,6 +581,14 @@ function createViewerHarness(mode, options = {}) {
     getElementById(id) {
       return id === "viewer" ? viewer : null;
     },
+    querySelector(selector) {
+      if (selector !== 'meta[name="ai-chat-drawio-channel"]' || !options.embeddedChannel) return null;
+      return {
+        getAttribute(name) {
+          return name === "content" ? options.embeddedChannel : null;
+        }
+      };
+    },
     createElement(tagName) {
       return new FakeElement(tagName);
     },
@@ -551,7 +634,7 @@ function createViewerHarness(mode, options = {}) {
     clearInterval: trackedClearInterval,
     console: { error() {} },
     document,
-    location: { hash: "#channel=viewer-test" },
+    location: { hash: options.embeddedChannel ? "" : "#channel=viewer-test" },
     parent,
     setInterval: trackedSetInterval,
     setTimeout,
@@ -561,12 +644,13 @@ function createViewerHarness(mode, options = {}) {
   vm.runInContext(runtimeSource, harnessContext, { filename: "drawio/viewer.js" });
   return {
     render() {
+      const activeChannel = options.embeddedChannel || "viewer-test";
       for (const listener of windowListeners.get("message") || []) {
         listener({
           source: parent,
           data: {
             type: "ai-chat-drawio-render",
-            channel: "viewer-test",
+            channel: activeChannel,
             artifactId: "artifact-runtime-test",
             xml: valid
           }

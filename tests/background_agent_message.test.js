@@ -95,9 +95,9 @@ const context = {
     text: async () => JSON.stringify({
       ok: true,
       releaseVersion: "0.6.0",
-      serverProtocolVersion: 11,
+      serverProtocolVersion: 12,
       helperProtocolVersion: 4,
-      skillProtocolVersion: 4,
+      skillProtocolVersion: 5,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       pid: 123
     })

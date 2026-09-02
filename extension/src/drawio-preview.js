@@ -5,6 +5,8 @@
   const DRAWIO_XML_MAX_BYTES = 1024 * 1024;
   const DRAWIO_VIEWER_STARTUP_TIMEOUT_MS = 7000;
   const DRAWIO_RENDER_ACCEPT_TIMEOUT_MS = 7000;
+  const DRAWIO_RENDER_REQUEST_RETRY_MS = 250;
+  const DRAWIO_CSP_NONCE_FETCH_TIMEOUT_MS = 3000;
   const DRAWIO_VIEWER_STARTUP_ATTEMPTS = 2;
   const DRAWIO_INVALID_LOG_KEYS_LIMIT = 64;
 
@@ -22,6 +24,118 @@
   let failedRenderResults = new Map();
   let maximized = false;
   let restoreWindowStyle = null;
+  let viewerEmbedStrategyPromise = null;
+
+  function isSafeCspNonce(value) {
+    return /^[A-Za-z0-9+/_=-]{8,256}$/.test(String(value || ""));
+  }
+
+  function extractCspScriptNonce(policy) {
+    const text = String(policy || "");
+    const directives = text.split(";");
+    const scriptDirective = directives.find((directive) => /^\s*script-src-elem\s/i.test(directive)) ||
+      directives.find((directive) => /^\s*script-src\s/i.test(directive));
+    if (!scriptDirective) {
+      return "";
+    }
+    for (const match of scriptDirective.matchAll(/'nonce-([^']+)'/g)) {
+      if (isSafeCspNonce(match[1])) {
+        return match[1];
+      }
+    }
+    return "";
+  }
+
+  function readDocumentCspNonce() {
+    if (typeof document?.querySelectorAll !== "function") {
+      return "";
+    }
+    for (const node of document.querySelectorAll("script[nonce]")) {
+      const nonce = String(node.nonce || node.getAttribute?.("nonce") || "");
+      if (isSafeCspNonce(nonce)) {
+        return nonce;
+      }
+    }
+    return "";
+  }
+
+  async function fetchDocumentCspNonce() {
+    if (typeof fetch !== "function" || typeof location?.href !== "string") {
+      return "";
+    }
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeout = setTimeout(() => controller?.abort(), DRAWIO_CSP_NONCE_FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(location.href, {
+        method: "GET",
+        cache: "no-store",
+        credentials: "include",
+        redirect: "follow",
+        signal: controller?.signal
+      });
+      const nonce = extractCspScriptNonce(response.headers?.get?.("content-security-policy") || "");
+      try {
+        await response.body?.cancel?.();
+      } catch {
+        // The response body is intentionally unused; cancellation is best-effort.
+      }
+      return nonce;
+    } catch {
+      return "";
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function escapeHtmlAttribute(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function buildViewerSrcdoc(options = {}) {
+    const nonce = String(options.nonce || "");
+    const channel = String(options.channel || "");
+    if (!isSafeCspNonce(nonce)) {
+      throw new Error("A valid host CSP nonce is required for the Draw.io srcdoc viewer.");
+    }
+    if (!/^[A-Za-z0-9._:-]{1,512}$/.test(channel)) {
+      throw new Error("The Draw.io viewer channel is invalid.");
+    }
+    const resourceUrls = options.resourceUrls || {
+      css: chrome.runtime.getURL("drawio/viewer.css"),
+      renderer: chrome.runtime.getURL("vendor/drawio/viewer-static.min.js"),
+      viewer: chrome.runtime.getURL("drawio/viewer.js")
+    };
+    const nonceAttribute = escapeHtmlAttribute(nonce);
+    return [
+      "<!doctype html>",
+      '<html lang="en"><head><meta charset="utf-8">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1">',
+      `<meta name="ai-chat-drawio-channel" content="${escapeHtmlAttribute(channel)}">`,
+      `<link nonce="${nonceAttribute}" rel="stylesheet" href="${escapeHtmlAttribute(resourceUrls.css)}">`,
+      '<title>Draw.io preview</title>',
+      `<script nonce="${nonceAttribute}" defer src="${escapeHtmlAttribute(resourceUrls.renderer)}"></script>`,
+      `<script nonce="${nonceAttribute}" defer src="${escapeHtmlAttribute(resourceUrls.viewer)}"></script>`,
+      '</head><body><main id="viewer" aria-live="polite">',
+      '<div id="loading">Preparing draw.io renderer…</div>',
+      "</main></body></html>"
+    ].join("");
+  }
+
+  async function resolveViewerEmbedStrategy() {
+    const nonce = readDocumentCspNonce() || await fetchDocumentCspNonce();
+    return Object.freeze({ nonce: isSafeCspNonce(nonce) ? nonce : "" });
+  }
+
+  function getViewerEmbedStrategy() {
+    if (!viewerEmbedStrategyPromise) {
+      viewerEmbedStrategyPromise = resolveViewerEmbedStrategy().catch(() => Object.freeze({ nonce: "" }));
+    }
+    return viewerEmbedStrategyPromise;
+  }
 
   function validateDrawioXml(xml) {
     const text = String(xml || "");
@@ -203,12 +317,16 @@
     let channel = "";
     let renderRequested = false;
     let renderAccepted = false;
+    let renderRequestRetryTimer = 0;
+    let mountRequestId = 0;
     const promise = new Promise((resolve) => {
       resolvePromise = resolve;
     });
 
     function cleanup() {
+      mountRequestId += 1;
       attemptPolicy.cancel();
+      clearRenderRequestRetry();
       window.removeEventListener("message", onMessage, true);
       iframe?.removeEventListener("error", onFrameError);
       iframe?.removeEventListener("load", onFrameLoad);
@@ -262,11 +380,26 @@
       if (settled) {
         return;
       }
+      const requestedMountId = ++mountRequestId;
+      setPreviewStatus("Preparing the isolated draw.io viewer locally…");
+      getViewerEmbedStrategy().then((embedStrategy) => {
+        if (settled || requestedMountId !== mountRequestId) {
+          return;
+        }
+        mountPreparedViewerAttempt(embedStrategy);
+      });
+    }
+
+    function mountPreparedViewerAttempt(embedStrategy) {
+      if (settled) {
+        return;
+      }
       iframe?.removeEventListener("error", onFrameError);
       iframe?.removeEventListener("load", onFrameLoad);
       layer?.remove();
 
       const startupAttempt = attemptPolicy.beginAttempt();
+      clearRenderRequestRetry();
       renderRequested = false;
       renderAccepted = false;
       channel = buildChannelToken(artifact.artifactId, `${artifact.generation}-${startupAttempt}`);
@@ -277,10 +410,17 @@
       iframe = document.createElement("iframe");
       iframe.title = `Rendering ${artifact.title || "draw.io preview"}`;
       iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("referrerpolicy", "no-referrer");
       iframe.setAttribute("aria-hidden", "true");
       iframe.addEventListener("error", onFrameError);
       iframe.addEventListener("load", onFrameLoad);
-      iframe.src = `${chrome.runtime.getURL("drawio/viewer.html")}#channel=${encodeURIComponent(channel)}`;
+      if (embedStrategy?.nonce) {
+        iframe.srcdoc = buildViewerSrcdoc({ nonce: embedStrategy.nonce, channel });
+        layer.dataset.embedMode = "nonce-srcdoc";
+      } else {
+        iframe.src = `${chrome.runtime.getURL("drawio/viewer.html")}#channel=${encodeURIComponent(channel)}`;
+        layer.dataset.embedMode = "extension-url";
+      }
       layer.appendChild(iframe);
       previewElements.viewport.appendChild(layer);
       updateHostDiagnostics();
@@ -291,13 +431,37 @@
         return;
       }
       renderRequested = true;
+      postRenderRequest();
+      // Some Chromium host pages deliver the parent iframe load event before
+      // the sandboxed extension listener is ready to receive its first
+      // cross-origin postMessage. Repeat only this idempotent, channel-bound
+      // request until the viewer acknowledges it; viewer.js accepts one render
+      // and ignores every duplicate.
+      renderRequestRetryTimer = setInterval(() => {
+        if (settled || renderAccepted) {
+          clearRenderRequestRetry();
+          return;
+        }
+        postRenderRequest();
+      }, DRAWIO_RENDER_REQUEST_RETRY_MS);
+      attemptPolicy.awaitAcceptance();
+    }
+
+    function postRenderRequest() {
+      if (settled || !iframe?.contentWindow) {
+        return;
+      }
       iframe.contentWindow.postMessage({
         type: "ai-chat-drawio-render",
         channel,
         artifactId: artifact.artifactId,
         xml: artifact.xml
       }, "*");
-      attemptPolicy.awaitAcceptance();
+    }
+
+    function clearRenderRequestRetry() {
+      clearInterval(renderRequestRetryTimer);
+      renderRequestRetryTimer = 0;
     }
 
     function succeed(message) {
@@ -365,6 +529,7 @@
       }
       if (action === "started") {
         renderAccepted = true;
+        clearRenderRequestRetry();
         attemptPolicy.accept();
         setPreviewStatus("The isolated draw.io viewer accepted the helper and is rendering it locally…");
         return;
@@ -455,10 +620,6 @@
         options.onRetry?.({ phase: timeoutPhase, attempt, nextAttempt: attempt + 1 });
         return true;
       }
-      if (timeoutPhase === "accept") {
-        phase = "awaiting-accept";
-        return false;
-      }
       stopped = true;
       phase = "failed";
       options.onFailure?.(message);
@@ -487,7 +648,7 @@
         startPhase("accept", options.acceptTimeoutMs);
       },
       accept() {
-        if (stopped || (phase !== "accept" && phase !== "awaiting-accept")) {
+        if (stopped || phase !== "accept") {
           return false;
         }
         cancelWatchdog();
@@ -916,6 +1077,8 @@
     hashDrawioXml,
     createVisibleTimeWatchdog,
     createRenderAttemptWatchdog,
-    classifyDrawioViewerMessage
+    classifyDrawioViewerMessage,
+    extractCspScriptNonce,
+    buildViewerSrcdoc
   });
 })();

@@ -407,13 +407,22 @@ async function verifyHiddenStopButtonDoesNotBlockHelperScan() {
   const context = loadContentContext();
   const hiddenStop = new MockNode({ text: "Stop generating", visible: false });
   const visibleStop = new MockNode({ text: "Stop generating", visible: true });
+  const composer = new MockNode({ visible: true });
+  const composerForm = new MockNode({ children: [composer, visibleStop] });
+  visibleStop.closest = (selector) => String(selector).trim() === "form" ? composerForm : null;
+  const outsideStop = new MockNode({ text: "Stop generating", visible: true });
   const ambiguousStop = new MockNode({ text: "Stop", visible: true });
 
   context.document.querySelectorAll = () => [hiddenStop];
   assert.equal(context.isAssistantGenerating(), false, "A hidden stale Stop button must not block helper execution.");
 
   context.document.querySelectorAll = () => [visibleStop];
-  assert.equal(context.isAssistantGenerating(), true, "A visible exact generation control label must be recognized.");
+  assert.equal(context.isAssistantGenerating(), true,
+    "A visible exact generation control in the ChatGPT composer form must be recognized.");
+
+  context.document.querySelectorAll = () => [outsideStop];
+  assert.equal(context.isAssistantGenerating(), false,
+    "A visible exact Stop outside the ChatGPT composer form must not become generation evidence.");
 
   context.document.querySelectorAll = () => [ambiguousStop];
   assert.equal(context.isAssistantGenerating(), false,

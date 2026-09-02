@@ -102,7 +102,7 @@ async function main() {
 function createPageContext(token, response) {
   const ids = [
     "loading", "result", "summary", "metadata", "stderr-section", "stdout-section", "stderr", "stdout",
-    "empty-output", "copy", "close", "stderr-title", "stdout-title"
+    "empty-output", "copy", "close", "stderr-title", "stdout-title", "title", "failure-badge"
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, element(id)]));
   for (const id of ["result", "metadata", "stderr-section", "stdout-section", "empty-output", "copy"]) {
@@ -122,6 +122,7 @@ function createPageContext(token, response) {
       }
     },
     document: {
+      title: "",
       getElementById(id) {
         return elements[id];
       }

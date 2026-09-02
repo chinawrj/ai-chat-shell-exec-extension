@@ -33,6 +33,10 @@ async function main() {
   await testInstallerSnapshotAndChangeRaceFailClosed();
   await testDefaultRunnerExecutesSnapshotAndCleansIt();
   await testInstallerEnvironmentIsMinimal();
+  await testConfiguredEnvironmentReachesInstallAndUninstallOnly();
+  await testUninstallFailureAndMalformedEnvironmentFailClosed();
+  await testSuccessfulUninstallCommitsAcrossSkillIdentityChanges();
+  await testFailedUninstallCannotPreserveAChangedSkillIdentity();
   await testStateRefreshForAddDeleteModifyAndExternalJsonChanges();
 }
 
@@ -475,6 +479,238 @@ async function testInstallerEnvironmentIsMinimal() {
   assert.equal(Object.prototype.hasOwnProperty.call(receivedEnv, "AI_HELPER_SKILL_PATHS"), false);
 }
 
+async function testConfiguredEnvironmentReachesInstallAndUninstallOnly() {
+  const fixture = makeFixture("skill-lifecycle-env-");
+  const skillPath = writeSkill(fixture.root, "environment-lifecycle", "Environment lifecycle", "body");
+  const skillDir = path.dirname(skillPath);
+  writeInstaller(skillDir, "printf '%s' \"$SKILL_LIFECYCLE_VALUE\" > install-env.txt");
+  writeUninstaller(skillDir, "printf '%s' \"$SKILL_LIFECYCLE_VALUE\" > uninstall-env.txt");
+  const envPath = path.join(fixture.root, "lifecycle.env");
+  fs.writeFileSync(envPath, "SKILL_LIFECYCLE_VALUE=from configured file\n", { mode: 0o600 });
+  const service = new SkillCatalogService({
+    stateDir: fixture.stateDir,
+    env: {
+      AI_HELPER_SKILL_PATHS: fixture.root,
+      AI_CHAT_SHELL_ENV_FILE: envPath,
+      PATH: process.env.PATH || "/usr/bin:/bin",
+      HOME: fixture.root,
+      SERVER_ONLY_SECRET: "must-not-leak"
+    },
+    cwd: fixture.root,
+    homeDir: fixture.root,
+    cacheMs: 0
+  });
+
+  let management = service.manage();
+  const initial = management.skills.find((entry) => entry.id === "environment-lifecycle");
+  assert.equal(initial.installAvailable, true);
+  assert.equal(initial.uninstallAvailable, true);
+  assert.match(initial.uninstallSha, /^[a-f0-9]{64}$/);
+  const installed = await service.install({
+    skillId: initial.id,
+    skillSha: initial.sha,
+    installSha: initial.installSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(installed.ok, true, JSON.stringify(installed));
+  assert.equal(fs.readFileSync(path.join(skillDir, "install-env.txt"), "utf8"), "from configured file");
+
+  fs.writeFileSync(envPath, "SKILL_LIFECYCLE_VALUE=fresh uninstall value\n", { mode: 0o600 });
+  management = service.manage();
+  const current = management.skills.find((entry) => entry.id === initial.id);
+  assert.equal(current.installed, true);
+  const uninstalled = await service.uninstall({
+    skillId: current.id,
+    skillSha: current.sha,
+    uninstallSha: current.uninstallSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(uninstalled.ok, true, JSON.stringify(uninstalled));
+  assert.equal(uninstalled.skill.installed, false);
+  assert.equal(fs.readFileSync(path.join(skillDir, "uninstall-env.txt"), "utf8"), "fresh uninstall value",
+    "Uninstall must reread the configured environment file instead of reusing the install snapshot.");
+  assert.equal(service.list().skills.length, 0, "Successfully uninstalled Skills must immediately leave the AI catalog.");
+  assert.equal(readJson(path.join(fixture.stateDir, SKILL_INSTALL_STATE_FILE)).skills[current.id].installed, false);
+  assert.deepEqual(fs.readdirSync(fixture.stateDir).filter((name) => /skill-(?:install|uninstall)-run-/.test(name)), [],
+    "Install and uninstall snapshots must both be removed.");
+}
+
+async function testUninstallFailureAndMalformedEnvironmentFailClosed() {
+  const fixture = makeFixture("skill-uninstall-negative-");
+  const skillPath = writeSkill(fixture.root, "negative-lifecycle", "Negative lifecycle", "body");
+  const skillDir = path.dirname(skillPath);
+  writeInstaller(skillDir, "exit 0");
+  writeUninstaller(skillDir, "exit 17");
+  const envPath = path.join(fixture.root, "negative.env");
+  fs.writeFileSync(envPath, "VISIBLE_TO_SCRIPT=ok\n", { mode: 0o600 });
+  let uninstallShouldFail = true;
+  let executions = 0;
+  const service = new SkillCatalogService({
+    stateDir: fixture.stateDir,
+    env: {
+      AI_HELPER_SKILL_PATHS: fixture.root,
+      AI_CHAT_SHELL_ENV_FILE: envPath,
+      PATH: process.env.PATH || "/usr/bin:/bin",
+      SERVER_ONLY_SECRET: "must-not-leak"
+    },
+    cwd: fixture.root,
+    homeDir: fixture.root,
+    cacheMs: 0,
+    runInstallScript: async ({ scriptPath, env }) => {
+      executions += 1;
+      assert.equal(env.VISIBLE_TO_SCRIPT, "ok");
+      assert.equal(Object.prototype.hasOwnProperty.call(env, "SERVER_ONLY_SECRET"), false);
+      if (path.basename(scriptPath) === "uninstall.sh" && uninstallShouldFail) {
+        return { code: 17, timedOut: false, stdout: "local uninstall stdout", stderr: "local uninstall stderr" };
+      }
+      return { code: 0, timedOut: false, stdout: "", stderr: "" };
+    }
+  });
+  let management = service.manage();
+  let record = management.skills[0];
+  assert.equal((await service.install({
+    skillId: record.id,
+    skillSha: record.sha,
+    installSha: record.installSha,
+    catalogSha: management.catalogSha
+  })).ok, true);
+
+  management = service.manage();
+  record = management.skills[0];
+  const failed = await service.uninstall({
+    skillId: record.id,
+    skillSha: record.sha,
+    uninstallSha: record.uninstallSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.errorCode, "uninstaller-failed");
+  assert.equal(failed.exitCode, 17);
+  assert.equal(failed.installerOutput.stderr, "local uninstall stderr");
+  assert.equal(service.manage().skills[0].installed, true, "A failed uninstaller must keep the Skill installed.");
+
+  uninstallShouldFail = false;
+  fs.writeFileSync(envPath, "ENV_SECRET_MUST_NOT_LEAK\n", { mode: 0o600 });
+  const executionsBeforeMalformed = executions;
+  management = service.manage();
+  record = management.skills[0];
+  const malformed = await service.uninstall({
+    skillId: record.id,
+    skillSha: record.sha,
+    uninstallSha: record.uninstallSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.errorCode, "uninstaller-launch-failed");
+  assert.ok(!JSON.stringify(malformed).includes("ENV_SECRET_MUST_NOT_LEAK"));
+  assert.equal(executions, executionsBeforeMalformed, "Malformed environment files must fail before spawning the uninstaller.");
+  assert.equal(service.manage().skills[0].installed, true);
+
+  fs.rmSync(path.join(skillDir, "uninstall.sh"));
+  delete service.env.AI_CHAT_SHELL_ENV_FILE;
+  management = service.manage();
+  record = management.skills[0];
+  assert.equal(record.uninstallAvailable, false);
+  assert.equal((await service.uninstall({
+    skillId: record.id,
+    skillSha: record.sha,
+    catalogSha: management.catalogSha
+  })).errorCode, "uninstall-script-unavailable");
+}
+
+async function testSuccessfulUninstallCommitsAcrossSkillIdentityChanges() {
+  for (const changedFile of ["SKILL.md", "install.sh"]) {
+    const fixture = makeFixture(`skill-uninstall-change-${changedFile.toLowerCase().replace(/\W/g, "-")}-`);
+    const skillPath = writeSkill(fixture.root, "changing-lifecycle", "Changing lifecycle", "body");
+    const skillDir = path.dirname(skillPath);
+    writeInstaller(skillDir, "exit 0");
+    writeUninstaller(skillDir, "exit 0");
+    let executions = 0;
+    const service = makeService(fixture, async () => {
+      executions += 1;
+      if (executions === 2) {
+        if (changedFile === "SKILL.md") {
+          fs.appendFileSync(skillPath, "\nchanged during uninstall");
+        } else {
+          writeInstaller(skillDir, "printf changed-during-uninstall; exit 0");
+        }
+      }
+      return { code: 0, timedOut: false, stdout: "", stderr: "" };
+    });
+
+    let management = service.manage();
+    let record = management.skills[0];
+    assert.equal((await service.install({
+      skillId: record.id,
+      skillSha: record.sha,
+      installSha: record.installSha,
+      catalogSha: management.catalogSha
+    })).ok, true);
+
+    management = service.manage();
+    record = management.skills[0];
+    const result = await service.uninstall({
+      skillId: record.id,
+      skillSha: record.sha,
+      uninstallSha: record.uninstallSha,
+      catalogSha: management.catalogSha
+    });
+    assert.equal(result.ok, true, `${changedFile} changes after a successful immutable uninstaller must not produce a false failure.`);
+    assert.equal(result.skill.installed, false);
+    assert.equal(service.manage().skills[0].installed, false);
+    assert.equal(service.list().skills.length, 0, "A successful uninstall must atomically remove even a changed Skill identity from the AI catalog.");
+    assert.equal(readJson(path.join(fixture.stateDir, SKILL_INSTALL_STATE_FILE)).skills[record.id].installed, false);
+  }
+}
+
+async function testFailedUninstallCannotPreserveAChangedSkillIdentity() {
+  for (const changedFile of ["SKILL.md", "install.sh"]) {
+    const fixture = makeFixture(`skill-uninstall-failed-change-${changedFile.toLowerCase().replace(/\W/g, "-")}-`);
+    const skillPath = writeSkill(fixture.root, "failed-changing-lifecycle", "Failed changing lifecycle", "body");
+    const skillDir = path.dirname(skillPath);
+    writeInstaller(skillDir, "exit 0");
+    writeUninstaller(skillDir, "exit 23");
+    let executions = 0;
+    const service = makeService(fixture, async () => {
+      executions += 1;
+      if (executions === 2) {
+        if (changedFile === "SKILL.md") {
+          fs.appendFileSync(skillPath, "\nchanged before failed exit");
+        } else {
+          writeInstaller(skillDir, "printf changed-before-failed-exit; exit 0");
+        }
+        return { code: 23, timedOut: false, stdout: "", stderr: "failed after changing identity" };
+      }
+      return { code: 0, timedOut: false, stdout: "", stderr: "" };
+    });
+
+    let management = service.manage();
+    let record = management.skills[0];
+    assert.equal((await service.install({
+      skillId: record.id,
+      skillSha: record.sha,
+      installSha: record.installSha,
+      catalogSha: management.catalogSha
+    })).ok, true);
+
+    management = service.manage();
+    record = management.skills[0];
+    const result = await service.uninstall({
+      skillId: record.id,
+      skillSha: record.sha,
+      uninstallSha: record.uninstallSha,
+      catalogSha: management.catalogSha
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, "uninstaller-failed");
+    assert.equal(readJson(path.join(fixture.stateDir, SKILL_INSTALL_STATE_FILE)).skills[record.id].installed, true,
+      "A failed uninstaller must not proactively clear the prior receipt before reconciliation.");
+    assert.equal(service.manage().skills[0].installed, false,
+      `A failed uninstaller cannot transfer the old installation receipt to a changed ${changedFile} identity.`);
+    assert.equal(service.list().skills.length, 0);
+  }
+}
+
 async function testDefaultRunnerExecutesSnapshotAndCleansIt() {
   const fixture = makeFixture("skill-install-default-runner-");
   const skillPath = writeSkill(fixture.root, "default-runner", "Default runner", "body");
@@ -606,6 +842,10 @@ function writeSkill(root, id, description, body) {
 
 function writeInstaller(skillDir, body) {
   fs.writeFileSync(path.join(skillDir, "install.sh"), `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+}
+
+function writeUninstaller(skillDir, body) {
+  fs.writeFileSync(path.join(skillDir, "uninstall.sh"), `#!/bin/sh\n${body}\n`, { mode: 0o700 });
 }
 
 function readJson(filePath) {

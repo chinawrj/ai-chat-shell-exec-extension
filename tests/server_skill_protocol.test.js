@@ -19,6 +19,7 @@ fs.writeFileSync(skillPath, [
   "secret=$NOT_ALLOWED"
 ].join("\n"));
 fs.writeFileSync(path.join(skillDir, "install.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+fs.writeFileSync(path.join(skillDir, "uninstall.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 
 process.env.AI_CHAT_SHELL_STATE_DIR = stateDir;
 process.env.AI_HELPER_SKILL_PATHS = root;
@@ -40,7 +41,7 @@ main()
 
 async function main() {
   const health = buildHealthResponse();
-  assert.equal(health.skillProtocolVersion, 4);
+  assert.equal(health.skillProtocolVersion, 5);
   assert.equal(health.skillCatalogOk, true, JSON.stringify(health.skillCatalogErrors));
   assert.equal(health.skillCount, 0);
   assert.equal(health.discoveredSkillCount, 1);
@@ -50,7 +51,7 @@ async function main() {
   const status = await request({ type: "skill-catalog-status" });
   assert.equal(status.ok, true, JSON.stringify(status));
   assert.equal(status.type, "skill-catalog-status");
-  assert.equal(status.skillProtocolVersion, 4);
+  assert.equal(status.skillProtocolVersion, 5);
   assert.equal(status.skillCount, 0);
   assert.equal(status.discoveredSkillCount, 1);
   assert.equal(status.skills, undefined, "Status should not unnecessarily disclose the catalog list.");
@@ -60,10 +61,14 @@ async function main() {
   assert.equal(management.ok, true, JSON.stringify(management));
   assert.equal(management.type, "skill-management-list");
   assert.equal(management.skills.length, 1);
-  assert.deepEqual(Object.keys(management.skills[0]).sort(), ["description", "id", "installAvailable", "installSha", "installed", "name", "sha"]);
+  assert.deepEqual(Object.keys(management.skills[0]).sort(), [
+    "description", "id", "installAvailable", "installSha", "installed", "name", "sha", "uninstallAvailable", "uninstallSha"
+  ]);
   assert.equal(management.skills[0].installed, false);
   assert.equal(management.skills[0].installAvailable, true);
   assert.match(management.skills[0].installSha, /^[a-f0-9]{64}$/);
+  assert.equal(management.skills[0].uninstallAvailable, true);
+  assert.match(management.skills[0].uninstallSha, /^[a-f0-9]{64}$/);
 
   let list = await request({ type: "skill-catalog-list" });
   assert.equal(list.ok, true, JSON.stringify(list));
@@ -88,6 +93,32 @@ async function main() {
   assert.equal(list.skills[0].id, "protocol-skill");
   assert.equal(list.skills[0].filePath, undefined, "Absolute local paths must not leak in a catalog response.");
   assertNoPrivateSkillPaths(list, "Skill list response");
+
+  management = await request({ type: "skill-management-list" });
+  const uninstallRecord = management.skills[0];
+  const uninstalled = await request({
+    type: "skill-uninstall",
+    skillId: uninstallRecord.id,
+    skillSha: uninstallRecord.sha,
+    uninstallSha: uninstallRecord.uninstallSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(uninstalled.ok, true, JSON.stringify(uninstalled));
+  assert.equal(uninstalled.type, "skill-uninstall");
+  assert.equal(uninstalled.skill.installed, false);
+  assert.equal((await request({ type: "skill-catalog-list" })).skills.length, 0);
+
+  management = await request({ type: "skill-management-list" });
+  installed = await request({
+    type: "skill-install",
+    skillId: management.skills[0].id,
+    skillSha: management.skills[0].sha,
+    installSha: management.skills[0].installSha,
+    catalogSha: management.catalogSha
+  });
+  assert.equal(installed.ok, true, JSON.stringify(installed));
+  list = await request({ type: "skill-catalog-list" });
+  assert.equal(list.skills.length, 1);
 
   fs.appendFileSync(skillPath, "\ncache-probe=true\n");
   const cachedStatus = await request({ type: "skill-catalog-status" });

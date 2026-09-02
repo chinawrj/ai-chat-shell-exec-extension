@@ -17,9 +17,9 @@ const SKILL_SYNC_TTL_MS = 10 * 60 * 1000;
 const SKILL_INSTALL_FAILURE_TTL_MS = 5 * 60 * 1000;
 const SKILL_INSTALL_FAILURE_LIMIT = 8;
 const SKILL_INSTALL_FAILURE_OUTPUT_CHARS = 20_000;
-const REQUIRED_SERVER_PROTOCOL_VERSION = 11;
+const REQUIRED_SERVER_PROTOCOL_VERSION = 12;
 const REQUIRED_HELPER_PROTOCOL_VERSION = 4;
-const REQUIRED_SKILL_PROTOCOL_VERSION = 4;
+const REQUIRED_SKILL_PROTOCOL_VERSION = 5;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
 const CONTENT_UI_DELAY_MAX_MS = 2_000;
 const BACKGROUND_VISION_MESSAGE_TYPES = new Set([
@@ -54,6 +54,7 @@ const BACKGROUND_SKILL_MESSAGE_TYPES = new Set([
   "skill-management-list",
   "skill-catalog-rescan",
   "skill-install",
+  "skill-uninstall",
   "skill-install-failure-show",
   "skill-install-failure-consume",
   "skill-install-failure-discard",
@@ -322,7 +323,7 @@ async function handleSkillMessage(message, sender = {}) {
     return discardSkillInstallFailure(message, sender);
   }
   const scope = getSkillMemoryScope(sender);
-  if (message.type === "skill-install") {
+  if (message.type === "skill-install" || message.type === "skill-uninstall") {
     const requestOwner = {
       tabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : null,
       tabClosed: false
@@ -331,10 +332,11 @@ async function handleSkillMessage(message, sender = {}) {
     try {
       await requireShellServerReady();
       const response = await runShellViaWebSocket({
-        type: "skill-install",
+        type: message.type,
         skillId: message.skillId,
         skillSha: message.skillSha,
         installSha: message.installSha,
+        uninstallSha: message.uninstallSha,
         catalogSha: message.catalogSha
       });
       if (!isSkillInstallerExecutionFailure(response)) {
@@ -349,6 +351,7 @@ async function handleSkillMessage(message, sender = {}) {
         response,
         skillId: message.skillId,
         skillName: message.skillName,
+        operation: message.type === "skill-uninstall" ? "uninstall" : "install",
         tabId: requestOwner.tabId
       });
       return safeResponse;
@@ -392,11 +395,18 @@ async function handleSkillMessage(message, sender = {}) {
 }
 
 function isSkillInstallerExecutionFailure(response) {
-  return response?.ok === false && ["installer-failed", "installer-signaled", "installer-timeout"]
+  return response?.ok === false && [
+    "installer-failed",
+    "installer-signaled",
+    "installer-timeout",
+    "uninstaller-failed",
+    "uninstaller-signaled",
+    "uninstaller-timeout"
+  ]
     .includes(String(response?.errorCode || ""));
 }
 
-function rememberSkillInstallFailure({ response = {}, skillId = "", skillName = "", tabId = null } = {}) {
+function rememberSkillInstallFailure({ response = {}, skillId = "", skillName = "", operation = "install", tabId = null } = {}) {
   const now = Date.now();
   for (const [token, entry] of pendingSkillInstallFailures) {
     if (Number(entry?.expiresAt || 0) <= now) {
@@ -420,6 +430,7 @@ function rememberSkillInstallFailure({ response = {}, skillId = "", skillName = 
     opening: false,
     shown: false,
     detail: {
+      operation: operation === "uninstall" ? "uninstall" : "install",
       skillId: String(skillId || ""),
       skillName: String(skillName || skillId || "Skill").slice(0, 256),
       errorCode: String(response?.errorCode || "installer-failed"),
@@ -1672,11 +1683,17 @@ function shouldKeepWebSocketAlive(payload) {
   return payload?.type === "run" ||
     payload?.type === "run-board" ||
     payload?.type === "skill-install" ||
+    payload?.type === "skill-uninstall" ||
     VISION_COMMAND_MESSAGE_TYPES.has(payload?.type);
 }
 
 function getWebSocketWatchdogMs(payload) {
-  if (payload && (payload.type === "run" || payload.type === "run-board" || payload.type === "skill-install")) {
+  if (payload && (
+    payload.type === "run" ||
+    payload.type === "run-board" ||
+    payload.type === "skill-install" ||
+    payload.type === "skill-uninstall"
+  )) {
     return 0;
   }
   return Math.max(5000, Number(payload?.timeoutMs || 30000) + 5000);

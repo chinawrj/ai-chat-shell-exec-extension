@@ -14,6 +14,7 @@ const originalEnv = {
   board: process.env.AI_CHAT_SHELL_BOARD_WINDOW,
   cwd: process.env.AI_CHAT_SHELL_FORAI_CWD,
   state: process.env.AI_CHAT_SHELL_STATE_DIR,
+  executionEnvFile: process.env.AI_CHAT_SHELL_ENV_FILE,
   runner: process.env.AI_CHAT_SHELL_RUNNER,
   delayedRunnerMarker: process.env.AI_CHAT_SHELL_DELAYED_RUNNER_MARKER,
   delayedRunnerOnce: process.env.AI_CHAT_SHELL_DELAYED_RUNNER_ONCE
@@ -31,6 +32,7 @@ main()
     restoreEnv("AI_CHAT_SHELL_BOARD_WINDOW", originalEnv.board);
     restoreEnv("AI_CHAT_SHELL_FORAI_CWD", originalEnv.cwd);
     restoreEnv("AI_CHAT_SHELL_STATE_DIR", originalEnv.state);
+    restoreEnv("AI_CHAT_SHELL_ENV_FILE", originalEnv.executionEnvFile);
     restoreEnv("AI_CHAT_SHELL_RUNNER", originalEnv.runner);
     restoreEnv("AI_CHAT_SHELL_DELAYED_RUNNER_MARKER", originalEnv.delayedRunnerMarker);
     restoreEnv("AI_CHAT_SHELL_DELAYED_RUNNER_ONCE", originalEnv.delayedRunnerOnce);
@@ -51,6 +53,7 @@ async function main() {
     ["queued followers resolve cwd after the pane becomes idle", testQueuedFollowerCwdResolution],
     ["owner release failure preserves completion proof", testOwnerReleaseFailureRecovery],
     ["respawned pane shell does not inherit duplicate history", testRespawnedPaneShellDedupIsolation],
+    ["configured execution environment is fresh and dedup-aware", testExecutionEnvironmentFile],
     ["Ctrl+C before the executed marker", testPreExecutionInterrupt]
   ]) {
     try {
@@ -63,6 +66,46 @@ async function main() {
   if (failures.length > 0) {
     throw new Error(failures.join("\n\n"));
   }
+}
+
+async function testExecutionEnvironmentFile() {
+  await withFixture("execution-env", async (fixture) => {
+    const envPath = path.join(fixture.tmpDir, "helper.env");
+    const outputPath = path.join(fixture.tmpDir, "execution-env-output.txt");
+    fs.writeFileSync(envPath, "AI_E2E_VALUE=first value\n", { mode: 0o600 });
+    process.env.AI_CHAT_SHELL_ENV_FILE = envPath;
+    const server = freshServerModule();
+    const command = `printf '%s\\n' "$AI_E2E_VALUE" >> ${shellQuote(outputPath)}`;
+
+    const first = await runHelper(server, "execution-env-first", command, 3000);
+    assert.equal(first.exitCode, 0, JSON.stringify(first));
+    assert.notEqual(first.duplicate, true, JSON.stringify(first));
+    assert.equal(fs.readFileSync(outputPath, "utf8"), "first value\n");
+
+    const duplicate = await runHelper(server, "execution-env-duplicate", command, 3000);
+    assert.equal(duplicate.duplicate, true, "The same completed command and environment snapshot may be deduplicated.");
+    assert.equal(fs.readFileSync(outputPath, "utf8"), "first value\n");
+
+    fs.writeFileSync(envPath, "AI_E2E_VALUE=second value\n", { mode: 0o600 });
+    const changed = await runHelper(server, "execution-env-changed", command, 3000);
+    assert.equal(changed.exitCode, 0, JSON.stringify(changed));
+    assert.notEqual(changed.duplicate, true, "A changed environment file must create a distinct server execution context.");
+    assert.equal(fs.readFileSync(outputPath, "utf8"), "first value\nsecond value\n");
+
+    const secret = "ENV_FILE_SECRET_MUST_NOT_ENTER_ERROR";
+    const secretName = "SECRET_CUSTOMER_ACME";
+    fs.writeFileSync(envPath, `${secretName}=${secret}\n${secretName}=other\n`, { mode: 0o600 });
+    await assert.rejects(
+      () => runHelper(server, "execution-env-malformed", `printf bad >> ${shellQuote(outputPath)}`, 3000),
+      (error) => {
+        assert.match(String(error.message), /invalid at line 2/i);
+        assert.ok(!String(error.message).includes(secret));
+        assert.ok(!String(error.message).includes(secretName), "Shell protocol errors must not expose configured variable names.");
+        return true;
+      }
+    );
+    assert.equal(fs.readFileSync(outputPath, "utf8"), "first value\nsecond value\n", "Malformed environment files must fail before command execution.");
+  });
 }
 
 async function testRespawnedPaneShellDedupIsolation() {
@@ -486,6 +529,7 @@ async function withFixture(label, task) {
   process.env.AI_CHAT_SHELL_BOARD_WINDOW = "board";
   process.env.AI_CHAT_SHELL_FORAI_CWD = cwd;
   process.env.AI_CHAT_SHELL_STATE_DIR = stateDir;
+  delete process.env.AI_CHAT_SHELL_ENV_FILE;
   delete process.env.AI_CHAT_SHELL_RUNNER;
   delete process.env.AI_CHAT_SHELL_DELAYED_RUNNER_MARKER;
   delete process.env.AI_CHAT_SHELL_DELAYED_RUNNER_ONCE;
@@ -495,6 +539,7 @@ async function withFixture(label, task) {
   } finally {
     delete require.cache[require.resolve(serverModulePath)];
     spawnSync("tmux", ["-S", socketPath, "kill-server"], { encoding: "utf8" });
+    delete process.env.AI_CHAT_SHELL_ENV_FILE;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }

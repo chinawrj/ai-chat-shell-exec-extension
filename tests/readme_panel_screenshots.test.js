@@ -7,17 +7,16 @@ const path = require("node:path");
 const root = path.join(__dirname, "..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const e2eSource = fs.readFileSync(path.join(root, "tests", "chrome_extension_e2e.test.js"), "utf8");
-const assetRoot = "docs/release-assets/v0.11.3";
-const screenshots = [
-  "extension-panel-idle.png",
-  "extension-panel-skills-update.png",
-  "extension-panel-force.png",
-  "extension-panel-running.png",
-  "extension-panel-awaiting-user.png",
-  "extension-panel-drawio.png",
-  "extension-panel-advanced.png",
-  "extension-panel-page-binding.png"
-];
+const screenshots = new Map([
+  ["extension-panel-idle.png", "docs/release-assets/v0.11.3"],
+  ["extension-panel-skills-update.png", "docs/release-assets/v0.11.3"],
+  ["extension-panel-force.png", "docs/release-assets/v0.11.11"],
+  ["extension-panel-running.png", "docs/release-assets/v0.11.3"],
+  ["extension-panel-awaiting-user.png", "docs/release-assets/v0.11.3"],
+  ["extension-panel-drawio.png", "docs/release-assets/v0.11.3"],
+  ["extension-panel-advanced.png", "docs/release-assets/v0.11.11"],
+  ["extension-panel-page-binding.png", "docs/release-assets/v0.11.11"]
+]);
 
 assert.match(readme, /## Latest Extension Panel Screenshots/);
 assert.match(readme, /real unpacked-extension Chrome E2E flow rather than composed mockups/);
@@ -28,7 +27,7 @@ assert.ok(
 assert.match(e2eSource, /async function savePanelScreenshot\(page, filePath\)/);
 assert.match(e2eSource, /ai-chat-shell-exec-screenshot-stage/);
 
-for (const filename of screenshots) {
+for (const [filename, assetRoot] of screenshots) {
   const relativePath = `${assetRoot}/${filename}`;
   const absolutePath = path.join(root, relativePath);
   assert.ok(readme.includes(relativePath), `README is missing ${relativePath}.`);

@@ -322,6 +322,26 @@ async function main() {
   assert.equal(context.shouldKeepWebSocketAlive({ type: "skill-install" }), true,
     "Long Skill installation must use the Chrome 116+ WebSocket heartbeat path.");
 
+  const uninstallSha = "e".repeat(64);
+  const uninstall = await context.handleSkillMessage({
+    type: "skill-uninstall",
+    skillId: "example",
+    skillName: "Example Skill",
+    skillSha: catalog.skills[0].sha,
+    uninstallSha,
+    catalogSha: catalog.catalogSha
+  }, chatgptTab1);
+  assert.equal(uninstall.ok, true);
+  const uninstallPayload = websocketPayloads.findLast((payload) => payload.type === "skill-uninstall");
+  assert.equal(uninstallPayload.skillId, "example");
+  assert.equal(uninstallPayload.skillSha, catalog.skills[0].sha);
+  assert.equal(uninstallPayload.uninstallSha, uninstallSha);
+  assert.equal(uninstallPayload.catalogSha, catalog.catalogSha);
+  assert.equal(uninstallPayload.skillName, undefined);
+  assert.equal(context.getWebSocketWatchdogMs({ type: "skill-uninstall" }), 0,
+    "Skill uninstallation must use the same output-idle lifecycle without an absolute browser watchdog.");
+  assert.equal(context.shouldKeepWebSocketAlive({ type: "skill-uninstall" }), true);
+
   skillInstallResponseOverride = {
     ...catalog,
     ok: false,
@@ -706,10 +726,10 @@ function createBackgroundContext({ healthGate } = {}) {
           allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
           releaseVersion: "0.11.2",
           serverReleaseVersion: "0.11.2",
-          protocolVersion: 11,
-          serverProtocolVersion: 11,
+          protocolVersion: 12,
+          serverProtocolVersion: 12,
           helperProtocolVersion: 4,
-          skillProtocolVersion: 4
+          skillProtocolVersion: 5
         })
       };
     },
@@ -793,6 +813,18 @@ function skillServerResponse(payload) {
       type: "skill-install",
       exitCode: 0,
       skill: { ...catalog.skills[0], installed: true, installAvailable: true }
+    };
+  }
+  if (payload.type === "skill-uninstall") {
+    if (skillInstallResponseOverride) {
+      return { ...skillInstallResponseOverride };
+    }
+    return {
+      ...catalog,
+      ok: true,
+      type: "skill-uninstall",
+      exitCode: 0,
+      skill: { ...catalog.skills[0], installed: false, uninstallAvailable: true }
     };
   }
   if (payload.type === "skill-load") {

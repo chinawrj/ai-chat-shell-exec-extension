@@ -13,6 +13,10 @@ const KEY_PATH = path.join(STATE_DIR, "localhost-key.pem");
 const PORT = Number(process.env.TEST_PAGE_PORT || process.argv[2] || 17443);
 const HOST = "127.0.0.1";
 const PAGE_PATH = path.join(ROOT_DIR, "tests", "manual", "tmux-test-page.html");
+const CHATGPT_CONTRACT_PAGE_PATH = path.join(ROOT_DIR, "tests", "manual", "chatgpt-contract-test-page.html");
+const CHATGPT_CONTRACT_PATH = "/chatgpt-contract-test-page.html";
+const CSP_DRAWIO_PATH = "/drawio-csp-test-page.html";
+const CSP_DRAWIO_NONCE = "ai-chat-shell-e2e-drawio-csp-2026";
 
 ensureCertificate();
 
@@ -21,17 +25,38 @@ const server = https.createServer({
   key: fs.readFileSync(KEY_PATH)
 }, (req, res) => {
   const url = new URL(req.url, `https://localhost:${PORT}`);
-  if (url.pathname !== "/" && url.pathname !== "/tmux-test-page.html") {
+  if (url.pathname !== "/" && url.pathname !== "/tmux-test-page.html" &&
+      url.pathname !== CSP_DRAWIO_PATH && url.pathname !== CHATGPT_CONTRACT_PATH) {
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("not found");
     return;
   }
 
-  res.writeHead(200, {
+  const headers = {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store"
-  });
-  res.end(fs.readFileSync(PAGE_PATH));
+  };
+  let page = fs.readFileSync(
+    url.pathname === CHATGPT_CONTRACT_PATH ? CHATGPT_CONTRACT_PAGE_PATH : PAGE_PATH,
+    "utf8"
+  );
+  if (url.pathname === CSP_DRAWIO_PATH) {
+    headers["content-security-policy"] = [
+      "default-src 'self'",
+      `script-src 'nonce-${CSP_DRAWIO_NONCE}'`,
+      `style-src 'nonce-${CSP_DRAWIO_NONCE}'`,
+      "frame-src 'self'",
+      "img-src 'self' data: blob:",
+      "connect-src 'self' http://127.0.0.1:17371 ws://127.0.0.1:17371",
+      "object-src 'none'",
+      "base-uri 'none'"
+    ].join("; ");
+    page = page
+      .replace("<style>", `<style nonce="${CSP_DRAWIO_NONCE}">`)
+      .replace("<script>", `<script nonce="${CSP_DRAWIO_NONCE}">`);
+  }
+  res.writeHead(200, headers);
+  res.end(page);
 });
 
 server.listen(PORT, HOST, () => {

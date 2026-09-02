@@ -2,7 +2,10 @@
   "use strict";
 
   const RENDER_OUTPUT_TIMEOUT_MS = 15000;
-  const channel = new URLSearchParams(location.hash.replace(/^#/, "")).get("channel") || "";
+  const embeddedChannel = typeof document.querySelector === "function"
+    ? document.querySelector('meta[name="ai-chat-drawio-channel"]')?.getAttribute("content") || ""
+    : "";
+  const channel = embeddedChannel || new URLSearchParams(location.hash.replace(/^#/, "")).get("channel") || "";
   const viewer = document.getElementById("viewer");
   let renderStarted = false;
   let renderSettled = false;
@@ -147,8 +150,14 @@
         xml
       }));
       viewer.replaceChildren(container);
-      globalThis.GraphViewer.processElements();
+      // Acknowledge the exact validated render request before entering the
+      // packaged renderer's synchronous layout work. On complex host pages
+      // that work can run longer than the parent's acceptance handshake even
+      // though the isolated viewer is healthy; delaying this acknowledgement
+      // causes the parent to replace the iframe mid-render and can strand the
+      // final retry in staging forever.
       post("ai-chat-drawio-render-started", { artifactId });
+      globalThis.GraphViewer.processElements();
       waitForRenderedSvg(container, artifactId, metadata);
     } catch (error) {
       fail(error, artifactId);

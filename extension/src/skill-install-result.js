@@ -44,6 +44,10 @@ async function loadResult() {
 function renderResult(detail) {
   loading.classList.add("hidden");
   result.classList.remove("hidden");
+  const operation = detail.operation === "uninstall" ? "uninstallation" : "installation";
+  document.title = `Skill ${operation} result`;
+  document.getElementById("title").textContent = `Skill ${operation} failed`;
+  document.getElementById("failure-badge").textContent = operation === "uninstallation" ? "Still installed" : "Not installed";
   const skillName = String(detail.skillName || detail.skillId || "Skill");
   const skillId = String(detail.skillId || "");
   summary.textContent = `${skillName}${skillId && skillId !== skillName ? ` (${skillId})` : ""}: ${String(detail.error || "The installer did not complete successfully.")}`;

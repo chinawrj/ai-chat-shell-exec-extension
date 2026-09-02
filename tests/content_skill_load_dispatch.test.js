@@ -9,9 +9,15 @@ const context = createContentContext();
 
 testLiveGenerationEvidenceSurvivesRemoval();
 testStableGenerationControlEvidenceBoundaries();
+testChatGptMorphingSubmitButtonProvesGeneration();
 testM365CopilotCurrentResponseGenerationIsEligible();
+testChatGptCurrentMessageRoleContract();
+testChatGptLateFinalLifecycleEvidenceIsCandidateBound();
+testChatGptReloadDuringVisibleStopCannotReviveHistoricalHelper();
+testChatGptSkillDispatchSurvivesAuthoredBodyRedraw();
 testGenerationEvidenceIsCandidateBound();
 testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute();
+testChatGptNewConversationRouteAssignmentCarriesUnboundGeneration();
 testUnrelatedGenerationCannotReviveKnownHistory();
 testTwoPhaseHistoricalRedrawCannotBecomeLive();
 testCompleteHelperCannotBorrowUnrelatedGeneration();
@@ -68,6 +74,7 @@ testColdHistoryRequiresExplicitSkillRecovery()
 
 function testLiveGenerationEvidenceSurvivesRemoval() {
   const stop = new context.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(context, stop);
   vm.runInContext("assistantGenerationObservedForLifecycle = false", context);
   context.observeAssistantGenerationEvidence([{ addedNodes: [], removedNodes: [stop] }]);
   assert.equal(
@@ -112,6 +119,7 @@ function testStableGenerationControlEvidenceBoundaries() {
   stableControl.getAttribute = (name) => name === "data-testid"
     ? "stop-button"
     : stableGetAttribute(name);
+  attachChatGptComposerActuator(local, stableControl);
   assert.equal(local.isAssistantGenerationControl(stableControl), true,
     "A production stable Stop test id must prove generation independently of localized button text.");
 
@@ -141,6 +149,136 @@ function testStableGenerationControlEvidenceBoundaries() {
   const genericStop = new local.Element({ role: "button", label: "Stop" });
   assert.equal(local.isAssistantGenerationControl(genericStop), false,
     "An unrelated generic Stop button remains insufficient generation evidence.");
+}
+
+function testChatGptMorphingSubmitButtonProvesGeneration() {
+  const local = createContentContext();
+  const helperText = [
+    "ai-helper-skill-start:chatgpt-morph",
+    "cmd: list",
+    "challenge: 0123456789abcdef0123456789abcdef",
+    "ai-helper-skill-end"
+  ].join("\n");
+  const conversation = new local.Element();
+  const user = new local.Element({ messageRole: "user" });
+  const userCopy = new local.Element();
+  userCopy.hasUserMessageCopy = true;
+  userCopy.textContent = "Synchronize Skills.";
+  userCopy.innerText = userCopy.textContent;
+  user.append(userCopy);
+  const assistant = new local.Element({ messageRole: "assistant" });
+  assistant.textContent = helperText;
+  assistant.innerText = helperText;
+  conversation.append(user);
+  conversation.append(assistant);
+  const candidate = {
+    call: local.parseCallPayload(helperText),
+    node: assistant,
+    textRoot: assistant,
+    source: "text",
+    blockIndex: 0
+  };
+  const submit = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, submit);
+  local.__chatGptMorphConversation = conversation;
+  local.__chatGptMorphCandidate = candidate;
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__chatGptMorphConversation;
+    extractShellCallCandidates = () => [globalThis.__chatGptMorphCandidate];
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  `, local);
+  const records = [
+    {
+      type: "attributes",
+      target: submit,
+      attributeName: "aria-label",
+      oldValue: "Send message",
+      addedNodes: [],
+      removedNodes: []
+    },
+    {
+      type: "characterData",
+      target: assistant,
+      oldValue: "ai-helper-skill-start:chatgpt-morph",
+      addedNodes: [],
+      removedNodes: []
+    }
+  ];
+  assert.equal(local.observeAssistantGenerationEvidence(records), true,
+    "ChatGPT's in-place Send-to-Stop aria-label morph must establish current generation evidence.");
+  local.trackAssistantGenerationHelperRoots(records);
+  local.markLiveGeneratedHelperCandidates(records);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "A helper in the exact assistant turn must remain live when ChatGPT morphs one composer button instead of adding a Stop node.");
+
+  const spoof = new local.Element({ author: "user", role: "button", label: "Stop generating" });
+  const spoofRecord = [{
+    type: "attributes",
+    target: spoof,
+    attributeName: "aria-label",
+    oldValue: "Send message",
+    addedNodes: [],
+    removedNodes: []
+  }];
+  assert.deepEqual(Array.from(local.collectAssistantGenerationAttributeControls(spoofRecord, "added")), [],
+    "An in-message aria-label morph must remain untrusted generation evidence.");
+
+  const unrelated = new local.Element({ role: "button", label: "Stop generating" });
+  const unrelatedRecord = [{
+    type: "attributes",
+    target: unrelated,
+    attributeName: "aria-label",
+    oldValue: "Send message",
+    addedNodes: [],
+    removedNodes: []
+  }];
+  assert.deepEqual(Array.from(local.collectAssistantGenerationAttributeControls(unrelatedRecord, "added")), [],
+    "An exact-looking morph outside the ChatGPT composer form must not become generation evidence.");
+
+  const startupSpoof = createContentContext();
+  const startupStop = new startupSpoof.Element({ role: "button", label: "Stop generating" });
+  startupSpoof.document.querySelectorAll = (selector) => String(selector).includes("button")
+    ? [startupStop]
+    : [];
+  assert.equal(startupSpoof.initializeAssistantGenerationEpochFromVisibleControls(), false,
+    "An exact Stop outside the ChatGPT composer must not establish an epoch during extension startup.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch", startupSpoof), null,
+    "The startup false positive must leave generation ownership empty.");
+
+  const wrongOldValue = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, wrongOldValue);
+  assert.deepEqual(Array.from(local.collectAssistantGenerationAttributeControls([{
+    type: "attributes",
+    target: wrongOldValue,
+    attributeName: "aria-label",
+    oldValue: "Retry",
+    addedNodes: [],
+    removedNodes: []
+  }], "added")), [],
+  "A composer button must make the exact Send message -> Stop generating transition.");
+
+  const completed = createContentContext();
+  const completedSubmit = new completed.Element({ role: "button", label: "Send message" });
+  attachChatGptComposerActuator(completed, completedSubmit);
+  vm.runInContext(`
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  `, completed);
+  completed.observeAssistantGenerationEvidence([{
+    type: "attributes",
+    target: completedSubmit,
+    attributeName: "aria-label",
+    oldValue: "Stop generating",
+    addedNodes: [],
+    removedNodes: []
+  }]);
+  assert.equal(vm.runInContext("assistantGenerationObservedForLifecycle", completed), true,
+    "An exact connected ChatGPT Stop-to-Send morph must retain bounded completion evidence even when no Stop node existed.");
+  assert.equal(vm.runInContext("assistantGenerationEvidenceUntil > Date.now()", completed), true,
+    "The in-place completion morph must retain a short final-helper scan window.");
 }
 
 function testM365CopilotCurrentResponseGenerationIsEligible() {
@@ -273,6 +411,432 @@ function testM365CopilotCurrentResponseGenerationIsEligible() {
     "An M365 Copilot-like node without role=article must fail closed.");
 }
 
+function testChatGptCurrentMessageRoleContract() {
+  const local = createContentContext();
+  const prompt = [
+    "The local SKILLS catalog has changed.",
+    "Local catalog version: 3",
+    `Local catalog SHA: ${"a".repeat(64)}`
+  ].join("\n");
+  const userCopy = new local.Element();
+  userCopy.textContent = prompt;
+  userCopy.innerText = prompt;
+  userCopy.hasUserMessageCopy = true;
+  const user = new local.Element({ messageRole: "user" });
+  user.textContent = `You said:\n\n${prompt}`;
+  user.innerText = user.textContent;
+  user.append(userCopy);
+  const assistant = new local.Element({ messageRole: "assistant" });
+
+  assert.equal(local.getMessageAuthorRole(user), "user",
+    "The current ChatGPT data-message-role=user root must be recognized explicitly.");
+  assert.equal(local.getMessageAuthorRole(assistant), "assistant",
+    "The current ChatGPT data-message-role=assistant root must be recognized explicitly.");
+  assert.equal(local.getMessageAuthorRole(userCopy), "user",
+    "A descendant of the exact current ChatGPT user root must inherit only that structural role.");
+  assert.equal(local.isSubmittedUserMessageNode(user), true,
+    "The current ChatGPT user root must participate in fresh submission proof.");
+  assert.equal(local.isSubmittedUserMessageNode(assistant), false,
+    "A current ChatGPT assistant root must never count as submitted-user proof.");
+  assert.equal(local.submittedUserMessageRootMatches(user, prompt), true,
+    "Submission proof must compare the exact data-user-message-copy payload without the host role label.");
+  assert.equal(local.submittedUserMessageRootMatches(user, `${prompt}\nextra`), false,
+    "A prefix match must not prove submission of a different ChatGPT payload.");
+
+  const nestedAssistant = new local.Element({ messageRole: "assistant" });
+  const nestedLegacyAssistant = new local.Element({ author: "assistant" });
+  user.append(nestedAssistant);
+  user.append(nestedLegacyAssistant);
+  assert.equal(local.getMessageAuthorRole(nestedAssistant), "user",
+    "A nested data-message-role spoof must not override the canonical outer ChatGPT user turn.");
+  assert.equal(local.getMessageAuthorRole(nestedLegacyAssistant), "user",
+    "A nested legacy assistant-role attribute must not override the canonical outer ChatGPT user turn.");
+  assert.equal(local.getExplicitMessageContainer(nestedAssistant), user,
+    "Nested message-looking content must resolve to the outer canonical ChatGPT turn.");
+  const conversation = new local.Element();
+  conversation.append(user);
+  assert.deepEqual(Array.from(local.getExplicitMessageRoots(conversation)), [user],
+    "A nested role spoof must not become a second authored ChatGPT turn.");
+
+  const duplicateCopyUser = new local.Element({ messageRole: "user" });
+  const duplicateCopyA = new local.Element();
+  duplicateCopyA.hasUserMessageCopy = true;
+  duplicateCopyA.textContent = prompt;
+  duplicateCopyA.innerText = prompt;
+  const duplicateCopyB = new local.Element();
+  duplicateCopyB.hasUserMessageCopy = true;
+  duplicateCopyB.textContent = prompt;
+  duplicateCopyB.innerText = prompt;
+  duplicateCopyUser.append(duplicateCopyA);
+  duplicateCopyUser.append(duplicateCopyB);
+  assert.equal(local.submittedUserMessageRootMatches(duplicateCopyUser, prompt), false,
+    "Multiple ChatGPT copy surfaces must fail closed instead of proving a submission ambiguously.");
+
+  const nestedCopyUser = new local.Element({ messageRole: "user" });
+  const nestedCopyAssistant = new local.Element({ messageRole: "assistant" });
+  const nestedCopy = new local.Element();
+  nestedCopy.hasUserMessageCopy = true;
+  nestedCopy.textContent = prompt;
+  nestedCopy.innerText = prompt;
+  nestedCopyAssistant.append(nestedCopy);
+  nestedCopyUser.append(nestedCopyAssistant);
+  assert.equal(local.submittedUserMessageRootMatches(nestedCopyUser, prompt), false,
+    "A copy surface hidden inside a nested role spoof must not prove the outer user submission.");
+
+  const spoofedLabel = new local.Element();
+  spoofedLabel.textContent = `You said:\n\n${prompt}`;
+  spoofedLabel.innerText = spoofedLabel.textContent;
+  assert.equal(local.getMessageAuthorRole(spoofedLabel), "",
+    "Visible You said text without the exact host attribute must remain untrusted.");
+  assert.equal(local.isSubmittedUserMessageNode(spoofedLabel), false,
+    "A visible role-label spoof must not become submission proof.");
+
+  local.location.hostname = "example.com";
+  assert.equal(local.getMessageAuthorRole(user), "",
+    "data-message-role must remain host-scoped and grant no authority on other sites.");
+  assert.equal(local.isSubmittedUserMessageNode(user), false,
+    "ChatGPT message roots must grant no submitted-user authority on another host.");
+}
+
+function testChatGptLateFinalLifecycleEvidenceIsCandidateBound() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ messageRole: "user" });
+  const userCopy = new local.Element();
+  userCopy.hasUserMessageCopy = true;
+  userCopy.textContent = "Generate the current helper.";
+  userCopy.innerText = userCopy.textContent;
+  user.append(userCopy);
+  const assistant = new local.Element({ messageRole: "assistant" });
+  const assistantContent = new local.Element();
+  assistantContent.hasAssistantMarkdown = true;
+  const helperText = [
+    "ai-helper-skill-start:chatgpt-late-final",
+    "cmd: list",
+    "challenge: 00112233445566778899aabbccddeeff",
+    "ai-helper-skill-end"
+  ].join("\n");
+  assistantContent.textContent = helperText;
+  assistantContent.innerText = helperText;
+  assistant.append(assistantContent);
+  conversation.append(user);
+  conversation.append(assistant);
+  const candidate = {
+    call: local.parseCallPayload(helperText),
+    node: assistant,
+    textRoot: assistantContent,
+    source: "text",
+    blockIndex: 0
+  };
+  local.__chatGptLateConversation = conversation;
+  local.__chatGptLateCandidates = [candidate];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__chatGptLateConversation;
+    extractShellCallCandidates = () => globalThis.__chatGptLateCandidates;
+    assistantGenerationObservedForLifecycle = true;
+    assistantGenerationEvidenceUntil = Date.now() + 3000;
+    assistantGenerationEpoch = createAssistantGenerationEpoch();
+    initialThreadSettled = false;
+  `, local);
+  assert.equal(local.isChatGptCurrentLifecycleCompletedHelperCandidate(candidate), true,
+    "A first completed helper discovered after its final mutation must use current-lifecycle Stop evidence and the exact final assistant turn.");
+  assert.equal(local.markCurrentLifecycleCompletedHelperCandidate(candidate), true,
+    "The exact late final helper must be promoted to candidate-bound live evidence.");
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "The promoted helper must pass the normal live-candidate gate exactly once.");
+
+  const sponsored = new local.Element();
+  sponsored.textContent = helperText;
+  sponsored.innerText = helperText;
+  assistant.append(sponsored);
+  const sponsoredCandidate = { ...candidate, textRoot: sponsored };
+  assert.equal(local.isChatGptCurrentLifecycleCompletedHelperCandidate(sponsoredCandidate), false,
+    "Helper-looking text outside data-assistant-markdown must not borrow lifecycle evidence.");
+
+  const laterUser = new local.Element({ messageRole: "user" });
+  conversation.append(laterUser);
+  assert.equal(local.isChatGptCurrentLifecycleCompletedHelperCandidate(candidate), false,
+    "A helper before the latest user turn must not borrow current-lifecycle generation evidence.");
+
+  conversation.children.pop();
+  vm.runInContext("assistantGenerationEvidenceUntil = 0", local);
+  assert.equal(local.isChatGptCurrentLifecycleCompletedHelperCandidate(candidate), false,
+    "Expired lifecycle evidence must not revive a helper during later transcript hydration.");
+}
+
+function testChatGptReloadDuringVisibleStopCannotReviveHistoricalHelper() {
+  const local = createContentContext();
+  const helperText = [
+    "ai-helper-skill-start:chatgpt-reload-history",
+    "cmd: list",
+    "challenge: 1234567890abcdef1234567890abcdef",
+    "ai-helper-skill-end"
+  ].join("\n");
+  const conversation = new local.Element();
+  const user = new local.Element({ messageRole: "user", id: "chatgpt-user-stable" });
+  const userCopy = new local.Element();
+  userCopy.hasUserMessageCopy = true;
+  userCopy.textContent = "Regenerate this answer.";
+  userCopy.innerText = userCopy.textContent;
+  user.append(userCopy);
+  const assistant = new local.Element({ messageRole: "assistant" });
+  setDataMessageId(assistant, "chatgpt-assistant-stable");
+  const assistantContent = new local.Element();
+  assistantContent.hasAssistantMarkdown = true;
+  assistantContent.textContent = helperText;
+  assistantContent.innerText = helperText;
+  assistant.append(assistantContent);
+  conversation.append(user);
+  conversation.append(assistant);
+  const candidate = {
+    call: local.parseCallPayload(helperText),
+    node: assistant,
+    textRoot: assistantContent,
+    source: "text",
+    blockIndex: 0
+  };
+  const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
+  local.__reloadConversation = conversation;
+  local.__reloadCandidate = candidate;
+  local.document.querySelectorAll = (selector) => String(selector).includes("button") ? [stop] : [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__reloadConversation;
+    extractShellCallCandidates = () => [globalThis.__reloadCandidate];
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  `, local);
+  local.rememberKnownRenderedHelperSemantics();
+  assert.equal(local.initializeAssistantGenerationEpochFromVisibleControls(), true,
+    "A content script that starts while Stop is already visible must create a snapshotted epoch immediately.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.historicalResponseSemantics.size", local), 1,
+    "The startup epoch must retain the pre-existing helper semantic independently of its render root.");
+
+  stop.label = "Send message";
+  local.observeAssistantGenerationEvidence([{
+    type: "attributes",
+    target: stop,
+    attributeName: "aria-label",
+    oldValue: "Stop generating",
+    addedNodes: [],
+    removedNodes: []
+  }]);
+  assert.equal(local.getChatGptCurrentLifecycleCompletedHelperCandidateReason(candidate), "known-before-generation",
+    "Stop -> Send after an extension reload must not promote a helper that was already present at epoch start.");
+  assert.equal(local.markCurrentLifecycleCompletedHelperCandidate(candidate), false,
+    "A pre-existing helper must remain inert even though the current lifecycle observed completion.");
+
+  const redrawnContent = new local.Element();
+  redrawnContent.hasAssistantMarkdown = true;
+  redrawnContent.textContent = helperText;
+  redrawnContent.innerText = helperText;
+  assistantContent.isConnected = false;
+  redrawnContent.parentElement = assistant;
+  assistant.children[0] = redrawnContent;
+  assistant.textContent = helperText;
+  assistant.innerText = helperText;
+  const redrawnCandidate = { ...candidate, textRoot: redrawnContent };
+  local.__reloadCandidate = redrawnCandidate;
+  const redrawRecord = {
+    type: "childList",
+    target: assistant,
+    addedNodes: [redrawnContent],
+    removedNodes: [assistantContent]
+  };
+  local.invalidateRenderedHelperTracking([redrawRecord]);
+  local.trackAssistantGenerationHelperRoots([redrawRecord]);
+  local.markLiveGeneratedHelperCandidates([redrawRecord]);
+  assert.equal(local.isLiveGeneratedHelperCandidate(redrawnCandidate), false,
+    "The full observer order must not promote a historical helper when React replaces its authored body under the same assistant id.");
+
+  const replacementAssistant = new local.Element({ messageRole: "assistant" });
+  setDataMessageId(replacementAssistant, "chatgpt-assistant-stable");
+  const replacementContent = new local.Element();
+  replacementContent.hasAssistantMarkdown = true;
+  replacementContent.textContent = helperText;
+  replacementContent.innerText = helperText;
+  replacementAssistant.append(replacementContent);
+  assistant.isConnected = false;
+  assistantContent.isConnected = false;
+  replacementAssistant.parentElement = conversation;
+  conversation.children[1] = replacementAssistant;
+  const replacementCandidate = { ...candidate, node: replacementAssistant, textRoot: replacementContent };
+  assert.equal(local.getChatGptCurrentLifecycleCompletedHelperCandidateReason(replacementCandidate), "known-before-generation",
+    "A React replacement root with the same stable assistant id and semantic must retain the historical boundary.");
+
+  const genuinelyNewAssistant = new local.Element({ messageRole: "assistant" });
+  setDataMessageId(genuinelyNewAssistant, "chatgpt-assistant-new");
+  const genuinelyNewContent = new local.Element();
+  genuinelyNewContent.hasAssistantMarkdown = true;
+  genuinelyNewContent.textContent = helperText;
+  genuinelyNewContent.innerText = helperText;
+  genuinelyNewAssistant.append(genuinelyNewContent);
+  replacementAssistant.isConnected = false;
+  replacementContent.isConnected = false;
+  genuinelyNewAssistant.parentElement = conversation;
+  conversation.children[1] = genuinelyNewAssistant;
+  const genuinelyNewCandidate = { ...candidate, node: genuinelyNewAssistant, textRoot: genuinelyNewContent };
+  assert.equal(local.getChatGptCurrentLifecycleCompletedHelperCandidateReason(genuinelyNewCandidate), "eligible",
+    "A genuinely new stable assistant message id may emit the same semantic without a global false positive.");
+
+  const noIdentity = createContentContext();
+  const noIdentityConversation = new noIdentity.Element();
+  const noIdentityUser = new noIdentity.Element({ messageRole: "user" });
+  const noIdentityUserCopy = new noIdentity.Element();
+  noIdentityUserCopy.hasUserMessageCopy = true;
+  noIdentityUserCopy.textContent = "Keep an unidentified historical response inert.";
+  noIdentityUserCopy.innerText = noIdentityUserCopy.textContent;
+  noIdentityUser.append(noIdentityUserCopy);
+  const noIdentityAssistant = new noIdentity.Element({ messageRole: "assistant" });
+  const noIdentityOldContent = new noIdentity.Element();
+  noIdentityOldContent.hasAssistantMarkdown = true;
+  noIdentityOldContent.textContent = helperText;
+  noIdentityOldContent.innerText = helperText;
+  noIdentityAssistant.append(noIdentityOldContent);
+  noIdentityConversation.append(noIdentityUser);
+  noIdentityConversation.append(noIdentityAssistant);
+  const noIdentityCandidate = {
+    call: noIdentity.parseCallPayload(helperText),
+    node: noIdentityAssistant,
+    textRoot: noIdentityOldContent,
+    source: "text",
+    blockIndex: 0
+  };
+  const noIdentityStop = new noIdentity.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(noIdentity, noIdentityStop);
+  noIdentity.__conversation = noIdentityConversation;
+  noIdentity.__candidate = noIdentityCandidate;
+  noIdentity.document.querySelectorAll = (selector) => String(selector).includes("button")
+    ? [noIdentityStop]
+    : [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__conversation;
+    extractShellCallCandidates = () => [globalThis.__candidate];
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  `, noIdentity);
+  noIdentity.rememberKnownRenderedHelperSemantics();
+  assert.equal(noIdentity.initializeAssistantGenerationEpochFromVisibleControls(), true);
+  const noIdentityNewContent = new noIdentity.Element();
+  noIdentityNewContent.hasAssistantMarkdown = true;
+  noIdentityNewContent.textContent = helperText;
+  noIdentityNewContent.innerText = helperText;
+  noIdentityOldContent.isConnected = false;
+  noIdentityNewContent.parentElement = noIdentityAssistant;
+  noIdentityAssistant.children[0] = noIdentityNewContent;
+  noIdentityAssistant.textContent = helperText;
+  noIdentityAssistant.innerText = helperText;
+  const noIdentityRedrawCandidate = { ...noIdentityCandidate, textRoot: noIdentityNewContent };
+  noIdentity.__candidate = noIdentityRedrawCandidate;
+  const noIdentityRedraw = {
+    type: "childList",
+    target: noIdentityAssistant,
+    addedNodes: [noIdentityNewContent],
+    removedNodes: [noIdentityOldContent]
+  };
+  noIdentity.invalidateRenderedHelperTracking([noIdentityRedraw]);
+  noIdentity.trackAssistantGenerationHelperRoots([noIdentityRedraw]);
+  noIdentity.markLiveGeneratedHelperCandidates([noIdentityRedraw]);
+  assert.equal(noIdentity.isLiveGeneratedHelperCandidate(noIdentityRedrawCandidate), false,
+    "A same-message authored-body replacement without any stable identity must retain its message-root historical tombstone.");
+}
+
+function setDataMessageId(element, value) {
+  const getAttribute = element.getAttribute.bind(element);
+  element.getAttribute = (name) => name === "data-message-id" ? value : getAttribute(name);
+}
+
+function attachChatGptComposerActuator(local, button) {
+  const form = new local.Element();
+  const originalMatches = form.matches.bind(form);
+  form.matches = (selector) => String(selector).trim() === "form" || originalMatches(selector);
+  const composer = new local.Element();
+  form.append(composer);
+  form.append(button);
+  return { form, composer, button };
+}
+
+function testChatGptSkillDispatchSurvivesAuthoredBodyRedraw() {
+  const local = createContentContext();
+  const prompt = "Synchronize the local Skills catalog.";
+  const helperText = [
+    "ai-helper-skill-start:chatgpt-redraw",
+    "cmd: list",
+    "challenge: aabbccddeeff00112233445566778899",
+    "ai-helper-skill-end"
+  ].join("\n");
+  const conversation = new local.Element();
+  const user = new local.Element({ messageRole: "user", id: "chatgpt-user-1" });
+  const userCopy = new local.Element();
+  userCopy.hasUserMessageCopy = true;
+  userCopy.textContent = prompt;
+  userCopy.innerText = prompt;
+  user.append(userCopy);
+  const assistant = new local.Element({ messageRole: "assistant", id: "chatgpt-assistant-1" });
+  const oldContent = new local.Element();
+  oldContent.hasAssistantMarkdown = true;
+  oldContent.textContent = helperText;
+  oldContent.innerText = helperText;
+  assistant.append(oldContent);
+  conversation.append(user);
+  conversation.append(assistant);
+  const call = local.parseCallPayload(helperText);
+  const oldCandidate = { call, node: assistant, textRoot: oldContent, source: "text", blockIndex: 0 };
+  local.__chatGptRedrawConversation = conversation;
+  local.__chatGptRedrawCandidates = [oldCandidate];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__chatGptRedrawConversation;
+    extractShellCallCandidates = () => globalThis.__chatGptRedrawCandidates;
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 10;
+  `, local);
+  const dispatchContext = local.createSkillDispatchContext(oldCandidate);
+  const storedProof = local.createStoredSkillOriginProof(dispatchContext);
+  assert.ok(dispatchContext.chatGptTurnProof,
+    "A strict ChatGPT Skill dispatch must capture stable user/assistant message identities.");
+  assert.equal(storedProof.transcriptScope, "chatgpt-authored-turn-v1",
+    "Persistent origin proof must exclude composer, response actions, and sponsored siblings.");
+
+  const newContent = new local.Element();
+  newContent.hasAssistantMarkdown = true;
+  newContent.textContent = helperText;
+  newContent.innerText = helperText;
+  oldContent.isConnected = false;
+  assistant.children = [];
+  assistant.append(newContent);
+  const newCandidate = { ...oldCandidate, textRoot: newContent };
+  local.__chatGptRedrawCandidates = [newCandidate];
+  assert.equal(local.isSkillDispatchContextCurrent(dispatchContext), true,
+    "An exact assistant-body redraw under the same canonical message id must rebind without discarding the queued result.");
+  assert.equal(dispatchContext.renderRoot, newContent,
+    "The delivery guard must transfer to the exact replacement helper root.");
+
+  const sponsored = new local.Element();
+  sponsored.textContent = "Sponsored content changed";
+  assistant.append(sponsored);
+  assert.equal(local.isStoredSkillOriginProofCurrent(storedProof), true,
+    "A sponsored sibling mutation must not invalidate ChatGPT authored-turn origin proof.");
+
+  const reply = "Local SKILLS catalog synchronization response: exact reply";
+  const submitted = new local.Element({ messageRole: "user", id: "chatgpt-user-2" });
+  const submittedCopy = new local.Element();
+  submittedCopy.hasUserMessageCopy = true;
+  submittedCopy.textContent = reply;
+  submittedCopy.innerText = reply;
+  submitted.append(submittedCopy);
+  conversation.append(submitted);
+  assert.equal(local.isStoredSkillOriginProofCurrent(storedProof), false,
+    "A later user turn must fail closed without proof that it is the exact plugin reply.");
+  assert.equal(local.isStoredSkillOriginProofCurrent(storedProof, reply), true,
+    "The exact newly submitted plugin reply may complete its own pending delivery without reviving any other turn.");
+  submittedCopy.textContent = `${reply}!`;
+  submittedCopy.innerText = submittedCopy.textContent;
+  assert.equal(local.isStoredSkillOriginProofCurrent(storedProof, reply), false,
+    "A one-character change to the submitted reply must invalidate the origin continuation.");
+}
+
 function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
   const local = createContentContext();
   const conversation = new local.Element();
@@ -285,6 +849,7 @@ function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
   local.__epochConversation = conversation;
   vm.runInContext("getConversationRoot = () => globalThis.__epochConversation; observedPageIdentity = location.href; pageLifecycleGeneration = 50;", local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ addedNodes: [stop], removedNodes: [] }]);
   local.trackAssistantGenerationHelperRoots([{ target: helperRoot, addedNodes: [], removedNodes: [] }]);
 
@@ -320,6 +885,93 @@ function testGenerationEpochCarriesOnlyTrackedRootsAcrossRoute() {
     "A new historical root from the post-route batch must not inherit an old route's removed Stop evidence.");
 }
 
+function testChatGptNewConversationRouteAssignmentCarriesUnboundGeneration() {
+  const local = createContentContext();
+  const conversation = new local.Element();
+  const user = new local.Element({ messageRole: "user" });
+  const userCopy = new local.Element();
+  userCopy.hasUserMessageCopy = true;
+  userCopy.textContent = "Create the first helper in this new chat.";
+  userCopy.innerText = userCopy.textContent;
+  user.append(userCopy);
+  conversation.append(user);
+  local.__chatGptAssignedConversation = conversation;
+  local.__chatGptAssignedCandidates = [];
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__chatGptAssignedConversation;
+    extractShellCallCandidates = () => globalThis.__chatGptAssignedCandidates;
+    observedPageIdentity = location.href;
+    assistantGenerationObservedForLifecycle = false;
+    assistantGenerationEvidenceUntil = 0;
+    assistantGenerationEpoch = null;
+  `, local);
+  const submit = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, submit);
+  assert.equal(local.observeAssistantGenerationEvidence([{
+    type: "attributes",
+    target: submit,
+    attributeName: "aria-label",
+    oldValue: "Send message",
+    addedNodes: [],
+    removedNodes: []
+  }]), true, "The pre-assignment ChatGPT response must establish a generation epoch.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.responseMessageRoot", local), null,
+    "The route may be assigned before the first assistant root exists.");
+
+  local.location.href = "https://chatgpt.com/uc/assigned-conversation";
+  assert.equal(local.refreshPageLifecycle(), true,
+    "Assigning the permanent ChatGPT new-conversation URL must start a page lifecycle handoff.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.routeCarryOnly", local), false,
+    "The exact root-to-/uc assignment must keep the unbound current generation eligible for its first response root.");
+
+  const helperText = [
+    "ai-helper-skill-start:chatgpt-assigned",
+    "cmd: list",
+    "challenge: fedcba9876543210fedcba9876543210",
+    "ai-helper-skill-end"
+  ].join("\n");
+  const assistant = new local.Element({ messageRole: "assistant" });
+  assistant.textContent = helperText;
+  assistant.innerText = helperText;
+  conversation.append(assistant);
+  const candidate = {
+    call: local.parseCallPayload(helperText),
+    node: assistant,
+    textRoot: assistant,
+    source: "text",
+    blockIndex: 0
+  };
+  local.__chatGptAssignedCandidates = [candidate];
+  const arrival = [{
+    type: "childList",
+    target: conversation,
+    addedNodes: [assistant],
+    removedNodes: []
+  }];
+  assert.equal(local.observeAssistantGenerationEvidence(arrival), true,
+    "The first assistant root must retain bounded generation evidence across URL assignment.");
+  local.trackAssistantGenerationHelperRoots(arrival);
+  local.markLiveGeneratedHelperCandidates(arrival);
+  assert.equal(local.isLiveGeneratedHelperCandidate(candidate), true,
+    "The first complete helper after the exact ChatGPT new-chat URL assignment must auto-dispatch.");
+
+  const unrelated = createContentContext();
+  const unrelatedConversation = new unrelated.Element();
+  const unrelatedUser = new unrelated.Element({ messageRole: "user" });
+  unrelatedConversation.append(unrelatedUser);
+  unrelated.__conversation = unrelatedConversation;
+  vm.runInContext(`
+    getConversationRoot = () => globalThis.__conversation;
+    assistantGenerationEpoch = createAssistantGenerationEpoch();
+    assistantGenerationObservedForLifecycle = true;
+    observedPageIdentity = location.href;
+  `, unrelated);
+  unrelated.location.href = "https://chatgpt.com/settings";
+  unrelated.refreshPageLifecycle();
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.routeCarryOnly", unrelated), true,
+    "An unrelated ChatGPT route must retain the restrictive carry mode and cannot authorize a new response root.");
+}
+
 function testUnrelatedGenerationCannotReviveKnownHistory() {
   const local = createContentContext();
   const conversation = new local.Element();
@@ -342,6 +994,7 @@ function testUnrelatedGenerationCannotReviveKnownHistory() {
   `, local);
   local.rememberKnownRenderedHelperSemantics();
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ addedNodes: [stop], removedNodes: [] }]);
   local.trackAssistantGenerationHelperRoots([{ target: historyRoot, addedNodes: [], removedNodes: [] }]);
   local.markLiveGeneratedHelperCandidates([{ target: historyRoot, addedNodes: [], removedNodes: [] }]);
@@ -374,6 +1027,7 @@ function testTwoPhaseHistoricalRedrawCannotBecomeLive() {
   local.markCallBaselineIgnored(candidate, semanticCallKey);
 
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ type: "childList", target: conversation, addedNodes: [stop], removedNodes: [] }]);
 
   const clearRecord = {
@@ -437,6 +1091,7 @@ function testCompleteHelperCannotBorrowUnrelatedGeneration() {
   `, local);
 
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
   const completeArrival = [{
     type: "childList",
@@ -456,6 +1111,7 @@ function testCompleteHelperCannotBorrowUnrelatedGeneration() {
 function testStaleRouteStopNodeCannotProveLaterHydration() {
   const local = createContentContext();
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.__reusedStopControls = [stop];
   local.document.querySelectorAll = (selector) => String(selector).includes("button")
     ? local.__reusedStopControls
@@ -544,6 +1200,7 @@ function testReusedStopNodeStartsASeparateSameRouteGeneration() {
   `, local);
 
   const reusedStop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, reusedStop);
   local.__sameRouteControls = [reusedStop];
   local.observeAssistantGenerationEvidence([{
     type: "childList",
@@ -620,6 +1277,7 @@ function testOldResponseCannotCompleteAfterLaterUserTurn() {
     extractShellCallCandidates = () => globalThis.__laterUserCandidates;
   `, local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{
     type: "childList",
     target: conversation,
@@ -662,6 +1320,7 @@ function testSameBatchRouteStopReconciliation() {
   for (const movedFromOldRoute of [false, true]) {
     const local = createContentContext();
     const stop = new local.Element({ role: "button", label: "Stop generating" });
+    attachChatGptComposerActuator(local, stop);
     local.__sameBatchControls = [];
     local.document.querySelectorAll = (selector) => String(selector).includes("button")
       ? local.__sameBatchControls
@@ -720,6 +1379,7 @@ function testRouteCarriedResponseSurvivesExpiredTail() {
     observedPageIdentity = location.href;
   `, local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{
     type: "childList",
     target: conversation,
@@ -774,6 +1434,7 @@ function testRouteCarriedStopCannotAuthorizeNewRoot() {
     observedPageIdentity = location.href;
   `, local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop, oldAssistant], removedNodes: [] }]);
   local.trackAssistantGenerationHelperRoots([{ target: oldAssistant, addedNodes: [oldAssistant], removedNodes: [] }]);
   local.location.href = "https://chatgpt.com/c/replacement-route-root";
@@ -822,6 +1483,7 @@ function testRouteCarriedRecycledElementsCannotAuthorizeRewrittenChat() {
     observedPageIdentity = location.href;
   `, local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{
     type: "childList",
     target: conversation,
@@ -1230,6 +1892,7 @@ async function testLiveStopSkillCompletionDispatchesExactlyOnce() {
     queueSkillComposerReply = async () => true;
   `, local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
   local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
 
@@ -1325,6 +1988,7 @@ async function testAtomicCurrentAssistantSkillDispatchesExactlyOnce() {
     autoSend: true
   });
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   const atomicBatch = [{
     type: "childList",
     target: conversation,
@@ -1709,6 +2373,7 @@ async function testUnknownRoleAtomicSkillFailsClosed() {
     autoSend: true
   });
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   const batch = [{ target: conversation, addedNodes: [stop, unknown], removedNodes: [] }];
   local.observeAssistantGenerationEvidence(batch);
   local.trackAssistantGenerationHelperRoots(batch);
@@ -1757,6 +2422,7 @@ async function testColdBaselineSurvivesRedrawButYieldsToLiveGeneration() {
 
   vm.runInContext("extractShellCallCandidates = () => [__candidate]; getConversationRoot = () => __conversation;", local);
   const stop = new local.Element({ role: "button", label: "Stop generating" });
+  attachChatGptComposerActuator(local, stop);
   local.observeAssistantGenerationEvidence([{ target: conversation, addedNodes: [stop], removedNodes: [] }]);
   local.trackAssistantGenerationHelperRoots([{ target: assistant, addedNodes: [assistant], removedNodes: [] }]);
   assert.equal(vm.runInContext("assistantGenerationEpoch?.responseMessageRoot === __candidate.textRoot", local), true,
@@ -3242,10 +3908,12 @@ async function testForceRunAndReplyRejectsRouteChangeWithRetainedDom() {
 
 function createContentContext() {
   class Element {
-    constructor({ author = "", role = "", label = "" } = {}) {
+    constructor({ author = "", messageRole = "", role = "", label = "", id = "" } = {}) {
       this.author = author;
+      this.messageRole = messageRole;
       this.role = role;
       this.label = label;
+      this.id = id;
       this.textContent = label;
       this.children = [];
       this.parentElement = null;
@@ -3264,26 +3932,72 @@ function createContentContext() {
     }
 
     closest(selector) {
+      if (this.matches(selector)) {
+        return this;
+      }
       if (String(selector).includes("data-message-author-role") && this.author) {
         return this;
+      }
+      if (String(selector).includes("data-message-role") && this.messageRole) {
+        const acceptsRole = String(selector).includes(`data-message-role=\"${this.messageRole}\"`);
+        if (acceptsRole) {
+          return this;
+        }
+      }
+      if (this.parentElement) {
+        return this.parentElement.closest(selector);
       }
       return null;
     }
 
     getAttribute(name) {
       if (name === "data-message-author-role") return this.author;
+      if (name === "data-message-role") return this.messageRole;
       if (name === "role") return this.role;
       if (name === "aria-label") return this.label;
+      if (name === "id") return this.id;
       return "";
     }
 
     matches(selector) {
+      if (this.author && String(selector).includes("data-message-author-role")) {
+        return true;
+      }
+      if (this.messageRole &&
+          String(selector).includes(`data-message-role=\"${this.messageRole}\"`)) {
+        return true;
+      }
+      if (this.hasUserMessageCopy === true && String(selector).includes("data-user-message-copy")) {
+        return true;
+      }
+      if (this.hasAssistantMarkdown === true && String(selector).includes("data-assistant-markdown")) {
+        return true;
+      }
       return (this.role === "button" && String(selector).includes("[role='button']")) ||
         (this.role === "button" && String(selector).includes("button"));
     }
 
-    querySelectorAll() {
+    querySelectorAll(selector = "") {
+      if (String(selector).includes("data-user-message-copy") ||
+          String(selector).includes("data-message-role") ||
+          String(selector).includes("data-assistant-markdown")) {
+        const matches = [];
+        const visit = (parent) => {
+          for (const child of parent.children) {
+            if (child.matches(selector)) {
+              matches.push(child);
+            }
+            visit(child);
+          }
+        };
+        visit(this);
+        return matches;
+      }
       return this.children;
+    }
+
+    querySelector(selector = "") {
+      return this.querySelectorAll(selector)[0] || null;
     }
 
     getBoundingClientRect() {
@@ -3323,6 +4037,7 @@ function createContentContext() {
       protocol: "https:"
     },
     setTimeout,
+    URL,
     window: {
       confirm: () => true,
       getComputedStyle: () => ({ visibility: "visible", display: "block" }),

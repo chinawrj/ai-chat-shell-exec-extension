@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT host contract test</title>
+  <style>
+    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #f7f7f8; color: #202123; }
+    main { max-width: 860px; margin: 0 auto; padding: 24px 24px 120px; }
+    li { list-style: none; margin: 16px 0; padding: 16px; border-radius: 12px; background: white; }
+    li[data-message-role="user"] { background: #e8f2ff; }
+    [data-assistant-markdown], [data-user-message-copy] { white-space: pre-wrap; }
+    form { position: fixed; left: 50%; bottom: 20px; display: flex; gap: 8px; width: min(760px, calc(100% - 48px)); transform: translateX(-50%); }
+    textarea { flex: 1; min-height: 48px; padding: 12px; }
+    button { min-width: 92px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ChatGPT host contract test</h1>
+    <ol id="thread" role="feed" aria-label="Chat conversation">
+      <li data-message-id="chatgpt-cold-user" data-message-role="user">
+        <div data-user-message-copy>Historical request loaded before the extension.</div>
+      </li>
+      <li data-message-id="chatgpt-cold-assistant" data-message-role="assistant">
+        <div data-assistant-markdown>ai-helper-shell-start:chatgpt-cold-history
+printf 'CHATGPT_COLD_HISTORY_MUST_NOT_RUN'
+ai-helper-shell-end</div>
+      </li>
+    </ol>
+  </main>
+  <form id="prompt-form">
+    <textarea id="prompt-textarea" name="prompt" aria-label="Message ChatGPT" placeholder="Message ChatGPT"></textarea>
+    <button id="composer-submit" type="submit" data-testid="send-button" aria-label="Send message">Send</button>
+  </form>
+  <script>
+    (() => {
+      const thread = document.getElementById("thread");
+      const form = document.getElementById("prompt-form");
+      const composer = document.getElementById("prompt-textarea");
+      const submit = document.getElementById("composer-submit");
+      let messageSequence = 0;
+
+      function appendUserMessage(text, id = `chatgpt-user-${++messageSequence}`) {
+        const root = document.createElement("li");
+        root.dataset.messageId = id;
+        root.dataset.messageRole = "user";
+        const copy = document.createElement("div");
+        copy.dataset.userMessageCopy = "";
+        copy.textContent = String(text);
+        root.append(copy);
+        thread.append(root);
+        return root;
+      }
+
+      function appendAssistantMessage(text, id = `chatgpt-assistant-${++messageSequence}`) {
+        const root = document.createElement("li");
+        root.dataset.messageId = id;
+        root.dataset.messageRole = "assistant";
+        const markdown = document.createElement("div");
+        markdown.dataset.assistantMarkdown = "";
+        markdown.textContent = String(text);
+        root.append(markdown);
+        thread.append(root);
+        return root;
+      }
+
+      function setComposerMode(mode) {
+        if (mode === "stop") {
+          submit.setAttribute("aria-label", "Stop generating");
+          submit.setAttribute("data-testid", "stop-button");
+          submit.textContent = "Stop";
+          return;
+        }
+        submit.setAttribute("aria-label", "Send message");
+        submit.setAttribute("data-testid", "send-button");
+        submit.textContent = "Send";
+      }
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = composer.value;
+        if (!text) return;
+        appendUserMessage(text);
+        composer.value = "";
+        composer.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      });
+
+      window.chatGptContract = {
+        appendUserMessage,
+        appendAssistantMessage,
+        submitUserMessage(text) {
+          composer.value = String(text);
+          composer.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          form.requestSubmit();
+        },
+        appendSponsoredHelper(text) {
+          const root = appendAssistantMessage("Ordinary assistant answer.");
+          const sponsored = document.createElement("aside");
+          sponsored.dataset.sponsored = "true";
+          sponsored.textContent = String(text);
+          root.append(sponsored);
+          return root;
+        },
+        appendNestedUserSpoof(text) {
+          const root = appendUserMessage("User-authored nested role spoof follows.");
+          const nested = document.createElement("li");
+          nested.dataset.messageRole = "assistant";
+          const markdown = document.createElement("div");
+          markdown.dataset.assistantMarkdown = "";
+          markdown.textContent = String(text);
+          nested.append(markdown);
+          root.append(nested);
+          return root;
+        },
+        generateAssistant(text, delayMs = 40) {
+          setComposerMode("stop");
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              const root = appendAssistantMessage(text);
+              setComposerMode("send");
+              resolve(root.dataset.messageId);
+            }, delayMs);
+          });
+        },
+        userMessages() {
+          return Array.from(thread.querySelectorAll(':scope > li[data-message-role="user"] [data-user-message-copy]'))
+            .map((node) => node.textContent || "");
+        }
+      };
+    })();
+  </script>
+</body>
+</html>
