@@ -27,6 +27,12 @@ const CHATGPT_ONLY = process.env.AI_SHELL_E2E_CHATGPT_ONLY === "1";
 const FORCE_IDLE_ONLY = process.env.AI_SHELL_E2E_FORCE_IDLE_ONLY === "1";
 const STARTUP_SETTLE_MS = 4200;
 const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
+const PANEL_THEMES = Object.freeze({
+  idle: { background: "rgb(17, 24, 39)", border: "rgb(57, 69, 92)" },
+  running: { background: "rgb(16, 42, 67)", border: "rgb(59, 130, 246)" },
+  ok: { background: "rgb(18, 55, 42)", border: "rgb(52, 211, 153)" },
+  error: { background: "rgb(67, 29, 43)", border: "rgb(251, 113, 133)" }
+});
 
 const cleanup = [];
 
@@ -260,6 +266,9 @@ async function main() {
       roleText: roleBadge?.textContent || "",
       roleState: roleBadge?.dataset.agentRole || "",
       roleAria: roleBadge?.getAttribute("aria-label") || "",
+      appearanceState: panel?.dataset.appearanceState || "",
+      background: panel ? getComputedStyle(panel).backgroundColor : "",
+      border: panel ? getComputedStyle(panel).borderTopColor : "",
       roleOverlapsSkill: !skillChip?.hidden && roleBadge && skillChip
         ? roleBadge.getBoundingClientRect().right > skillChip.getBoundingClientRect().left
         : false,
@@ -282,6 +291,7 @@ async function main() {
   assert.equal(compactPanelState.roleText, "None", JSON.stringify(compactPanelState));
   assert.equal(compactPanelState.roleState, "none", JSON.stringify(compactPanelState));
   assert.match(compactPanelState.roleAria, /Page role: None; shell target ForAI:host/);
+  assertPanelTheme(compactPanelState, "idle");
   assert.equal(compactPanelState.roleOverlapsSkill, false, JSON.stringify(compactPanelState));
   assert.deepEqual(compactPanelState.groups, [
     "common",
@@ -1043,7 +1053,11 @@ async function main() {
     const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
     const stop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
     const force = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="force"]');
-    return stop?.hidden === false && stop.disabled === false && force?.hidden === true;
+    const style = panel ? getComputedStyle(panel) : null;
+    return stop?.hidden === false && stop.disabled === false && force?.hidden === true &&
+      panel?.dataset.appearanceState === "running" &&
+      style?.backgroundColor === ${JSON.stringify(PANEL_THEMES.running.background)} &&
+      style?.borderTopColor === ${JSON.stringify(PANEL_THEMES.running.border)};
   })()`, "Stop helper to replace Force run while a helper is active");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-running.png"));
@@ -1054,11 +1068,15 @@ async function main() {
     const commonStop = panel?.querySelector('[data-shell-panel-group="common"] [data-shell-tool-action="stop-helper"]');
     const continueButton = control?.querySelector('[data-shell-tool-action="continue-helper"]');
     const contextualStop = control?.querySelector('[data-shell-tool-action="stop-helper"]');
+    const style = panel ? getComputedStyle(panel) : null;
     return control?.hidden === false &&
       control.innerText.includes("No output update") &&
       commonStop?.hidden === true &&
       continueButton?.disabled === false &&
-      contextualStop?.disabled === false;
+      contextualStop?.disabled === false &&
+      panel?.dataset.appearanceState === "running" &&
+      style?.backgroundColor === ${JSON.stringify(PANEL_THEMES.running.background)} &&
+      style?.borderTopColor === ${JSON.stringify(PANEL_THEMES.running.border)};
   })()`, "idle timeout decision prompt with adjacent Continue waiting and Stop helper controls");
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-awaiting-user.png"));
@@ -1089,6 +1107,7 @@ async function main() {
   })()`, "idle helper result after panel termination");
   assert.match(idleTerminatedText, /^interrupted: true$/m);
   assert.match(idleTerminatedText, /^interruptSignal: INT$/m);
+  await waitForPanelTheme(page, "ok", "Ctrl+C-completed helper to use the terminal success theme");
   await settingsPage.evaluate("chrome.storage.sync.set({ defaultTimeoutMs: 180000 })");
 
   const heartbeatToken = `ai-chat-shell-heartbeat-${Date.now()}`;
@@ -4032,6 +4051,38 @@ async function savePanelScreenshot(page, filePath) {
   }
 }
 
+async function readPanelTheme(page) {
+  return page.evaluate(`(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const style = panel ? getComputedStyle(panel) : null;
+    return {
+      appearanceState: panel?.dataset.appearanceState || "",
+      background: style?.backgroundColor || "",
+      border: style?.borderTopColor || "",
+      aria: panel?.querySelector('#ai-chat-shell-exec-status-text')?.getAttribute("aria-label") || ""
+    };
+  })()`);
+}
+
+function assertPanelTheme(actual, state) {
+  assert.equal(actual?.appearanceState, state, JSON.stringify(actual));
+  assert.equal(actual?.background, PANEL_THEMES[state].background, JSON.stringify(actual));
+  assert.equal(actual?.border, PANEL_THEMES[state].border, JSON.stringify(actual));
+}
+
+async function waitForPanelTheme(page, state, label) {
+  await waitForEvaluate(page, `(() => {
+    const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
+    const style = panel ? getComputedStyle(panel) : null;
+    return panel?.dataset.appearanceState === ${JSON.stringify(state)} &&
+      style?.backgroundColor === ${JSON.stringify(PANEL_THEMES[state].background)} &&
+      style?.borderTopColor === ${JSON.stringify(PANEL_THEMES[state].border)};
+  })()`, label);
+  const theme = await readPanelTheme(page);
+  assertPanelTheme(theme, state);
+  assert.match(theme.aria, state === "running" ? /^In progress:/ : state === "ok" ? /^Completed:/ : state === "error" ? /^Error:/ : /^Idle:/);
+}
+
 async function waitForEvaluate(page, expression, label, timeoutMs = E2E_TIMEOUT_MS) {
   await waitFor(async () => Boolean(await page.evaluate(expression)), label, timeoutMs);
 }
@@ -4119,6 +4170,10 @@ async function runDrawioPreviewE2E(page) {
       host.dataset.currentTitle === "Draw.io E2E v1" &&
       host.shadowRoot?.querySelector(".drawio-frame-current iframe");
   })()`, "first draw.io SVG preview");
+  await waitForPanelTheme(page, "ok", "successful Draw.io helper to use the success theme");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-success.png"));
+  }
   await waitForEvaluate(page, `(() => {
     const button = document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-drawio-action');
     return button?.hidden === false && button.textContent === "Draw.io preview";
@@ -4266,6 +4321,10 @@ async function runDrawioPreviewE2E(page) {
     const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
     return users.length === ${baseline.userCount + 1} && /Draw\.io helper failed:/.test(users.at(-1)?.innerText || "") && /drawio-e2e-malformed/.test(users.at(-1)?.innerText || "");
   })()`, "malformed Draw.io error to be sent once to the AI");
+  await waitForPanelTheme(page, "error", "failed Draw.io helper to use the error theme");
+  if (SCREENSHOT_DIR) {
+    await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-error.png"));
+  }
 
   const brokenRendererXml = '<mxfile><diagram name="Broken renderer">definitely-not-valid-compressed-drawio-data</diagram></mxfile>';
   const errorCountBeforeRenderFailure = Number((await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.errorCount`)) || 0);

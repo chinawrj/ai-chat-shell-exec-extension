@@ -40,7 +40,39 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.12";
+const CONTENT_SCRIPT_VERSION = "0.11.13";
+const PANEL_STATE_THEME = Object.freeze({
+  idle: Object.freeze({
+    background: "#111827",
+    border: "#39455c",
+    dot: "#64748b",
+    ring: "rgba(100,116,139,.16)"
+  }),
+  running: Object.freeze({
+    background: "#102a43",
+    border: "#3b82f6",
+    dot: "#60a5fa",
+    ring: "rgba(96,165,250,.18)"
+  }),
+  ok: Object.freeze({
+    background: "#12372a",
+    border: "#34d399",
+    dot: "#34d399",
+    ring: "rgba(52,211,153,.16)"
+  }),
+  error: Object.freeze({
+    background: "#431d2b",
+    border: "#fb7185",
+    dot: "#fb7185",
+    ring: "rgba(251,113,133,.18)"
+  })
+});
+const PANEL_STATE_ARIA_LABEL = Object.freeze({
+  idle: "Idle",
+  running: "In progress",
+  ok: "Completed",
+  error: "Error"
+});
 const DRAWIO_HELPER_MAX_SCAN_CHARS = 1_100_000;
 const SHELL_OUTPUT_COMMAND_DISPLAY_CHARS = 64;
 const COMPOSER_PROFILE_PREFIX = "composerProfile:";
@@ -1770,6 +1802,7 @@ async function performPendingHelperDeliveryFinalization(entry, phase) {
 
 function setPendingHelperDeliveryStatus(entry) {
   const label = pendingHelperDeliveryLabel(entry);
+  const appearance = pendingHelperDeliveryAppearance(entry);
   if (entry.kind === "skill-error") {
     const lastError = entry.lastError ? ` Last send state: ${summarizeCommand(entry.lastError)}.` : "";
     const message = entry.phase === "inserted"
@@ -1779,7 +1812,8 @@ function setPendingHelperDeliveryStatus(entry) {
         : `Skill protocol response is cached locally and waiting for the chat composer.${lastError}`;
     setStatus(message, "running", {
       owner: "helper-delivery",
-      ownerKey: buildSemanticCallKey(entry.call)
+      ownerKey: buildSemanticCallKey(entry.call),
+      appearance
     });
     return;
   }
@@ -1796,8 +1830,18 @@ function setPendingHelperDeliveryStatus(entry) {
         : `${completedLabel}; result cached locally and waiting for the chat composer. The backend operation has ended and will not be repeated.${lastError}`;
   setStatus(message, "running", {
     owner: "helper-delivery",
-    ownerKey: buildSemanticCallKey(entry.call)
+    ownerKey: buildSemanticCallKey(entry.call),
+    appearance
   });
+}
+
+function pendingHelperDeliveryAppearance(entry) {
+  if (entry?.kind === "skill-error" || entry?.response?.ok === false) {
+    return "error";
+  }
+  return entry?.phase === "submitted" || entry?.phase === "presented"
+    ? "ok"
+    : "running";
 }
 
 async function markPendingHelperDeliverySubmittedUnconfirmed(entry, options = {}) {
@@ -3839,17 +3883,34 @@ function processLatestDrawioCandidates(allCandidates) {
 
   const validation = preview.validateDrawioXml(latestCandidate.call.xml);
   const artifactId = preview.hashDrawioXml(latestCandidate.call.xml);
+  const beforeRender = typeof preview.getDiagnostics === "function"
+    ? preview.getDiagnostics()
+    : null;
+  const shouldAnnounceOutcome = shouldUpdateDrawioPanelOutcome(beforeRender, artifactId);
   if (!validation.ok) {
     const result = preview.reportInvalid({
       key: `${artifactId}:${validation.error}`,
       artifactId,
       error: validation.error
     });
+    if (shouldAnnounceOutcome) {
+      setStatus(`Draw.io helper failed: ${summarizeCommand(validation.error)}`, "error", {
+        owner: "drawio-render",
+        ownerKey: artifactId
+      });
+    }
     queueDrawioErrorReply(latestCandidate, result).catch((error) => {
       console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
     });
     updateDrawioContextAction();
     return;
+  }
+
+  if (shouldAnnounceOutcome) {
+    setStatus("Rendering latest Draw.io helper", "running", {
+      owner: "drawio-render",
+      ownerKey: artifactId
+    });
   }
 
   const renderPromise = preview.consider({
@@ -3860,6 +3921,7 @@ function processLatestDrawioCandidates(allCandidates) {
   });
   Promise.resolve(renderPromise)
     .then((result) => {
+      updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutcome);
       queueDrawioErrorReply(latestCandidate, result).catch((error) => {
         console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
       });
@@ -3870,11 +3932,54 @@ function processLatestDrawioCandidates(allCandidates) {
         artifactId,
         error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
       });
+      updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutcome);
       return queueDrawioErrorReply(latestCandidate, result);
     })
     .finally(() => {
       updateDrawioContextAction();
     });
+}
+
+function shouldUpdateDrawioPanelOutcome(diagnostics, artifactId) {
+  if (!diagnostics) {
+    return true;
+  }
+  const pendingArtifactId = String(diagnostics.pendingArtifactId || "");
+  if (pendingArtifactId === artifactId) {
+    return false;
+  }
+  if (!pendingArtifactId && diagnostics.state === "ready" && diagnostics.currentArtifactId === artifactId) {
+    return false;
+  }
+  const latestError = diagnostics.errors?.at?.(-1);
+  if (!pendingArtifactId && !diagnostics.currentArtifactId && diagnostics.state === "error" && latestError?.artifactId === artifactId) {
+    return false;
+  }
+  return true;
+}
+
+function updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutcome) {
+  if (!shouldAnnounceOutcome || !result || result.cancelled === true ||
+      !isPanelStatusOwnedBy("drawio-render", artifactId)) {
+    return;
+  }
+  const diagnostics = typeof preview?.getDiagnostics === "function"
+    ? preview.getDiagnostics()
+    : null;
+  if (result.ok === true && !diagnostics?.pendingArtifactId && diagnostics?.currentArtifactId === artifactId) {
+    setStatus("Draw.io helper rendered", "ok", {
+      owner: "drawio-render",
+      ownerKey: artifactId
+    });
+    return;
+  }
+  const latestError = diagnostics?.errors?.at?.(-1);
+  if (result.ok === false && latestError?.artifactId === artifactId) {
+    setStatus(`Draw.io helper failed: ${summarizeCommand(result.error || "preview failed")}`, "error", {
+      owner: "drawio-render",
+      ownerKey: artifactId
+    });
+  }
 }
 
 async function queueDrawioErrorReply(candidate, result) {
@@ -3998,6 +4103,10 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
 
   skillHelperInFlight = true;
   updateContextualPanelActions();
+  setStatus(buildSkillRunningStatus(call), "running", {
+    owner: "skill-helper",
+    ownerKey: semanticCallKey
+  });
   chainCallCount += 1;
   try {
     let response;
@@ -4153,6 +4262,19 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     updateContextualPanelActions();
     scheduleScan();
   }
+}
+
+function buildSkillRunningStatus(call) {
+  if (call?.cmd === "list") {
+    return "Processing Skill catalog request";
+  }
+  if (call?.cmd === "load") {
+    return `Loading Skill ${call.skillId || ""}`.trim();
+  }
+  if (call?.cmd === "list-updated") {
+    return "Validating Skill catalog acknowledgement";
+  }
+  return "Recording Skill synchronization failure";
 }
 
 function claimProcessedSkillCandidate(candidate, callKey, semanticCallKey) {
@@ -9190,6 +9312,7 @@ function injectStatus() {
   const panel = document.createElement("div");
   panel.id = STATUS_ID;
   panel.dataset.state = "idle";
+  panel.dataset.appearanceState = "idle";
   panel.style.cssText = [
     "position:fixed",
     "right:16px",
@@ -10467,9 +10590,12 @@ function updateContextualPanelActions() {
 }
 
 function isPanelStatusOwnedByHelperDelivery(call) {
+  return isPanelStatusOwnedBy("helper-delivery", buildSemanticCallKey(call));
+}
+
+function isPanelStatusOwnedBy(owner, ownerKey) {
   const panel = document.getElementById(STATUS_ID);
-  return panel?.dataset?.statusOwner === "helper-delivery" &&
-    panel.dataset.statusOwnerKey === buildSemanticCallKey(call);
+  return panel?.dataset?.statusOwner === owner && panel.dataset.statusOwnerKey === ownerKey;
 }
 
 function setStatus(text, state = "idle", options = {}) {
@@ -10484,6 +10610,10 @@ function setStatus(text, state = "idle", options = {}) {
     ? `${requestedText} (${extensionVersionWarning})`
     : requestedText;
   const effectiveState = extensionVersionWarning ? "error" : state;
+  const requestedAppearance = extensionVersionWarning ? "error" : options.appearance || effectiveState;
+  const appearanceState = Object.prototype.hasOwnProperty.call(PANEL_STATE_THEME, requestedAppearance)
+    ? requestedAppearance
+    : "idle";
   const suppressed = isSuppressionStatusText(text);
   if (!suppressed && lastSuppressedCallStatus) {
     lastSuppressedCallStatus = "";
@@ -10493,27 +10623,34 @@ function setStatus(text, state = "idle", options = {}) {
   if (statusText.textContent !== nextStatusText) {
     statusText.textContent = nextStatusText;
   }
-  statusText.setAttribute("aria-label", statusText.textContent);
+  statusText.setAttribute("aria-label", `${PANEL_STATE_ARIA_LABEL[appearanceState]}: ${statusText.textContent}`);
   const statusDetail = document.getElementById(STATUS_DETAIL_ID);
   if (statusDetail && statusDetail.textContent !== statusText.textContent) {
     statusDetail.textContent = statusText.textContent;
   }
   panel.dataset.state = effectiveState;
+  const theme = applyPanelStateTheme(panel, appearanceState);
   panel.dataset.statusOwner = String(options.owner || "");
   panel.dataset.statusOwnerKey = String(options.ownerKey || "");
   updateContextualPanelActions();
-  const colors = {
-    idle: { dot: "#64748b", ring: "rgba(100,116,139,.16)" },
-    running: { dot: "#60a5fa", ring: "rgba(96,165,250,.18)" },
-    ok: { dot: "#34d399", ring: "rgba(52,211,153,.16)" },
-    error: { dot: "#fb7185", ring: "rgba(251,113,133,.18)" }
-  };
   const indicator = document.getElementById(STATUS_INDICATOR_ID);
-  const color = colors[effectiveState] || colors.idle;
   if (indicator) {
-    indicator.style.background = color.dot;
-    indicator.style.boxShadow = `0 0 0 3px ${color.ring}`;
+    indicator.style.background = theme.dot;
+    indicator.style.boxShadow = `0 0 0 3px ${theme.ring}`;
   }
+}
+
+function applyPanelStateTheme(panel, state) {
+  const normalizedState = Object.prototype.hasOwnProperty.call(PANEL_STATE_THEME, state)
+    ? state
+    : "idle";
+  const theme = PANEL_STATE_THEME[normalizedState];
+  panel.dataset.appearanceState = normalizedState;
+  if (panel.style) {
+    panel.style.background = theme.background;
+    panel.style.borderColor = theme.border;
+  }
+  return theme;
 }
 
 async function handleShellRunProgress(message) {
@@ -10759,7 +10896,7 @@ async function checkStartupTmux() {
   if (!versionOk) {
     return;
   }
-  setStatus("Checking shell server and ForAI tmux session", "running");
+  setStatus("Checking shell server and ForAI tmux session", "running", { appearance: "idle" });
   const health = await chrome.runtime.sendMessage({ type: "shell-health" });
   const healthError = getShellHealthStatusError(health);
   if (healthError) {
@@ -10773,7 +10910,11 @@ async function checkStartupTmux() {
     setStatus(`ForAI tmux unavailable: ${summarizeCommand(tmux?.error || "run install/start script")}`, "error");
     return;
   }
-  setStatus(`Shell tool ready v${getDisplayVersion()}; ${formatServerProtocolStatus(health)}; ${formatForAiStatus(tmux)}`, "ok");
+  setStatus(
+    `Shell tool ready v${getDisplayVersion()}; ${formatServerProtocolStatus(health)}; ${formatForAiStatus(tmux)}`,
+    "ok",
+    { appearance: "idle" }
+  );
 }
 
 function formatForAiStatus(tmux) {

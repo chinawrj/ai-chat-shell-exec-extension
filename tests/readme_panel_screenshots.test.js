@@ -10,12 +10,14 @@ const e2eSource = fs.readFileSync(path.join(root, "tests", "chrome_extension_e2e
 const screenshots = new Map([
   ["extension-panel-idle.png", "docs/release-assets/v0.11.3"],
   ["extension-panel-skills-update.png", "docs/release-assets/v0.11.3"],
-  ["extension-panel-force.png", "docs/release-assets/v0.11.11"],
-  ["extension-panel-running.png", "docs/release-assets/v0.11.3"],
-  ["extension-panel-awaiting-user.png", "docs/release-assets/v0.11.3"],
-  ["extension-panel-drawio.png", "docs/release-assets/v0.11.3"],
-  ["extension-panel-advanced.png", "docs/release-assets/v0.11.11"],
-  ["extension-panel-page-binding.png", "docs/release-assets/v0.11.11"]
+  ["extension-panel-force.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-running.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-awaiting-user.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-success.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-error.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-drawio.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-advanced.png", "docs/release-assets/v0.11.13"],
+  ["extension-panel-page-binding.png", "docs/release-assets/v0.11.13"]
 ]);
 
 assert.match(readme, /## Latest Extension Panel Screenshots/);

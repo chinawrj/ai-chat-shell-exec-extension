@@ -118,7 +118,7 @@ For executable/file helpers, the content script waits until the assistant stops 
 
 ## Latest Extension Panel Screenshots
 
-The panel is state-driven: it keeps the healthy idle view minimal and reveals an action only when that action is relevant. These images are cropped automatically from the real unpacked-extension Chrome E2E flow rather than composed mockups.
+The panel is state-driven: it keeps the healthy idle view minimal and reveals an action only when that action is relevant. Its unchanged charcoal background means idle, deep blue means an end-to-end helper operation is still in progress, deep green means completion, and deep red means failure or another actionable exception. The status dot, text, and accessibility label repeat the same meaning so color is never the only signal. These images are cropped automatically from the real unpacked-extension Chrome E2E flow rather than composed mockups.
 
 | Healthy idle | Skills update available |
 | --- | --- |
@@ -127,17 +127,22 @@ The panel is state-driven: it keeps the healthy idle view minimal and reveals an
 
 | Force run available |
 | --- |
-| <img src="docs/release-assets/v0.11.11/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run below the distinct Skills version chip and beside More"> |
+| <img src="docs/release-assets/v0.11.13/extension-panel-force.png" width="328" alt="Extension panel showing contextual Force run below the distinct Skills version chip and beside More"> |
 | After the latest detected executable or Skill helper has accumulated 20 seconds of real idle time, `Force run` appears as a compact recovery fallback. Repeated scans and semantic-equivalent DOM redraws do not restart that clock; a real helper/backend execution pauses it. |
 
 | Shell helper running | Waiting for user decision |
 | --- | --- |
-| <img src="docs/release-assets/v0.11.3/extension-panel-running.png" width="328" alt="Running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.11.3/extension-panel-awaiting-user.png" width="328" alt="Output-idle extension panel showing Stop helper and Continue waiting"> |
-| During execution, `Stop helper` replaces `Force run`. | After the output-idle interval, `Continue waiting` and `Stop helper` appear together in the decision card. |
+| <img src="docs/release-assets/v0.11.13/extension-panel-running.png" width="328" alt="Deep-blue running shell helper extension panel showing Stop helper"> | <img src="docs/release-assets/v0.11.13/extension-panel-awaiting-user.png" width="328" alt="Deep-blue output-idle extension panel showing Stop helper and Continue waiting"> |
+| During execution, the deep-blue panel shows that work remains in progress and `Stop helper` replaces `Force run`. | Output-idle is still an active execution: the panel remains blue while `Continue waiting` and `Stop helper` appear together in the decision card. |
+
+| Helper completed | Helper failed |
+| --- | --- |
+| <img src="docs/release-assets/v0.11.13/extension-panel-success.png" width="328" alt="Deep-green extension panel after a helper completed"> | <img src="docs/release-assets/v0.11.13/extension-panel-error.png" width="328" alt="Deep-red extension panel after a helper failed"> |
+| Green is retained after a user-visible successful completion; Ctrl+C after execution started is also a completed execution and uses this state. | Red appears immediately for failures and protocol/render exceptions, including while a bounded error reply is still waiting for composer delivery. |
 
 | Draw.io available |
 | --- |
-| <img src="docs/release-assets/v0.11.3/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
+| <img src="docs/release-assets/v0.11.13/extension-panel-drawio.png" width="328" alt="Extension panel showing the contextual Draw.io preview action"> |
 | `Draw.io preview` appears only after a preview artifact or render error exists and remains available after closing the preview. |
 
 ### Expanded advanced controls
@@ -146,7 +151,7 @@ The panel is state-driven: it keeps the healthy idle view minimal and reveals an
 
 | Advanced controls | Page binding at the bottom |
 | --- | --- |
-| <img src="docs/release-assets/v0.11.11/extension-panel-advanced.png" width="328" alt="Expanded extension panel with the permanent Force run entry under Setup and recovery and a separate Skills header chip"> | <img src="docs/release-assets/v0.11.11/extension-panel-page-binding.png" width="328" alt="Bottom of the expanded extension panel showing Page binding folded by default"> |
+| <img src="docs/release-assets/v0.11.13/extension-panel-advanced.png" width="328" alt="Expanded extension panel with the permanent Force run entry under Setup and recovery and a separate Skills header chip"> | <img src="docs/release-assets/v0.11.13/extension-panel-page-binding.png" width="328" alt="Bottom of the expanded extension panel showing Page binding folded by default"> |
 
 ## Basic Helper Screenshots
 

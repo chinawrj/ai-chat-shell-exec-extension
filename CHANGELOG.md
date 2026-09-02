@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.11.13] - 2026-09-03
+
+- Adds low-saturation whole-panel state themes while preserving the exact idle background: deep blue for active end-to-end helper work, deep green for completed work, and deep red for failures or actionable exceptions. The existing dot and explicit text remain, with matching accessibility labels.
+- Covers shell, file, board, agent, Skill, and Draw.io lifecycles. Successful backend results remain blue until their user-visible composer delivery completes, then remain green if only the server presentation receipt is pending; failed results turn red immediately even while error delivery is pending, output-idle remains blue, and Ctrl+C after execution starts is a green completed execution.
+- Prevents cancelled or superseded Draw.io work from overwriting a newer helper state, restores green when an already-rendered latest artifact cancels a staging replacement, and adds focused positive, negative, boundary, stale-result, and real-Chrome computed-style regressions plus release screenshots.
+
 ## [0.11.12] - 2026-09-02
 
 - Makes `View Skills` a complete local management inventory: every successfully discovered Skill is rendered exactly once, and `installed` is only per-row state rather than a list filter. The smaller AI/composer catalog-size bound may still fail closed without blanking the local management rows.
