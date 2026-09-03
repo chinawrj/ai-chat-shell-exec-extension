@@ -26,13 +26,13 @@ async function main() {
 
     assert.equal(server.SERVER_PROTOCOL_VERSION, 12);
     assert.equal(server.HELPER_PROTOCOL_VERSION, 4);
-    assert.equal(server.SKILL_PROTOCOL_VERSION, 5);
+    assert.equal(server.SKILL_PROTOCOL_VERSION, 6);
     assert.match(doctorSource, new RegExp(`EXPECTED_SERVER_PROTOCOL_VERSION=${server.SERVER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_HELPER_PROTOCOL_VERSION=${server.HELPER_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(doctorSource, new RegExp(`EXPECTED_SKILL_PROTOCOL_VERSION=${server.SKILL_PROTOCOL_VERSION}(?:\\n|$)`));
     assert.match(chromeE2eSource, /serverHealth\.helperProtocolVersion,\s*4,/,
       "The real-Chrome preflight must expect the current helper protocol.");
-    assert.match(chromeE2eSource, /serverHealth\.skillProtocolVersion,\s*5,/,
+    assert.match(chromeE2eSource, /serverHealth\.skillProtocolVersion,\s*6,/,
       "The real-Chrome preflight must expect the current Skill protocol.");
     assert.deepEqual(server.getVisionTmuxAppNames(), ["Terminal", "Ghostty"]);
     process.env.AI_CHAT_SHELL_VISION_TMUX_APPS = "Ghostty,Google Chrome,bad\napp";
@@ -47,7 +47,7 @@ async function main() {
     assert.equal(metadata.protocolVersion, 12);
     assert.equal(metadata.serverProtocolVersion, 12);
     assert.equal(metadata.helperProtocolVersion, 4);
-    assert.equal(metadata.skillProtocolVersion, 5);
+    assert.equal(metadata.skillProtocolVersion, 6);
     assert.equal(metadata.helperProtocol, "ai-helper-plain-text");
     assert.equal(metadata.visualProtocolVersion, 1);
     assert.deepEqual(metadata.visualTmuxApps, ["Terminal", "Ghostty"]);
@@ -58,7 +58,7 @@ async function main() {
     assert.equal(health.serverReleaseVersion, manifest.version);
     assert.equal(health.serverProtocolVersion, 12);
     assert.equal(health.helperProtocolVersion, 4);
-    assert.equal(health.skillProtocolVersion, 5);
+    assert.equal(health.skillProtocolVersion, 6);
     assert.equal(health.visualProtocolVersion, 1);
     assert.deepEqual(health.visualTmuxApps, ["Terminal", "Ghostty"]);
     assert.equal(health.executionBackend, "tmux");
@@ -77,7 +77,7 @@ async function main() {
         protocolVersion: 12,
         serverProtocolVersion: 12,
         helperProtocolVersion: 4,
-        skillProtocolVersion: 5
+        skillProtocolVersion: 6
       },
       assertHealth: (result) => {
         assert.equal(result.ok, true);
@@ -87,7 +87,7 @@ async function main() {
         assert.equal(result.releaseMatches, true);
         assert.equal(result.requiredServerProtocolVersion, 12);
         assert.equal(result.requiredHelperProtocolVersion, 4);
-        assert.equal(result.requiredSkillProtocolVersion, 5);
+        assert.equal(result.requiredSkillProtocolVersion, 6);
       }
     });
 
@@ -103,7 +103,7 @@ async function main() {
         assert.equal(result.staleServer, true);
         assert.equal(result.protocolMatches, false);
         assert.equal(result.helperProtocolMatches, false);
-        assert.match(result.error, /Expected server protocol 12, helper protocol 4, and Skill protocol 5/);
+        assert.match(result.error, /Expected server protocol 12, helper protocol 4, and Skill protocol 6/);
         assert.match(result.error, /start_shell_server\.sh/);
       }
     });
@@ -118,7 +118,7 @@ async function main() {
         protocolVersion: 12,
         serverProtocolVersion: 12,
         helperProtocolVersion: 0,
-        skillProtocolVersion: 5
+        skillProtocolVersion: 6
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);
@@ -137,7 +137,7 @@ async function main() {
         serverReleaseVersion: manifest.version,
         protocolVersion: 12,
         serverProtocolVersion: 12,
-        skillProtocolVersion: 5
+        skillProtocolVersion: 6
       },
       assertHealth: (result) => {
         assert.equal(result.ok, false);

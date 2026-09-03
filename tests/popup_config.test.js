@@ -110,7 +110,7 @@ function makeContext() {
             protocolVersion: 12,
             serverProtocolVersion: 12,
             helperProtocolVersion: 4,
-            skillProtocolVersion: 5,
+            skillProtocolVersion: 6,
             skillCatalogVersion: 2,
             skillCount: 3,
             visualProtocolVersion: 1,
@@ -165,19 +165,19 @@ function makeContext() {
   await context.loadSettings();
   await context.loadCurrentSite();
   await context.refreshHealth();
-  assert.equal(elements.get("health").textContent, "Server v0.6.0, protocol 12, helper 4, skill 5, Skills v2/3, apps Terminal/Ghostty, vision ok, pid 123");
+  assert.equal(elements.get("health").textContent, "Server v0.6.0, protocol 12, helper 4, skill 6, Skills v2/3, apps Terminal/Ghostty, vision ok, pid 123");
   assert.equal(context.formatServerHealth({
     releaseVersion: "0.6.0",
     serverReleaseVersion: "0.6.0",
     protocolVersion: 12,
     serverProtocolVersion: 12,
     helperProtocolVersion: 4,
-    skillProtocolVersion: 5,
+    skillProtocolVersion: 6,
     visualProtocolVersion: 1,
     visualTmuxApps: ["Terminal", "Ghostty"],
     visionAvailable: false,
     pid: 123
-  }), "Server v0.6.0, protocol 12, helper 4, skill 5, pid 123");
+  }), "Server v0.6.0, protocol 12, helper 4, skill 6, pid 123");
   await context.refreshTmuxTargets();
   assert.equal(elements.get("tmuxTargets").textContent.includes("defaultSession=ForAI host=%41 board=%40 cwd=/tmp/project"), true);
   assert.equal(elements.get("tmuxTargets").textContent.includes("target=%24 address=espcam:0.0 window=build command=zsh cwd=/tmp/project active=false"), true);

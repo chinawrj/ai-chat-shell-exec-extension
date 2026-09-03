@@ -10,21 +10,32 @@ const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "skill-protocol-state-"))
 const skillDir = path.join(root, "protocol-skill");
 fs.mkdirSync(skillDir, { recursive: true });
 const skillPath = path.join(skillDir, "SKILL.md");
+const executionEnvPath = path.join(stateDir, "runtime.env");
+const executionEnvValue = `protocol-env-file-${Date.now()}`;
 fs.writeFileSync(skillPath, [
   "---",
   "name: protocol-skill",
   "description: Exercises the dedicated Skill server protocol.",
   "---",
   "home=$HOME",
-  "secret=$NOT_ALLOWED"
+  "secret=$NOT_ALLOWED",
+  "env_file=$PROTOCOL_ENV_FILE",
+  "overlap=$PROTOCOL_OVERLAP"
 ].join("\n"));
 fs.writeFileSync(path.join(skillDir, "install.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 fs.writeFileSync(path.join(skillDir, "uninstall.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+fs.writeFileSync(executionEnvPath, [
+  `PROTOCOL_ENV_FILE=${executionEnvValue}`,
+  "PROTOCOL_OVERLAP=env-file-wins",
+  ""
+].join("\n"), { mode: 0o600 });
 
 process.env.AI_CHAT_SHELL_STATE_DIR = stateDir;
 process.env.AI_HELPER_SKILL_PATHS = root;
+process.env.AI_CHAT_SHELL_ENV_FILE = executionEnvPath;
 process.env.HOME = "/protocol/home";
 process.env.NOT_ALLOWED = "must-not-leak";
+process.env.PROTOCOL_OVERLAP = "process-loses";
 process.env.AI_CHAT_SHELL_TMUX_SOCKET = path.join(stateDir, "intentionally-missing-tmux.sock");
 
 const {
@@ -41,7 +52,7 @@ main()
 
 async function main() {
   const health = buildHealthResponse();
-  assert.equal(health.skillProtocolVersion, 5);
+  assert.equal(health.skillProtocolVersion, 6);
   assert.equal(health.skillCatalogOk, true, JSON.stringify(health.skillCatalogErrors));
   assert.equal(health.skillCount, 0);
   assert.equal(health.discoveredSkillCount, 1);
@@ -51,7 +62,7 @@ async function main() {
   const status = await request({ type: "skill-catalog-status" });
   assert.equal(status.ok, true, JSON.stringify(status));
   assert.equal(status.type, "skill-catalog-status");
-  assert.equal(status.skillProtocolVersion, 5);
+  assert.equal(status.skillProtocolVersion, 6);
   assert.equal(status.skillCount, 0);
   assert.equal(status.discoveredSkillCount, 1);
   assert.equal(status.skills, undefined, "Status should not unnecessarily disclose the catalog list.");
@@ -147,7 +158,43 @@ async function main() {
   assert.equal(loaded.type, "skill-load");
   assert.ok(loaded.content.includes("home=/protocol/home"));
   assert.ok(loaded.content.includes("secret=$NOT_ALLOWED"));
+  assert.ok(loaded.content.includes(`env_file=${executionEnvValue}`));
+  assert.ok(loaded.content.includes("overlap=env-file-wins"));
+  assert.ok(loaded.replacedVariables.includes("PROTOCOL_ENV_FILE"));
+  assert.ok(loaded.replacedVariables.includes("PROTOCOL_OVERLAP"));
   assert.ok(!loaded.content.includes("must-not-leak"));
+
+  const updatedExecutionEnvValue = `${executionEnvValue}-updated`;
+  fs.writeFileSync(executionEnvPath, [
+    `PROTOCOL_ENV_FILE=${updatedExecutionEnvValue}`,
+    "PROTOCOL_OVERLAP=env-file-still-wins",
+    ""
+  ].join("\n"), { mode: 0o600 });
+  const hotReloaded = await request({
+    type: "skill-load",
+    skillId: "protocol-skill",
+    catalogSha: list.catalogSha
+  });
+  assert.equal(hotReloaded.ok, true, JSON.stringify(hotReloaded));
+  assert.ok(hotReloaded.content.includes(`env_file=${updatedExecutionEnvValue}`));
+  assert.equal(hotReloaded.catalogSha, list.catalogSha);
+  assert.equal(hotReloaded.version, list.version);
+
+  fs.writeFileSync(executionEnvPath, `PROTOCOL_ENV_FILE=${executionEnvValue}\ninvalid-line\n`, { mode: 0o600 });
+  const malformedEnvironment = await request({
+    type: "skill-load",
+    skillId: "protocol-skill",
+    catalogSha: list.catalogSha
+  });
+  assert.equal(malformedEnvironment.ok, false);
+  assert.equal(malformedEnvironment.errorCode, "execution-env-file-malformed");
+  assert.ok(!JSON.stringify(malformedEnvironment).includes(executionEnvValue));
+  assertNoPrivateSkillPaths(malformedEnvironment, "Malformed Skill load environment failure");
+  fs.writeFileSync(executionEnvPath, [
+    `PROTOCOL_ENV_FILE=${updatedExecutionEnvValue}`,
+    "PROTOCOL_OVERLAP=env-file-still-wins",
+    ""
+  ].join("\n"), { mode: 0o600 });
 
   const invalidPath = await request({
     type: "skill-load",

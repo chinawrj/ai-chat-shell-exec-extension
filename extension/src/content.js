@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.13";
+const CONTENT_SCRIPT_VERSION = "0.11.14";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -126,6 +126,7 @@ let lastThreadText = "";
 let lastThreadTextAt = Date.now();
 let activeCallId = "";
 let activeCallToken = null;
+let preparingRunnableDispatchToken = null;
 let pageLifecycleGeneration = 0;
 let observedPageIdentity = "";
 let routeHandoffPreviousPageIdentity = "";
@@ -160,6 +161,7 @@ let pendingForceRunRequested = false;
 let pendingForceRunTimer = 0;
 let pendingForceRunCandidateSnapshot = null;
 let forceRunInFlight = false;
+let activeForceRunCallId = "";
 let extensionVersionWarning = "";
 let agentPollTimer = 0;
 let agentDeliveryInFlight = false;
@@ -204,6 +206,7 @@ let skillStatePollInFlight = false;
 let skillCatalogDialogRefreshInFlight = false;
 let skillCatalogDialogRefreshPending = false;
 let skillHelperInFlight = false;
+let activeSkillHelperCallKey = "";
 let skillRecoveryInFlight = false;
 let lastOwnedSkillSyncRecoveryStatus = "none";
 const skillInstallInFlight = new Set();
@@ -272,13 +275,16 @@ async function activateExtension() {
 }
 
 function deactivateExtension() {
-  const hadActiveLifecycle = Boolean(activeCallToken || threadObserver || document.getElementById(STATUS_ID));
+  const hadActiveLifecycle = Boolean(
+    activeCallToken || preparingRunnableDispatchToken || threadObserver || document.getElementById(STATUS_ID)
+  );
   extensionActive = false;
   if (hadActiveLifecycle) {
     beginPageLifecycle();
   } else {
     activeCallId = "";
     activeCallToken = null;
+    preparingRunnableDispatchToken = null;
   }
   bindingMode = "";
   pendingSelfTest = null;
@@ -792,7 +798,15 @@ async function scanForShellCall(options = {}) {
   }
   refreshPageLifecycle();
   await loadPendingHelperDeliveriesForCurrentPage();
+  // Loading pending state may yield while a new ChatGPT conversation receives
+  // its permanent SPA URL. Reconcile before inspecting the current DOM.
+  refreshPageLifecycle();
   schedulePendingHelperDeliveryRetry();
+
+  if (!force && isManualHelperDispatchInFlight()) {
+    scheduleScan();
+    return;
+  }
 
   if (!force) {
     expirePendingSelfTest();
@@ -820,7 +834,12 @@ async function scanForShellCall(options = {}) {
     // let a transient scan failure block the rest of the scanner.
   }
 
-  if (activeCallId) {
+  if (preparingRunnableDispatchToken &&
+      !isPreparingRunnableDispatchCurrent(preparingRunnableDispatchToken)) {
+    releasePreparingRunnableDispatch(preparingRunnableDispatchToken);
+  }
+
+  if (activeCallId || preparingRunnableDispatchToken) {
     if (force) {
       pendingForceRunRequested = true;
       pendingForceRunCandidateSnapshot = expectedForceCandidate;
@@ -841,6 +860,13 @@ async function scanForShellCall(options = {}) {
   }
 
   const settings = await chrome.storage.sync.get(["enabled", "enabledHosts", "maxChainCalls"]);
+  // Keep the candidate URL and lifecycle generation on the same side of this
+  // second storage await before creating any candidate-bound dispatch state.
+  refreshPageLifecycle();
+  if (!force && isManualHelperDispatchInFlight()) {
+    scheduleScan();
+    return;
+  }
   if (settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts)) {
     deactivateExtension();
     return;
@@ -948,6 +974,10 @@ async function scanForShellCall(options = {}) {
 
   if (!force && hasSkillCandidate) {
     await processLatestSkillCandidate(allCandidates, settings);
+    if (isManualHelperDispatchInFlight()) {
+      scheduleScan();
+      return;
+    }
   }
 
   if (!candidate) {
@@ -968,6 +998,9 @@ async function scanForShellCall(options = {}) {
   }
   const semanticCallKey = buildSemanticCallKey(call);
   const callKey = buildCandidateCallKey(candidate, semanticCallKey);
+  const forceDispatchSnapshot = force
+    ? (expectedForceCandidate || createRenderedHelperCandidateSnapshot(candidate))
+    : null;
   const repeatableAgentQuery = isRepeatableAgentQueryHelperCall(call);
   if (!force) {
     const handledReason = getHandledHelperReason(candidate, callKey, semanticCallKey, call);
@@ -997,17 +1030,52 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
+  const dispatchContext = force ? null : createRunnableHelperDispatchContext(candidate);
+  const dispatchClaim = dispatchContext
+    ? claimPreparingRunnableDispatch(callKey, call, dispatchContext)
+    : null;
+  if (dispatchContext && !dispatchClaim) {
+    scheduleScan();
+    return;
+  }
+
   const validation = validateHelperCall(call);
   if (!validation.ok) {
     markCallProcessed(candidate, callKey, semanticCallKey);
-    await replyWithRejectedCall(call, validation.reason);
+    try {
+      await replyWithRejectedCall(call, validation.reason, {
+        dispatchContext,
+        dispatchClaim,
+        forceCandidateSnapshot: forceDispatchSnapshot
+      });
+    } catch (error) {
+      if (!force) {
+        unmarkCallProcessed(candidate, semanticCallKey);
+      }
+      throw error;
+    } finally {
+      releasePreparingRunnableDispatch(dispatchClaim);
+    }
     return;
   }
 
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
   if (!force && chainCallCount >= maxChainCalls) {
     markCallProcessed(candidate, callKey, semanticCallKey);
-    await replyWithRejectedCall(call, `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`);
+    try {
+      await replyWithRejectedCall(
+        call,
+        `Chain limit reached (${maxChainCalls}). Ask the user before running more shell calls.`,
+        { dispatchContext, dispatchClaim, forceCandidateSnapshot: forceDispatchSnapshot }
+      );
+    } catch (error) {
+      if (!force) {
+        unmarkCallProcessed(candidate, semanticCallKey);
+      }
+      throw error;
+    } finally {
+      releasePreparingRunnableDispatch(dispatchClaim);
+    }
     return;
   }
 
@@ -1019,13 +1087,22 @@ async function scanForShellCall(options = {}) {
       markCallProcessed(candidate, callKey, semanticCallKey);
     }
   }
-  const forceDispatchSnapshot = force
-    ? (expectedForceCandidate || createRenderedHelperCandidateSnapshot(candidate))
-    : null;
-  const outcome = await runAndReply(executionCallKey, call, {
-    force,
-    forceCandidateSnapshot: forceDispatchSnapshot
-  });
+  let outcome;
+  try {
+    outcome = await runAndReply(executionCallKey, call, {
+      force,
+      forceCandidateSnapshot: forceDispatchSnapshot,
+      dispatchContext,
+      dispatchClaim
+    });
+  } catch (error) {
+    if (!force) {
+      unmarkCallProcessed(candidate, semanticCallKey);
+    }
+    throw error;
+  } finally {
+    releasePreparingRunnableDispatch(dispatchClaim);
+  }
   if (!force && outcome?.retryable === true) {
     unmarkCallProcessed(candidate, semanticCallKey);
   }
@@ -1181,12 +1258,32 @@ function beginPageLifecycle(options = {}) {
   routeHandoffPreviousPageIdentity = options.routeTransition === true
     ? String(options.previousPageIdentity || "")
     : "";
-  const preservesChatGptNewConversationGeneration = options.routeTransition === true &&
-    isChatGptNewConversationRouteAssignment(
+  const activeRunnableCallRouteHandoff = options.routeTransition === true
+    ? prepareActiveRunnableCallRouteHandoff(
+      activeCallToken,
       options.previousPageIdentity,
-      getCurrentPageIdentity(),
-      assistantGenerationEpoch
-    );
+      getCurrentPageIdentity()
+    )
+    : null;
+  const preparingRunnableDispatchRouteHandoff = options.routeTransition === true
+    ? preparePreparingRunnableDispatchRouteHandoff(
+      preparingRunnableDispatchToken,
+      options.previousPageIdentity,
+      getCurrentPageIdentity()
+    )
+    : null;
+  // ChatGPT assigns a permanent /c or /uc URL after beginning the first
+  // response. Keep the execution lock only when the exact candidate-bound
+  // origin survives that one assignment; ordinary chat navigation still
+  // clears the token and prevents a stale result from entering the new chat.
+  const preservesChatGptNewConversationGeneration = options.routeTransition === true &&
+    (Boolean(activeRunnableCallRouteHandoff) ||
+      Boolean(preparingRunnableDispatchRouteHandoff) ||
+      isChatGptNewConversationRouteAssignment(
+        options.previousPageIdentity,
+        getCurrentPageIdentity(),
+        assistantGenerationEpoch
+      ));
   cancelPendingHelperDeliveryRetry();
   pendingHelperDeliveries = new Map();
   locallyPresentedHelperExecutions = new Map();
@@ -1196,6 +1293,7 @@ function beginPageLifecycle(options = {}) {
   observedPageIdentity = getCurrentPageIdentity();
   activeCallId = "";
   activeCallToken = null;
+  preparingRunnableDispatchToken = null;
   initialThreadSettled = false;
   staleRouteGenerationControls = options.routeTransition === true &&
       !preservesChatGptNewConversationGeneration
@@ -1232,6 +1330,12 @@ function beginPageLifecycle(options = {}) {
   resetPanelForceRunIdleState({ clearCandidate: true });
   lastOwnedSkillSyncRecoveryStatus = "none";
   committedOwnedSkillSyncSemanticKeys.clear();
+  if (activeRunnableCallRouteHandoff) {
+    commitActiveRunnableCallRouteHandoff(activeRunnableCallRouteHandoff);
+  }
+  if (preparingRunnableDispatchRouteHandoff) {
+    commitPreparingRunnableDispatchRouteHandoff(preparingRunnableDispatchRouteHandoff);
+  }
   updateContextualPanelActions();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
@@ -1239,8 +1343,36 @@ function beginPageLifecycle(options = {}) {
   if (routeHandoffEntries.length > 0) {
     const nextPageIdentity = getCurrentPageIdentity();
     for (const entry of routeHandoffEntries) {
-      entry.pageIdentity = nextPageIdentity;
-      if (entry.skillOriginProof) {
+      const receiptCleanupOnly = entry.phase === "submitted" || entry.phase === "presented";
+      if (receiptCleanupOnly) {
+        // Submission is already proven, so carrying this entry cannot write or
+        // submit composer text. Retain it only to finish the canonical server
+        // presentation receipt, without requiring a volatile DOM proof that a
+        // restored entry cannot possess.
+        entry.pageIdentity = nextPageIdentity;
+        entry.routeReceiptCleanupOnly = true;
+        entry.volatileLifecycleGuard = null;
+        entry.volatileStaleHandler = null;
+        entry.runnableRouteHandoffPending = false;
+        entry.skillRouteHandoffPending = false;
+      } else if (!entry.skillOriginProof) {
+        // Volatile guards are deliberately absent after reload. A queued or
+        // inserted ordinary result therefore has no authority to migrate even
+        // across ChatGPT's provisional URL assignment. Live entries may move
+        // only after their exact candidate/turn guard rebases successfully.
+        if (typeof entry.volatileLifecycleGuard !== "function" ||
+            !isRememberedPendingHelperLifecycleCurrent({
+              lifecycleGuard: entry.volatileLifecycleGuard
+            })) {
+          continue;
+        }
+        entry.pageIdentity = nextPageIdentity;
+        entry.runnableRouteRevision = Number(entry.runnableRouteRevision || 0) + 1;
+        entry.activeDeliveryAttemptToken = null;
+        entry.runnableRouteHandoffPending = ["queued", "inserted", "submitted-unconfirmed"]
+          .includes(entry.phase);
+      } else {
+        entry.pageIdentity = nextPageIdentity;
         // A URL change is not proof of a provisional-to-permanent route
         // assignment: it can also be a user navigating to another chat. Carry
         // local Skill content only while the exact originating helper root is
@@ -1292,6 +1424,23 @@ function beginPageLifecycle(options = {}) {
   }
 }
 
+function isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity) {
+  if (location.hostname !== "chatgpt.com") {
+    return false;
+  }
+  try {
+    const previous = new URL(String(previousIdentity || ""));
+    const next = new URL(String(nextIdentity || ""));
+    return previous.origin === next.origin &&
+      previous.hostname === "chatgpt.com" &&
+      next.hostname === previous.hostname &&
+      previous.pathname === "/" &&
+      /^\/(?:c|uc)\/[^/]+/.test(next.pathname);
+  } catch (_unused) {
+    return false;
+  }
+}
+
 function isChatGptNewConversationRouteAssignment(previousIdentity, nextIdentity, epoch) {
   if (location.hostname !== "chatgpt.com" ||
       !(epoch?.userAnchor instanceof Element) ||
@@ -1302,12 +1451,7 @@ function isChatGptNewConversationRouteAssignment(previousIdentity, nextIdentity,
     return false;
   }
   try {
-    const previous = new URL(String(previousIdentity || ""));
-    const next = new URL(String(nextIdentity || ""));
-    return previous.origin === "https://chatgpt.com" &&
-      next.origin === previous.origin &&
-      previous.pathname === "/" &&
-      /^\/(?:c|uc)\/[^/]+/.test(next.pathname);
+    return isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity);
   } catch (_unused) {
     return false;
   }
@@ -1580,7 +1724,7 @@ function snapshotPendingHelperResponse(response) {
 
 async function rememberPendingHelperDelivery(callId, call, response, reply, settings, options = {}) {
   await loadPendingHelperDeliveriesForCurrentPage();
-  if (typeof options.lifecycleGuard === "function" && options.lifecycleGuard() !== true) {
+  if (!isRememberedPendingHelperLifecycleCurrent(options)) {
     return null;
   }
   const now = Date.now();
@@ -1591,7 +1735,7 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
     if (existing) {
       existing.updatedAt = now;
       await persistPendingHelperDeliveries();
-      return existing;
+      return validateRememberedPendingHelperDelivery(existing, options);
     }
   }
   const submittedMessageRootsBefore = getSubmittedMessageRootsMatching(reply);
@@ -1623,13 +1767,39 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
       : null,
     volatileStaleHandler: typeof options.staleHandler === "function"
       ? options.staleHandler
-      : null
+      : null,
+    runnableRouteHandoffPending: options.runnableRouteHandoffPending === true,
+    runnableRouteRevision: 0
   };
   pendingHelperDeliveries.set(callId, entry);
   const pruned = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()));
   pendingHelperDeliveries = new Map(pruned.map((pending) => [pending.callId, pending]));
   await persistPendingHelperDeliveries();
-  return pendingHelperDeliveries.get(callId) || entry;
+  return validateRememberedPendingHelperDelivery(entry, options);
+}
+
+async function validateRememberedPendingHelperDelivery(entry, options = {}) {
+  if (isRememberedPendingHelperLifecycleCurrent(options)) {
+    return pendingHelperDeliveries.get(entry.callId) === entry ? entry : null;
+  }
+  // A stale persistence continuation may clean up only the exact object it
+  // created. A newer same-call replacement owns its own durable snapshot.
+  if (pendingHelperDeliveries.get(entry.callId) === entry) {
+    pendingHelperDeliveries.delete(entry.callId);
+    await persistPendingHelperDeliveries();
+  }
+  return null;
+}
+
+function isRememberedPendingHelperLifecycleCurrent(options = {}) {
+  if (typeof options.lifecycleGuard !== "function") {
+    return true;
+  }
+  try {
+    return options.lifecycleGuard() === true;
+  } catch (_unused) {
+    return false;
+  }
 }
 
 function persistPendingHelperDeliveries(
@@ -1739,7 +1909,9 @@ async function cancelPendingHelperDeliveryAfterComposerRemoval(entry, attemptTok
   }
   await persistPendingHelperDeliveries();
   const label = pendingHelperDeliveryLabel(entry);
-  setStatus(`${label} result delivery and the current queued batch were cancelled because composer content was removed or changed; they will not be inserted again.`, "ok");
+  if (!hasActiveRunnablePanelOwner(entry)) {
+    setStatus(`${label} result delivery and the current queued batch were cancelled because composer content was removed or changed; they will not be inserted again.`, "ok");
+  }
   return true;
 }
 
@@ -1777,6 +1949,24 @@ async function finalizePendingHelperDelivery(entry, phase) {
   }
 }
 
+async function finishRouteReceiptCleanup(entry) {
+  const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry ||
+      entry.routeReceiptCleanupOnly !== true ||
+      (entry.phase !== "submitted" && entry.phase !== "presented")) {
+    return false;
+  }
+  if (receiptAcknowledged) {
+    await clearPendingHelperDelivery(entry);
+    return true;
+  }
+  entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
+  entry.updatedAt = Date.now();
+  await persistPendingHelperDeliveries();
+  schedulePendingHelperDeliveryRetry();
+  return false;
+}
+
 async function performPendingHelperDeliveryFinalization(entry, phase) {
   entry.phase = phase;
   entry.updatedAt = Date.now();
@@ -1784,17 +1974,23 @@ async function performPendingHelperDeliveryFinalization(entry, phase) {
   // Presentation proof is the user-visible completion boundary. Surface it
   // before best-effort storage and receipt I/O so a slow extension channel
   // cannot leave a successfully submitted result looking unfinished.
-  setHelperCompletionStatus(entry.call, entry.response);
+  if (entry.routeReceiptCleanupOnly !== true && !hasActiveRunnablePanelOwner(entry)) {
+    setHelperCompletionStatus(entry.call, entry.response);
+  }
   await persistPendingHelperDeliveries();
   await rememberLocallyPresentedHelperExecution(entry);
   const receiptAcknowledged = await acknowledgePendingHelperResultPresented(entry);
   if (receiptAcknowledged) {
     await clearPendingHelperDelivery(entry);
-    setHelperCompletionStatus(entry.call, entry.response);
+    if (entry.routeReceiptCleanupOnly !== true && !hasActiveRunnablePanelOwner(entry)) {
+      setHelperCompletionStatus(entry.call, entry.response);
+    }
   } else {
     entry.lastError = "result presented locally; waiting for server receipt acknowledgement";
     await persistPendingHelperDeliveries();
-    setPendingHelperDeliveryStatus(entry);
+    if (entry.routeReceiptCleanupOnly !== true && !hasActiveRunnablePanelOwner(entry)) {
+      setPendingHelperDeliveryStatus(entry);
+    }
     schedulePendingHelperDeliveryRetry();
   }
   return true;
@@ -2085,11 +2281,45 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
     sequence: pendingHelperDeliveryAttemptSequence,
     pageIdentity: getCurrentPageIdentity(),
     generation: pageLifecycleGeneration,
-    skillRouteRevision: Number(entry.skillRouteRevision || 0)
+    skillRouteRevision: Number(entry.skillRouteRevision || 0),
+    runnableRouteRevision: Number(entry.runnableRouteRevision || 0)
   };
   entry.activeDeliveryAttemptToken = attemptToken;
   entry.deliveryInFlight = true;
   try {
+    if (entry.routeReceiptCleanupOnly === true) {
+      if (entry.phase !== "submitted" && entry.phase !== "presented") {
+        await clearPendingHelperDelivery(entry);
+        return false;
+      }
+      return await finishRouteReceiptCleanup(entry);
+    }
+    if (entry.runnableRouteHandoffPending === true) {
+      if (!initialThreadSettled) {
+        setPendingHelperDeliveryStatus(entry);
+        schedulePendingHelperDeliveryRetry();
+        return false;
+      }
+      if (typeof entry.volatileLifecycleGuard !== "function" ||
+          entry.volatileLifecycleGuard() !== true) {
+        entry.volatileStaleHandler?.();
+        await discardStaleRunnablePendingDelivery(entry);
+        return false;
+      }
+      entry.runnableRouteHandoffPending = false;
+      entry.updatedAt = Date.now();
+      await persistPendingHelperDeliveries();
+      if (!(await requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken))) {
+        return false;
+      }
+    }
+    if (!entry.skillOriginProof &&
+        typeof entry.volatileLifecycleGuard === "function" &&
+        entry.volatileLifecycleGuard() !== true) {
+      entry.volatileStaleHandler?.();
+      await discardStaleRunnablePendingDelivery(entry);
+      return false;
+    }
     if (entry.skillRouteHandoffPending === true) {
       if (!initialThreadSettled) {
         setPendingHelperDeliveryStatus(entry);
@@ -2218,11 +2448,17 @@ function isPendingHelperDeliveryAttemptCurrent(entry, attemptToken) {
     entry.pageIdentity === attemptToken.pageIdentity &&
     getCurrentPageIdentity() === attemptToken.pageIdentity &&
     pageLifecycleGeneration === attemptToken.generation &&
-    Number(entry.skillRouteRevision || 0) === attemptToken.skillRouteRevision;
+    Number(entry.skillRouteRevision || 0) === attemptToken.skillRouteRevision &&
+    Number(entry.runnableRouteRevision || 0) === attemptToken.runnableRouteRevision;
 }
 
 function isPendingHelperDeliverySideEffectCurrent(entry, attemptToken = null) {
   if (attemptToken && !isPendingHelperDeliveryAttemptCurrent(entry, attemptToken)) {
+    return false;
+  }
+  if (!entry?.skillOriginProof &&
+      typeof entry?.volatileLifecycleGuard === "function" &&
+      entry.volatileLifecycleGuard() !== true) {
     return false;
   }
   return isPendingSkillDeliveryOriginCurrent(entry);
@@ -2235,6 +2471,13 @@ async function requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken
     return false;
   }
   if (isPendingSkillDeliveryOriginCurrent(entry)) {
+    if (!entry?.skillOriginProof &&
+        typeof entry?.volatileLifecycleGuard === "function" &&
+        entry.volatileLifecycleGuard() !== true) {
+      entry.volatileStaleHandler?.();
+      await discardStaleRunnablePendingDelivery(entry);
+      return false;
+    }
     return true;
   }
   if (entry?.skillOriginProof && pendingHelperDeliveries.get(entry.callId) === entry) {
@@ -2242,6 +2485,20 @@ async function requirePendingHelperDeliverySideEffectCurrent(entry, attemptToken
     await discardStaleSkillPendingDelivery(entry);
   }
   return false;
+}
+
+async function discardStaleRunnablePendingDelivery(entry) {
+  if (!entry || pendingHelperDeliveries.get(entry.callId) !== entry) {
+    return;
+  }
+  pendingHelperDeliveries.delete(entry.callId);
+  await persistPendingHelperDeliveries();
+  if (!hasActiveRunnablePanelOwner(entry)) {
+    setStatus(
+      "Discarded a cached helper result because its originating response could no longer be proven",
+      "idle"
+    );
+  }
 }
 
 function isPendingSkillDeliveryOriginCurrent(entry) {
@@ -2266,7 +2523,9 @@ async function discardStaleSkillPendingDelivery(entry) {
   }
   pendingHelperDeliveries.delete(entry.callId);
   await persistPendingHelperDeliveries();
-  setStatus("Discarded a cached Skill result because its originating chat could no longer be proven; process the current helper again if needed", "idle");
+  if (!hasActiveRunnablePanelOwner(entry)) {
+    setStatus("Discarded a cached Skill result because its originating chat could no longer be proven; process the current helper again if needed", "idle");
+  }
 }
 
 async function finishPendingHelperDeliveryAttempt(entry, attemptToken = null) {
@@ -2418,6 +2677,333 @@ function migratePendingAgentDeliveryToCurrentPage(options = {}) {
   persistPendingAgentDelivery();
 }
 
+function createRunnableHelperDispatchContext(candidate) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const semanticCallKey = buildSemanticCallKey(candidate?.call);
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    renderRoot,
+    renderGeneration: getHelperRenderRootGeneration(renderRoot),
+    renderedHelperKey: buildRenderedHelperKey(candidate, semanticCallKey),
+    semanticCallKey,
+    source: candidate?.source || "",
+    blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
+    routeHandoffCount: 0,
+    chatGptTurnProof: createChatGptRunnableDispatchTurnProof(candidate)
+  };
+}
+
+function isRunnableHelperDispatchContextCurrent(context) {
+  if (!context) {
+    return true;
+  }
+  refreshPageLifecycle();
+  const currentPageIdentity = getCurrentPageIdentity();
+  let candidate = findRetainedRunnableHelperDispatchCandidate(context);
+  if (!candidate && location.hostname === "chatgpt.com" && context.chatGptTurnProof) {
+    candidate = rebindChatGptRunnableDispatchCandidate(context);
+  }
+  if (!candidate) {
+    return false;
+  }
+  if (context.chatGptTurnProof &&
+      !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate)) {
+    return false;
+  }
+  if (context.pageIdentity === currentPageIdentity &&
+      context.generation === pageLifecycleGeneration) {
+    return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
+  }
+  if (Number(context.routeHandoffCount || 0) >= 1 ||
+      routeHandoffPreviousPageIdentity !== context.pageIdentity ||
+      !isChatGptProvisionalConversationRouteAssignment(
+        context.pageIdentity,
+        currentPageIdentity
+      )) {
+    return false;
+  }
+  // Claim the equivalent helper under the assigned route before any backend
+  // side effect or composer work continues. This also keeps later scans from
+  // treating a React-redrawn copy as a fresh request.
+  rebaseRunnableHelperDispatchContext(context, candidate);
+  return true;
+}
+
+function prepareActiveRunnableCallRouteHandoff(callToken, previousIdentity, nextIdentity) {
+  const context = callToken?.dispatchContext;
+  if (!context ||
+      activeCallToken !== callToken ||
+      activeCallId !== callToken.callId ||
+      context.pageIdentity !== String(previousIdentity || "") ||
+      context.generation !== callToken.generation ||
+      Number(context.routeHandoffCount || 0) >= 1 ||
+      !isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
+    return null;
+  }
+  let candidate = findRetainedRunnableHelperDispatchCandidate(context);
+  if (!candidate && context.chatGptTurnProof) {
+    candidate = rebindChatGptRunnableDispatchCandidate(context);
+  }
+  if (!candidate ||
+      (context.chatGptTurnProof &&
+        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate))) {
+    return null;
+  }
+  return { callToken, context, candidate };
+}
+
+function preparePreparingRunnableDispatchRouteHandoff(callToken, previousIdentity, nextIdentity) {
+  const context = callToken?.dispatchContext;
+  if (!context ||
+      preparingRunnableDispatchToken !== callToken ||
+      context.pageIdentity !== String(previousIdentity || "") ||
+      context.generation !== callToken.generation ||
+      Number(context.routeHandoffCount || 0) >= 1 ||
+      !isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
+    return null;
+  }
+  let candidate = findRetainedRunnableHelperDispatchCandidate(context);
+  if (!candidate && context.chatGptTurnProof) {
+    candidate = rebindChatGptRunnableDispatchCandidate(context);
+  }
+  if (!candidate ||
+      (context.chatGptTurnProof &&
+        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate))) {
+    return null;
+  }
+  return { callToken, context, candidate };
+}
+
+function commitActiveRunnableCallRouteHandoff(handoff) {
+  const callToken = handoff?.callToken;
+  const context = handoff?.context;
+  const candidate = handoff?.candidate;
+  if (!callToken || !context || !candidate) {
+    return false;
+  }
+  rebaseRunnableHelperDispatchContext(context, candidate);
+  callToken.pageIdentity = context.pageIdentity;
+  callToken.generation = context.generation;
+  activeCallId = callToken.callId;
+  activeCallToken = callToken;
+  setStatus(buildRunningStatus(callToken.call, callToken.force === true), "running");
+  if (isShellHelperExecutionCall(callToken.call)) {
+    updateStopHelperButton(true);
+  }
+  return true;
+}
+
+function commitPreparingRunnableDispatchRouteHandoff(handoff) {
+  const callToken = handoff?.callToken;
+  const context = handoff?.context;
+  const candidate = handoff?.candidate;
+  if (!callToken || !context || !candidate) {
+    return false;
+  }
+  rebaseRunnableHelperDispatchContext(context, candidate);
+  callToken.pageIdentity = context.pageIdentity;
+  callToken.generation = context.generation;
+  preparingRunnableDispatchToken = callToken;
+  return true;
+}
+
+function claimPreparingRunnableDispatch(callId, call, dispatchContext) {
+  if (!dispatchContext || preparingRunnableDispatchToken || activeCallId) {
+    return null;
+  }
+  const token = {
+    callId,
+    call,
+    dispatchContext,
+    pageIdentity: dispatchContext.pageIdentity,
+    generation: dispatchContext.generation,
+    phase: "pre-backend"
+  };
+  preparingRunnableDispatchToken = token;
+  updateContextualPanelActions();
+  return token;
+}
+
+function isPreparingRunnableDispatchCurrent(token) {
+  return Boolean(token) &&
+    preparingRunnableDispatchToken === token &&
+    token.dispatchContext &&
+    // The context guard owns route reconciliation. It must run before the
+    // final identity comparison because a route-only pushState can occur
+    // without the observer having refreshed this lifecycle yet.
+    isRunnableHelperDispatchContextCurrent(token.dispatchContext) &&
+    preparingRunnableDispatchToken === token &&
+    token.pageIdentity === getCurrentPageIdentity() &&
+    token.generation === pageLifecycleGeneration;
+}
+
+function releasePreparingRunnableDispatch(token) {
+  if (!token || preparingRunnableDispatchToken !== token) {
+    return false;
+  }
+  preparingRunnableDispatchToken = null;
+  updateContextualPanelActions();
+  return true;
+}
+
+function rebaseRunnableHelperDispatchContext(context, candidate) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  context.pageIdentity = getCurrentPageIdentity();
+  context.generation = pageLifecycleGeneration;
+  context.renderRoot = renderRoot;
+  context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+  context.source = candidate?.source || "";
+  context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
+  context.renderedHelperKey = buildRenderedHelperKey(candidate, context.semanticCallKey);
+  context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
+  markCallProcessed(candidate, "runnable-route-handoff", context.semanticCallKey);
+}
+
+function findRetainedRunnableHelperDispatchCandidate(context) {
+  const renderRoot = context?.renderRoot;
+  const conversationRoot = getConversationRoot();
+  if (!(renderRoot instanceof Element) ||
+      renderRoot.isConnected === false ||
+      !(conversationRoot instanceof Element) ||
+      (renderRoot !== conversationRoot && !conversationRoot.contains(renderRoot))) {
+    return null;
+  }
+  try {
+    return extractShellCallCandidates(conversationRoot).find((candidate) =>
+      isRunnableHelperCall(candidate.call) &&
+      getCandidateRenderRoot(candidate) === renderRoot &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey &&
+      (candidate.source || "") === context.source &&
+      (candidate.blockIndex ?? candidate.index ?? "") === context.blockIndex
+    ) || null;
+  } catch (_unused) {
+    return null;
+  }
+}
+
+function createChatGptRunnableDispatchTurnProof(candidate) {
+  if (location.hostname !== "chatgpt.com" || !isRunnableHelperCall(candidate?.call)) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getChatGptMessageRoot(renderRoot, "assistant");
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const assistantContent = getChatGptAssistantContentRoot(messageRoot);
+  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
+  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      !(userCopy instanceof Element) ||
+      !(assistantContent instanceof Element) ||
+      !userRootIdentity ||
+      !assistantRootIdentity ||
+      userIndex < 0 ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1 ||
+      !userText) {
+    return null;
+  }
+  return {
+    userRootIdentity,
+    assistantRootIdentity,
+    userTextHash: stableHash(userText),
+    userTextLength: userText.length
+  };
+}
+
+function isChatGptRunnableDispatchTurnProofCurrent(proof, candidate) {
+  if (!proof) {
+    return true;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "user" &&
+    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  );
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  );
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  return userRoot instanceof Element &&
+    messageRoot instanceof Element &&
+    userCopy instanceof Element &&
+    stableHash(userText) === proof.userTextHash &&
+    userText.length === Number(proof.userTextLength) &&
+    responseIndex === userIndex + 1 &&
+    responseIndex === authoredRoots.length - 1 &&
+    getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot;
+}
+
+function rebindChatGptRunnableDispatchCandidate(context) {
+  const proof = context?.chatGptTurnProof;
+  if (location.hostname !== "chatgpt.com" || !proof) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  );
+  if (!(messageRoot instanceof Element)) {
+    return null;
+  }
+  let matches = [];
+  try {
+    matches = extractShellCallCandidates(conversationRoot).filter((candidate) =>
+      isRunnableHelperCall(candidate.call) &&
+      getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey
+    );
+  } catch (_unused) {
+    return null;
+  }
+  if (matches.length !== 1 ||
+      !isChatGptRunnableDispatchTurnProofCurrent(proof, matches[0])) {
+    return null;
+  }
+  const candidate = matches[0];
+  const renderRoot = getCandidateRenderRoot(candidate);
+  context.renderRoot = renderRoot;
+  context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+  context.source = candidate.source || "";
+  context.blockIndex = candidate.blockIndex ?? candidate.index ?? "";
+  context.renderedHelperKey = buildRenderedHelperKey(candidate, context.semanticCallKey);
+  return candidate;
+}
+
+function reportStaleRunnableHelperDispatch(context, phase, details = {}) {
+  console.warn(
+    `[AI Chat Shell Exec] Ignored a helper ${String(phase || "result")} after its originating chat changed.`
+  );
+  if (!hasActiveRunnablePanelOwner()) {
+    setStatus(
+      "Helper result kept out of this chat because the originating response could no longer be proven",
+      "idle"
+    );
+  }
+  return {
+    retryable: false,
+    abandoned: true,
+    staleOrigin: true,
+    ...details
+  };
+}
+
 function createSkillDispatchContext(candidate) {
   const renderRoot = getCandidateRenderRoot(candidate);
   const semanticCallKey = buildSemanticCallKey(candidate?.call);
@@ -2430,6 +3016,7 @@ function createSkillDispatchContext(candidate) {
     semanticCallKey,
     source: candidate?.source || "",
     blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
+    routeHandoffCount: 0,
     chatGptTurnProof: createChatGptSkillDispatchTurnProof(candidate)
   };
 }
@@ -2464,7 +3051,12 @@ function isSkillDispatchContextCurrent(context) {
   // the response DOM intact. Permit that one route handoff only when the exact
   // originating render root is still connected inside the current transcript.
   // A result from a removed/older chat therefore cannot enter the new chat.
-  if (routeHandoffPreviousPageIdentity !== context.pageIdentity) {
+  if (Number(context.routeHandoffCount || 0) >= 1 ||
+      routeHandoffPreviousPageIdentity !== context.pageIdentity ||
+      !isChatGptProvisionalConversationRouteAssignment(
+        context.pageIdentity,
+        currentPageIdentity
+      )) {
     return false;
   }
   if (context.skillSyncTurnProof) {
@@ -2482,6 +3074,7 @@ function isSkillDispatchContextCurrent(context) {
   context.generation = pageLifecycleGeneration;
   context.renderGeneration = getHelperRenderRootGeneration(context.renderRoot);
   context.renderedHelperKey = buildRenderedHelperKey(retainedCandidate, context.semanticCallKey);
+  context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
   return true;
 }
 
@@ -2600,8 +3193,30 @@ function findRetainedSkillDispatchCandidate(context) {
 function reportStaleSkillDispatch(context = null) {
   releaseStaleSkillDispatchForRecovery(context);
   console.warn("[AI Chat Skills] Ignored a backend response after the originating chat changed.");
-  setStatus("Skill result ignored because the originating chat changed; process the helper again in the current chat", "idle");
+  if (!hasActiveRunnablePanelOwner()) {
+    setStatus("Skill result ignored because the originating chat changed; process the helper again in the current chat", "idle");
+  }
   return false;
+}
+
+function hasActiveRunnablePanelOwner(entry = null) {
+  const entryCallId = String(entry?.callId || "");
+  const ownsActiveRunnable = Boolean(entryCallId && activeCallId === entryCallId);
+  const ownsActiveSkill = Boolean(
+    entryCallId && activeSkillHelperCallKey &&
+    entryCallId.endsWith(`:${activeSkillHelperCallKey}`)
+  );
+  const ownsActiveForce = Boolean(
+    entryCallId && activeForceRunCallId === entryCallId
+  );
+  return Boolean(
+    preparingRunnableDispatchToken ||
+    (activeCallId && !ownsActiveRunnable) ||
+    (panelShellHelperActive && !ownsActiveRunnable) ||
+    (skillHelperInFlight && !ownsActiveSkill) ||
+    (skillRecoveryInFlight && !ownsActiveSkill) ||
+    (forceRunInFlight && !ownsActiveForce)
+  );
 }
 
 function releaseStaleSkillDispatchForRecovery(context) {
@@ -3782,8 +4397,15 @@ function resetPanelForceRunIdleState(options = {}) {
   }
 }
 
+function isManualHelperDispatchInFlight() {
+  return Boolean(
+    forceRunInFlight || skillRecoveryInFlight || pendingForceRunRequested
+  );
+}
+
 function isPanelForceRunExecutionActive() {
-  return Boolean(activeCallId) || skillHelperInFlight || skillRecoveryInFlight ||
+  return Boolean(activeCallId) || Boolean(preparingRunnableDispatchToken) ||
+    skillHelperInFlight || skillRecoveryInFlight ||
     forceRunInFlight || panelShellHelperActive;
 }
 
@@ -3880,6 +4502,7 @@ function processLatestDrawioCandidates(allCandidates) {
     updateDrawioContextAction();
     return;
   }
+  const dispatchContext = createDrawioDispatchContext(latestCandidate);
 
   const validation = preview.validateDrawioXml(latestCandidate.call.xml);
   const artifactId = preview.hashDrawioXml(latestCandidate.call.xml);
@@ -3899,7 +4522,7 @@ function processLatestDrawioCandidates(allCandidates) {
         ownerKey: artifactId
       });
     }
-    queueDrawioErrorReply(latestCandidate, result).catch((error) => {
+    queueDrawioErrorReply(latestCandidate, result, dispatchContext).catch((error) => {
       console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
     });
     updateDrawioContextAction();
@@ -3921,23 +4544,212 @@ function processLatestDrawioCandidates(allCandidates) {
   });
   Promise.resolve(renderPromise)
     .then((result) => {
+      if (!isDrawioDispatchContextCurrent(dispatchContext)) {
+        return false;
+      }
       updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutcome);
-      queueDrawioErrorReply(latestCandidate, result).catch((error) => {
+      queueDrawioErrorReply(latestCandidate, result, dispatchContext).catch((error) => {
         console.error("[AI Chat Draw.io] Error feedback delivery failed.", error);
       });
+      return true;
     })
     .catch((error) => {
+      if (!isDrawioDispatchContextCurrent(dispatchContext)) {
+        return false;
+      }
       const result = preview.reportInvalid({
         key: `${artifactId}:unexpected:${error?.message || String(error)}`,
         artifactId,
         error: `Unexpected draw.io preview failure: ${error?.message || String(error)}`
       });
       updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutcome);
-      return queueDrawioErrorReply(latestCandidate, result);
+      return queueDrawioErrorReply(latestCandidate, result, dispatchContext);
     })
     .finally(() => {
-      updateDrawioContextAction();
+      if (isDrawioDispatchContextCurrent(dispatchContext)) {
+        updateDrawioContextAction();
+      }
     });
+}
+
+function createDrawioDispatchContext(candidate) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const semanticCallKey = buildSemanticCallKey(candidate?.call);
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration,
+    renderRoot,
+    renderGeneration: getHelperRenderRootGeneration(renderRoot),
+    semanticCallKey,
+    source: candidate?.source || "",
+    blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
+    routeHandoffCount: 0,
+    chatGptTurnProof: createChatGptDrawioDispatchTurnProof(candidate)
+  };
+}
+
+function isDrawioDispatchContextCurrent(context) {
+  if (!context) {
+    return true;
+  }
+  refreshPageLifecycle();
+  const currentPageIdentity = getCurrentPageIdentity();
+  let candidate = findRetainedDrawioDispatchCandidate(context);
+  if (!candidate && location.hostname === "chatgpt.com" && context.chatGptTurnProof) {
+    candidate = rebindChatGptDrawioDispatchCandidate(context);
+  }
+  if (!candidate ||
+      (context.chatGptTurnProof &&
+        !isChatGptDrawioDispatchTurnProofCurrent(context.chatGptTurnProof, candidate))) {
+    return false;
+  }
+  if (context.pageIdentity === currentPageIdentity &&
+      context.generation === pageLifecycleGeneration) {
+    return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
+  }
+  if (Number(context.routeHandoffCount || 0) >= 1 ||
+      !context.chatGptTurnProof ||
+      routeHandoffPreviousPageIdentity !== context.pageIdentity ||
+      !isChatGptProvisionalConversationRouteAssignment(
+        context.pageIdentity,
+        currentPageIdentity
+      )) {
+    return false;
+  }
+  const renderRoot = getCandidateRenderRoot(candidate);
+  context.pageIdentity = currentPageIdentity;
+  context.generation = pageLifecycleGeneration;
+  context.renderRoot = renderRoot;
+  context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+  context.source = candidate?.source || "";
+  context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
+  context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
+  return true;
+}
+
+function findRetainedDrawioDispatchCandidate(context) {
+  const renderRoot = context?.renderRoot;
+  const conversationRoot = getConversationRoot();
+  if (!(renderRoot instanceof Element) ||
+      renderRoot.isConnected === false ||
+      !(conversationRoot instanceof Element) ||
+      (renderRoot !== conversationRoot && !conversationRoot.contains(renderRoot))) {
+    return null;
+  }
+  try {
+    return extractShellCallCandidates(conversationRoot).find((candidate) =>
+      isDrawioHelperCall(candidate.call) &&
+      getCandidateRenderRoot(candidate) === renderRoot &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey &&
+      (candidate.source || "") === context.source &&
+      (candidate.blockIndex ?? candidate.index ?? "") === context.blockIndex
+    ) || null;
+  } catch (_unused) {
+    return null;
+  }
+}
+
+function createChatGptDrawioDispatchTurnProof(candidate) {
+  if (location.hostname !== "chatgpt.com" || !isDrawioHelperCall(candidate?.call)) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const messageRoot = getChatGptMessageRoot(renderRoot, "assistant");
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const assistantContent = getChatGptAssistantContentRoot(messageRoot);
+  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
+  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(messageRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      !(userCopy instanceof Element) ||
+      !(assistantContent instanceof Element) ||
+      !userRootIdentity ||
+      !assistantRootIdentity ||
+      userIndex < 0 ||
+      responseIndex !== userIndex + 1 ||
+      responseIndex !== authoredRoots.length - 1 ||
+      !userText) {
+    return null;
+  }
+  return {
+    userRootIdentity,
+    assistantRootIdentity,
+    userTextHash: stableHash(userText),
+    userTextLength: userText.length
+  };
+}
+
+function isChatGptDrawioDispatchTurnProofCurrent(proof, candidate) {
+  if (!proof) {
+    return true;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "user" &&
+    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  );
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  );
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  return userRoot instanceof Element &&
+    messageRoot instanceof Element &&
+    userCopy instanceof Element &&
+    stableHash(userText) === proof.userTextHash &&
+    userText.length === Number(proof.userTextLength) &&
+    responseIndex === userIndex + 1 &&
+    responseIndex === authoredRoots.length - 1 &&
+    getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot;
+}
+
+function rebindChatGptDrawioDispatchCandidate(context) {
+  const proof = context?.chatGptTurnProof;
+  if (location.hostname !== "chatgpt.com" || !proof) {
+    return null;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const messageRoot = authoredRoots.find((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  );
+  if (!(messageRoot instanceof Element)) {
+    return null;
+  }
+  let matches = [];
+  try {
+    matches = extractShellCallCandidates(conversationRoot).filter((candidate) =>
+      isDrawioHelperCall(candidate.call) &&
+      getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot &&
+      buildSemanticCallKey(candidate.call) === context.semanticCallKey
+    );
+  } catch (_unused) {
+    return null;
+  }
+  if (matches.length !== 1 ||
+      !isChatGptDrawioDispatchTurnProofCurrent(proof, matches[0])) {
+    return null;
+  }
+  const candidate = matches[0];
+  const renderRoot = getCandidateRenderRoot(candidate);
+  context.renderRoot = renderRoot;
+  context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+  context.source = candidate?.source || "";
+  context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
+  return candidate;
 }
 
 function shouldUpdateDrawioPanelOutcome(diagnostics, artifactId) {
@@ -3982,11 +4794,17 @@ function updateDrawioPanelStatus(preview, artifactId, result, shouldAnnounceOutc
   }
 }
 
-async function queueDrawioErrorReply(candidate, result) {
+async function queueDrawioErrorReply(candidate, result, dispatchContext = null) {
   if (!result || result.ok === true || result.cancelled === true || result.newError !== true) {
     return false;
   }
+  if (dispatchContext && !isDrawioDispatchContextCurrent(dispatchContext)) {
+    return false;
+  }
   const settings = await chrome.storage.sync.get(["autoSend", "maxChainCalls"]);
+  if (dispatchContext && !isDrawioDispatchContextCurrent(dispatchContext)) {
+    return false;
+  }
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
   if (chainCallCount >= maxChainCalls) {
     setStatus(`Draw.io error was kept local because the chain limit (${maxChainCalls}) was reached.`, "error");
@@ -4006,18 +4824,33 @@ async function queueDrawioErrorReply(candidate, result) {
     "```"
   ].join("\n");
   const callId = `drawio-error:${stableHash(`${getCurrentPageIdentity()}\n${helperId}\n${artifactId}\n${error}`)}`;
-  chainCallCount += 1;
   const pending = await rememberPendingHelperDelivery(
     callId,
     call,
     { ok: false, error },
     reply,
-    settings
+    settings,
+    dispatchContext ? {
+      lifecycleGuard: () => isDrawioDispatchContextCurrent(dispatchContext),
+      staleHandler: () => {
+        console.warn("[AI Chat Draw.io] Discarded an error reply after its originating response changed.");
+      },
+      runnableRouteHandoffPending: Number(dispatchContext.routeHandoffCount || 0) > 0
+    } : {}
   );
+  if (!pending) {
+    return false;
+  }
+  chainCallCount += 1;
   return attemptPendingHelperDelivery(pending, settings);
 }
 
 async function processLatestSkillCandidate(allCandidates, settings = {}, options = {}) {
+  const manualRecovery = options.allowBaselineRecovery === true || options.forceDetected === true;
+  if (!manualRecovery && isManualHelperDispatchInFlight()) {
+    scheduleScan();
+    return false;
+  }
   if (skillHelperInFlight) {
     // The last DOM mutation for a second Skill helper can arrive while the
     // previous helper is still finalizing its composer delivery. Keep a
@@ -4102,6 +4935,7 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
   }
 
   skillHelperInFlight = true;
+  activeSkillHelperCallKey = callKey;
   updateContextualPanelActions();
   setStatus(buildSkillRunningStatus(call), "running", {
     owner: "skill-helper",
@@ -4259,6 +5093,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     return false;
   } finally {
     skillHelperInFlight = false;
+    if (activeSkillHelperCallKey === callKey) {
+      activeSkillHelperCallKey = "";
+    }
     updateContextualPanelActions();
     scheduleScan();
   }
@@ -5889,26 +6726,68 @@ function validateShellCall(call) {
   return { ok: true };
 }
 
-async function replyWithRejectedCall(call, reason) {
-  chainCallCount += 1;
-  const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : isAgentRosterHelperCall(call) ? "agent roster query" : isAgentTaskStatusHelperCall(call) ? "agent task status query" : "shell call";
-  setStatus(`Rejected ${helperName}: ${reason}`, "error");
-  const reply = [
-    isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : isAgentRosterHelperCall(call) ? "Agent roster query rejected:" : isAgentTaskStatusHelperCall(call) ? "Agent task status query rejected:" : "Shell call rejected:",
-    "",
-    "```shell-output",
-    formatRejectedCallSubject(call),
-    `error: ${reason}`,
-    "```"
-  ].join("\n");
-  const settings = await chrome.storage.sync.get(["autoSend"]);
-  const response = {
-    ok: false,
-    error: String(reason || "Helper rejected")
-  };
-  const callId = `rejected:${stableHash(`${getCurrentPageIdentity()}\n${reply}`)}`;
-  const pending = await rememberPendingHelperDelivery(callId, call, response, reply, settings);
-  return attemptPendingHelperDelivery(pending, settings);
+async function replyWithRejectedCall(call, reason, options = {}) {
+  const dispatchContext = options.dispatchContext || null;
+  const dispatchClaim = options.dispatchClaim || null;
+  const forceCandidateSnapshot = options.forceCandidateSnapshot || null;
+  const pendingOptions = createRejectedPendingDeliveryOptions(
+    dispatchContext,
+    forceCandidateSnapshot,
+    "during rejection persistence"
+  );
+  let claimReleased = false;
+  let forcePanelCallId = "";
+  try {
+    chainCallCount += 1;
+    const helperName = isFileHelperCall(call) ? "file helper" : isBoardHelperCall(call) ? "board helper" : isAgentMessageHelperCall(call) ? "agent message" : isAgentRosterHelperCall(call) ? "agent roster query" : isAgentTaskStatusHelperCall(call) ? "agent task status query" : "shell call";
+    setStatus(`Rejected ${helperName}: ${reason}`, "error");
+    const reply = [
+      isFileHelperCall(call) ? "File helper rejected:" : isBoardHelperCall(call) ? "Board command rejected:" : isAgentMessageHelperCall(call) ? "Agent message rejected:" : isAgentRosterHelperCall(call) ? "Agent roster query rejected:" : isAgentTaskStatusHelperCall(call) ? "Agent task status query rejected:" : "Shell call rejected:",
+      "",
+      "```shell-output",
+      formatRejectedCallSubject(call),
+      `error: ${reason}`,
+      "```"
+    ].join("\n");
+    const settings = await chrome.storage.sync.get(["autoSend"]);
+    if ((dispatchContext && !isPreparingRunnableDispatchCurrent(dispatchClaim)) ||
+        (forceCandidateSnapshot && !isForceRunCandidateSnapshotCurrent(forceCandidateSnapshot))) {
+      return reportStaleRunnableHelperDispatch(dispatchContext, "before rejection delivery");
+    }
+    const response = {
+      ok: false,
+      error: String(reason || "Helper rejected")
+    };
+    const callId = `rejected:${stableHash(`${getCurrentPageIdentity()}\n${reply}`)}`;
+    if (forceCandidateSnapshot) {
+      activeForceRunCallId = callId;
+      forcePanelCallId = callId;
+    }
+    const pending = await rememberPendingHelperDelivery(
+      callId,
+      call,
+      response,
+      reply,
+      settings,
+      pendingOptions
+    );
+    if (!pending) {
+      return reportStaleRunnableHelperDispatch(
+        dispatchContext,
+        "during rejection persistence"
+      );
+    }
+    releasePreparingRunnableDispatch(dispatchClaim);
+    claimReleased = true;
+    return attemptPendingHelperDelivery(pending, settings);
+  } finally {
+    if (forcePanelCallId && activeForceRunCallId === forcePanelCallId) {
+      activeForceRunCallId = "";
+    }
+    if (!claimReleased) {
+      releasePreparingRunnableDispatch(dispatchClaim);
+    }
+  }
 }
 
 function formatRejectedCallSubject(call) {
@@ -5937,7 +6816,19 @@ async function runAndReply(callId, call, options = {}) {
 
   const force = options.force === true;
   const forceCandidateSnapshot = options.forceCandidateSnapshot || null;
+  const dispatchContext = force ? null : options.dispatchContext || null;
+  const dispatchClaim = dispatchContext
+    ? (options.dispatchClaim || claimPreparingRunnableDispatch(callId, call, dispatchContext))
+    : null;
+  if (dispatchContext && !dispatchClaim) {
+    return { retryable: false, abandoned: true, preparingDispatchBusy: true };
+  }
+  try {
   const settings = await chrome.storage.sync.get(["requireApproval", "autoSend"]);
+  if (dispatchContext && !isPreparingRunnableDispatchCurrent(dispatchClaim)) {
+    releasePreparingRunnableDispatch(dispatchClaim);
+    return reportStaleRunnableHelperDispatch(dispatchContext, "before backend execution");
+  }
   if (force && !isForceRunCandidateSnapshotCurrent(forceCandidateSnapshot)) {
     clearPendingForceRun();
     setStatus("Force run cancelled because the latest helper changed", "idle");
@@ -5946,7 +6837,26 @@ async function runAndReply(callId, call, options = {}) {
   if (!force && isPersistentResultHelperCall(call)) {
     await loadPendingHelperDeliveriesForCurrentPage();
     const pending = pendingHelperDeliveries.get(callId);
+    if (dispatchContext && !isPreparingRunnableDispatchCurrent(dispatchClaim)) {
+      releasePreparingRunnableDispatch(dispatchClaim);
+      if (pending) {
+        await discardStaleRunnablePendingDelivery(pending);
+      }
+      return reportStaleRunnableHelperDispatch(
+        dispatchContext,
+        "before cached result delivery"
+      );
+    }
     if (pending) {
+      if (dispatchContext) {
+        pending.volatileLifecycleGuard = () =>
+          isRunnableHelperDispatchContextCurrent(dispatchContext);
+        pending.volatileStaleHandler = () => reportStaleRunnableHelperDispatch(
+          dispatchContext,
+          "during cached result delivery"
+        );
+      }
+      releasePreparingRunnableDispatch(dispatchClaim);
       const delivered = await attemptPendingHelperDelivery(pending, settings);
       return {
         retryable: false,
@@ -6017,8 +6927,14 @@ async function runAndReply(callId, call, options = {}) {
     );
 
     if (!approved) {
+      releasePreparingRunnableDispatch(dispatchClaim);
       return { retryable: false, cancelled: true };
     }
+  }
+
+  if (dispatchContext && !isPreparingRunnableDispatchCurrent(dispatchClaim)) {
+    releasePreparingRunnableDispatch(dispatchClaim);
+    return reportStaleRunnableHelperDispatch(dispatchContext, "before backend execution");
   }
 
   refreshPageLifecycle();
@@ -6026,10 +6942,17 @@ async function runAndReply(callId, call, options = {}) {
     callId,
     pageIdentity: getCurrentPageIdentity(),
     generation: pageLifecycleGeneration,
-    phase: "created"
+    phase: "created",
+    call,
+    force,
+    dispatchContext
   };
   activeCallId = callId;
   activeCallToken = callToken;
+  if (force) {
+    activeForceRunCallId = callId;
+  }
+  releasePreparingRunnableDispatch(dispatchClaim);
   if (!isFileHelperCall(call) && !isBoardHelperCall(call) && !isAgentMessageHelperCall(call) && !isAgentRosterHelperCall(call) && !isAgentTaskStatusHelperCall(call)) {
     updateStopHelperButton(true);
   }
@@ -6044,22 +6967,26 @@ async function runAndReply(callId, call, options = {}) {
     const response = isFileHelperCall(call) ?
       await sendWriteFileMessage(callId, call, force) :
       isBoardHelperCall(call) ?
-      await sendRunBoardMessage(callId, call, force) :
+      await sendRunBoardMessage(callId, call, force, dispatchContext, callToken) :
       isAgentMessageHelperCall(call) ?
-      await sendAgentMessage(callId, call, force) :
+      await sendAgentMessage(callId, call, force, dispatchContext, callToken) :
       isAgentRosterHelperCall(call) ?
-      await sendAgentRosterQuery(callId, call, force) :
+      await sendAgentRosterQuery(callId, call, force, dispatchContext, callToken) :
       isAgentTaskStatusHelperCall(call) ?
-      await sendAgentTaskStatusQuery(callId, call, force) :
-      await sendRunShellMessage(callId, call, force);
+      await sendAgentTaskStatusQuery(callId, call, force, dispatchContext, callToken) :
+      await sendRunShellMessage(callId, call, force, dispatchContext, callToken);
     callToken.phase = "response-received";
+    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(dispatchContext)) {
+      return reportStaleRunnableHelperDispatch(dispatchContext, "after backend execution", {
+        response
+      });
+    }
+    if (!isCurrentCallToken(callToken)) {
+      return { retryable: false, abandoned: true };
+    }
     if (!isFileHelperCall(call) && !isBoardHelperCall(call)) {
       clearShellRunNotice(response?.executionId || "");
       updateStopHelperButton(false);
-    }
-
-    if (!isCurrentCallToken(callToken)) {
-      return { retryable: false, abandoned: true };
     }
 
     let effectiveResponse = response;
@@ -6099,7 +7026,26 @@ async function runAndReply(callId, call, options = {}) {
       formatAgentTaskStatusOutput(call, effectiveResponse, startedAt) :
       formatShellOutput(call, effectiveResponse, startedAt);
     if (isPersistentResultHelperCall(call)) {
-      const pending = await rememberPendingHelperDelivery(callId, call, effectiveResponse, reply, settings);
+      const pending = await rememberPendingHelperDelivery(
+        callId,
+        call,
+        effectiveResponse,
+        reply,
+        settings,
+        createRunnablePendingDeliveryOptions(
+          callToken,
+          dispatchContext,
+          force,
+          "during result persistence"
+        )
+      );
+      if (!pending) {
+        return reportStaleRunnableHelperDispatch(
+          dispatchContext,
+          "during result persistence",
+          { response }
+        );
+      }
       setPendingHelperDeliveryStatus(pending);
       releaseActiveCall(callToken);
       if (!isCallLifecycleCurrent(callToken)) {
@@ -6127,6 +7073,11 @@ async function runAndReply(callId, call, options = {}) {
       deliveryFailed: !delivered
     };
   } catch (error) {
+    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(dispatchContext)) {
+      return reportStaleRunnableHelperDispatch(dispatchContext, "after backend failure", {
+        error: error.message || String(error)
+      });
+    }
     if (!isCallLifecycleCurrent(callToken)) {
       return { retryable: false, abandoned: true };
     }
@@ -6167,8 +7118,21 @@ async function runAndReply(callId, call, options = {}) {
       call,
       failedResponse,
       failedReply,
-      settings
+      settings,
+      createRunnablePendingDeliveryOptions(
+        callToken,
+        dispatchContext,
+        force,
+        "during failed-result persistence"
+      )
     );
+    if (!pending) {
+      return reportStaleRunnableHelperDispatch(
+        dispatchContext,
+        "during failed-result persistence",
+        { error: error.message || String(error) }
+      );
+    }
     releaseActiveCall(callToken);
     const delivered = await attemptPendingHelperDelivery(pending, settings);
     return {
@@ -6181,11 +7145,73 @@ async function runAndReply(callId, call, options = {}) {
       deliveryFailed: !delivered
     };
   } finally {
-    if (!isFileHelperCall(call) && !isBoardHelperCall(call)) {
-      updateStopHelperButton(false);
-    }
     releaseActiveCall(callToken);
+    if (force && activeForceRunCallId === callId) {
+      activeForceRunCallId = "";
+    }
+    if (isShellHelperExecutionCall(call)) {
+      updateStopHelperButton(Boolean(
+        activeCallToken && isShellHelperExecutionCall(activeCallToken.call)
+      ));
+    }
   }
+  } finally {
+    // Exact-token CAS release: failures or early returns before backend
+    // transfer cannot orphan the pre-backend single-flight claim, and an old
+    // continuation can never clear a newer helper's claim.
+    releasePreparingRunnableDispatch(dispatchClaim);
+  }
+}
+
+function createRunnablePendingDeliveryOptions(
+  callToken,
+  dispatchContext,
+  force,
+  stalePhase
+) {
+  const lifecycleGuard = dispatchContext
+    ? () => isRunnableHelperDispatchContextCurrent(dispatchContext)
+    : force === true && callToken
+      ? () => isCallLifecycleCurrent(callToken)
+      : null;
+  if (!lifecycleGuard) {
+    return {};
+  }
+  return {
+    lifecycleGuard,
+    staleHandler: () => reportStaleRunnableHelperDispatch(
+      dispatchContext,
+      stalePhase
+    ),
+    runnableRouteHandoffPending: Boolean(
+      dispatchContext && Number(dispatchContext.routeHandoffCount || 0) > 0
+    )
+  };
+}
+
+function createRejectedPendingDeliveryOptions(
+  dispatchContext,
+  forceCandidateSnapshot,
+  stalePhase
+) {
+  const lifecycleGuard = dispatchContext
+    ? () => isRunnableHelperDispatchContextCurrent(dispatchContext)
+    : forceCandidateSnapshot
+      ? () => isForceRunCandidateSnapshotCurrent(forceCandidateSnapshot)
+      : null;
+  if (!lifecycleGuard) {
+    return {};
+  }
+  return {
+    lifecycleGuard,
+    staleHandler: () => reportStaleRunnableHelperDispatch(
+      dispatchContext,
+      stalePhase
+    ),
+    runnableRouteHandoffPending: Boolean(
+      dispatchContext && Number(dispatchContext.routeHandoffCount || 0) > 0
+    )
+  };
 }
 
 function isAuthoritativeDuplicateResponse(response) {
@@ -6337,6 +7363,14 @@ function releaseActiveCall(callToken) {
   updateContextualPanelActions();
 }
 
+function isShellHelperExecutionCall(call) {
+  return !isFileHelperCall(call) &&
+    !isBoardHelperCall(call) &&
+    !isAgentMessageHelperCall(call) &&
+    !isAgentRosterHelperCall(call) &&
+    !isAgentTaskStatusHelperCall(call);
+}
+
 function formatBoardApprovalTarget(call) {
   const boardName = normalizeCommand(call?.boardName || "board") || "board";
   return `${boardName} (AI_CHAT_SHELL_BOARD_TARGET may override this on the local server)`;
@@ -6361,13 +7395,11 @@ function buildRunningStatus(call, force) {
   return `${force ? "Force running" : "Running"}: ${summarizeCommand(call.cmd)}`;
 }
 
-async function sendRunShellMessage(callId, call, force) {
+async function sendRunShellMessage(callId, call, force, dispatchContext = null, callToken = null) {
   const profile = await getCurrentAgentProfile();
+  requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken);
   const agentId = profile.agentId && profile.role !== "none" ? profile.agentId : "";
-  const recoveryLifecycle = {
-    pageIdentity: getCurrentPageIdentity(),
-    generation: pageLifecycleGeneration
-  };
+  const recoveryLifecycle = createRunnableBackendRecoveryLifecycle(dispatchContext);
   const payload = {
     type: "run-shell",
     id: callId,
@@ -6422,10 +7454,7 @@ async function recoverRunShellResult(callKey, originalError, lifecycle = {}) {
   let transportFailureCount = 0;
 
   while (true) {
-    if (
-      (lifecycle.pageIdentity && getCurrentPageIdentity() !== lifecycle.pageIdentity) ||
-      (Number.isInteger(lifecycle.generation) && pageLifecycleGeneration !== lifecycle.generation)
-    ) {
+    if (!isRunnableBackendRecoveryLifecycleCurrent(lifecycle)) {
       throw createNonRetryableShellRecoveryError(
         "Shell result recovery stopped because the page lifecycle changed; the command was not resubmitted."
       );
@@ -6447,6 +7476,12 @@ async function recoverRunShellResult(callKey, originalError, lifecycle = {}) {
       }
       await sleep(RUN_STATUS_POLL_INTERVAL_MS);
       continue;
+    }
+
+    if (!isRunnableBackendRecoveryLifecycleCurrent(lifecycle)) {
+      throw createNonRetryableShellRecoveryError(
+        "Shell result recovery stopped because the page lifecycle changed; the command was not resubmitted."
+      );
     }
 
     if (!status?.ok) {
@@ -6523,13 +7558,11 @@ function sendWriteFileMessage(callId, call, force) {
   });
 }
 
-async function sendRunBoardMessage(callId, call, force) {
+async function sendRunBoardMessage(callId, call, force, dispatchContext = null, callToken = null) {
   const profile = await getCurrentAgentProfile();
+  requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken);
   const agentId = profile.agentId && profile.role !== "none" ? profile.agentId : "";
-  const recoveryLifecycle = {
-    pageIdentity: getCurrentPageIdentity(),
-    generation: pageLifecycleGeneration
-  };
+  const recoveryLifecycle = createRunnableBackendRecoveryLifecycle(dispatchContext);
   const payload = {
     type: "run-board",
     id: callId,
@@ -6565,10 +7598,7 @@ async function recoverRunBoardResult(callKey, originalError, lifecycle = {}) {
   let transportFailureCount = 0;
 
   while (true) {
-    if (
-      (lifecycle.pageIdentity && getCurrentPageIdentity() !== lifecycle.pageIdentity) ||
-      (Number.isInteger(lifecycle.generation) && pageLifecycleGeneration !== lifecycle.generation)
-    ) {
+    if (!isRunnableBackendRecoveryLifecycleCurrent(lifecycle)) {
       throw createNonRetryableBoardRecoveryError(
         "Board result recovery stopped because the page lifecycle changed; the board command was not resubmitted."
       );
@@ -6590,6 +7620,12 @@ async function recoverRunBoardResult(callKey, originalError, lifecycle = {}) {
       }
       await sleep(RUN_STATUS_POLL_INTERVAL_MS);
       continue;
+    }
+
+    if (!isRunnableBackendRecoveryLifecycleCurrent(lifecycle)) {
+      throw createNonRetryableBoardRecoveryError(
+        "Board result recovery stopped because the page lifecycle changed; the board command was not resubmitted."
+      );
     }
 
     if (!status?.ok) {
@@ -6629,6 +7665,48 @@ async function recoverRunBoardResult(callKey, originalError, lifecycle = {}) {
   }
 }
 
+function createRunnableBackendRecoveryLifecycle(dispatchContext) {
+  if (dispatchContext) {
+    return {
+      isCurrent: () => isRunnableHelperDispatchContextCurrent(dispatchContext)
+    };
+  }
+  // Force runs and direct callers intentionally retain the original strict
+  // lifecycle snapshot. Only an automatically scanned, candidate-bound call
+  // may follow ChatGPT's one provisional-to-permanent URL assignment.
+  return {
+    pageIdentity: getCurrentPageIdentity(),
+    generation: pageLifecycleGeneration
+  };
+}
+
+function isRunnableBackendRecoveryLifecycleCurrent(lifecycle = {}) {
+  if (typeof lifecycle.isCurrent === "function") {
+    try {
+      return lifecycle.isCurrent() === true;
+    } catch (_unused) {
+      return false;
+    }
+  }
+  return (!lifecycle.pageIdentity || getCurrentPageIdentity() === lifecycle.pageIdentity) &&
+    (!Number.isInteger(lifecycle.generation) || pageLifecycleGeneration === lifecycle.generation);
+}
+
+function requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken = null) {
+  const dispatchContextCurrent = !dispatchContext ||
+    isRunnableHelperDispatchContextCurrent(dispatchContext);
+  const callTokenCurrent = !callToken || isCurrentCallToken(callToken);
+  if (dispatchContextCurrent && callTokenCurrent) {
+    return;
+  }
+  const error = new Error(
+    "Helper dispatch stopped because its originating chat changed before runtime delivery."
+  );
+  error.helperRetryable = false;
+  error.helperSuppressReply = true;
+  throw error;
+}
+
 function createNonRetryableBoardRecoveryError(message) {
   const error = new Error(message);
   error.helperRetryable = false;
@@ -6636,8 +7714,9 @@ function createNonRetryableBoardRecoveryError(message) {
   return error;
 }
 
-async function sendAgentMessage(callId, call, force) {
+async function sendAgentMessage(callId, call, force, dispatchContext = null, callToken = null) {
   const profile = await getCurrentAgentProfile();
+  requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken);
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before sending agent messages.");
   }
@@ -6659,8 +7738,9 @@ async function sendAgentMessage(callId, call, force) {
   });
 }
 
-async function sendAgentRosterQuery(_callId, call, _force) {
+async function sendAgentRosterQuery(_callId, call, _force, dispatchContext = null, callToken = null) {
   const profile = await getCurrentAgentProfile();
+  requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken);
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying the agent roster.");
   }
@@ -6685,8 +7765,9 @@ async function sendAgentRosterQuery(_callId, call, _force) {
   };
 }
 
-async function sendAgentTaskStatusQuery(_callId, call, _force) {
+async function sendAgentTaskStatusQuery(_callId, call, _force, dispatchContext = null, callToken = null) {
   const profile = await getCurrentAgentProfile();
+  requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken);
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying task status.");
   }
@@ -10661,6 +11742,11 @@ async function handleShellRunProgress(message) {
   if (String(message.agentId || "") !== agentId) {
     return;
   }
+  // Role-level progress remains useful when recovering a task after refresh,
+  // but it must never overwrite a newer in-page helper's exact UI ownership.
+  if (activeCallId && String(message.callKey || "") !== activeCallId) {
+    return;
+  }
   if (message.state === "awaiting-user") {
     startShellRunMonitor();
     activeShellRunNotice = normalizeShellRunNotice(message);
@@ -11739,6 +12825,7 @@ function isSkillRecoveryCandidateSnapshotCurrent(snapshot, candidate) {
 
 async function processLatestSkillRecovery(options = {}) {
   const forceDetected = options.forceDetected === true;
+  let recoveryPanelOwnerCallKey = "";
   if (refreshPageLifecycle() || isSkillRecoveryBlocked({ explicitForce: forceDetected })) {
     return false;
   }
@@ -11802,12 +12889,21 @@ async function processLatestSkillRecovery(options = {}) {
       return false;
     }
     setStatus("Processing the latest Skill helper once", "running");
+    recoveryPanelOwnerCallKey = buildCandidateCallKey(
+      skillCandidate,
+      buildSemanticCallKey(skillCandidate.call)
+    );
+    activeSkillHelperCallKey = recoveryPanelOwnerCallKey;
     return processLatestSkillCandidate(allCandidates, settings, {
       allowBaselineRecovery: true,
       forceDetected
     });
   } finally {
     skillRecoveryInFlight = false;
+    if (recoveryPanelOwnerCallKey &&
+        activeSkillHelperCallKey === recoveryPanelOwnerCallKey) {
+      activeSkillHelperCallKey = "";
+    }
     updateContextualPanelActions();
   }
 }

@@ -72,7 +72,7 @@ assert.match(backgroundSource, /message\.type === "tmux-ensure"/);
 assert.match(backgroundSource, /message\.type === "tmux-reset-forai"/);
 assert.match(backgroundSource, /const REQUIRED_SERVER_PROTOCOL_VERSION = 12/);
 assert.match(backgroundSource, /const REQUIRED_HELPER_PROTOCOL_VERSION = 4/);
-assert.match(backgroundSource, /const REQUIRED_SKILL_PROTOCOL_VERSION = 5/);
+assert.match(backgroundSource, /const REQUIRED_SKILL_PROTOCOL_VERSION = 6/);
 assert.match(backgroundSource, /startsWith\("vision-"\)/);
 assert.match(backgroundSource, /function handleVisionMessage\(/);
 assert.match(backgroundSource, /BACKGROUND_VISION_MESSAGE_TYPES/);

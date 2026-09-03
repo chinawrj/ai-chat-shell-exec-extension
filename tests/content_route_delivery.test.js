@@ -170,6 +170,17 @@ function navigateWithoutLifecycleRefresh(context, pathname) {
   context.location.href = `${context.location.origin}${pathname}`;
 }
 
+function installSyntheticLiveRouteProof(context) {
+  const entry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  assert.ok(entry, "The route-delivery fixture must have one pending entry.");
+  // These tests isolate post-handoff composer behavior. The scanner suite
+  // separately proves the real candidate/turn rebase; model that live proof
+  // explicitly here so a restored entry without a guard cannot pass.
+  entry.volatileLifecycleGuard = () => true;
+  entry.volatileStaleHandler = () => {};
+  return entry;
+}
+
 async function settleBootstrap() {
   await Promise.resolve();
   await Promise.resolve();
@@ -246,6 +257,7 @@ async function testExactPluginTextMigratesAcrossRouteChange() {
   assert.match(insertedText, /route-owned-output/);
   const oldGeneration = vm.runInContext("pageLifecycleGeneration", context);
   const oldIdentity = context.getCurrentPageIdentity();
+  installSyntheticLiveRouteProof(context);
 
   // A route-only pushState/replaceState can happen without any DOM mutation.
   // The retry timer itself must refresh/migrate lifecycle state before it
@@ -253,6 +265,8 @@ async function testExactPluginTextMigratesAcrossRouteChange() {
   navigateWithoutLifecycleRefresh(context, "/c/route-owned");
   assert.notEqual(context.getCurrentPageIdentity(), oldIdentity);
 
+  await context.retryPendingHelperDeliveries();
+  vm.runInContext("initialThreadSettled = true;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.ok(
@@ -325,7 +339,10 @@ async function testDifferentUserDraftDoesNotMigrateOrSend() {
 
   currentComposer.innerText = "This is the user's unrelated draft";
   currentComposer.textContent = currentComposer.innerText;
+  installSyntheticLiveRouteProof(context);
   navigateWithoutLifecycleRefresh(context, "/c/user-draft");
+  await context.retryPendingHelperDeliveries();
+  vm.runInContext("initialThreadSettled = true;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.equal(backendRuns, 1);
@@ -392,8 +409,11 @@ async function testSubmittedUnconfirmedExactComposerSurvivesRouteAndResumesSendO
   entry.composerElement = null;
   entry.lastError = "waiting for exact submitted-message proof";
   await context.persistPendingHelperDeliveries();
+  installSyntheticLiveRouteProof(context);
 
   navigateWithoutLifecycleRefresh(context, "/c/submitted-unconfirmed-exact");
+  await context.retryPendingHelperDeliveries();
+  vm.runInContext("initialThreadSettled = true;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.equal(backendRuns, 1, "Route recovery must never replay the backend operation.");
@@ -455,10 +475,13 @@ async function testSubmittedUnconfirmedChangedComposerCancelsAcrossRoute() {
     entry.composerElement = null;
     entry.lastError = "waiting for exact submitted-message proof";
     await context.persistPendingHelperDeliveries();
+    installSyntheticLiveRouteProof(context);
     composer.innerText = replacement;
     composer.textContent = replacement;
 
     navigateWithoutLifecycleRefresh(context, `/c/submitted-unconfirmed-cancel-${replacement.length}`);
+    await context.retryPendingHelperDeliveries();
+    vm.runInContext("initialThreadSettled = true;", context);
     await context.retryPendingHelperDeliveries();
 
     assert.equal(backendRuns, 1);
@@ -548,9 +571,11 @@ async function testQueuedFileResultSurvivesRouteWithoutBackendReplay() {
   assert.equal(backendRuns, 1);
   assert.equal(composerWrites, 0);
   assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "queued");
+  installSyntheticLiveRouteProof(context);
 
   navigateWithoutLifecycleRefresh(context, "/c/queued-file-route");
   context.refreshPageLifecycle();
+  vm.runInContext("initialThreadSettled = true;", context);
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1, "Queued backend results must survive a route handoff.");
   assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "queued");
   const secondCallKey = context.buildCandidateCallKey(candidate, semanticCallKey);
@@ -636,6 +661,142 @@ async function testSubmittedReceiptAndTombstoneSurviveRouteChange() {
   assert.equal(sendAttempts, 1, "Receipt recovery must not submit the message again.");
   assert.equal(receiptAttempts, 2, "Only the failed presentation receipt should retry.");
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function seedRestoredPendingDelivery(context, { kind, phase, callId, executionId = "" }) {
+  const call = kind === "drawio-error"
+    ? {
+        kind: "drawio-error",
+        helperId: "restored-drawio",
+        artifactId: "restored-artifact",
+        error: "restored renderer failure"
+      }
+    : createShellCall(context, "printf RESTORED_ROUTE_MUST_NOT_SEND");
+  const response = kind === "drawio-error"
+    ? { ok: false, error: "restored renderer failure" }
+    : { ok: true, executionId, exitCode: 0, stdout: "RESTORED_ROUTE_MUST_NOT_SEND" };
+  const reply = kind === "drawio-error"
+    ? "Draw.io helper failed:\n\n```shell-output\nerror: restored renderer failure\n```"
+    : "Shell call result:\n\n```shell-output\nstdout:\nRESTORED_ROUTE_MUST_NOT_SEND\n```";
+  const entry = await context.rememberPendingHelperDelivery(
+    callId,
+    call,
+    response,
+    reply,
+    { autoSend: true }
+  );
+  assert.ok(entry);
+  entry.phase = phase;
+  entry.executionId = executionId;
+  entry.updatedAt = Date.now();
+  await context.persistPendingHelperDeliveries();
+  vm.runInContext("pendingHelperDeliveries = new Map(); pendingHelperDeliveriesLoadedKey = '';", context);
+  await context.loadPendingHelperDeliveriesForCurrentPage();
+  const restored = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  assert.equal(restored?.restored, true);
+  assert.equal(typeof restored?.volatileLifecycleGuard, "undefined");
+  return restored;
+}
+
+async function testRestoredUnsubmittedPendingCannotCrossAnyRoute() {
+  const transitions = [
+    { name: "permanent-to-permanent", from: "/c/restored-a", to: "/c/restored-b" },
+    { name: "provisional-to-permanent", from: "/", to: "/c/restored-assigned" }
+  ];
+  for (const transition of transitions) {
+    for (const kind of ["shell", "drawio-error"]) {
+      for (const phase of ["queued", "inserted", "submitted-unconfirmed"]) {
+        const context = loadContentContext();
+        await settleBootstrap();
+        context.location.pathname = transition.from;
+        context.location.href = `${context.location.origin}${transition.from}`;
+        vm.runInContext("extensionActive = true; beginPageLifecycle(); initialThreadSettled = true;", context);
+        let composerWrites = 0;
+        let sendAttempts = 0;
+        context.insertReply = async () => {
+          composerWrites += 1;
+          return { innerText: "", textContent: "", isConnected: true };
+        };
+        context.clickSendWhenReady = async () => {
+          sendAttempts += 1;
+          return true;
+        };
+        context.chrome.storage.sync.get = async () => ({ autoSend: true });
+        const callId = `restored-${transition.name}-${kind}-${phase}`;
+        const oldStorageKey = context.pendingHelperDeliveryStorageKey();
+        await seedRestoredPendingDelivery(context, { kind, phase, callId });
+
+        navigate(context, transition.to);
+        assert.equal(
+          vm.runInContext("pendingHelperDeliveries.size", context),
+          0,
+          `${transition.name} ${kind} ${phase} must fail closed without a live exact origin proof.`
+        );
+        vm.runInContext("initialThreadSettled = true;", context);
+        await context.retryPendingHelperDeliveries();
+        await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+        await Promise.resolve();
+
+        assert.equal(composerWrites, 0);
+        assert.equal(sendAttempts, 0);
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(context.__localStore, oldStorageKey),
+          false,
+          "The discarded route's durable snapshot must be removed."
+        );
+      }
+    }
+  }
+}
+
+async function testRestoredSubmittedPendingCrossesOnlyForReceiptCleanup() {
+  for (const phase of ["submitted", "presented"]) {
+    const context = loadContentContext();
+    await settleBootstrap();
+    context.location.pathname = "/c/receipt-old";
+    context.location.href = `${context.location.origin}/c/receipt-old`;
+    vm.runInContext("extensionActive = true; beginPageLifecycle(); initialThreadSettled = true;", context);
+    let composerWrites = 0;
+    let sendAttempts = 0;
+    let receiptAttempts = 0;
+    let statusUpdates = 0;
+    context.insertReply = async () => {
+      composerWrites += 1;
+      return { innerText: "", textContent: "", isConnected: true };
+    };
+    context.clickSendWhenReady = async () => {
+      sendAttempts += 1;
+      return true;
+    };
+    context.setStatus = () => { statusUpdates += 1; };
+    context.chrome.storage.sync.get = async () => ({ autoSend: true });
+    context.chrome.runtime.sendMessage = async (payload) => {
+      assert.equal(payload.type, "run-result-presented");
+      receiptAttempts += 1;
+      return { ok: receiptAttempts > 1, found: true };
+    };
+    await seedRestoredPendingDelivery(context, {
+      kind: "shell",
+      phase,
+      callId: `restored-receipt-${phase}`,
+      executionId: phase === "submitted" ? "1234567890abcdef" : "abcdef1234567890"
+    });
+
+    navigate(context, "/c/receipt-new");
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+    assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].routeReceiptCleanupOnly", context), true);
+    vm.runInContext("initialThreadSettled = true;", context);
+    await context.retryPendingHelperDeliveries();
+
+    assert.equal(receiptAttempts, 1);
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
+    await context.retryPendingHelperDeliveries();
+    assert.equal(receiptAttempts, 2);
+    assert.equal(composerWrites, 0);
+    assert.equal(sendAttempts, 0);
+    assert.equal(statusUpdates, 0, "Receipt-only route cleanup must not publish the old chat's status.");
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  }
 }
 
 async function testBackendFailureUsesOneWriteSendOnlyRetry() {
@@ -1700,6 +1861,8 @@ async function runTests() {
     ["submitted-unconfirmed route cancellation", testSubmittedUnconfirmedChangedComposerCancelsAcrossRoute],
     ["queued file route carry", testQueuedFileResultSurvivesRouteWithoutBackendReplay],
     ["receipt route carry", testSubmittedReceiptAndTombstoneSurviveRouteChange],
+    ["restored unsubmitted route rejection", testRestoredUnsubmittedPendingCannotCrossAnyRoute],
+    ["restored receipt-only route cleanup", testRestoredSubmittedPendingCrossesOnlyForReceiptCleanup],
     ["backend failure one-write", testBackendFailureUsesOneWriteSendOnlyRetry],
     ["rejected feedback one-write", testRejectedFeedbackUsesOneWriteSendOnlyRetry],
     ["same lifecycle send-only retry", testSameLifecycleRetriesExactOwnedComposerWithoutRewrite],

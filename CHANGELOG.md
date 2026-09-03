@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.11.14] - 2026-09-03
+
+- Extends `AI_CHAT_SHELL_ENV_FILE` to exact-SHA Skill loads. Every valid variable declared in the freshly reread file is automatically eligible for `$NAME`/`${NAME}` expansion and overrides the same shell-server process variable without requiring a duplicate `AI_HELPER_SKILL_ENV_ALLOWLIST` entry.
+- Preserves one-pass expansion, Claude runtime placeholders, non-spoofable server-owned Skill-root placeholders, output-size limits, and catalog SHA/version stability. Malformed, missing, unsafe, or oversized env files fail the load without returning file values or paths.
+- Adds focused catalog/protocol regressions plus real unpacked-Chrome coverage for initial expansion, env-file hot reload without a server restart, non-allowlisted process isolation, and malformed-file failure. Skill protocol advances to 6 so an old foreground server is rejected clearly.
+- Preserves an automatically detected helper across ChatGPT's one-time new-chat `/` to `/c` or `/uc` URL assignment while its settings read, backend request, MV3 runtime-channel status recovery, or durable result enqueue is in flight. The active execution lock and exact originating helper/turn proof move together, so shell and board results are recovered through kind-scoped read-only status, then written and submitted once without replaying the backend.
+- Preserves send-only ownership when that proven URL assignment occurs after the result was already written and React replaces the composer with the same exact plugin-owned text. The original actuator is invalidated at the route boundary; recovery neither reruns the helper nor writes the composer again.
+- Rejects transcript replacement, existing-chat navigation, detached/changed helpers, and a second route before any stale backend, recovery-status, or composer side effect. Recovery revalidates exact ownership both before and after each status await. Adds focused gated-settings/backend/runtime-loss races plus independent real-Chrome retained/replaced-transcript pages using a real tmux command; Force keeps its strict route boundary and the v0.8.6/v0.8.9 send actuator remains unchanged.
+- Revalidates pending-result ownership after both local-state loading and the first durable write. A stale continuation removes only the exact entry object it created, cannot erase a newer same-call replacement or overwrite a newer active status, and Force backend or validation results cannot migrate across a route while persistence is blocked.
+- Binds Draw.io render completion and automatic error feedback to the exact originating candidate/turn across settings and durable-queue awaits. One proven ChatGPT new-chat URL assignment may retain the result; transcript replacement, navigation between permanent conversations, or a second route cannot update the panel or write/send the old error in another chat.
+- Prevents restored ordinary pending output from migrating into another route without a live exact candidate/turn guard, including an apparent `/` to permanent ChatGPT URL assignment. Queued, inserted, and submitted-unconfirmed shell/file/board/agent/Draw.io/Skill-prompt output now fails closed and its old storage is removed; already-submitted entries may migrate only to finish their presentation receipt without composer or old-status side effects.
+
 ## [0.11.13] - 2026-09-03
 
 - Adds low-saturation whole-panel state themes while preserving the exact idle background: deep blue for active end-to-end helper work, deep green for completed work, and deep red for failures or actionable exceptions. The existing dot and explicit text remain, with matching accessibility labels.

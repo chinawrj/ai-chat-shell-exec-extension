@@ -119,6 +119,7 @@ function createRoot(messages) {
 
 function loadContentContext() {
   const context = {
+    URL,
     CSS: { escape: (value) => String(value) },
     Element: FakeElement,
     HTMLElement: FakeElement,
@@ -703,6 +704,2976 @@ async function verifyStaleLongCallCannotAffectNewPageCall() {
   assert.match(inserted[1], /AFTER_ENABLE/);
 }
 
+async function verifyFirstResponseRouteAssignmentCarriesInFlightShellResult() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+
+  const command = "printf FIRST_RESPONSE_ROUTE_RESULT";
+  const user = new MockNode({
+    order: 1,
+    role: "user",
+    text: "Run the helper while this new chat receives its permanent URL."
+  });
+  const assistant = createAssistantMessage({
+    order: 2,
+    text: createHelperBlock({ cmd: command })
+  });
+  const root = createRoot([user, assistant]);
+  for (const node of [root, user, assistant]) {
+    node.isConnected = true;
+  }
+  context.document.body = root;
+  context.__firstResponseRouteRoot = root;
+  context.__firstResponseRouteAssistant = assistant;
+  context.getConversationRoot = () => context.__firstResponseRouteRoot;
+
+  const candidate = context.getLastShellCallCandidate(root);
+  assert.ok(candidate, "The first response fixture must expose one complete shell helper.");
+  context.__firstResponseRouteCandidate = candidate;
+
+  let backendRuns = 0;
+  let resolveBackend;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  let receiptAttempts = 0;
+  const submitted = [];
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.document.querySelectorAll = (selector) =>
+    selector.includes("data-message-author-role") ? submitted : [];
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.chrome.runtime.sendMessage = (payload) => {
+    if (payload.type === "content-ui-delay") {
+      return Promise.resolve({ ok: true });
+    }
+    if (payload.type === "run-result-presented") {
+      receiptAttempts += 1;
+      return Promise.resolve({ ok: true, found: true });
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return new Promise((resolve) => {
+      resolveBackend = resolve;
+    });
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    const submittedRoot = new MockNode({
+      order: 3,
+      role: "user",
+      text: composer.innerText
+    });
+    submittedRoot.isConnected = true;
+    submitted.push(submittedRoot);
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__firstResponseRouteRoot.innerText || globalThis.__firstResponseRouteRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const routeCandidate = globalThis.__firstResponseRouteCandidate;
+    const routeSemanticKey = buildSemanticCallKey(routeCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(routeCandidate),
+      new Set([buildRenderedHelperKey(routeCandidate, routeSemanticKey)])
+    );
+  `, context);
+
+  const scan = context.scanForShellCall();
+  await waitForTestCondition(() => typeof resolveBackend === "function");
+  assert.equal(backendRuns, 1, "The helper must be dispatched exactly once on the provisional new-chat URL.");
+
+  context.location.pathname = "/c/first-response-permanent";
+  context.location.href = "https://chatgpt.com/c/first-response-permanent";
+  assert.equal(context.refreshPageLifecycle(), true, "The test must cross a real content-script route lifecycle.");
+  vm.runInContext("initialThreadSettled = true;", context);
+  resolveBackend({
+    ok: true,
+    executed: true,
+    executionCompleted: true,
+    executionId: "1234567890abcdef",
+    exitCode: 0,
+    stdout: "FIRST_RESPONSE_ROUTE_RESULT"
+  });
+  await scan;
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1, "A permanent URL assignment must never replay the shell command.");
+  assert.equal(composerWrites, 1,
+    "The completed in-flight result must be written once when the exact first-response transcript survives the route assignment.");
+  assert.equal(sendAttempts, 1, "The retained result must be submitted exactly once.");
+  assert.equal(submitted.length, 1);
+  assert.match(submitted[0].innerText, /FIRST_RESPONSE_ROUTE_RESULT/);
+  assert.equal(receiptAttempts, 1, "The canonical execution must receive one presentation receipt.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function verifyInFlightShellResultCannotCrossRouteAfterTranscriptReplacement() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+
+  const command = "printf OLD_CHAT_ROUTE_RESULT";
+  const oldAssistant = createAssistantMessage({
+    order: 1,
+    text: createHelperBlock({ cmd: command })
+  });
+  const oldRoot = createRoot([oldAssistant]);
+  oldRoot.isConnected = true;
+  oldAssistant.isConnected = true;
+  context.document.body = oldRoot;
+  context.__routeReplacementRoot = oldRoot;
+  context.getConversationRoot = () => context.__routeReplacementRoot;
+  const candidate = context.getLastShellCallCandidate(oldRoot);
+  context.__routeReplacementCandidate = candidate;
+
+  let backendRuns = 0;
+  let resolveBackend;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.chrome.runtime.sendMessage = (payload) => {
+    if (payload.type === "content-ui-delay") {
+      return Promise.resolve({ ok: true });
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return new Promise((resolve) => {
+      resolveBackend = resolve;
+    });
+  };
+  context.insertReply = async () => {
+    composerWrites += 1;
+    return { innerText: "", textContent: "", isConnected: true };
+  };
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    return true;
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__routeReplacementRoot.innerText || globalThis.__routeReplacementRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const routeCandidate = globalThis.__routeReplacementCandidate;
+    const routeSemanticKey = buildSemanticCallKey(routeCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(routeCandidate),
+      new Set([buildRenderedHelperKey(routeCandidate, routeSemanticKey)])
+    );
+  `, context);
+
+  const scan = context.scanForShellCall();
+  await waitForTestCondition(() => typeof resolveBackend === "function");
+  const replacement = createRoot([
+    new MockNode({ order: 1, role: "user", text: "This is a different chat." })
+  ]);
+  replacement.isConnected = true;
+  oldAssistant.isConnected = false;
+  oldRoot.isConnected = false;
+  context.__routeReplacementRoot = replacement;
+  context.document.body = replacement;
+  context.location.pathname = "/c/unrelated-existing-chat";
+  context.location.href = "https://chatgpt.com/c/unrelated-existing-chat";
+  assert.equal(context.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true;", context);
+  resolveBackend({
+    ok: true,
+    executed: true,
+    executionCompleted: true,
+    executionId: "fedcba0987654321",
+    exitCode: 0,
+    stdout: "OLD_CHAT_ROUTE_RESULT"
+  });
+  await scan;
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1, "The old helper request must not be replayed after navigation.");
+  assert.equal(composerWrites, 0, "An old-chat result must never be written into the replacement transcript.");
+  assert.equal(sendAttempts, 0);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function verifySettingsAwaitRouteAdjudication() {
+  const cases = [
+    {
+      name: "provisional route assignment with retained transcript",
+      startPath: "/",
+      nextPath: "/c/settings-retained",
+      replaceTranscript: false,
+      expectedBackendRuns: 1,
+      expectedPending: 1
+    },
+    {
+      name: "provisional route assignment with replacement transcript",
+      startPath: "/",
+      nextPath: "/c/settings-replaced",
+      replaceTranscript: true,
+      expectedBackendRuns: 0,
+      expectedPending: 0
+    },
+    {
+      name: "existing-chat to second route with retained transcript",
+      startPath: "/c/settings-existing-a",
+      nextPath: "/c/settings-existing-b",
+      replaceTranscript: false,
+      expectedBackendRuns: 0,
+      expectedPending: 0
+    }
+  ];
+
+  for (const testCase of cases) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    context.location.pathname = testCase.startPath;
+    context.location.href = `https://chatgpt.com${testCase.startPath}`;
+
+    const command = `printf SETTINGS_ROUTE_${testCase.expectedBackendRuns}_${testCase.nextPath.replaceAll("/", "_")}`;
+    const user = new MockNode({
+      order: 1,
+      role: "user",
+      text: "Run only if this is still the same first-response chat."
+    });
+    const assistant = createAssistantMessage({
+      order: 2,
+      text: createHelperBlock({ cmd: command })
+    });
+    const root = createRoot([user, assistant]);
+    for (const node of [root, user, assistant]) {
+      node.isConnected = true;
+    }
+    context.document.body = root;
+    context.__settingsRouteRoot = root;
+    context.getConversationRoot = () => context.__settingsRouteRoot;
+    const candidate = context.getLastShellCallCandidate(root);
+    assert.ok(candidate, `${testCase.name} must expose the intended helper candidate.`);
+    context.__settingsRouteCandidate = candidate;
+
+    let releaseSettings;
+    let markSettingsRequested;
+    const settingsGate = new Promise((resolve) => {
+      releaseSettings = resolve;
+    });
+    const settingsRequested = new Promise((resolve) => {
+      markSettingsRequested = resolve;
+    });
+    let backendRuns = 0;
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("requireApproval")) {
+        markSettingsRequested();
+        return settingsGate;
+      }
+      return {
+        enabled: true,
+        enabledHosts: ["chatgpt.com"],
+        maxChainCalls: 100
+      };
+    };
+    context.chrome.runtime.sendMessage = async (payload) => {
+      assert.equal(payload.type, "run-shell");
+      backendRuns += 1;
+      return {
+        ok: true,
+        executed: true,
+        executionCompleted: true,
+        executionId: backendRuns === 1 ? "aaaabbbbccccdddd" : "1111222233334444",
+        exitCode: 0,
+        stdout: "SETTINGS_ROUTE_RESULT"
+      };
+    };
+    context.setStatus = () => {};
+    context.scheduleScan = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.updateSiteActionButton = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__settingsRouteRoot.innerText || globalThis.__settingsRouteRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const settingsCandidate = globalThis.__settingsRouteCandidate;
+      const settingsSemanticKey = buildSemanticCallKey(settingsCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(settingsCandidate),
+        new Set([buildRenderedHelperKey(settingsCandidate, settingsSemanticKey)])
+      );
+      deliverHelperReply = async () => false;
+    `, context);
+
+    const scan = context.scanForShellCall();
+    await settingsRequested;
+    if (testCase.replaceTranscript) {
+      const replacement = createRoot([
+        new MockNode({ order: 1, role: "user", text: "Replacement transcript" })
+      ]);
+      replacement.isConnected = true;
+      assistant.isConnected = false;
+      root.isConnected = false;
+      context.__settingsRouteRoot = replacement;
+      context.document.body = replacement;
+    }
+    context.location.pathname = testCase.nextPath;
+    context.location.href = `https://chatgpt.com${testCase.nextPath}`;
+    assert.equal(context.refreshPageLifecycle(), true, `${testCase.name} must create a new lifecycle.`);
+    vm.runInContext("initialThreadSettled = true;", context);
+    releaseSettings({ requireApproval: false, autoSend: true });
+    await scan;
+
+    assert.equal(
+      backendRuns,
+      testCase.expectedBackendRuns,
+      `${testCase.name} backend dispatch adjudication failed.`
+    );
+    assert.equal(
+      vm.runInContext("pendingHelperDeliveries.size", context),
+      testCase.expectedPending,
+      `${testCase.name} must not create an unexpected result queue.`
+    );
+  }
+}
+
+function createStableChatGptRouteTurn(context, {
+  userText,
+  helperText,
+  userId,
+  assistantId
+}) {
+  const userCopy = new MockNode({ text: userText, order: 1 });
+  const user = new MockNode({ text: userText, order: 1, children: [userCopy] });
+  const assistantContent = new MockNode({ text: helperText, order: 2 });
+  const assistant = new MockNode({ text: helperText, order: 2, children: [assistantContent] });
+  const root = new MockNode({
+    text: `${userText}\n${helperText}`,
+    order: 0,
+    children: [user, assistant]
+  });
+
+  const installMessageContract = (node, role, id) => {
+    node.getAttribute = (name) => {
+      if (name === "data-message-role" || name === "data-message-author-role") return role;
+      if (name === "data-message-id") return id;
+      return "";
+    };
+    node.matches = (selector) => String(selector).includes(`li[data-message-role="${role}"]`);
+    node.closest = (selector) => node.matches(selector)
+      ? node
+      : node.parentElement?.closest?.(selector) || null;
+  };
+  installMessageContract(user, "user", userId);
+  installMessageContract(assistant, "assistant", assistantId);
+
+  userCopy.matches = (selector) => String(selector).includes("data-user-message-copy");
+  userCopy.closest = (selector) => userCopy.matches(selector)
+    ? userCopy
+    : user.closest(selector);
+  assistantContent.matches = (selector) => String(selector).includes("data-assistant-markdown");
+  assistantContent.closest = (selector) => assistantContent.matches(selector)
+    ? assistantContent
+    : assistant.closest(selector);
+  user.querySelectorAll = (selector) => String(selector).includes("data-user-message-copy")
+    ? [userCopy]
+    : [];
+  assistant.querySelectorAll = (selector) => String(selector).includes("data-assistant-markdown")
+    ? [assistantContent]
+    : [];
+  root.querySelectorAll = (selector) => {
+    const value = String(selector);
+    const matches = [];
+    if (value.includes("data-message-role") || value.includes("data-message-author-role")) {
+      matches.push(user, assistant);
+    }
+    if (value.includes("data-user-message-copy")) {
+      matches.push(userCopy);
+    }
+    if (value.includes("data-assistant-markdown")) {
+      matches.push(assistantContent);
+    }
+    return matches.length > 0
+      ? Array.from(new Set(matches))
+      : [user, userCopy, assistant, assistantContent];
+  };
+
+  for (const node of [root, user, userCopy, assistant, assistantContent]) {
+    node.isConnected = true;
+  }
+  return {
+    root,
+    user,
+    assistant,
+    assistantContent,
+    candidate: {
+      call: context.parseCallPayload(helperText),
+      node: assistant,
+      textRoot: assistantContent,
+      source: "text",
+      blockIndex: 0
+    }
+  };
+}
+
+function setMockTreeConnected(node, connected) {
+  if (!(node instanceof MockNode)) {
+    return;
+  }
+  node.isConnected = connected;
+  for (const child of node.children || []) {
+    setMockTreeConnected(child, connected);
+  }
+}
+
+async function verifyRouteRedrawDuringSettingsAwaitIsSingleFlight() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+
+  const helperText = createHelperBlock({ cmd: "printf ROUTE_REDRAW_SETTINGS_RESULT" });
+  const stableIds = {
+    userId: "route-redraw-settings-user",
+    assistantId: "route-redraw-settings-assistant"
+  };
+  const original = createStableChatGptRouteTurn(context, {
+    userText: "Run once while this response receives its permanent route.",
+    helperText,
+    ...stableIds
+  });
+  context.__settingsRedrawRoot = original.root;
+  context.__settingsRedrawCandidate = original.candidate;
+  context.document.body = original.root;
+  context.getConversationRoot = () => context.__settingsRedrawRoot;
+  context.extractShellCallCandidates = () => [context.__settingsRedrawCandidate];
+
+  let settingsRequests = 0;
+  let releaseSettings;
+  const settingsGate = new Promise((resolve) => {
+    releaseSettings = resolve;
+  });
+  let backendRuns = 0;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  let receiptAttempts = 0;
+  const submitted = [];
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.document.querySelectorAll = (selector) =>
+    selector.includes("data-message-author-role") ? submitted : [];
+  context.chrome.storage.sync.get = async (keys) => {
+    if (Array.isArray(keys) && keys.includes("requireApproval")) {
+      settingsRequests += 1;
+      return settingsGate;
+    }
+    return {
+      enabled: true,
+      enabledHosts: ["chatgpt.com"],
+      maxChainCalls: 100
+    };
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay") {
+      return { ok: true };
+    }
+    if (payload.type === "run-result-presented") {
+      receiptAttempts += 1;
+      return { ok: true, found: true };
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: backendRuns === 1 ? "abcddcba12344321" : "0123456789abcdef",
+      exitCode: 0,
+      stdout: "ROUTE_REDRAW_SETTINGS_RESULT"
+    };
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    const submittedRoot = new MockNode({
+      order: 3,
+      role: "user",
+      text: composer.innerText
+    });
+    submittedRoot.isConnected = true;
+    submitted.push(submittedRoot);
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__settingsRedrawRoot.innerText || globalThis.__settingsRedrawRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const firstCandidate = globalThis.__settingsRedrawCandidate;
+    const firstSemanticKey = buildSemanticCallKey(firstCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(firstCandidate),
+      new Set([buildRenderedHelperKey(firstCandidate, firstSemanticKey)])
+    );
+  `, context);
+
+  const firstScan = context.scanForShellCall();
+  await waitForTestCondition(() => settingsRequests === 1);
+
+  const redraw = createStableChatGptRouteTurn(context, {
+    userText: "Run once while this response receives its permanent route.",
+    helperText,
+    ...stableIds
+  });
+  setMockTreeConnected(original.root, false);
+  context.__settingsRedrawRoot = redraw.root;
+  context.__settingsRedrawCandidate = redraw.candidate;
+  context.document.body = redraw.root;
+  context.location.pathname = "/c/route-redraw-settings";
+  context.location.href = "https://chatgpt.com/c/route-redraw-settings";
+  assert.equal(context.refreshPageLifecycle(), true);
+  vm.runInContext(`
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__settingsRedrawRoot.innerText || globalThis.__settingsRedrawRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const secondCandidate = globalThis.__settingsRedrawCandidate;
+    const secondSemanticKey = buildSemanticCallKey(secondCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(secondCandidate),
+      new Set([buildRenderedHelperKey(secondCandidate, secondSemanticKey)])
+    );
+  `, context);
+
+  let secondSettled = false;
+  const secondScan = context.scanForShellCall().finally(() => {
+    secondSettled = true;
+  });
+  await waitForTestCondition(() => settingsRequests >= 2 || secondSettled);
+  releaseSettings({ requireApproval: false, autoSend: true });
+  await Promise.all([firstScan, secondScan]);
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1,
+    "A route redraw plus a second scan must retain one frontend backend dispatch claim.");
+  assert.equal(composerWrites, 1, "The single result must be written exactly once.");
+  assert.equal(sendAttempts, 1, "The single result must be submitted exactly once.");
+  assert.equal(submitted.length, 1);
+  assert.equal(receiptAttempts, 1, "The single canonical execution must receive one receipt.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+}
+
+async function verifyRejectedHelperRouteSettingsGuard() {
+  for (const testCase of [
+    { name: "validation retained first-response turn", rejectionKind: "validation", replaceTranscript: false, expectedWrites: 1 },
+    { name: "validation replacement transcript", rejectionKind: "validation", replaceTranscript: true, expectedWrites: 0 },
+    { name: "chain-limit retained first-response turn", rejectionKind: "chain", replaceTranscript: false, expectedWrites: 1 },
+    { name: "chain-limit replacement transcript", rejectionKind: "chain", replaceTranscript: true, expectedWrites: 0 }
+  ]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const helperText = testCase.rejectionKind === "validation"
+      ? [
+        "ai-helper-file-start:route-rejected-file",
+        "../unsafe.txt",
+        "must not cross chats",
+        "ai-helper-file-end"
+      ].join("\n")
+      : createHelperBlock({ cmd: "printf CHAIN_LIMIT_REJECTION" });
+    const stableIds = {
+      userId: `rejected-route-user-${testCase.replaceTranscript ? "negative" : "positive"}`,
+      assistantId: `rejected-route-assistant-${testCase.replaceTranscript ? "negative" : "positive"}`
+    };
+    const original = createStableChatGptRouteTurn(context, {
+      userText: "Validate this helper in its originating response only.",
+      helperText,
+      ...stableIds
+    });
+    context.document.body = original.root;
+    context.__rejectedRouteRoot = original.root;
+    context.__rejectedRouteCandidate = original.candidate;
+    context.getConversationRoot = () => context.__rejectedRouteRoot;
+    context.extractShellCallCandidates = () => context.__rejectedRouteCandidate
+      ? [context.__rejectedRouteCandidate]
+      : [];
+
+    let requestSettings;
+    let releaseSettings;
+    const settingsRequested = new Promise((resolve) => {
+      requestSettings = resolve;
+    });
+    const settingsGate = new Promise((resolve) => {
+      releaseSettings = resolve;
+    });
+    let composerWrites = 0;
+    let sendAttempts = 0;
+    const submitted = [];
+    const composer = { innerText: "", textContent: "", isConnected: true };
+    context.document.querySelectorAll = (selector) =>
+      selector.includes("data-message-author-role") ? submitted : [];
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.length === 1 && keys[0] === "autoSend") {
+        requestSettings();
+        return settingsGate;
+      }
+      return {
+        enabled: true,
+        enabledHosts: ["chatgpt.com"],
+        maxChainCalls: testCase.rejectionKind === "chain" ? 1 : 100
+      };
+    };
+    context.chrome.runtime.sendMessage = async () => ({ ok: true, found: true });
+    context.insertReply = async (text) => {
+      composerWrites += 1;
+      composer.innerText = text;
+      composer.textContent = text;
+      return composer;
+    };
+    context.findReplyInput = async () => composer;
+    context.clickSendWhenReady = async () => {
+      sendAttempts += 1;
+      const submittedRoot = new MockNode({ order: 3, role: "user", text: composer.innerText });
+      submittedRoot.isConnected = true;
+      submitted.push(submittedRoot);
+      composer.innerText = "";
+      composer.textContent = "";
+      return true;
+    };
+    context.setStatus = () => {};
+    context.scheduleScan = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.updateSiteActionButton = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      chainCallCount = ${testCase.rejectionKind === "chain" ? 1 : 0};
+      lastThreadText = normalizeText(globalThis.__rejectedRouteRoot.innerText || globalThis.__rejectedRouteRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const rejectedCandidate = globalThis.__rejectedRouteCandidate;
+      const rejectedSemanticKey = buildSemanticCallKey(rejectedCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(rejectedCandidate),
+        new Set([buildRenderedHelperKey(rejectedCandidate, rejectedSemanticKey)])
+      );
+    `, context);
+
+    const scan = context.scanForShellCall();
+    await settingsRequested;
+    setMockTreeConnected(original.root, false);
+    if (testCase.replaceTranscript) {
+      const replacement = createRoot([
+        new MockNode({ order: 1, role: "user", text: "A different chat owns this route." })
+      ]);
+      replacement.isConnected = true;
+      context.__rejectedRouteRoot = replacement;
+      context.__rejectedRouteCandidate = null;
+      context.document.body = replacement;
+    } else {
+      const redraw = createStableChatGptRouteTurn(context, {
+        userText: "Validate this helper in its originating response only.",
+        helperText,
+        ...stableIds
+      });
+      context.__rejectedRouteRoot = redraw.root;
+      context.__rejectedRouteCandidate = redraw.candidate;
+      context.document.body = redraw.root;
+    }
+    context.location.pathname = `/c/rejected-route-${testCase.replaceTranscript ? "negative" : "positive"}`;
+    context.location.href = `https://chatgpt.com${context.location.pathname}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    vm.runInContext("initialThreadSettled = true;", context);
+    releaseSettings({ autoSend: true });
+    await scan;
+    await context.retryPendingHelperDeliveries();
+
+    assert.equal(composerWrites, testCase.expectedWrites,
+      `${testCase.name}: rejected helper reply route ownership failed.`);
+    assert.equal(sendAttempts, testCase.expectedWrites);
+    assert.equal(submitted.length, testCase.expectedWrites);
+    if (submitted.length > 0) {
+      assert.match(
+        submitted[0].innerText,
+        testCase.rejectionKind === "validation" ? /File helper rejected:/ : /Chain limit reached/
+      );
+    }
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+    assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
+  }
+}
+
+async function verifyPreparingDispatchStorageFailureReleasesForNewRootRetry() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+
+  const helperText = createHelperBlock({ cmd: "printf STORAGE_REJECT_RETRY" });
+  const stableIds = {
+    userId: "storage-reject-user",
+    assistantId: "storage-reject-assistant"
+  };
+  const firstTurn = createStableChatGptRouteTurn(context, {
+    userText: "Retry this helper after a transient settings failure.",
+    helperText,
+    ...stableIds
+  });
+  context.__storageRejectRoot = firstTurn.root;
+  context.__storageRejectCandidate = firstTurn.candidate;
+  context.document.body = firstTurn.root;
+  context.getConversationRoot = () => context.__storageRejectRoot;
+  context.extractShellCallCandidates = () => [context.__storageRejectCandidate];
+
+  let executionSettingsRequests = 0;
+  let backendRuns = 0;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  const submitted = [];
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.document.querySelectorAll = (selector) =>
+    selector.includes("data-message-author-role") ? submitted : [];
+  context.chrome.storage.sync.get = async (keys) => {
+    if (Array.isArray(keys) && keys.includes("requireApproval")) {
+      executionSettingsRequests += 1;
+      if (executionSettingsRequests === 1) {
+        throw new Error("transient settings read failure");
+      }
+      return { requireApproval: false, autoSend: true };
+    }
+    return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay" || payload.type === "run-result-presented") {
+      return { ok: true, found: true };
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "feedfacecafebeef",
+      exitCode: 0,
+      stdout: "STORAGE_REJECT_RETRY"
+    };
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    const submittedRoot = new MockNode({ order: 3, role: "user", text: composer.innerText });
+    submittedRoot.isConnected = true;
+    submitted.push(submittedRoot);
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__storageRejectRoot.innerText || globalThis.__storageRejectRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const storageRejectCandidate = globalThis.__storageRejectCandidate;
+    const storageRejectSemanticKey = buildSemanticCallKey(storageRejectCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(storageRejectCandidate),
+      new Set([buildRenderedHelperKey(storageRejectCandidate, storageRejectSemanticKey)])
+    );
+  `, context);
+
+  await assert.rejects(context.scanForShellCall(), /transient settings read failure/);
+  assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null,
+    "A rejected settings await must release exactly its pre-backend claim.");
+  assert.equal(backendRuns, 0);
+
+  const redraw = createStableChatGptRouteTurn(context, {
+    userText: "Retry this helper after a transient settings failure.",
+    helperText,
+    ...stableIds
+  });
+  setMockTreeConnected(firstTurn.root, false);
+  context.__storageRejectRoot = redraw.root;
+  context.__storageRejectCandidate = redraw.candidate;
+  context.document.body = redraw.root;
+  vm.runInContext(`
+    lastThreadText = normalizeText(globalThis.__storageRejectRoot.innerText || globalThis.__storageRejectRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const retryCandidate = globalThis.__storageRejectCandidate;
+    const retrySemanticKey = buildSemanticCallKey(retryCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(retryCandidate),
+      new Set([buildRenderedHelperKey(retryCandidate, retrySemanticKey)])
+    );
+  `, context);
+  await context.scanForShellCall();
+  await context.retryPendingHelperDeliveries();
+
+  assert.equal(backendRuns, 1, "The same semantic helper in a fresh DOM root must retry exactly once.");
+  assert.equal(composerWrites, 1);
+  assert.equal(sendAttempts, 1);
+  assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
+}
+
+async function verifyChangedRouteClaimUsesExactTokenRelease() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+
+  const oldTurn = createStableChatGptRouteTurn(context, {
+    userText: "Run the old helper only in its original chat.",
+    helperText: createHelperBlock({ cmd: "printf OLD_PREPARING_CLAIM" }),
+    userId: "old-preparing-user",
+    assistantId: "old-preparing-assistant"
+  });
+  context.__claimRouteRoot = oldTurn.root;
+  context.__claimRouteCandidate = oldTurn.candidate;
+  context.document.body = oldTurn.root;
+  context.getConversationRoot = () => context.__claimRouteRoot;
+  context.extractShellCallCandidates = () => [context.__claimRouteCandidate];
+
+  const settingsResolvers = [];
+  let settingsRequests = 0;
+  const backendCommands = [];
+  context.chrome.storage.sync.get = async (keys) => {
+    if (Array.isArray(keys) && keys.includes("requireApproval")) {
+      settingsRequests += 1;
+      return new Promise((resolve) => settingsResolvers.push(resolve));
+    }
+    return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay" || payload.type === "run-result-presented") {
+      return { ok: true, found: true };
+    }
+    assert.equal(payload.type, "run-shell");
+    backendCommands.push(payload.cmd);
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "0123abcdeffedcba",
+      exitCode: 0,
+      stdout: "NEW_PREPARING_CLAIM"
+    };
+  };
+  context.insertReply = async (text) => ({ innerText: text, textContent: text, isConnected: true });
+  context.findReplyInput = async () => ({ innerText: "", textContent: "", isConnected: true });
+  context.clickSendWhenReady = async () => false;
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__claimRouteRoot.innerText || globalThis.__claimRouteRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const oldClaimCandidate = globalThis.__claimRouteCandidate;
+    const oldClaimSemanticKey = buildSemanticCallKey(oldClaimCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(oldClaimCandidate),
+      new Set([buildRenderedHelperKey(oldClaimCandidate, oldClaimSemanticKey)])
+    );
+  `, context);
+
+  const oldScan = context.scanForShellCall();
+  await waitForTestCondition(() => settingsRequests === 1);
+
+  const newTurn = createStableChatGptRouteTurn(context, {
+    userText: "This replacement chat owns a different helper.",
+    helperText: createHelperBlock({ cmd: "printf NEW_PREPARING_CLAIM" }),
+    userId: "new-preparing-user",
+    assistantId: "new-preparing-assistant"
+  });
+  setMockTreeConnected(oldTurn.root, false);
+  context.__claimRouteRoot = newTurn.root;
+  context.__claimRouteCandidate = newTurn.candidate;
+  context.document.body = newTurn.root;
+  context.location.pathname = "/c/new-preparing-owner";
+  context.location.href = "https://chatgpt.com/c/new-preparing-owner";
+  assert.equal(context.refreshPageLifecycle(), true);
+  vm.runInContext(`
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__claimRouteRoot.innerText || globalThis.__claimRouteRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const newClaimCandidate = globalThis.__claimRouteCandidate;
+    const newClaimSemanticKey = buildSemanticCallKey(newClaimCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(newClaimCandidate),
+      new Set([buildRenderedHelperKey(newClaimCandidate, newClaimSemanticKey)])
+    );
+  `, context);
+
+  const newScan = context.scanForShellCall();
+  await waitForTestCondition(() => settingsRequests === 2);
+  settingsResolvers[0]({ requireApproval: false, autoSend: true });
+  await oldScan;
+  assert.equal(
+    vm.runInContext("preparingRunnableDispatchToken?.call?.cmd", context),
+    "printf NEW_PREPARING_CLAIM",
+    "The stale continuation's finally must not clear the newer exact-token claim."
+  );
+  settingsResolvers[1]({ requireApproval: false, autoSend: true });
+  await newScan;
+
+  assert.deepEqual(backendCommands, ["printf NEW_PREPARING_CLAIM"]);
+  assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
+}
+
+async function verifyTrustedForceCannotBypassPreparingDispatchClaim() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  const turn = createStableChatGptRouteTurn(context, {
+    userText: "Do not let Force race the automatic preflight.",
+    helperText: createHelperBlock({ cmd: "printf FORCE_PREPARING_GUARD" }),
+    userId: "force-preparing-user",
+    assistantId: "force-preparing-assistant"
+  });
+  context.__forceClaimRoot = turn.root;
+  context.__forceClaimCandidate = turn.candidate;
+  context.document.body = turn.root;
+  context.getConversationRoot = () => context.__forceClaimRoot;
+  context.extractShellCallCandidates = () => [context.__forceClaimCandidate];
+  let releaseSettings;
+  let settingsRequests = 0;
+  const settingsGate = new Promise((resolve) => {
+    releaseSettings = resolve;
+  });
+  let backendRuns = 0;
+  context.chrome.storage.sync.get = async (keys) => {
+    if (Array.isArray(keys) && keys.includes("requireApproval")) {
+      settingsRequests += 1;
+      return settingsGate;
+    }
+    return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay" || payload.type === "run-result-presented") {
+      return { ok: true, found: true };
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "abc12345def67890",
+      exitCode: 0,
+      stdout: "FORCE_PREPARING_GUARD"
+    };
+  };
+  context.insertReply = async () => ({ innerText: "", textContent: "", isConnected: true });
+  context.clickSendWhenReady = async () => false;
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__forceClaimRoot.innerText || globalThis.__forceClaimRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const forceClaimCandidate = globalThis.__forceClaimCandidate;
+    const forceClaimSemanticKey = buildSemanticCallKey(forceClaimCandidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(forceClaimCandidate),
+      new Set([buildRenderedHelperKey(forceClaimCandidate, forceClaimSemanticKey)])
+    );
+  `, context);
+
+  const automaticScan = context.scanForShellCall();
+  await waitForTestCondition(() => settingsRequests === 1);
+  assert.equal(await context.forceRunLatestDetectedHelper(), false,
+    "The trusted Force path must refuse a live automatic pre-backend claim.");
+  assert.equal(backendRuns, 0);
+  releaseSettings({ requireApproval: false, autoSend: true });
+  await automaticScan;
+  assert.equal(backendRuns, 1, "Only the original automatic dispatch may reach the backend.");
+}
+
+async function verifyCachedPendingLoadAwaitCannotCrossRoute() {
+  for (const testCase of [
+    { name: "replacement transcript", startPath: "/", nextPath: "/c/cached-pending-replaced", replaceTranscript: true },
+    { name: "second permanent route", startPath: "/c/cached-pending-a", nextPath: "/c/cached-pending-b", replaceTranscript: false }
+  ]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    context.location.pathname = testCase.startPath;
+    context.location.href = `https://chatgpt.com${testCase.startPath}`;
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Deliver this cached result only to its original conversation.",
+      helperText: createHelperBlock({ cmd: "printf CACHED_PENDING_ROUTE" }),
+      userId: `cached-pending-user-${testCase.name}`,
+      assistantId: `cached-pending-assistant-${testCase.name}`
+    });
+    context.__cachedPendingRoot = turn.root;
+    context.__cachedPendingCandidate = turn.candidate;
+    context.document.body = turn.root;
+    context.getConversationRoot = () => context.__cachedPendingRoot;
+    const call = turn.candidate.call;
+    const semanticKey = context.buildSemanticCallKey(call);
+    const callId = context.buildCandidateCallKey(turn.candidate, semanticKey);
+    const dispatchContext = context.createRunnableHelperDispatchContext(turn.candidate);
+    context.__cachedPendingCall = call;
+    context.__cachedPendingCallId = callId;
+    let loadStarted;
+    let releaseLoad;
+    const loadObserved = new Promise((resolve) => {
+      loadStarted = resolve;
+    });
+    const loadGate = new Promise((resolve) => {
+      releaseLoad = resolve;
+    });
+    let backendRuns = 0;
+    let deliveryAttempts = 0;
+    context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type === "run-shell") backendRuns += 1;
+      return { ok: true };
+    };
+    context.loadPendingHelperDeliveriesForCurrentPage = async () => {
+      loadStarted();
+      await loadGate;
+    };
+    context.attemptPendingHelperDelivery = async () => {
+      deliveryAttempts += 1;
+      return true;
+    };
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    context.updateContextualPanelActions = () => {};
+    context.setStatus = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      pendingHelperDeliveriesLoadedKey = pendingHelperDeliveryStorageKey();
+      pendingHelperDeliveries.set(globalThis.__cachedPendingCallId, {
+        callId: globalThis.__cachedPendingCallId,
+        creationSequence: 1,
+        executionId: "9999aaaabbbbcccc",
+        kind: "shell",
+        call: snapshotPendingHelperCall(globalThis.__cachedPendingCall),
+        response: { ok: true, exitCode: 0, stdout: "CACHED_PENDING_ROUTE" },
+        reply: "Shell call result: CACHED_PENDING_ROUTE",
+        autoSend: true,
+        pageIdentity: getCurrentPageIdentity(),
+        phase: "queued",
+        submittedMessageCountBefore: 0,
+        submittedMessageRootIdsBefore: [],
+        submittedMessageRootsBefore: new Set(),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        attempts: 0,
+        lastError: "",
+        restored: true
+      });
+    `, context);
+
+    const run = context.runAndReply(callId, call, { dispatchContext });
+    await loadObserved;
+    if (testCase.replaceTranscript) {
+      setMockTreeConnected(turn.root, false);
+      const replacement = createRoot([
+        new MockNode({ order: 1, role: "user", text: "A replacement chat is now mounted." })
+      ]);
+      replacement.isConnected = true;
+      context.__cachedPendingRoot = replacement;
+      context.document.body = replacement;
+    }
+    context.location.pathname = testCase.nextPath;
+    context.location.href = `https://chatgpt.com${testCase.nextPath}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    releaseLoad();
+    await run;
+    await Promise.resolve();
+
+    assert.equal(backendRuns, 0, `${testCase.name}: cached delivery must not fall through to backend.`);
+    assert.equal(deliveryAttempts, 0, `${testCase.name}: stale cached output must not reach the composer.`);
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0,
+      `${testCase.name}: stale cached pending state must be discarded.`);
+    assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
+  }
+}
+
+async function verifyDeferredProfileDispatchRouteGuards() {
+  const helperCases = [
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf PROFILE_ROUTE_SHELL" }),
+      runtimeType: "run-shell"
+    },
+    {
+      name: "board",
+      helperText: "ai-helper-board-start\nstatus\nai-helper-board-end",
+      runtimeType: "run-board"
+    },
+    {
+      name: "agent-message",
+      helperText: [
+        "ai-helper-agent-message-start",
+        "to: slave-a",
+        "task-id: profile-route-task",
+        "",
+        "Check profile-await route ownership.",
+        "ai-helper-agent-message-end"
+      ].join("\n"),
+      runtimeType: "agent-send"
+    },
+    {
+      name: "agent-roster",
+      helperText: createAgentRosterBlock(),
+      runtimeType: "agent-list"
+    },
+    {
+      name: "agent-task-status",
+      helperText: createAgentTaskStatusBlock(),
+      runtimeType: "agent-task-status"
+    }
+  ];
+  const routeCases = [
+    {
+      name: "retained provisional assignment",
+      startPath: "/",
+      routePath: (index) => `${index % 2 === 0 ? "/c" : "/uc"}/profile-retained-${index}`,
+      replacement: false,
+      expectedRuntimeCalls: 1
+    },
+    {
+      name: "replacement transcript",
+      startPath: "/",
+      routePath: (index) => `/c/profile-replaced-${index}`,
+      replacement: true,
+      expectedRuntimeCalls: 0
+    },
+    {
+      name: "second permanent route",
+      startPath: "/c/profile-existing-a",
+      routePath: () => "/c/profile-existing-b",
+      replacement: false,
+      expectedRuntimeCalls: 0
+    }
+  ];
+
+  for (const [helperIndex, helperCase] of helperCases.entries()) {
+    for (const routeCase of routeCases) {
+      const context = loadContentContext();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      installPersistentLocalStorage(context);
+      context.location.pathname = routeCase.startPath;
+      context.location.href = `https://chatgpt.com${routeCase.startPath}`;
+      const stableIds = {
+        userId: `profile-route-user-${helperCase.name}`,
+        assistantId: `profile-route-assistant-${helperCase.name}`
+      };
+      const turn = createStableChatGptRouteTurn(context, {
+        userText: `Run the ${helperCase.name} helper in this exact conversation.`,
+        helperText: helperCase.helperText,
+        ...stableIds
+      });
+      context.__profileRouteRoot = turn.root;
+      context.document.body = turn.root;
+      context.getConversationRoot = () => context.__profileRouteRoot;
+      const call = turn.candidate.call;
+      const semanticKey = context.buildSemanticCallKey(call);
+      const callId = context.buildCandidateCallKey(turn.candidate, semanticKey);
+      const dispatchContext = context.createRunnableHelperDispatchContext(turn.candidate);
+
+      let profileRequested;
+      let releaseProfile;
+      const profileObserved = new Promise((resolve) => {
+        profileRequested = resolve;
+      });
+      const profileGate = new Promise((resolve) => {
+        releaseProfile = resolve;
+      });
+      const runtimeCalls = [];
+      context.getCurrentAgentProfile = async () => {
+        profileRequested();
+        return profileGate;
+      };
+      context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+      context.chrome.runtime.sendMessage = async (payload) => {
+        runtimeCalls.push(payload);
+        if (payload.type === "run-shell" || payload.type === "run-board") {
+          return {
+            ok: true,
+            executed: true,
+            executionCompleted: true,
+            executionId: "aa11bb22cc33dd44",
+            exitCode: 0,
+            stdout: "PROFILE_ROUTE_OK"
+          };
+        }
+        if (payload.type === "agent-list") {
+          return { ok: true, agents: [] };
+        }
+        return { ok: true, messageId: "profile-route-message" };
+      };
+      context.rememberPendingHelperDelivery = async (_callId, _call, response) => ({
+        callId,
+        response,
+        phase: "queued"
+      });
+      context.attemptPendingHelperDelivery = async () => true;
+      context.schedulePendingHelperDeliveryRetry = () => {};
+      context.updateContextualPanelActions = () => {};
+      context.updateStopHelperButton = () => {};
+      context.setStatus = () => {};
+      vm.runInContext(`
+        extensionActive = true;
+        observedPageIdentity = location.href;
+        initialThreadSettled = true;
+      `, context);
+
+      const run = context.runAndReply(callId, call, { dispatchContext });
+      await profileObserved;
+      assert.equal(vm.runInContext("activeCallId", context), callId,
+        `${helperCase.name}/${routeCase.name}: profile await must occur after active ownership starts.`);
+
+      if (routeCase.replacement) {
+        setMockTreeConnected(turn.root, false);
+        const replacement = createRoot([
+          new MockNode({ order: 1, role: "user", text: "A different conversation replaced this turn." })
+        ]);
+        replacement.isConnected = true;
+        context.__profileRouteRoot = replacement;
+        context.document.body = replacement;
+      } else if (routeCase.startPath === "/") {
+        const redraw = createStableChatGptRouteTurn(context, {
+          userText: `Run the ${helperCase.name} helper in this exact conversation.`,
+          helperText: helperCase.helperText,
+          ...stableIds
+        });
+        setMockTreeConnected(turn.root, false);
+        context.__profileRouteRoot = redraw.root;
+        context.document.body = redraw.root;
+      }
+      const nextPath = routeCase.routePath(helperIndex);
+      context.location.pathname = nextPath;
+      context.location.href = `https://chatgpt.com${nextPath}`;
+      assert.equal(context.refreshPageLifecycle(), true);
+      releaseProfile({ role: "master", agentId: "master-profile-route" });
+      await run;
+
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+        routeCase.expectedRuntimeCalls,
+        `${helperCase.name}/${routeCase.name}: runtime dispatch crossed an invalid profile await route.`
+      );
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type !== helperCase.runtimeType).length,
+        0,
+        `${helperCase.name}/${routeCase.name}: no unrelated runtime message is expected.`
+      );
+    }
+  }
+}
+
+async function verifyForceDeferredProfileDispatchRouteGuards() {
+  const helperCases = [
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf FORCE_PROFILE_ROUTE_SHELL" }),
+      runtimeType: "run-shell"
+    },
+    {
+      name: "board",
+      helperText: "ai-helper-board-start\nstatus\nai-helper-board-end",
+      runtimeType: "run-board"
+    },
+    {
+      name: "agent-message",
+      helperText: [
+        "ai-helper-agent-message-start",
+        "to: slave-a",
+        "task-id: force-profile-route-task",
+        "",
+        "Check Force profile-await ownership.",
+        "ai-helper-agent-message-end"
+      ].join("\n"),
+      runtimeType: "agent-send"
+    },
+    {
+      name: "agent-roster",
+      helperText: createAgentRosterBlock(),
+      runtimeType: "agent-list"
+    },
+    {
+      name: "agent-task-status",
+      helperText: createAgentTaskStatusBlock(),
+      runtimeType: "agent-task-status"
+    }
+  ];
+  const routeCases = [
+    {
+      name: "same lifecycle",
+      nextPath: "",
+      replacement: false,
+      expectedRuntimeCalls: 1
+    },
+    {
+      name: "second permanent route",
+      nextPath: "/c/force-profile-b",
+      replacement: false,
+      expectedRuntimeCalls: 0
+    },
+    {
+      name: "replacement transcript",
+      nextPath: "/c/force-profile-replaced",
+      replacement: true,
+      expectedRuntimeCalls: 0
+    }
+  ];
+
+  for (const [helperIndex, helperCase] of helperCases.entries()) {
+    for (const routeCase of routeCases) {
+      const context = loadContentContext();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      installPersistentLocalStorage(context);
+      context.location.pathname = "/c/force-profile-a";
+      context.location.href = "https://chatgpt.com/c/force-profile-a";
+      const turn = createStableChatGptRouteTurn(context, {
+        userText: `Force the ${helperCase.name} helper only in this exact chat.`,
+        helperText: helperCase.helperText,
+        userId: `force-profile-user-${helperCase.name}`,
+        assistantId: `force-profile-assistant-${helperCase.name}`
+      });
+      context.__forceProfileRoot = turn.root;
+      context.document.body = turn.root;
+      context.getConversationRoot = () => context.__forceProfileRoot;
+      context.extractShellCallCandidates = () => [turn.candidate];
+      const call = turn.candidate.call;
+      const semanticKey = context.buildSemanticCallKey(call);
+      const callId = `force-profile:${helperIndex}:${routeCase.name}`;
+      const forceCandidateSnapshot = context.createRenderedHelperCandidateSnapshot(turn.candidate);
+
+      let profileRequested;
+      let releaseProfile;
+      const profileObserved = new Promise((resolve) => {
+        profileRequested = resolve;
+      });
+      const profileGate = new Promise((resolve) => {
+        releaseProfile = resolve;
+      });
+      const runtimeCalls = [];
+      context.getCurrentAgentProfile = async () => {
+        profileRequested();
+        return profileGate;
+      };
+      context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+      context.chrome.runtime.sendMessage = async (payload) => {
+        runtimeCalls.push(payload);
+        if (payload.type === "run-shell" || payload.type === "run-board") {
+          return {
+            ok: true,
+            executed: true,
+            executionCompleted: true,
+            executionId: "ee11ff22aa33bb44",
+            exitCode: 0,
+            stdout: "FORCE_PROFILE_ROUTE_OK"
+          };
+        }
+        if (payload.type === "agent-list") {
+          return { ok: true, agents: [] };
+        }
+        return { ok: true, messageId: "force-profile-route-message" };
+      };
+      context.rememberPendingHelperDelivery = async (_callId, _call, response) => ({
+        callId,
+        response,
+        phase: "queued"
+      });
+      context.attemptPendingHelperDelivery = async () => true;
+      context.schedulePendingHelperDeliveryRetry = () => {};
+      context.updateContextualPanelActions = () => {};
+      context.updateStopHelperButton = () => {};
+      context.setStatus = () => {};
+      vm.runInContext(`
+        extensionActive = true;
+        observedPageIdentity = location.href;
+        initialThreadSettled = true;
+      `, context);
+
+      const run = context.runAndReply(callId, call, {
+        force: true,
+        forceCandidateSnapshot
+      });
+      await profileObserved;
+      assert.equal(vm.runInContext("activeCallId", context), callId,
+        `${helperCase.name}/${routeCase.name}: Force profile await must own an active token.`);
+
+      if (routeCase.nextPath) {
+        if (routeCase.replacement) {
+          setMockTreeConnected(turn.root, false);
+          const replacement = createRoot([
+            new MockNode({ order: 1, role: "user", text: "A replacement chat owns this route." })
+          ]);
+          replacement.isConnected = true;
+          context.__forceProfileRoot = replacement;
+          context.document.body = replacement;
+        }
+        context.location.pathname = routeCase.nextPath;
+        context.location.href = `https://chatgpt.com${routeCase.nextPath}`;
+        assert.equal(context.refreshPageLifecycle(), true);
+      }
+      releaseProfile({ role: "master", agentId: "master-force-profile" });
+      await run;
+
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+        routeCase.expectedRuntimeCalls,
+        `${helperCase.name}/${routeCase.name}: Force runtime crossed its active-token lifecycle.`
+      );
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type !== helperCase.runtimeType).length,
+        0,
+        `${helperCase.name}/${routeCase.name}: no unrelated Force runtime message is expected.`
+      );
+      assert.equal(vm.runInContext("activeCallId", context), "");
+      assert.equal(vm.runInContext("activeForceRunCallId", context), "");
+      assert.equal(semanticKey, context.buildSemanticCallKey(call));
+    }
+  }
+}
+
+async function verifyOuterSettingsAwaitRouteReconciliation() {
+  const catalogSha = "a".repeat(64);
+  const helperCases = [
+    {
+      name: "skill-load",
+      helperText: createSkillLoadBlock({
+        helperId: "outer-settings-skill",
+        skillId: "example",
+        catalogSha
+      }),
+      runtimeType: "skill-load"
+    },
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf OUTER_SETTINGS_ROUTE" }),
+      runtimeType: "run-shell"
+    }
+  ];
+  const routeCases = [
+    {
+      name: "retained provisional assignment",
+      startPath: "/",
+      nextPath: "/c/outer-settings-retained",
+      replacement: false,
+      expectedRuntimeCalls: 1,
+      expectedReplies: 1
+    },
+    {
+      name: "replacement transcript",
+      startPath: "/",
+      nextPath: "/c/outer-settings-replaced",
+      replacement: true,
+      expectedRuntimeCalls: 0,
+      expectedReplies: 0
+    },
+    {
+      name: "second permanent route",
+      startPath: "/c/outer-settings-a",
+      nextPath: "/c/outer-settings-b",
+      replacement: false,
+      expectedRuntimeCalls: 0,
+      expectedReplies: 0
+    }
+  ];
+
+  for (const helperCase of helperCases) {
+    for (const routeCase of routeCases) {
+      const context = loadContentContext();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      installPersistentLocalStorage(context);
+      context.location.pathname = routeCase.startPath;
+      context.location.href = `https://chatgpt.com${routeCase.startPath}`;
+      const stableIds = {
+        userId: `outer-settings-user-${helperCase.name}`,
+        assistantId: `outer-settings-assistant-${helperCase.name}`
+      };
+      const turn = createStableChatGptRouteTurn(context, {
+        userText: `Run the ${helperCase.name} helper after assigning this chat URL.`,
+        helperText: helperCase.helperText,
+        ...stableIds
+      });
+      context.__outerSettingsRoot = turn.root;
+      context.__outerSettingsCandidate = turn.candidate;
+      context.document.body = turn.root;
+      context.getConversationRoot = () => context.__outerSettingsRoot;
+      context.extractShellCallCandidates = () => context.__outerSettingsCandidate
+        ? [context.__outerSettingsCandidate]
+        : [];
+
+      let outerSettingsRequested;
+      let releaseOuterSettings;
+      const outerSettingsObserved = new Promise((resolve) => {
+        outerSettingsRequested = resolve;
+      });
+      const outerSettingsGate = new Promise((resolve) => {
+        releaseOuterSettings = resolve;
+      });
+      let outerSettingsCalls = 0;
+      const runtimeCalls = [];
+      let replies = 0;
+      let scanScheduled = false;
+      context.chrome.storage.sync.get = async (keys) => {
+        if (Array.isArray(keys) && keys.includes("enabled")) {
+          outerSettingsCalls += 1;
+          if (outerSettingsCalls === 1) {
+            outerSettingsRequested();
+            return outerSettingsGate;
+          }
+          return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+        }
+        return { requireApproval: false, autoSend: true };
+      };
+      context.chrome.runtime.sendMessage = async (payload) => {
+        runtimeCalls.push(payload);
+        if (payload.type === "skill-load") {
+          return {
+            ok: true,
+            catalogSha,
+            skill: { id: "example", sha: "b".repeat(64) },
+            content: "# Example\nUse the loaded example Skill."
+          };
+        }
+        if (payload.type === "run-shell") {
+          return {
+            ok: true,
+            executed: true,
+            executionCompleted: true,
+            executionId: "bb22cc33dd44ee55",
+            exitCode: 0,
+            stdout: "OUTER_SETTINGS_ROUTE"
+          };
+        }
+        return { ok: true };
+      };
+      context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+      context.queueSkillComposerReply = async () => {
+        replies += 1;
+        return true;
+      };
+      context.rememberPendingHelperDelivery = async (_callId, _call, response) => {
+        replies += 1;
+        return { callId: "outer-settings-shell", response, phase: "queued" };
+      };
+      context.setPendingHelperDeliveryStatus = () => {};
+      context.attemptPendingHelperDelivery = async () => true;
+      context.schedulePendingHelperDeliveryRetry = () => {};
+      context.scheduleScan = () => {
+        scanScheduled = true;
+      };
+      context.updateContextualPanelActions = () => {};
+      context.updateSiteActionButton = () => {};
+      context.updateStopHelperButton = () => {};
+      context.resetChainForNewHumanPrompt = () => {};
+      context.setStatus = () => {};
+      vm.runInContext(`
+        extensionActive = true;
+        observedPageIdentity = location.href;
+        initialThreadSettled = true;
+        lastThreadText = normalizeText(globalThis.__outerSettingsRoot.innerText || globalThis.__outerSettingsRoot.textContent || "");
+        lastThreadTextAt = Date.now() - 5000;
+        const outerSettingsCandidate = globalThis.__outerSettingsCandidate;
+        const outerSettingsSemanticKey = buildSemanticCallKey(outerSettingsCandidate.call);
+        liveGeneratedRenderedHelpers.set(
+          getCandidateRenderRoot(outerSettingsCandidate),
+          new Set([buildRenderedHelperKey(outerSettingsCandidate, outerSettingsSemanticKey)])
+        );
+      `, context);
+
+      const firstScan = context.scanForShellCall();
+      await outerSettingsObserved;
+      if (routeCase.replacement) {
+        setMockTreeConnected(turn.root, false);
+        const replacement = createRoot([
+          new MockNode({ order: 1, role: "user", text: "This is an unrelated replacement chat." })
+        ]);
+        replacement.isConnected = true;
+        context.__outerSettingsRoot = replacement;
+        context.__outerSettingsCandidate = null;
+        context.document.body = replacement;
+      } else if (routeCase.startPath === "/") {
+        const redraw = createStableChatGptRouteTurn(context, {
+          userText: `Run the ${helperCase.name} helper after assigning this chat URL.`,
+          helperText: helperCase.helperText,
+          ...stableIds
+        });
+        setMockTreeConnected(turn.root, false);
+        context.__outerSettingsRoot = redraw.root;
+        context.__outerSettingsCandidate = redraw.candidate;
+        context.document.body = redraw.root;
+      }
+      context.location.pathname = routeCase.nextPath;
+      context.location.href = `https://chatgpt.com${routeCase.nextPath}`;
+      if (!routeCase.replacement && routeCase.startPath === "/") {
+        vm.runInContext(`
+          const assignedCandidate = globalThis.__outerSettingsCandidate;
+          const assignedSemanticKey = buildSemanticCallKey(assignedCandidate.call);
+          liveGeneratedRenderedHelpers.set(
+            getCandidateRenderRoot(assignedCandidate),
+            new Set([buildRenderedHelperKey(assignedCandidate, assignedSemanticKey)])
+          );
+        `, context);
+      }
+      releaseOuterSettings({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+      await firstScan;
+      for (let retry = 0; retry < 3 && scanScheduled; retry += 1) {
+        scanScheduled = false;
+        vm.runInContext("lastThreadTextAt = Date.now() - 5000;", context);
+        await context.scanForShellCall();
+      }
+
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+        routeCase.expectedRuntimeCalls,
+        `${helperCase.name}/${routeCase.name}: outer settings await used a stale route lifecycle.`
+      );
+      assert.equal(
+        replies,
+        routeCase.expectedReplies,
+        `${helperCase.name}/${routeCase.name}: result delivery did not match the reconciled route.`
+      );
+    }
+  }
+}
+
+async function verifySkillBackendRouteHandoffRejectsSecondPermanentRoute() {
+  const catalogSha = "a".repeat(64);
+  for (const routeCase of [
+    { name: "provisional c", startPath: "/", nextPath: "/c/skill-backend-c", expectedReplies: 1 },
+    { name: "provisional uc", startPath: "/", nextPath: "/uc/skill-backend-uc", expectedReplies: 1 },
+    { name: "second permanent route", startPath: "/c/skill-backend-a", nextPath: "/c/skill-backend-b", expectedReplies: 0 }
+  ]) {
+    const context = loadContentContext();
+    context.location.pathname = routeCase.startPath;
+    context.location.href = `https://chatgpt.com${routeCase.startPath}`;
+    const helperText = createSkillLoadBlock({
+      helperId: `skill-backend-${routeCase.name.replaceAll(" ", "-")}`,
+      skillId: "example",
+      catalogSha
+    });
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Load the exact Skill for this stable assistant turn.",
+      helperText,
+      userId: "skill-backend-route-user",
+      assistantId: "skill-backend-route-assistant"
+    });
+    context.__skillBackendRouteRoot = turn.root;
+    context.document.body = turn.root;
+    context.getConversationRoot = () => context.__skillBackendRouteRoot;
+    context.extractShellCallCandidates = () => [turn.candidate];
+    let runtimeStarted;
+    let releaseRuntime;
+    const runtimeObserved = new Promise((resolve) => {
+      runtimeStarted = resolve;
+    });
+    const runtimeGate = new Promise((resolve) => {
+      releaseRuntime = resolve;
+    });
+    let runtimeCalls = 0;
+    let replies = 0;
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type !== "skill-load") {
+        return { ok: true };
+      }
+      runtimeCalls += 1;
+      runtimeStarted();
+      await runtimeGate;
+      return {
+        ok: true,
+        catalogSha,
+        skill: { id: "example", sha: "b".repeat(64) },
+        content: "# Example\nUse this Skill."
+      };
+    };
+    context.queueSkillComposerReply = async () => {
+      replies += 1;
+      return true;
+    };
+    context.updateContextualPanelActions = () => {};
+    context.scheduleScan = () => {};
+    context.setStatus = () => {};
+    vm.runInContext("extensionActive = true; observedPageIdentity = location.href;", context);
+
+    const processing = context.processLatestSkillCandidate(
+      [turn.candidate],
+      { maxChainCalls: 100 }
+    );
+    await runtimeObserved;
+    context.location.pathname = routeCase.nextPath;
+    context.location.href = `https://chatgpt.com${routeCase.nextPath}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    releaseRuntime();
+    await processing;
+
+    assert.equal(runtimeCalls, 1);
+    assert.equal(replies, routeCase.expectedReplies,
+      `${routeCase.name}: Skill backend response crossed an invalid route boundary.`);
+  }
+}
+
+async function verifyManualForceDispatchWinsOuterScanRace() {
+  for (const manualStartsFirst of [false, true]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const helperText = createHelperBlock({ cmd: "printf MANUAL_FORCE_WINS" });
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Run this helper once even if Force overlaps automatic scanning.",
+      helperText,
+      userId: `force-race-user-${manualStartsFirst}`,
+      assistantId: `force-race-assistant-${manualStartsFirst}`
+    });
+    context.__forceRaceRoot = turn.root;
+    context.document.body = turn.root;
+    context.getConversationRoot = () => context.__forceRaceRoot;
+    context.extractShellCallCandidates = () => [turn.candidate];
+    const forceSnapshot = context.createRenderedHelperCandidateSnapshot(turn.candidate);
+    let firstOuterStarted;
+    let releaseFirstOuter;
+    const firstOuterObserved = new Promise((resolve) => {
+      firstOuterStarted = resolve;
+    });
+    const firstOuterGate = new Promise((resolve) => {
+      releaseFirstOuter = resolve;
+    });
+    let outerCalls = 0;
+    const runtimeCalls = [];
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("enabled")) {
+        outerCalls += 1;
+        if (outerCalls === 1) {
+          firstOuterStarted();
+          return firstOuterGate;
+        }
+        return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+      }
+      return { requireApproval: false, autoSend: true };
+    };
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type === "run-shell") {
+        runtimeCalls.push(payload);
+        return {
+          ok: true,
+          executed: true,
+          executionCompleted: true,
+          executionId: `force-race-${manualStartsFirst ? "first" : "second"}`,
+          exitCode: 0,
+          stdout: "MANUAL_FORCE_WINS"
+        };
+      }
+      return { ok: true };
+    };
+    context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+    context.rememberPendingHelperDelivery = async (callId, call, response) => ({
+      callId,
+      call,
+      response,
+      phase: "queued"
+    });
+    context.attemptPendingHelperDelivery = async () => true;
+    context.setPendingHelperDeliveryStatus = () => {};
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    context.scheduleScan = () => {};
+    context.updateContextualPanelActions = () => {};
+    context.updateSiteActionButton = () => {};
+    context.updateStopHelperButton = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.setStatus = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__forceRaceRoot.innerText || globalThis.__forceRaceRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const forceRaceCandidate = globalThis.__forceRaceRoot && extractShellCallCandidates(globalThis.__forceRaceRoot)[0];
+      const forceRaceSemanticKey = buildSemanticCallKey(forceRaceCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(forceRaceCandidate),
+        new Set([buildRenderedHelperKey(forceRaceCandidate, forceRaceSemanticKey)])
+      );
+    `, context);
+
+    let autoScan;
+    let forceScan;
+    if (manualStartsFirst) {
+      vm.runInContext("forceRunInFlight = true;", context);
+      forceScan = context.scanForShellCall({ force: true, forceCandidateSnapshot: forceSnapshot });
+      await firstOuterObserved;
+      autoScan = context.scanForShellCall();
+      releaseFirstOuter({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+    } else {
+      autoScan = context.scanForShellCall();
+      await firstOuterObserved;
+      vm.runInContext("forceRunInFlight = true;", context);
+      forceScan = context.scanForShellCall({ force: true, forceCandidateSnapshot: forceSnapshot });
+      await waitForTestCondition(() => runtimeCalls.length === 1);
+      releaseFirstOuter({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+    }
+    await Promise.all([autoScan, forceScan]);
+    vm.runInContext("forceRunInFlight = false;", context);
+
+    assert.equal(runtimeCalls.length, 1,
+      `${manualStartsFirst ? "Force-first" : "auto-first"}: overlapping scans must execute once.`);
+    assert.equal(runtimeCalls[0].callMeta?.force, true,
+      "The trusted manual Force dispatch must win over an automatic pre-claim scan.");
+  }
+}
+
+async function verifyManualSkillRecoveryWinsOuterScanRace() {
+  const catalogSha = "c".repeat(64);
+  for (const manualStartsFirst of [false, true]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const helperText = createSkillLoadBlock({
+      helperId: `skill-recovery-race-${manualStartsFirst}`,
+      skillId: "example",
+      catalogSha
+    });
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Process this Skill exactly once.",
+      helperText,
+      userId: `skill-recovery-race-user-${manualStartsFirst}`,
+      assistantId: `skill-recovery-race-assistant-${manualStartsFirst}`
+    });
+    context.__skillRecoveryRaceRoot = turn.root;
+    context.document.body = turn.root;
+    context.getConversationRoot = () => context.__skillRecoveryRaceRoot;
+    context.extractShellCallCandidates = () => [turn.candidate];
+    let firstOuterStarted;
+    let releaseFirstOuter;
+    const firstOuterObserved = new Promise((resolve) => {
+      firstOuterStarted = resolve;
+    });
+    const firstOuterGate = new Promise((resolve) => {
+      releaseFirstOuter = resolve;
+    });
+    let outerCalls = 0;
+    let runtimeStarted;
+    let releaseRuntime;
+    const runtimeObserved = new Promise((resolve) => {
+      runtimeStarted = resolve;
+    });
+    const runtimeGate = new Promise((resolve) => {
+      releaseRuntime = resolve;
+    });
+    let runtimeCalls = 0;
+    let replies = 0;
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("enabled")) {
+        outerCalls += 1;
+        if (outerCalls === 1) {
+          firstOuterStarted();
+          return firstOuterGate;
+        }
+        return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+      }
+      return { autoSend: true };
+    };
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type !== "skill-load") {
+        return { ok: true };
+      }
+      runtimeCalls += 1;
+      runtimeStarted();
+      await runtimeGate;
+      return {
+        ok: true,
+        catalogSha,
+        skill: { id: "example", sha: "d".repeat(64) },
+        content: "# Example\nUse this Skill."
+      };
+    };
+    context.queueSkillComposerReply = async () => {
+      replies += 1;
+      return true;
+    };
+    context.scheduleScan = () => {};
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    context.updateContextualPanelActions = () => {};
+    context.updateSiteActionButton = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.setStatus = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__skillRecoveryRaceRoot.innerText || globalThis.__skillRecoveryRaceRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const skillRecoveryRaceCandidate = extractShellCallCandidates(globalThis.__skillRecoveryRaceRoot)[0];
+      const skillRecoveryRaceSemanticKey = buildSemanticCallKey(skillRecoveryRaceCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(skillRecoveryRaceCandidate),
+        new Set([buildRenderedHelperKey(skillRecoveryRaceCandidate, skillRecoveryRaceSemanticKey)])
+      );
+    `, context);
+
+    let autoScan;
+    let recovery;
+    if (manualStartsFirst) {
+      recovery = context.processLatestSkillRecovery({ forceDetected: true });
+      await firstOuterObserved;
+      autoScan = context.scanForShellCall();
+      releaseFirstOuter({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+      await runtimeObserved;
+    } else {
+      autoScan = context.scanForShellCall();
+      await firstOuterObserved;
+      recovery = context.processLatestSkillRecovery({ forceDetected: true });
+      await runtimeObserved;
+      releaseFirstOuter({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+    }
+    await autoScan;
+    releaseRuntime();
+    await recovery;
+
+    assert.equal(runtimeCalls, 1,
+      `${manualStartsFirst ? "Process-Skill-first" : "auto-first"}: overlapping Skill scans must execute once.`);
+    assert.equal(replies, 1, "Only the manual Process Skill dispatch may queue one reply.");
+  }
+}
+
+async function verifyStaleShellCompletionCannotClearNewActiveUi() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  context.location.pathname = "/c/old-shell-ui";
+  context.location.href = "https://chatgpt.com/c/old-shell-ui";
+  const oldTurn = createStableChatGptRouteTurn(context, {
+    userText: "Start the old shell helper.",
+    helperText: createHelperBlock({ cmd: "printf OLD_SHELL_UI" }),
+    userId: "old-shell-ui-user",
+    assistantId: "old-shell-ui-assistant"
+  });
+  context.__shellUiRoot = oldTurn.root;
+  context.document.body = oldTurn.root;
+  context.getConversationRoot = () => context.__shellUiRoot;
+
+  const pendingRuntime = new Map();
+  const statuses = [];
+  const stopStates = [];
+  const clearedNotices = [];
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.chrome.runtime.sendMessage = (payload) => {
+    if (payload.type === "run-shell") {
+      return new Promise((resolve) => pendingRuntime.set(payload.cmd, resolve));
+    }
+    return Promise.resolve({ ok: true, found: true });
+  };
+  context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.updateStopHelperButton = (active) => {
+    stopStates.push(active === true);
+    vm.runInContext(`panelShellHelperActive = ${active === true ? "true" : "false"};`, context);
+  };
+  context.clearShellRunNotice = (executionId = "") => clearedNotices.push(executionId);
+  context.rememberPendingHelperDelivery = async (callId, _call, response) => ({
+    callId,
+    response,
+    phase: "queued"
+  });
+  context.setPendingHelperDeliveryStatus = () => {};
+  context.attemptPendingHelperDelivery = async () => true;
+  context.schedulePendingHelperDeliveryRetry = () => {};
+  context.updateContextualPanelActions = () => {};
+  vm.runInContext("extensionActive = true; observedPageIdentity = location.href; initialThreadSettled = true;", context);
+
+  const oldCall = oldTurn.candidate.call;
+  const oldContext = context.createRunnableHelperDispatchContext(oldTurn.candidate);
+  const oldRun = context.runAndReply("old-shell-ui-call", oldCall, { dispatchContext: oldContext });
+  await waitForTestCondition(() => pendingRuntime.has("printf OLD_SHELL_UI"));
+
+  const newTurn = createStableChatGptRouteTurn(context, {
+    userText: "This new chat owns its own shell helper.",
+    helperText: createHelperBlock({ cmd: "printf NEW_SHELL_UI" }),
+    userId: "new-shell-ui-user",
+    assistantId: "new-shell-ui-assistant"
+  });
+  setMockTreeConnected(oldTurn.root, false);
+  context.__shellUiRoot = newTurn.root;
+  context.document.body = newTurn.root;
+  context.location.pathname = "/c/new-shell-ui";
+  context.location.href = "https://chatgpt.com/c/new-shell-ui";
+  assert.equal(context.refreshPageLifecycle(), true);
+
+  const newCall = newTurn.candidate.call;
+  const newContext = context.createRunnableHelperDispatchContext(newTurn.candidate);
+  const newRun = context.runAndReply("new-shell-ui-call", newCall, { dispatchContext: newContext });
+  await waitForTestCondition(() => pendingRuntime.has("printf NEW_SHELL_UI"));
+  assert.equal(vm.runInContext("activeCallId", context), "new-shell-ui-call");
+  assert.equal(stopStates.at(-1), true);
+  assert.match(statuses.at(-1).text, /NEW_SHELL_UI/);
+  const statusCountBeforeOldCompletion = statuses.length;
+  const noticeClearCountBeforeOldCompletion = clearedNotices.length;
+
+  pendingRuntime.get("printf OLD_SHELL_UI")({
+    ok: true,
+    executed: true,
+    executionCompleted: true,
+    executionId: "1111aaaabbbb2222",
+    exitCode: 0,
+    stdout: "OLD_SHELL_UI"
+  });
+  await oldRun;
+
+  assert.equal(vm.runInContext("activeCallId", context), "new-shell-ui-call",
+    "A stale completion must not release the new exact active token.");
+  assert.equal(stopStates.at(-1), true,
+    "A stale completion and its finally must leave Stop visible for the new shell.");
+  assert.equal(statuses.length, statusCountBeforeOldCompletion,
+    "A stale reporter must not replace the new shell's running status.");
+  assert.equal(clearedNotices.length, noticeClearCountBeforeOldCompletion,
+    "A stale completion must not clear the new shell's output-idle notice state.");
+
+  pendingRuntime.get("printf NEW_SHELL_UI")({
+    ok: true,
+    executed: true,
+    executionCompleted: true,
+    executionId: "3333ccccdddd4444",
+    exitCode: 0,
+    stdout: "NEW_SHELL_UI"
+  });
+  await newRun;
+  assert.equal(vm.runInContext("activeCallId", context), "");
+  assert.equal(stopStates.at(-1), false, "The current shell's own completion must hide Stop normally.");
+  assert.deepEqual(clearedNotices, ["3333ccccdddd4444"]);
+}
+
+function verifyStaleSkillReporterCannotOverwriteNewRunnableStatus() {
+  const context = loadContentContext();
+  const statuses = [];
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  vm.runInContext(`
+    activeCallId = "new-runnable-after-skill";
+    activeCallToken = {
+      callId: activeCallId,
+      pageIdentity: getCurrentPageIdentity(),
+      generation: pageLifecycleGeneration,
+      call: parseCallPayload(${JSON.stringify(createHelperBlock({ cmd: "printf NEW_AFTER_SKILL" }))})
+    };
+  `, context);
+  context.reportStaleSkillDispatch(null);
+  assert.equal(statuses.length, 0,
+    "A stale Skill response must not overwrite a newer runnable helper's status.");
+  assert.equal(vm.runInContext("activeCallId", context), "new-runnable-after-skill");
+}
+
+async function verifyShellProgressUsesExactActiveCallAfterProfileAwait() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const statuses = [];
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.updateShellRunControlPanel = () => {};
+  context.startShellRunMonitor = () => {};
+  vm.runInContext("extensionActive = true;", context);
+
+  let profileRequested;
+  let releaseProfile;
+  const profileObserved = new Promise((resolve) => {
+    profileRequested = resolve;
+  });
+  const profileGate = new Promise((resolve) => {
+    releaseProfile = resolve;
+  });
+  context.getCurrentAgentProfile = async () => {
+    profileRequested();
+    return profileGate;
+  };
+  const staleProgress = context.handleShellRunProgress({
+    state: "awaiting-user",
+    callKey: "old-progress-call",
+    executionId: "old-progress-execution",
+    agentId: "",
+    idleForMs: 180000
+  });
+  await profileObserved;
+  vm.runInContext(`
+    activeCallId = "new-progress-call";
+    activeCallToken = {
+      callId: activeCallId,
+      pageIdentity: getCurrentPageIdentity(),
+      generation: pageLifecycleGeneration,
+      call: parseCallPayload(${JSON.stringify(createHelperBlock({ cmd: "printf NEW_PROGRESS" }))})
+    };
+    activeShellRunNotice = {
+      callKey: activeCallId,
+      executionId: "new-progress-execution",
+      agentId: "",
+      idleForMs: 1000,
+      idleTimeoutMs: 180000
+    };
+  `, context);
+  statuses.push({ text: "Running: printf NEW_PROGRESS", state: "running" });
+  releaseProfile({ role: "none", agentId: "" });
+  await staleProgress;
+
+  assert.equal(vm.runInContext("activeShellRunNotice.callKey", context), "new-progress-call");
+  assert.deepEqual(statuses, [{ text: "Running: printf NEW_PROGRESS", state: "running" }],
+    "Old progress resolving after profile lookup must not overwrite the new call UI.");
+
+  context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+  await context.handleShellRunProgress({
+    state: "awaiting-user",
+    callKey: "new-progress-call",
+    executionId: "new-progress-execution",
+    agentId: "",
+    idleForMs: 200000
+  });
+  assert.equal(vm.runInContext("activeShellRunNotice.callKey", context), "new-progress-call");
+  assert.match(statuses.at(-1).text, /produced no output/,
+    "Progress for the exact active call must remain accepted.");
+}
+
+async function verifyOldFinalizationCannotOverwriteNewRunnableStatus() {
+  for (const receiptAcknowledged of [true, false]) {
+    for (const newerOwner of ["shell", "skill", "force"]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const statuses = [];
+    context.setStatus = (text, state) => statuses.push({ text, state });
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    let receiptRequested;
+    let releaseReceipt;
+    const receiptObserved = new Promise((resolve) => {
+      receiptRequested = resolve;
+    });
+    const receiptGate = new Promise((resolve) => {
+      releaseReceipt = resolve;
+    });
+    context.acknowledgePendingHelperResultPresented = async () => {
+      receiptRequested();
+      return receiptGate;
+    };
+    const oldCall = context.parseCallPayload(createHelperBlock({ cmd: "printf OLD_FINALIZATION" }));
+    context.__oldFinalizationCall = oldCall;
+    vm.runInContext(`
+      const oldFinalizationEntry = {
+        callId: "old-finalization-call",
+        executionId: "5555aaaabbbb6666",
+        kind: "shell",
+        call: snapshotPendingHelperCall(globalThis.__oldFinalizationCall),
+        response: { ok: true, exitCode: 0, stdout: "OLD_FINALIZATION" },
+        reply: "Shell call result: OLD_FINALIZATION",
+        pageIdentity: getCurrentPageIdentity(),
+        phase: "submitted",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        attempts: 1,
+        lastError: ""
+      };
+      pendingHelperDeliveriesLoadedKey = pendingHelperDeliveryStorageKey();
+      pendingHelperDeliveries.set(oldFinalizationEntry.callId, oldFinalizationEntry);
+      globalThis.__oldFinalizationEntry = oldFinalizationEntry;
+    `, context);
+
+    const finalization = context.performPendingHelperDeliveryFinalization(
+      context.__oldFinalizationEntry,
+      "submitted"
+    );
+    await receiptObserved;
+    if (newerOwner === "shell") {
+      vm.runInContext(`
+        activeCallId = "new-call-during-finalization";
+        activeCallToken = {
+          callId: activeCallId,
+          pageIdentity: getCurrentPageIdentity(),
+          generation: pageLifecycleGeneration,
+          call: parseCallPayload(${JSON.stringify(createHelperBlock({ cmd: "printf NEW_DURING_FINALIZATION" }))})
+        };
+        panelShellHelperActive = true;
+      `, context);
+    } else if (newerOwner === "skill") {
+      vm.runInContext(`
+        skillHelperInFlight = true;
+        activeSkillHelperCallKey = "new-skill-during-finalization";
+      `, context);
+    } else {
+      vm.runInContext(`
+        forceRunInFlight = true;
+        activeForceRunCallId = "new-force-during-finalization";
+      `, context);
+    }
+    statuses.push({ text: `Running: new ${newerOwner} during finalization`, state: "running" });
+    const statusCountBeforeReceipt = statuses.length;
+    releaseReceipt(receiptAcknowledged);
+    await finalization;
+
+    assert.equal(statuses.length, statusCountBeforeReceipt,
+      `Receipt ${receiptAcknowledged ? "ack" : "retry"} must not overwrite a newer running status.`);
+    assert.deepEqual(statuses.at(-1), {
+      text: `Running: new ${newerOwner} during finalization`,
+      state: "running"
+    });
+    assert.equal(
+      vm.runInContext("locallyPresentedHelperExecutions.has('5555aaaabbbb6666')", context),
+      true,
+      "The local presentation tombstone must still be recorded while UI ownership is protected."
+    );
+    assert.equal(
+      vm.runInContext("pendingHelperDeliveries.has('old-finalization-call')", context),
+      !receiptAcknowledged,
+      "Receipt state must still clear or retain the pending entry normally."
+    );
+    }
+  }
+}
+
+async function verifyStaleDiscardCannotOverwriteNewRunnableStatus() {
+  for (const kind of ["runnable", "skill"]) {
+    for (const newerOwner of ["shell", "skill", "force"]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const statuses = [];
+    context.setStatus = (text, state) => statuses.push({ text, state });
+    let releasePersist;
+    let persistStarted;
+    const persistObserved = new Promise((resolve) => {
+      persistStarted = resolve;
+    });
+    const persistGate = new Promise((resolve) => {
+      releasePersist = resolve;
+    });
+    context.persistPendingHelperDeliveries = async () => {
+      persistStarted();
+      await persistGate;
+    };
+    vm.runInContext(`
+      const staleDiscardEntry = {
+        callId: "stale-${kind}-discard",
+        pageIdentity: getCurrentPageIdentity(),
+        phase: "queued"
+      };
+      pendingHelperDeliveries.set(staleDiscardEntry.callId, staleDiscardEntry);
+      globalThis.__staleDiscardEntry = staleDiscardEntry;
+    `, context);
+    const discard = kind === "skill"
+      ? context.discardStaleSkillPendingDelivery(context.__staleDiscardEntry)
+      : context.discardStaleRunnablePendingDelivery(context.__staleDiscardEntry);
+    await persistObserved;
+    if (newerOwner === "shell") {
+      vm.runInContext(`
+        activeCallId = "new-call-during-${kind}-discard";
+        activeCallToken = {
+          callId: activeCallId,
+          pageIdentity: getCurrentPageIdentity(),
+          generation: pageLifecycleGeneration,
+          call: parseCallPayload(${JSON.stringify(createHelperBlock({ cmd: "printf NEW_DURING_DISCARD" }))})
+        };
+        panelShellHelperActive = true;
+      `, context);
+    } else if (newerOwner === "skill") {
+      vm.runInContext(`
+        skillHelperInFlight = true;
+        activeSkillHelperCallKey = "new-skill-during-${kind}-discard";
+      `, context);
+    } else {
+      vm.runInContext(`
+        forceRunInFlight = true;
+        activeForceRunCallId = "new-force-during-${kind}-discard";
+      `, context);
+    }
+    statuses.push({ text: `Running: new ${newerOwner} during ${kind} discard`, state: "running" });
+    releasePersist();
+    await discard;
+    assert.deepEqual(statuses, [{ text: `Running: new ${newerOwner} during ${kind} discard`, state: "running" }],
+      `${kind} discard must not overwrite a newer ${newerOwner} operation after persistence.`);
+    }
+  }
+}
+
+async function verifyCurrentPanelOperationMayPublishItsOwnCompletion() {
+  for (const owner of ["shell", "skill", "force"]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const statuses = [];
+    context.setStatus = (text, state) => statuses.push({ text, state });
+    context.acknowledgePendingHelperResultPresented = async () => true;
+    const callId = owner === "skill"
+      ? "skill-load:own-skill-operation"
+      : `own-${owner}-operation`;
+    const call = owner === "skill"
+      ? { kind: "skill-load", cmd: "load", skillId: "own-skill" }
+      : context.parseCallPayload(createHelperBlock({ cmd: `printf OWN_${owner.toUpperCase()}` }));
+    context.__ownPanelEntry = {
+      callId,
+      executionId: "",
+      kind: owner === "skill" ? "skill-load" : "shell",
+      call,
+      response: { ok: true, exitCode: 0, stdout: "OWN" },
+      reply: "own operation result",
+      pageIdentity: context.getCurrentPageIdentity(),
+      phase: "submitted",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      attempts: 1,
+      lastError: ""
+    };
+    vm.runInContext(`
+      pendingHelperDeliveries.set(globalThis.__ownPanelEntry.callId, globalThis.__ownPanelEntry);
+    `, context);
+    if (owner === "shell") {
+      vm.runInContext(`
+        activeCallId = globalThis.__ownPanelEntry.callId;
+        activeCallToken = { callId: activeCallId, call: globalThis.__ownPanelEntry.call };
+        panelShellHelperActive = true;
+      `, context);
+    } else if (owner === "skill") {
+      vm.runInContext(`
+        skillHelperInFlight = true;
+        activeSkillHelperCallKey = "own-skill-operation";
+      `, context);
+    } else {
+      vm.runInContext(`
+        forceRunInFlight = true;
+        activeForceRunCallId = globalThis.__ownPanelEntry.callId;
+      `, context);
+    }
+
+    await context.performPendingHelperDeliveryFinalization(context.__ownPanelEntry, "submitted");
+    assert.ok(statuses.length >= 1, `${owner} operation must be allowed to publish its own completion.`);
+    assert.match(statuses.at(-1).text, owner === "skill" ? /Skill own-skill sent/ : /Shell helper completed/);
+  }
+
+  for (const kind of ["runnable", "skill"]) {
+    const context = loadContentContext();
+    const statuses = [];
+    context.setStatus = (text, state) => statuses.push({ text, state });
+    context.persistPendingHelperDeliveries = async () => {};
+    context.__ownDiscardEntry = {
+      callId: `own-${kind}-discard`,
+      pageIdentity: context.getCurrentPageIdentity(),
+      phase: "queued"
+    };
+    vm.runInContext(`
+      pendingHelperDeliveries.set(globalThis.__ownDiscardEntry.callId, globalThis.__ownDiscardEntry);
+    `, context);
+    if (kind === "skill") {
+      await context.discardStaleSkillPendingDelivery(context.__ownDiscardEntry);
+    } else {
+      await context.discardStaleRunnablePendingDelivery(context.__ownDiscardEntry);
+    }
+    assert.equal(statuses.length, 1, `${kind} discard must remain visible without a newer operation.`);
+    assert.match(statuses[0].text, /Discarded a cached/);
+  }
+}
+
+async function verifyManualSkillRejectionPublishesItsOwnCompletion() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  const helperText = [
+    "ai-helper-skill-start:manual-invalid-skill",
+    "cmd: load",
+    "skill-id: example",
+    "ai-helper-skill-end"
+  ].join("\n");
+  const turn = createStableChatGptRouteTurn(context, {
+    userText: "Process this invalid Skill helper once.",
+    helperText,
+    userId: "manual-invalid-skill-user",
+    assistantId: "manual-invalid-skill-assistant"
+  });
+  context.__manualInvalidSkillRoot = turn.root;
+  context.document.body = turn.root;
+  context.getConversationRoot = () => context.__manualInvalidSkillRoot;
+  context.extractShellCallCandidates = () => [turn.candidate];
+  const statuses = [];
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  context.acknowledgePendingHelperResultPresented = async () => true;
+  context.attemptPendingHelperDelivery = async (entry) =>
+    context.performPendingHelperDeliveryFinalization(entry, "submitted");
+  context.schedulePendingHelperDeliveryRetry = () => {};
+  context.scheduleScan = () => {};
+  context.updateContextualPanelActions = () => {};
+  vm.runInContext("extensionActive = true; observedPageIdentity = location.href;", context);
+
+  assert.equal(await context.processLatestSkillRecovery({ forceDetected: true }), false);
+  assert.equal(vm.runInContext("skillRecoveryInFlight", context), false);
+  assert.equal(vm.runInContext("activeSkillHelperCallKey", context), "");
+  assert.ok(statuses.length > 0);
+  assert.equal(statuses.at(-1).state, "error",
+    "A manual Skill rejection must publish its own terminal status instead of staying blue/running.");
+  assert.match(statuses.at(-1).text, /Skill protocol error sent/);
+}
+
+async function verifyCancelledBatchCannotOverwriteNewPanelOperation() {
+  for (const newerOwner of ["skill", "force"]) {
+    const context = loadContentContext();
+    const statuses = [];
+    context.setStatus = (text, state) => statuses.push({ text, state });
+    context.markPendingHelperCancellationBoundary = () => {};
+    context.waitForPendingHelperSubmissionProof = async () => false;
+    let persistStarted;
+    let releasePersist;
+    const persistObserved = new Promise((resolve) => {
+      persistStarted = resolve;
+    });
+    const persistGate = new Promise((resolve) => {
+      releasePersist = resolve;
+    });
+    context.persistPendingHelperDeliveries = async () => {
+      persistStarted();
+      await persistGate;
+    };
+    context.__cancelledOldEntry = {
+      callId: "cancelled-old-entry",
+      creationSequence: 1,
+      cancellationBatchSequence: 1,
+      pageIdentity: context.getCurrentPageIdentity(),
+      phase: "inserted",
+      kind: "shell",
+      call: context.parseCallPayload(createHelperBlock({ cmd: "printf CANCEL_OLD" }))
+    };
+    vm.runInContext(`
+      pendingHelperDeliveryCreationSequence = 1;
+      pendingHelperDeliveries.set(globalThis.__cancelledOldEntry.callId, globalThis.__cancelledOldEntry);
+    `, context);
+    const cancellation = context.cancelPendingHelperDeliveryAfterComposerRemoval(
+      context.__cancelledOldEntry
+    );
+    await persistObserved;
+    if (newerOwner === "skill") {
+      vm.runInContext(`
+        skillHelperInFlight = true;
+        activeSkillHelperCallKey = "new-skill-during-cancel";
+      `, context);
+    } else {
+      vm.runInContext(`
+        forceRunInFlight = true;
+        activeForceRunCallId = "new-force-during-cancel";
+      `, context);
+    }
+    statuses.push({ text: `Running: new ${newerOwner} during cancellation`, state: "running" });
+    releasePersist();
+    assert.equal(await cancellation, true);
+    assert.deepEqual(statuses, [{
+      text: `Running: new ${newerOwner} during cancellation`,
+      state: "running"
+    }]);
+  }
+
+  const context = loadContentContext();
+  const statuses = [];
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.markPendingHelperCancellationBoundary = () => {};
+  context.waitForPendingHelperSubmissionProof = async () => false;
+  context.persistPendingHelperDeliveries = async () => {};
+  context.__visibleCancellationEntry = {
+    callId: "visible-cancellation-entry",
+    creationSequence: 1,
+    cancellationBatchSequence: 1,
+    pageIdentity: context.getCurrentPageIdentity(),
+    phase: "inserted",
+    kind: "shell",
+    call: context.parseCallPayload(createHelperBlock({ cmd: "printf CANCEL_VISIBLE" }))
+  };
+  vm.runInContext(`
+    pendingHelperDeliveryCreationSequence = 1;
+    pendingHelperDeliveries.set(globalThis.__visibleCancellationEntry.callId, globalThis.__visibleCancellationEntry);
+  `, context);
+  assert.equal(await context.cancelPendingHelperDeliveryAfterComposerRemoval(
+    context.__visibleCancellationEntry
+  ), true);
+  assert.equal(statuses.length, 1);
+  assert.match(statuses[0].text, /were cancelled/);
+}
+
+async function verifyForceRejectedReplyKeepsStrictRouteBoundary() {
+  for (const testCase of [
+    { name: "same lifecycle", gate: "none", expectedReplies: 1 },
+    { name: "route during auto-send settings", gate: "settings", expectedReplies: 0 },
+    { name: "route during persistence", gate: "persist", expectedReplies: 0 }
+  ]) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    const helperText = [
+      "ai-helper-file-start:force-rejected-route",
+      "../unsafe-force.txt",
+      "must stay in the force origin",
+      "ai-helper-file-end"
+    ].join("\n");
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Force-check this invalid helper only in this chat.",
+      helperText,
+      userId: `force-rejected-user-${testCase.gate}`,
+      assistantId: `force-rejected-assistant-${testCase.gate}`
+    });
+    context.__forceRejectedRoot = turn.root;
+    context.__forceRejectedCandidate = turn.candidate;
+    context.document.body = turn.root;
+    context.getConversationRoot = () => context.__forceRejectedRoot;
+    context.extractShellCallCandidates = () => context.__forceRejectedCandidate
+      ? [context.__forceRejectedCandidate]
+      : [];
+    const forceSnapshot = context.createRenderedHelperCandidateSnapshot(turn.candidate);
+
+    let settingsRequested;
+    let releaseSettings;
+    const settingsObserved = new Promise((resolve) => {
+      settingsRequested = resolve;
+    });
+    const settingsGate = new Promise((resolve) => {
+      releaseSettings = resolve;
+    });
+    let persistenceGate = null;
+    if (testCase.gate === "persist") {
+      persistenceGate = deferFirstLocalStorageSet(context);
+    }
+    let replies = 0;
+    let runtimeCalls = 0;
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("autoSend") && testCase.gate === "settings") {
+        settingsRequested();
+        return settingsGate;
+      }
+      return {
+        enabled: true,
+        enabledHosts: ["chatgpt.com"],
+        maxChainCalls: 100,
+        autoSend: true
+      };
+    };
+    context.chrome.runtime.sendMessage = async () => {
+      runtimeCalls += 1;
+      return { ok: true };
+    };
+    context.attemptPendingHelperDelivery = async () => {
+      replies += 1;
+      return true;
+    };
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    context.scheduleScan = () => {};
+    context.updateSiteActionButton = () => {};
+    context.updateContextualPanelActions = () => {};
+    context.setStatus = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__forceRejectedRoot.innerText || globalThis.__forceRejectedRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+    `, context);
+
+    const scan = context.scanForShellCall({
+      force: true,
+      forceCandidateSnapshot: forceSnapshot
+    });
+    if (testCase.gate === "settings") {
+      await settingsObserved;
+    } else if (testCase.gate === "persist") {
+      await persistenceGate.firstSetStarted;
+    }
+    if (testCase.gate !== "none") {
+      setMockTreeConnected(turn.root, false);
+      const replacement = createRoot([
+        new MockNode({ order: 1, role: "user", text: "A replacement chat must not receive Force rejection output." })
+      ]);
+      replacement.isConnected = true;
+      context.__forceRejectedRoot = replacement;
+      context.__forceRejectedCandidate = null;
+      context.document.body = replacement;
+      context.location.pathname = `/c/force-rejected-${testCase.gate}`;
+      context.location.href = `https://chatgpt.com${context.location.pathname}`;
+      assert.equal(context.refreshPageLifecycle(), true);
+      if (testCase.gate === "settings") {
+        releaseSettings({ autoSend: true });
+      } else {
+        persistenceGate.releaseFirstSet();
+      }
+    }
+    await scan;
+    await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+
+    assert.equal(replies, testCase.expectedReplies,
+      `${testCase.name}: Force rejection crossed its strict origin boundary.`);
+    assert.equal(runtimeCalls, 0, "Rejected Force helpers must never reach a runtime backend.");
+    if (testCase.expectedReplies === 0) {
+      assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+    }
+  }
+}
+
+async function verifyFirstResponseRouteAssignmentCarriesRuntimeStatusRecovery() {
+  const cases = [
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf ROUTE_STATUS_SHELL_RESULT" }),
+      runType: "run-shell",
+      statusType: "run-shell-status",
+      output: "ROUTE_STATUS_SHELL_RESULT",
+      assignedPath: "/c/route-status-shell"
+    },
+    {
+      name: "board",
+      helperText: "ai-helper-board-start\nstatus\nai-helper-board-end",
+      runType: "run-board",
+      statusType: "run-board-status",
+      output: "ROUTE_STATUS_BOARD_RESULT\nBOARD> ",
+      assignedPath: "/uc/route-status-board"
+    }
+  ];
+
+  for (const testCase of cases) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    context.sleep = async () => {};
+
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: `Recover the ${testCase.name} result after this new chat receives its permanent URL.`,
+      helperText: testCase.helperText,
+      userId: `route-status-${testCase.name}-user`,
+      assistantId: `route-status-${testCase.name}-assistant`
+    });
+    context.document.body = turn.root;
+    context.__routeStatusRoot = turn.root;
+    context.__routeStatusCandidate = turn.candidate;
+    context.getConversationRoot = () => context.__routeStatusRoot;
+    context.extractShellCallCandidates = () => [context.__routeStatusCandidate];
+
+    let runCount = 0;
+    let statusCount = 0;
+    let composerWrites = 0;
+    let sendAttempts = 0;
+    let receiptAttempts = 0;
+    const submitted = [];
+    const messageTypes = [];
+    const composer = { innerText: "", textContent: "", isConnected: true };
+    context.document.querySelectorAll = (selector) =>
+      selector.includes("data-message-author-role") ? submitted : [];
+    context.chrome.storage.sync.get = async () => ({
+      enabled: true,
+      enabledHosts: ["chatgpt.com"],
+      maxChainCalls: 100,
+      requireApproval: false,
+      autoSend: true
+    });
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type === "content-ui-delay") {
+        return { ok: true };
+      }
+      if (payload.type === "run-result-presented") {
+        receiptAttempts += 1;
+        return { ok: true, found: true };
+      }
+      messageTypes.push(payload.type);
+      if (payload.type === testCase.runType) {
+        runCount += 1;
+        context.location.pathname = testCase.assignedPath;
+        context.location.href = `https://chatgpt.com${testCase.assignedPath}`;
+        assert.equal(context.refreshPageLifecycle(), true);
+        vm.runInContext("initialThreadSettled = true;", context);
+        throw new Error("The message port closed before a response was received.");
+      }
+      assert.equal(payload.type, testCase.statusType);
+      statusCount += 1;
+      return {
+        ok: true,
+        found: true,
+        state: "completed",
+        result: {
+          ok: true,
+          executed: true,
+          executionCompleted: true,
+          executionId: testCase.name === "shell" ? "aaaabbbb00001111" : "ccccdddd22223333",
+          exitCode: 0,
+          stdout: testCase.output
+        }
+      };
+    };
+    context.insertReply = async (text) => {
+      composerWrites += 1;
+      composer.innerText = text;
+      composer.textContent = text;
+      return composer;
+    };
+    context.findReplyInput = async () => composer;
+    context.clickSendWhenReady = async () => {
+      sendAttempts += 1;
+      const submittedRoot = new MockNode({ order: 3, role: "user", text: composer.innerText });
+      submittedRoot.isConnected = true;
+      submitted.push(submittedRoot);
+      composer.innerText = "";
+      composer.textContent = "";
+      return true;
+    };
+    context.setStatus = () => {};
+    context.scheduleScan = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.updateSiteActionButton = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__routeStatusRoot.innerText || globalThis.__routeStatusRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const routeCandidate = globalThis.__routeStatusCandidate;
+      const routeSemanticKey = buildSemanticCallKey(routeCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(routeCandidate),
+        new Set([buildRenderedHelperKey(routeCandidate, routeSemanticKey)])
+      );
+    `, context);
+
+    assert.ok(
+      context.getLastShellCallCandidate(turn.root),
+      `${testCase.name}: the route-status fixture must expose its helper through the production scanner.`
+    );
+
+    await context.scanForShellCall();
+    await context.retryPendingHelperDeliveries();
+
+    assert.equal(runCount, 1, `${testCase.name}: runtime recovery must never resubmit the helper.`);
+    assert.equal(statusCount, 1, `${testCase.name}: the executed attempt must recover through status only.`);
+    assert.deepEqual(messageTypes, [testCase.runType, testCase.statusType]);
+    assert.equal(composerWrites, 1, `${testCase.name}: the recovered result must be written once.`);
+    assert.equal(sendAttempts, 1, `${testCase.name}: the recovered result must be sent once.`);
+    assert.equal(submitted.length, 1);
+    assert.match(submitted[0].innerText, new RegExp(testCase.output.split("\n")[0]));
+    assert.equal(receiptAttempts, 1, `${testCase.name}: presentation must be acknowledged once.`);
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  }
+}
+
+async function verifyRuntimeStatusRecoveryCannotCrossInvalidRoute() {
+  const cases = [
+    {
+      name: "shell transcript replacement",
+      helperText: createHelperBlock({ cmd: "printf STALE_ROUTE_STATUS_SHELL" }),
+      runType: "run-shell",
+      statusType: "run-shell-status",
+      replaceTranscript: true,
+      expectedStatusCount: 0
+    },
+    {
+      name: "board second route",
+      helperText: "ai-helper-board-start\nstatus\nai-helper-board-end",
+      runType: "run-board",
+      statusType: "run-board-status",
+      secondRoute: true,
+      expectedStatusCount: 1
+    }
+  ];
+
+  for (const testCase of cases) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    context.sleep = async () => {};
+
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: `Do not leak this ${testCase.name} result into another chat.`,
+      helperText: testCase.helperText,
+      userId: `invalid-route-status-${testCase.runType}-user`,
+      assistantId: `invalid-route-status-${testCase.runType}-assistant`
+    });
+    context.document.body = turn.root;
+    context.__invalidRouteStatusRoot = turn.root;
+    context.__invalidRouteStatusCandidate = turn.candidate;
+    context.getConversationRoot = () => context.__invalidRouteStatusRoot;
+    context.extractShellCallCandidates = (root) =>
+      root === context.__invalidRouteStatusRoot && root === turn.root
+        ? [context.__invalidRouteStatusCandidate]
+        : [];
+
+    let runCount = 0;
+    let statusCount = 0;
+    let composerWrites = 0;
+    let sendAttempts = 0;
+    context.chrome.storage.sync.get = async () => ({
+      enabled: true,
+      enabledHosts: ["chatgpt.com"],
+      maxChainCalls: 100,
+      requireApproval: false,
+      autoSend: true
+    });
+    context.chrome.runtime.sendMessage = async (payload) => {
+      if (payload.type === "content-ui-delay") {
+        return { ok: true };
+      }
+      if (payload.type === testCase.runType) {
+        runCount += 1;
+        if (testCase.replaceTranscript) {
+          const replacement = createRoot([
+            new MockNode({ order: 1, role: "user", text: "A different conversation now owns this page." })
+          ]);
+          replacement.isConnected = true;
+          setMockTreeConnected(turn.root, false);
+          context.__invalidRouteStatusRoot = replacement;
+          context.document.body = replacement;
+        }
+        context.location.pathname = `/c/invalid-route-status-${testCase.runType}`;
+        context.location.href = `https://chatgpt.com/c/invalid-route-status-${testCase.runType}`;
+        assert.equal(context.refreshPageLifecycle(), true);
+        vm.runInContext("initialThreadSettled = true;", context);
+        throw new Error("The message channel closed before a response was received.");
+      }
+      if (payload.type === testCase.statusType) {
+        statusCount += 1;
+        if (testCase.secondRoute) {
+          context.location.pathname = `/c/invalid-route-status-${testCase.runType}-second`;
+          context.location.href = `https://chatgpt.com/c/invalid-route-status-${testCase.runType}-second`;
+          assert.equal(context.refreshPageLifecycle(), true);
+          vm.runInContext("initialThreadSettled = true;", context);
+        }
+        return {
+          ok: true,
+          found: true,
+          state: "completed",
+          result: { ok: true, exitCode: 0, stdout: "MUST_NOT_BE_DELIVERED" }
+        };
+      }
+      return { ok: true };
+    };
+    context.insertReply = async () => {
+      composerWrites += 1;
+      return { innerText: "", textContent: "", isConnected: true };
+    };
+    context.clickSendWhenReady = async () => {
+      sendAttempts += 1;
+      return true;
+    };
+    context.setStatus = () => {};
+    context.scheduleScan = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.updateSiteActionButton = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__invalidRouteStatusRoot.innerText || globalThis.__invalidRouteStatusRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      const routeCandidate = globalThis.__invalidRouteStatusCandidate;
+      const routeSemanticKey = buildSemanticCallKey(routeCandidate.call);
+      liveGeneratedRenderedHelpers.set(
+        getCandidateRenderRoot(routeCandidate),
+        new Set([buildRenderedHelperKey(routeCandidate, routeSemanticKey)])
+      );
+    `, context);
+
+    await context.scanForShellCall();
+    await context.retryPendingHelperDeliveries();
+
+    assert.equal(runCount, 1, `${testCase.name}: an ambiguous completed attempt must never be resubmitted.`);
+    assert.equal(statusCount, testCase.expectedStatusCount,
+      `${testCase.name}: recovery must stop at the first lifecycle boundary around its status await.`);
+    assert.equal(composerWrites, 0, `${testCase.name}: stale output must not enter the replacement composer.`);
+    assert.equal(sendAttempts, 0, `${testCase.name}: stale output must not be submitted.`);
+    assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  }
+}
+
 async function verifyRuntimeChannelCloseRecoversByStatusOnly() {
   const context = loadContentContext();
   await Promise.resolve();
@@ -800,6 +3771,461 @@ async function verifyRuntimeChannelCloseRecoversByStatusOnly() {
   const ordinaryFailureResponse = await context.sendRunShellMessage("normal-command-error-key", call, false);
   assert.equal(ordinaryFailureResponse, normalCommandFailure);
   assert.deepEqual(sent.map((payload) => payload.type), ["run-shell"], "Ordinary command errors must not enter status recovery.");
+}
+
+async function verifyForceRuntimeRecoveryKeepsStrictRouteBoundary() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  context.sleep = async () => {};
+  let runCount = 0;
+  let statusCount = 0;
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "run-shell") {
+      runCount += 1;
+      context.location.pathname = "/c/force-must-not-follow-route";
+      context.location.href = "https://chatgpt.com/c/force-must-not-follow-route";
+      assert.equal(context.refreshPageLifecycle(), true);
+      throw new Error("The message port closed before a response was received.");
+    }
+    if (payload.type === "run-shell-status") {
+      statusCount += 1;
+      return {
+        ok: true,
+        found: true,
+        state: "completed",
+        result: { ok: true, exitCode: 0, stdout: "FORCE_STALE_RESULT" }
+      };
+    }
+    return { ok: true };
+  };
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+  `, context);
+
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf FORCE_STALE_RESULT" }));
+  await assert.rejects(
+    () => context.sendRunShellMessage("force-route-recovery", call, true, null),
+    (error) => error?.helperRetryable === false && /page lifecycle changed/.test(error.message)
+  );
+  assert.equal(runCount, 1, "Force recovery must never resend the original helper.");
+  assert.equal(statusCount, 0,
+    "Force has no automatic candidate-bound route handoff and must retain the strict lifecycle snapshot.");
+}
+
+function deferFirstLocalStorageSet(context) {
+  const originalSet = context.chrome.storage.local.set.bind(context.chrome.storage.local);
+  let releaseFirstSet;
+  let markFirstSetStarted;
+  let setCount = 0;
+  const firstSetStarted = new Promise((resolve) => {
+    markFirstSetStarted = resolve;
+  });
+  const firstSetGate = new Promise((resolve) => {
+    releaseFirstSet = resolve;
+  });
+  context.chrome.storage.local.set = async (values) => {
+    setCount += 1;
+    if (setCount === 1) {
+      markFirstSetStarted();
+      await firstSetGate;
+    }
+    return originalSet(values);
+  };
+  return {
+    firstSetStarted,
+    releaseFirstSet,
+    getSetCount: () => setCount
+  };
+}
+
+async function verifyRetainedRouteDuringPendingPersistenceQueuesOnce() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const backing = installPersistentLocalStorage(context);
+  const storageGate = deferFirstLocalStorageSet(context);
+  const helperText = createHelperBlock({ cmd: "printf PERSIST_ROUTE_RETAINED" });
+  const turn = createStableChatGptRouteTurn(context, {
+    userText: "Keep this result while persistence crosses the permanent route assignment.",
+    helperText,
+    userId: "persist-route-user",
+    assistantId: "persist-route-assistant"
+  });
+  context.document.body = turn.root;
+  context.__persistRouteRoot = turn.root;
+  context.__persistRouteCandidate = turn.candidate;
+  context.getConversationRoot = () => context.__persistRouteRoot;
+  context.extractShellCallCandidates = () => [context.__persistRouteCandidate];
+
+  let backendRuns = 0;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  let receiptAttempts = 0;
+  const submitted = [];
+  const composer = { innerText: "", textContent: "", isConnected: true };
+  context.document.querySelectorAll = (selector) =>
+    selector.includes("data-message-author-role") ? submitted : [];
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "content-ui-delay") return { ok: true };
+    if (payload.type === "run-result-presented") {
+      receiptAttempts += 1;
+      return { ok: true, found: true };
+    }
+    assert.equal(payload.type, "run-shell");
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "1111aaaa2222bbbb",
+      exitCode: 0,
+      stdout: "PERSIST_ROUTE_RETAINED"
+    };
+  };
+  context.insertReply = async (text) => {
+    composerWrites += 1;
+    composer.innerText = text;
+    composer.textContent = text;
+    return composer;
+  };
+  context.findReplyInput = async () => composer;
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    const submittedRoot = new MockNode({ order: 3, role: "user", text: composer.innerText });
+    submittedRoot.isConnected = true;
+    submitted.push(submittedRoot);
+    composer.innerText = "";
+    composer.textContent = "";
+    return true;
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__persistRouteRoot.innerText || globalThis.__persistRouteRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const candidate = globalThis.__persistRouteCandidate;
+    const semanticKey = buildSemanticCallKey(candidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(candidate),
+      new Set([buildRenderedHelperKey(candidate, semanticKey)])
+    );
+  `, context);
+
+  const scan = context.scanForShellCall();
+  await storageGate.firstSetStarted;
+  assert.equal(backendRuns, 1);
+  assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]?.attempts", context), 0,
+    "The queued result must not begin composer work before its first durable write completes.");
+  context.location.pathname = "/uc/persist-route-retained";
+  context.location.href = "https://chatgpt.com/uc/persist-route-retained";
+  assert.equal(context.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true;", context);
+  storageGate.releaseFirstSet();
+  await scan;
+  await context.retryPendingHelperDeliveries();
+  await waitForTestCondition(() => composerWrites === 1 && sendAttempts === 1 && receiptAttempts === 1 &&
+    vm.runInContext("pendingHelperDeliveries.size", context) === 0);
+  await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+
+  assert.equal(backendRuns, 1);
+  assert.equal(composerWrites, 1, "A retained persisted result must be written exactly once.");
+  assert.equal(sendAttempts, 1, "A retained persisted result must be sent exactly once.");
+  assert.equal(receiptAttempts, 1);
+  assert.equal(submitted.length, 1);
+  assert.match(submitted[0].innerText, /PERSIST_ROUTE_RETAINED/);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.ok(storageGate.getSetCount() >= 1);
+  assert.doesNotMatch(JSON.stringify(backing), /PERSIST_ROUTE_RETAINED/,
+    "Finalization must remove the delivered result from persistent pending state.");
+}
+
+async function verifyInvalidRouteDuringPendingPersistenceCannotReviveOldEntry() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  const backing = installPersistentLocalStorage(context);
+  const storageGate = deferFirstLocalStorageSet(context);
+  const helperText = createHelperBlock({ cmd: "printf STALE_PERSISTED_ROUTE_RESULT" });
+  const turn = createStableChatGptRouteTurn(context, {
+    userText: "Do not carry this result into a replacement transcript.",
+    helperText,
+    userId: "stale-persist-user",
+    assistantId: "stale-persist-assistant"
+  });
+  context.document.body = turn.root;
+  context.__stalePersistRoot = turn.root;
+  context.__stalePersistCandidate = turn.candidate;
+  context.getConversationRoot = () => context.__stalePersistRoot;
+  context.extractShellCallCandidates = (root) => root === turn.root
+    ? [context.__stalePersistCandidate]
+    : [];
+
+  let oldBackendRuns = 0;
+  let newBackendRuns = 0;
+  let resolveNewBackend;
+  let composerWrites = 0;
+  let sendAttempts = 0;
+  const statuses = [];
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    requireApproval: false,
+    autoSend: true
+  });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type !== "run-shell") return { ok: true };
+    if (payload.cmd.includes("STALE_PERSISTED_ROUTE_RESULT")) {
+      oldBackendRuns += 1;
+      return {
+        ok: true,
+        executed: true,
+        executionCompleted: true,
+        executionId: "3333cccc4444dddd",
+        exitCode: 0,
+        stdout: "STALE_PERSISTED_ROUTE_RESULT"
+      };
+    }
+    newBackendRuns += 1;
+    return new Promise((resolve) => {
+      resolveNewBackend = resolve;
+    });
+  };
+  context.insertReply = async () => {
+    composerWrites += 1;
+    return { innerText: "", textContent: "", isConnected: true };
+  };
+  context.clickSendWhenReady = async () => {
+    sendAttempts += 1;
+    return true;
+  };
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.scheduleScan = () => {};
+  context.resetChainForNewHumanPrompt = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__stalePersistRoot.innerText || globalThis.__stalePersistRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const candidate = globalThis.__stalePersistCandidate;
+    const semanticKey = buildSemanticCallKey(candidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(candidate),
+      new Set([buildRenderedHelperKey(candidate, semanticKey)])
+    );
+  `, context);
+
+  const oldScan = context.scanForShellCall();
+  await storageGate.firstSetStarted;
+  const oldEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  assert.equal(oldEntry.attempts, 0);
+
+  const replacement = createRoot([
+    new MockNode({ order: 1, role: "user", text: "Replacement transcript owns this route." })
+  ]);
+  replacement.isConnected = true;
+  setMockTreeConnected(turn.root, false);
+  context.__stalePersistRoot = replacement;
+  context.document.body = replacement;
+  context.location.pathname = "/c/stale-persist-replacement";
+  context.location.href = "https://chatgpt.com/c/stale-persist-replacement";
+  assert.equal(context.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true;", context);
+
+  const newCall = context.parseCallPayload(createHelperBlock({ cmd: "printf NEW_ACTIVE_ROUTE_CALL" }));
+  const newRun = context.runAndReply("new-active-route-call", newCall);
+  await waitForTestCondition(() => typeof resolveNewBackend === "function");
+  assert.equal(vm.runInContext("activeCallId", context), "new-active-route-call");
+  storageGate.releaseFirstSet();
+  await oldScan;
+  await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+
+  assert.equal(oldBackendRuns, 1);
+  assert.equal(newBackendRuns, 1);
+  assert.equal(oldEntry.attempts, 0, "The stale continuation must never start a delivery attempt.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0,
+    "The stale entry must be removed precisely after its blocked persistence returns.");
+  assert.doesNotMatch(JSON.stringify(backing), /STALE_PERSISTED_ROUTE_RESULT/,
+    "The stale entry must be removed from persistent state as well as memory.");
+  assert.equal(composerWrites, 0);
+  assert.equal(sendAttempts, 0);
+  assert.equal(vm.runInContext("activeCallId", context), "new-active-route-call",
+    "Cleanup from the old continuation must not release the new active call.");
+  assert.match(statuses.at(-1)?.text || "", /NEW_ACTIVE_ROUTE_CALL/,
+    "Cleanup from the old continuation must not overwrite the new active status.");
+  void newRun;
+}
+
+async function verifyForcePendingPersistenceKeepsStrictRouteBoundary() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  const backing = installPersistentLocalStorage(context);
+  const storageGate = deferFirstLocalStorageSet(context);
+  const helperText = createHelperBlock({ cmd: "printf FORCE_STALE_PERSISTED_RESULT" });
+  const assistant = createAssistantMessage({ order: 1, text: helperText });
+  const root = createRoot([assistant]);
+  root.isConnected = true;
+  assistant.isConnected = true;
+  context.document.body = root;
+  context.getConversationRoot = () => root;
+  const candidate = context.getLastShellCallCandidate(root);
+  const forceSnapshot = context.createRenderedHelperCandidateSnapshot(candidate);
+  let backendRuns = 0;
+  let composerWrites = 0;
+  context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type !== "run-shell") return { ok: true };
+    backendRuns += 1;
+    return {
+      ok: true,
+      executed: true,
+      executionCompleted: true,
+      executionId: "5555eeee6666ffff",
+      exitCode: 0,
+      stdout: "FORCE_STALE_PERSISTED_RESULT"
+    };
+  };
+  context.insertReply = async () => {
+    composerWrites += 1;
+    return { innerText: "", textContent: "", isConnected: true };
+  };
+  context.setStatus = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext("extensionActive = true; observedPageIdentity = location.href; initialThreadSettled = true;", context);
+
+  const forceRun = context.runAndReply("force-stale-persist", candidate.call, {
+    force: true,
+    forceCandidateSnapshot: forceSnapshot
+  });
+  await storageGate.firstSetStarted;
+  const forceEntry = vm.runInContext("pendingHelperDeliveries.get('force-stale-persist')", context);
+  assert.equal(forceEntry.attempts, 0);
+  context.location.pathname = "/c/force-stale-persist";
+  context.location.href = "https://chatgpt.com/c/force-stale-persist";
+  assert.equal(context.refreshPageLifecycle(), true);
+  storageGate.releaseFirstSet();
+  await forceRun;
+  await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+
+  assert.equal(backendRuns, 1);
+  assert.equal(forceEntry.attempts, 0);
+  assert.equal(composerWrites, 0);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.doesNotMatch(JSON.stringify(backing), /FORCE_STALE_PERSISTED_RESULT/);
+}
+
+async function verifyForceRejectedPersistenceKeepsStrictRouteBoundary() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  const backing = installPersistentLocalStorage(context);
+  const storageGate = deferFirstLocalStorageSet(context);
+  const helperText = [
+    "ai-helper-file-start:force-rejected-persist",
+    "../unsafe.txt",
+    "must remain on the original route",
+    "ai-helper-file-end"
+  ].join("\n");
+  const assistant = createAssistantMessage({ order: 1, text: helperText });
+  const root = createRoot([assistant]);
+  root.isConnected = true;
+  assistant.isConnected = true;
+  context.document.body = root;
+  context.getConversationRoot = () => root;
+  const candidate = context.getLastShellCallCandidate(root);
+  assert.ok(candidate);
+  const forceSnapshot = context.createRenderedHelperCandidateSnapshot(candidate);
+  let composerWrites = 0;
+  context.chrome.storage.sync.get = async () => ({
+    enabled: true,
+    enabledHosts: ["chatgpt.com"],
+    maxChainCalls: 100,
+    autoSend: true
+  });
+  context.chrome.runtime.sendMessage = async () => ({ ok: true });
+  context.insertReply = async () => {
+    composerWrites += 1;
+    return { innerText: "", textContent: "", isConnected: true };
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext("extensionActive = true; observedPageIdentity = location.href; initialThreadSettled = true;", context);
+
+  const forceScan = context.scanForShellCall({
+    force: true,
+    forceCandidateSnapshot: forceSnapshot
+  });
+  await storageGate.firstSetStarted;
+  const rejectedEntry = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", context);
+  assert.equal(rejectedEntry.attempts, 0);
+  context.location.pathname = "/c/force-rejected-persist";
+  context.location.href = "https://chatgpt.com/c/force-rejected-persist";
+  assert.equal(context.refreshPageLifecycle(), true);
+  storageGate.releaseFirstSet();
+  await forceScan;
+  await vm.runInContext("pendingHelperDeliveryStorageTail", context);
+
+  assert.equal(rejectedEntry.attempts, 0,
+    "A Force validation reply must not begin delivery after its strict route boundary changes.");
+  assert.equal(composerWrites, 0);
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.doesNotMatch(JSON.stringify(backing), /must remain on the original route/);
+}
+
+async function verifyStalePersistenceCleanupCannotDeleteReplacementIdentity() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  const backing = installPersistentLocalStorage(context);
+  const storageGate = deferFirstLocalStorageSet(context);
+  let lifecycleCurrent = true;
+  const call = context.parseCallPayload(createHelperBlock({ cmd: "printf OLD_IDENTITY" }));
+  vm.runInContext("extensionActive = true; beginPageLifecycle();", context);
+  const remember = context.rememberPendingHelperDelivery(
+    "shared-call-id",
+    call,
+    { ok: true, executionId: "7777aaaa8888bbbb", stdout: "OLD_IDENTITY" },
+    "Shell call result:\n\nstdout:\nOLD_IDENTITY",
+    { autoSend: true },
+    { lifecycleGuard: () => lifecycleCurrent }
+  );
+  await storageGate.firstSetStarted;
+  const oldEntry = vm.runInContext("pendingHelperDeliveries.get('shared-call-id')", context);
+  const replacement = { ...oldEntry, reply: "Shell call result:\n\nstdout:\nNEW_IDENTITY" };
+  context.__replacementPendingIdentity = replacement;
+  vm.runInContext("pendingHelperDeliveries.set('shared-call-id', globalThis.__replacementPendingIdentity);", context);
+  const replacementPersist = context.persistPendingHelperDeliveries();
+  lifecycleCurrent = false;
+  storageGate.releaseFirstSet();
+  assert.equal(await remember, null);
+  await replacementPersist;
+  assert.equal(vm.runInContext("pendingHelperDeliveries.get('shared-call-id')", context), replacement,
+    "A stale continuation may delete only the exact entry object it created.");
+  const storedReplacement = Object.values(backing)
+    .flatMap((snapshot) => Array.isArray(snapshot?.entries) ? snapshot.entries : [])
+    .find((entry) => entry?.callId === "shared-call-id");
+  assert.equal(storedReplacement?.reply, replacement.reply,
+    "A stale cleanup must not overwrite the newer same-call identity's durable snapshot.");
 }
 
 async function verifyAmbiguousShellRecoveryFailureDoesNotResendSameRenderedHelper() {
@@ -3372,7 +6798,39 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyPendingAgentDeliveryDefersSkillWithoutConsumingHelper())
   .then(() => verifyRetryableAttemptDoesNotConsumeSameRenderedHelper())
   .then(() => verifyStaleLongCallCannotAffectNewPageCall())
+  .then(() => verifyFirstResponseRouteAssignmentCarriesInFlightShellResult())
+  .then(() => verifyInFlightShellResultCannotCrossRouteAfterTranscriptReplacement())
+  .then(() => verifySettingsAwaitRouteAdjudication())
+  .then(() => verifyRouteRedrawDuringSettingsAwaitIsSingleFlight())
+  .then(() => verifyRejectedHelperRouteSettingsGuard())
+  .then(() => verifyPreparingDispatchStorageFailureReleasesForNewRootRetry())
+  .then(() => verifyChangedRouteClaimUsesExactTokenRelease())
+  .then(() => verifyTrustedForceCannotBypassPreparingDispatchClaim())
+  .then(() => verifyCachedPendingLoadAwaitCannotCrossRoute())
+  .then(() => verifyDeferredProfileDispatchRouteGuards())
+  .then(() => verifyForceDeferredProfileDispatchRouteGuards())
+  .then(() => verifyOuterSettingsAwaitRouteReconciliation())
+  .then(() => verifySkillBackendRouteHandoffRejectsSecondPermanentRoute())
+  .then(() => verifyManualForceDispatchWinsOuterScanRace())
+  .then(() => verifyManualSkillRecoveryWinsOuterScanRace())
+  .then(() => verifyStaleShellCompletionCannotClearNewActiveUi())
+  .then(() => verifyStaleSkillReporterCannotOverwriteNewRunnableStatus())
+  .then(() => verifyShellProgressUsesExactActiveCallAfterProfileAwait())
+  .then(() => verifyOldFinalizationCannotOverwriteNewRunnableStatus())
+  .then(() => verifyStaleDiscardCannotOverwriteNewRunnableStatus())
+  .then(() => verifyCurrentPanelOperationMayPublishItsOwnCompletion())
+  .then(() => verifyManualSkillRejectionPublishesItsOwnCompletion())
+  .then(() => verifyCancelledBatchCannotOverwriteNewPanelOperation())
+  .then(() => verifyForceRejectedReplyKeepsStrictRouteBoundary())
+  .then(() => verifyFirstResponseRouteAssignmentCarriesRuntimeStatusRecovery())
+  .then(() => verifyRuntimeStatusRecoveryCannotCrossInvalidRoute())
   .then(() => verifyRuntimeChannelCloseRecoversByStatusOnly())
+  .then(() => verifyForceRuntimeRecoveryKeepsStrictRouteBoundary())
+  .then(() => verifyRetainedRouteDuringPendingPersistenceQueuesOnce())
+  .then(() => verifyInvalidRouteDuringPendingPersistenceCannotReviveOldEntry())
+  .then(() => verifyForcePendingPersistenceKeepsStrictRouteBoundary())
+  .then(() => verifyForceRejectedPersistenceKeepsStrictRouteBoundary())
+  .then(() => verifyStalePersistenceCleanupCannotDeleteReplacementIdentity())
   .then(() => verifyAmbiguousShellRecoveryFailureDoesNotResendSameRenderedHelper())
   .then(() => verifyBoardRuntimeChannelCloseRecoversByStatusOnly())
   .then(() => verifyBoardRecoveryFailureStaysLocal())

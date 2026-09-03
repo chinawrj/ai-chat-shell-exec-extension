@@ -458,9 +458,25 @@ class SkillCatalogService {
     } catch (_error) {
       return skillError(catalog, "invalid-skill-encoding", `Skill ${skill.id} is not valid UTF-8.`);
     }
+    let expansionContext;
+    try {
+      expansionContext = buildSkillLoadExpansionContext({
+        env: this.env,
+        cwd: this.cwd
+      });
+    } catch (error) {
+      const errorCode = /^execution-env-[a-z0-9-]+$/.test(String(error?.code || ""))
+        ? String(error.code)
+        : "skill-load-environment-unavailable";
+      return skillError(
+        catalog,
+        errorCode,
+        "The configured execution environment file could not be used for Skill loading. Fix the file and retry."
+      );
+    }
     const expanded = expandSkillEnvironment(source, {
-      env: this.env,
-      allowlist: getSkillEnvironmentAllowlist(this.env),
+      env: expansionContext.env,
+      allowlist: expansionContext.allowlist,
       skillDir: path.dirname(skill.filePath),
       runtimeVariables: getSkillRuntimeVariables({
         env: this.env,
@@ -1406,6 +1422,21 @@ function getSkillEnvironmentAllowlist(env = process.env) {
   return Array.from(new Set([...DEFAULT_SKILL_ENV_ALLOWLIST, ...configured]));
 }
 
+function buildSkillLoadExpansionContext({ env = process.env, cwd = process.cwd() } = {}) {
+  const loadedEnvironment = loadExecutionEnvironment({ env, cwd });
+  return {
+    // The env file is itself an explicit variable list for command, lifecycle,
+    // and Skill-load use. Its names therefore do not need to be duplicated in
+    // AI_HELPER_SKILL_ENV_ALLOWLIST. That allowlist continues to govern extra
+    // values inherited from the long-lived shell-server process.
+    env: mergeExecutionEnvironment(env, loadedEnvironment),
+    allowlist: Array.from(new Set([
+      ...getSkillEnvironmentAllowlist(env),
+      ...Object.keys(loadedEnvironment.variables || {})
+    ]))
+  };
+}
+
 function aggregateSkillShas(shas) {
   const hash = crypto.createHash("sha256");
   const sorted = Array.from(shas || []).map(String).sort();
@@ -1864,6 +1895,7 @@ module.exports = {
   SkillCatalogService,
   aggregateSkillShas,
   buildSkillInstallEnvironment,
+  buildSkillLoadExpansionContext,
   createSkillInstallSnapshot,
   createSkillLifecycleSnapshot,
   expandSkillEnvironment,

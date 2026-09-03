@@ -15,6 +15,7 @@ const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
 const CSP_DRAWIO_TEST_PAGE_URL = "https://localhost:17443/drawio-csp-test-page.html";
 const M365_TEST_PAGE_URL = "https://m365.cloud.microsoft:17443/tmux-test-page.html";
 const CHATGPT_CONTRACT_TEST_PAGE_URL = "https://chatgpt.com:17443/chatgpt-contract-test-page.html";
+const CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL = "https://chatgpt.com:17443/";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
 const DRAWIO_PREVIEW_ID = "ai-chat-shell-exec-drawio-preview";
 const EXPECTED_EXTENSION_ORIGIN = "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke";
@@ -25,6 +26,7 @@ const SKILLS_ONLY = process.env.AI_SHELL_E2E_SKILLS_ONLY === "1";
 const DRAWIO_ONLY = process.env.AI_SHELL_E2E_DRAWIO_ONLY === "1";
 const CHATGPT_ONLY = process.env.AI_SHELL_E2E_CHATGPT_ONLY === "1";
 const FORCE_IDLE_ONLY = process.env.AI_SHELL_E2E_FORCE_IDLE_ONLY === "1";
+const ROUTE_ONLY = process.env.AI_SHELL_E2E_ROUTE_ONLY === "1";
 const STARTUP_SETTLE_MS = 4200;
 const SCREENSHOT_DIR = process.env.AI_SHELL_E2E_SCREENSHOT_DIR || "";
 const PANEL_THEMES = Object.freeze({
@@ -85,7 +87,7 @@ async function main() {
     );
     assert.equal(
       serverHealth.skillProtocolVersion,
-      5,
+      6,
       `Existing Skill protocol is ${serverHealth.skillProtocolVersion || "(missing)"}; restart the local shell server from this checkout before running e2e.`
     );
   }
@@ -110,6 +112,7 @@ async function main() {
   const executionEnvPath = path.join(shellStateDir, "execution.env");
   const shellExecutionEnvValue = `shell-env-${Date.now()}`;
   const skillLifecycleEnvValue = `skill-lifecycle-env-${Date.now()}`;
+  const skillLoadEnvValue = `skill-load-env-${Date.now()}`;
   const skillAllowedValue = `skill-allowed-${Date.now()}`;
   const skillSecretValue = `skill-secret-${Date.now()}`;
   fs.mkdirSync(skillDirectory, { recursive: true });
@@ -117,11 +120,11 @@ async function main() {
   cleanup.push(() => fs.rmSync(helperFileOverrideDir, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(shellStateDir, { recursive: true, force: true }));
   cleanup.push(() => fs.rmSync(skillRootDir, { recursive: true, force: true }));
-  fs.writeFileSync(executionEnvPath, [
-    `AI_SHELL_E2E_ENV=${shellExecutionEnvValue}`,
-    `SKILL_LIFECYCLE_E2E_ENV=${skillLifecycleEnvValue}`,
-    ""
-  ].join("\n"), { mode: 0o600 });
+  writeE2eExecutionEnvironment(executionEnvPath, {
+    shellExecutionEnvValue,
+    skillLifecycleEnvValue,
+    skillLoadEnvValue
+  });
 
   let managedShellServer = null;
   const managedShellServerEnv = {
@@ -352,6 +355,10 @@ async function main() {
     await runChatGptHostContractE2E(page);
     return;
   }
+  if (ROUTE_ONLY) {
+    await runFirstResponseRouteAssignmentE2E(debugPort);
+    return;
+  }
 
   if (managedShellServer) {
     await runEmptySkillCatalogE2E(page, debugPort, {
@@ -367,6 +374,10 @@ async function main() {
       skillPath,
       skillInstallRunPath,
       shellStateDir,
+      executionEnvPath,
+      shellExecutionEnvValue,
+      skillLifecycleEnvValue,
+      skillLoadEnvValue,
       expectedHome: helperFileTestHome,
       allowedValue: skillAllowedValue,
       secretValue: skillSecretValue
@@ -379,6 +390,8 @@ async function main() {
     assert.ok(managedShellServer, "Skills-only Chrome E2E requires the isolated managed shell server.");
     return;
   }
+
+  await runFirstResponseRouteAssignmentE2E(debugPort);
 
   // A developer may rerun this E2E against an already-running foreground
   // server after a prior browser process crashed before unregistering. Clear
@@ -1374,7 +1387,6 @@ async function main() {
     const composer = document.getElementById("composer");
     window.__aiShellComposerRedrawnForFileResult = false;
     window.__aiShellComposerTextRestoredForFileResult = false;
-    window.__aiShellRouteChangedForFileResult = false;
     window.__aiShellFileComposerWriteSnapshot = "";
     window.__aiShellFileUserCountBefore = document.querySelectorAll('[data-message-author-role="user"]').length;
     const redrawAfterPluginWrite = () => {
@@ -1402,10 +1414,6 @@ async function main() {
           window.__aiShellComposerTextRestoredForFileResult = true;
         }, 350);
       }, 100);
-      window.setTimeout(() => {
-        history.pushState({}, "", location.pathname + "?file-result-route=" + Date.now());
-        window.__aiShellRouteChangedForFileResult = true;
-      }, 900);
     };
     composer.addEventListener("input", redrawAfterPluginWrite);
     composer.focus();
@@ -1450,7 +1458,6 @@ async function main() {
       const newMessages = userMessages.slice(Number(window.__aiShellFileUserCountBefore || 0));
       if (window.__aiShellComposerRedrawnForFileResult !== true ||
           window.__aiShellComposerTextRestoredForFileResult !== true ||
-          window.__aiShellRouteChangedForFileResult !== true ||
           !window.__aiShellFileComposerWriteSnapshot ||
           newMessages.length !== 1 ||
           (composer?.innerText || "").trim()) {
@@ -1471,7 +1478,6 @@ async function main() {
       composer: document.getElementById("composer")?.innerText || "",
       redraw: window.__aiShellComposerRedrawnForFileResult,
       textRestored: window.__aiShellComposerTextRestoredForFileResult,
-      routeChanged: window.__aiShellRouteChangedForFileResult,
       snapshot: window.__aiShellFileComposerWriteSnapshot || "",
       userCountBefore: window.__aiShellFileUserCountBefore,
       users: Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
@@ -1790,6 +1796,10 @@ async function runSkillE2E(page, debugPort, {
   skillPath,
   skillInstallRunPath,
   shellStateDir,
+  executionEnvPath,
+  shellExecutionEnvValue,
+  skillLifecycleEnvValue,
+  skillLoadEnvValue,
   expectedHome,
   allowedValue,
   secretValue
@@ -2261,12 +2271,61 @@ async function runSkillE2E(page, debugPort, {
   const loadReply = await waitForNewUserMessage(page, beforeLoad, "Local Skill load result:", "valid Skill body load");
   assert.match(loadReply, new RegExp(escapeRegExp(`home=${expectedHome}`)));
   assert.match(loadReply, new RegExp(escapeRegExp(`allowed=${allowedValue}`)));
+  assert.match(loadReply, new RegExp(escapeRegExp(`env_file=${skillLoadEnvValue}`)));
   assert.match(loadReply, /secret=\$\{E2E_SKILL_SECRET\}/);
   assert.match(loadReply, /arguments=\$ARGUMENTS/);
   assert.match(loadReply, /ai-helper-skill-start/);
   assert.match(loadReply, /ai-helper-skill-end/);
   assert.ok(!loadReply.includes(secretValue), "A non-allowlisted local environment variable must not leak to the AI.");
+  assert.ok(!loadReply.includes(shellExecutionEnvValue),
+    "An env-file shell-only value that the Skill does not reference must not enter the AI load reply.");
+  assert.ok(!loadReply.includes(skillLifecycleEnvValue),
+    "An env-file lifecycle-only value that the Skill does not reference must not enter the AI load reply.");
   await assertUserMessageCountStable(page, beforeLoad + 1, "Loaded Skill helper examples must stay inert inside skill-output provenance");
+
+  const hotSkillLoadEnvValue = `${skillLoadEnvValue}-hot`;
+  writeE2eExecutionEnvironment(executionEnvPath, {
+    shellExecutionEnvValue,
+    skillLifecycleEnvValue,
+    skillLoadEnvValue: hotSkillLoadEnvValue
+  });
+  const beforeHotLoad = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:hot-env-file-load-e2e`,
+    "cmd: load",
+    "skill-id: e2e-skill",
+    `catalog-sha: ${retryCatalogSha}`,
+    endMarker
+  ]);
+  const hotLoadReply = await waitForNewUserMessage(page, beforeHotLoad, "Local Skill load result:", "hot-reloaded env-file Skill body load");
+  assert.match(hotLoadReply, new RegExp(escapeRegExp(`env_file=${hotSkillLoadEnvValue}`)));
+  assert.match(hotLoadReply, new RegExp(escapeRegExp(`catalog-sha: ${retryCatalogSha}`)));
+  assert.ok(!hotLoadReply.includes(shellExecutionEnvValue));
+  assert.ok(!hotLoadReply.includes(skillLifecycleEnvValue));
+  await assertUserMessageCountStable(page, beforeHotLoad + 1, "A fresh env-file Skill load must submit exactly once");
+
+  fs.writeFileSync(executionEnvPath, `SKILL_LOAD_E2E_ENV=${skillLoadEnvValue}\nmalformed-line\n`, { mode: 0o600 });
+  const beforeMalformedEnvLoad = await pageUserMessageCount(page);
+  await appendAssistantSkillHelper(page, [
+    `${startMarker}:malformed-env-file-load-e2e`,
+    "cmd: load",
+    "skill-id: e2e-skill",
+    `catalog-sha: ${retryCatalogSha}`,
+    endMarker
+  ]);
+  const malformedEnvReply = await waitForNewUserMessage(
+    page,
+    beforeMalformedEnvLoad,
+    "error-code: execution-env-file-malformed",
+    "malformed env-file Skill load rejection"
+  );
+  assert.doesNotMatch(malformedEnvReply, new RegExp(escapeRegExp(skillLoadEnvValue)));
+  await assertUserMessageCountStable(page, beforeMalformedEnvLoad + 1, "A malformed env-file Skill load error must submit exactly once");
+  writeE2eExecutionEnvironment(executionEnvPath, {
+    shellExecutionEnvValue,
+    skillLifecycleEnvValue,
+    skillLoadEnvValue: hotSkillLoadEnvValue
+  });
 
   const failingSkillId = "e2e-failing-skill";
   const failingSkillDir = path.join(path.dirname(path.dirname(skillPath)), failingSkillId);
@@ -2961,28 +3020,52 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
 
   await withFreshSkillCasePage(debugPort, "pending-load-route-recovery", async (page, nonce) => {
     const helper = makeLoad(`pending-route-${nonce}`);
-    await page.evaluate(`(async () => {
-      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load&route=${nonce}");
-      document.getElementById("thread").innerHTML = "";
-      appendMessage("user", "Load the E2E Skill while the composer is temporarily unavailable.");
-      const form = document.getElementById("composerForm");
-      window.__heldPendingSkillForm = form;
-      form.remove();
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      await appendLiveAssistantToolCall(${JSON.stringify(helper)}, "text");
-      return true;
-    })()`);
+    await appendLiveChatGptHelperWithComposerRemoved(page, {
+      nonce: `pending-route-${nonce}`,
+      userText: "Load the E2E Skill while the composer is temporarily unavailable.",
+      helperText: helper,
+      heldFormProperty: "__heldPendingSkillForm"
+    });
     await waitForEvaluate(page, `(() => {
       const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
       return /result cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
     })()`, "Skill load result to remain queued without a composer");
     assert.equal(await countSkillLoadReplies(page), 0);
+    const beforeRouteProof = await page.evaluate(`(() => ({
+      hostname: location.hostname,
+      pathname: location.pathname,
+      userRetained: document.querySelector('[data-message-id="user-pending-route-${nonce}"]') === window.__heldPendingSkillFormUser,
+      assistantRetained: document.querySelector('[data-message-id="assistant-pending-route-${nonce}"]') === window.__heldPendingSkillFormAssistant,
+      userCopies: window.__heldPendingSkillFormUser?.querySelectorAll('[data-user-message-copy]').length || 0,
+      assistantMarkdown: window.__heldPendingSkillFormAssistant?.querySelectorAll('[data-assistant-markdown]').length || 0,
+      helperText: window.__heldPendingSkillFormAssistant?.querySelector('[data-assistant-markdown]')?.innerText || ""
+    }))()`);
+    assert.deepEqual(beforeRouteProof, {
+      hostname: "chatgpt.com",
+      pathname: "/",
+      userRetained: true,
+      assistantRetained: true,
+      userCopies: 1,
+      assistantMarkdown: 1,
+      helperText: helper
+    }, "The queued positive must begin on the exact current ChatGPT authored turn at the provisional root URL.");
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-load-restored&route=${nonce}");
+      history.pushState({}, "", "/c/${nonce}");
       document.querySelector("main").appendChild(window.__heldPendingSkillForm);
       delete window.__heldPendingSkillForm;
+      document.querySelector("main")?.setAttribute("aria-label", "Retained Skill route ${nonce}");
       return true;
     })()`);
+    const afterRouteProof = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      userRetained: document.querySelector('[data-message-id="user-pending-route-${nonce}"]') === window.__heldPendingSkillFormUser,
+      assistantRetained: document.querySelector('[data-message-id="assistant-pending-route-${nonce}"]') === window.__heldPendingSkillFormAssistant
+    }))()`);
+    assert.deepEqual(afterRouteProof, {
+      pathname: `/c/${nonce}`,
+      userRetained: true,
+      assistantRetained: true
+    }, "The permanent route assignment must retain the exact authored nodes that produced the queued Skill result.");
     const reply = await waitForEvaluateValue(page, `(() => {
       const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
         .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:"));
@@ -2990,31 +3073,32 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     })()`, "queued Skill load result to recover exactly once after a proven retained-root route assignment");
     assert.match(reply, /revision 2/);
     await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
-  });
+  }, { baseUrl: CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL });
 
   await withFreshSkillCasePage(debugPort, "pending-load-cross-chat-negative", async (page, nonce) => {
     const helper = makeLoad(`pending-cross-chat-${nonce}`);
-    await page.evaluate(`(async () => {
-      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-cross-chat-a&route=${nonce}");
-      document.getElementById("thread").innerHTML = "";
-      appendMessage("user", "Load the E2E Skill in chat A while its composer is unavailable.");
-      const form = document.getElementById("composerForm");
-      window.__heldCrossChatSkillForm = form;
-      form.remove();
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      await appendLiveAssistantToolCall(${JSON.stringify(helper)}, "text");
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/c/${nonce}-a");
+      document.querySelector("main")?.setAttribute("aria-label", "Skill chat A ${nonce}");
       return true;
     })()`);
+    await appendLiveChatGptHelperWithComposerRemoved(page, {
+      nonce: `pending-cross-chat-${nonce}`,
+      userText: "Load the E2E Skill in chat A while its composer is unavailable.",
+      helperText: helper,
+      heldFormProperty: "__heldCrossChatSkillForm"
+    });
     await waitForEvaluate(page, `(() => {
       const panel = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)});
       return /result cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
     })()`, "chat A Skill result to remain queued without a composer");
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/tmux-test-page.html?skill-case=pending-cross-chat-b&route=${nonce}");
+      history.pushState({}, "", "/c/${nonce}-b");
       document.getElementById("thread").innerHTML = "";
       appendMessage("user", "This is unrelated chat B and must not receive chat A local Skill content.");
       document.querySelector("main").appendChild(window.__heldCrossChatSkillForm);
       delete window.__heldCrossChatSkillForm;
+      document.querySelector("main")?.setAttribute("aria-label", "Skill chat B ${nonce}");
       return true;
     })()`);
     await waitForValue(async () => {
@@ -3038,7 +3122,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       "A queued local Skill result from chat A must be discarded before chat B composer delivery.");
     assert.equal(await countSkillLoadReplies(page), 0,
       "Unrelated chat B must receive no Skill load result from chat A.");
-  });
+  }, { baseUrl: CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL });
 
   await withFreshSkillCasePage(debugPort, "late-history-manual-recovery", async (page, nonce) => {
     await page.evaluate(`(() => {
@@ -3402,6 +3486,383 @@ async function withFreshSkillCasePage(debugPort, caseName, task, options = {}) {
   }
 }
 
+async function runFirstResponseRouteAssignmentE2E(debugPort) {
+  await withFreshRouteCasePage(debugPort, "helper-completes-after-route", async (page, nonce) => {
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-route-final-mutation-${process.pid}-${nonce}.txt`);
+    const outputToken = `ROUTE_FINAL_MUTATION_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'executed\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await appendLiveChatGptHelper(page, {
+      nonce: `final-mutation-${nonce}`,
+      userText: "Run the helper that completes after this chat receives its permanent URL.",
+      helperText: [
+        `ai-helper-shell-start:route-final-mutation-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n"),
+      routePath: `/c/${nonce}`
+    });
+    const submitted = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "helper completed by the final DOM mutation after route assignment");
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "executed\n",
+      "A helper completed after route assignment must execute exactly once.");
+  });
+
+  await withFreshRouteCasePage(debugPort, "inflight-retained-transcript", async (page, nonce) => {
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-route-retained-${process.pid}-${nonce}.txt`);
+    const outputToken = `FIRST_RESPONSE_ROUTE_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await appendLiveChatGptHelper(page, {
+      nonce: `retained-${nonce}`,
+      userText: "Run this helper while the new chat receives its permanent URL.",
+      helperText: [
+      `ai-helper-shell-start:first-response-route-${nonce}`,
+      command,
+      "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "first-response route helper backend execution to start"
+    );
+
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/c/${nonce}");
+      // pushState itself has no DOM event. Change one attribute from the
+      // content observer's explicit filter so the production lifecycle sees
+      // the route exactly as it would in a host render batch, without changing
+      // the retained conversation/helper text.
+      document.querySelector("main")?.setAttribute("aria-label", "Conversation route ${nonce}");
+      return true;
+    })()`);
+    const submitted = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+      return matches.length === 1 ? (matches[0].innerText || matches[0].textContent || "") : "";
+    })()`, "in-flight first-response result to survive a retained-transcript route assignment");
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n",
+      "A retained first-response route assignment must execute the shell command exactly once.");
+    const contentWorld = (await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") return null;
+      return {
+        contentWorld: true,
+        activeCallId,
+        pending: pendingHelperDeliveries.size,
+        composer: document.getElementById("composer")?.innerText || ""
+      };
+    })()`)).find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(contentWorld, {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+  });
+
+  await withFreshRouteCasePage(debugPort, "inserted-redraw-retained-transcript", async (page, nonce) => {
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-route-inserted-${process.pid}-${nonce}.txt`);
+    const outputToken = `INSERTED_ROUTE_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'executed\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      const originalComposer = document.getElementById("composer");
+      const send = document.getElementById("send");
+      window.__insertedRouteRedrawn = false;
+      window.__insertedRouteAssigned = false;
+      window.__insertedRouteSnapshot = "";
+      let releaseSend = false;
+      const blockEarlySend = (event) => {
+        const currentComposer = document.getElementById("composer");
+        const blocksClick = event.type === "click" &&
+          (event.target === send || send.contains(event.target));
+        const blocksSubmit = event.type === "submit";
+        const blocksEnter = event.type === "keydown" && event.key === "Enter" &&
+          currentComposer && (event.target === currentComposer || currentComposer.contains(event.target));
+        if (!releaseSend && (blocksClick || blocksSubmit || blocksEnter)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      };
+      document.addEventListener("click", blockEarlySend, true);
+      document.addEventListener("submit", blockEarlySend, true);
+      document.addEventListener("keydown", blockEarlySend, true);
+      const onPluginWrite = () => {
+        const text = originalComposer.innerText || originalComposer.textContent || "";
+        if (!text.includes(${JSON.stringify(outputToken)})) return;
+        originalComposer.removeEventListener("input", onPluginWrite);
+        window.__insertedRouteSnapshot = text;
+        window.setTimeout(() => {
+          const replacement = originalComposer.cloneNode(false);
+          originalComposer.replaceWith(replacement);
+          replacement.innerText = text;
+          replacement.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            composed: true,
+            inputType: "insertText",
+            data: text
+          }));
+          window.__insertedRouteRedrawn = true;
+        }, 50);
+        window.setTimeout(() => {
+          history.pushState({}, "", "/c/${nonce}");
+          document.querySelector("main")?.setAttribute("aria-label", "Inserted route ${nonce}");
+          window.__insertedRouteAssigned = true;
+        }, 180);
+        window.setTimeout(() => {
+          releaseSend = true;
+          document.removeEventListener("click", blockEarlySend, true);
+          document.removeEventListener("submit", blockEarlySend, true);
+          document.removeEventListener("keydown", blockEarlySend, true);
+        }, 750);
+      };
+      originalComposer.addEventListener("input", onPluginWrite);
+      return true;
+    })()`);
+    await appendLiveChatGptHelper(page, {
+      nonce: `inserted-${nonce}`,
+      userText: "Run this helper while its inserted result and composer survive the permanent URL assignment.",
+      helperText: [
+        `ai-helper-shell-start:inserted-response-route-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    const submitted = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+      if (window.__insertedRouteRedrawn !== true ||
+          window.__insertedRouteAssigned !== true ||
+          location.pathname !== "/c/${nonce}" ||
+          !window.__insertedRouteSnapshot || matches.length !== 1 ||
+          (document.getElementById("composer")?.innerText || "")) {
+        return "";
+      }
+      return matches[0].innerText || matches[0].textContent || "";
+    })()`, "inserted exact result to resume send-only after composer redraw and permanent route assignment");
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "executed\n",
+      "An inserted-result route assignment must not replay the backend command.");
+    const contentWorld = (await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") return null;
+      return { contentWorld: true, activeCallId, pending: pendingHelperDeliveries.size };
+    })()`)).find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(contentWorld, { contentWorld: true, activeCallId: "", pending: 0 });
+  });
+
+  await withFreshRouteCasePage(debugPort, "inflight-replaced-transcript", async (page, nonce) => {
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-route-replaced-${process.pid}-${nonce}.txt`);
+    const outputToken = `OLD_CHAT_ROUTE_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    await appendLiveChatGptHelper(page, {
+      nonce: `replaced-${nonce}`,
+      userText: "Run a helper in the chat that will be replaced.",
+      helperText: [
+      `ai-helper-shell-start:replaced-response-route-${nonce}`,
+      command,
+      "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "replacement-route helper backend execution to start"
+    );
+
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/c/${nonce}");
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "This is a different chat transcript.");
+      document.querySelector("main")?.setAttribute("aria-label", "Different conversation route ${nonce}");
+      return true;
+    })()`);
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("done\n"),
+      "old-chat helper execution to finish after transcript replacement"
+    );
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3500))");
+    const pageState = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      submittedMatches: Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
+    }))()`);
+    const contentWorld = (await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") return null;
+      return { contentWorld: true, activeCallId, pending: pendingHelperDeliveries.size };
+    })()`)).find((entry) => entry.value?.contentWorld)?.value;
+    assert.deepEqual(pageState, {
+      composer: "",
+      submittedMatches: 0,
+      bodyContainsOldResult: false
+    }, "A completed old-chat result must never enter the replacement transcript or composer.");
+    assert.deepEqual(contentWorld, { contentWorld: true, activeCallId: "", pending: 0 });
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n",
+      "Transcript replacement must not replay the already-running backend command.");
+  });
+}
+
+async function withFreshRouteCasePage(debugPort, caseName, task) {
+  const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`.replace(/[^a-z0-9]/gi, "").slice(-24);
+  const url = `${CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL}?isolated-route-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
+  const page = await openChromePage(debugPort, url);
+  try {
+    await page.send("Page.enable");
+    await page.send("Runtime.enable");
+    await page.send("Page.bringToFront");
+    await waitForEvaluate(page, "document.readyState === 'complete'", `${caseName} route page load`);
+    await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`,
+      `${caseName} route extension panel`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2600))");
+    await task(page, nonce);
+  } finally {
+    await page.send("Page.close").catch(() => null);
+    page.close();
+  }
+}
+
+async function appendLiveChatGptHelper(page, { nonce, userText, helperText, routePath = "" }) {
+  await page.evaluate(`(async () => {
+    const thread = document.getElementById("thread");
+    const send = document.getElementById("send");
+    thread.innerHTML = "";
+
+    const user = document.createElement("li");
+    user.dataset.messageRole = "user";
+    user.dataset.messageAuthorRole = "user";
+    user.dataset.messageId = ${JSON.stringify(`user-${nonce}`)};
+    const userCopy = document.createElement("div");
+    userCopy.setAttribute("data-user-message-copy", "true");
+    userCopy.textContent = ${JSON.stringify(userText)};
+    user.appendChild(userCopy);
+    thread.appendChild(user);
+
+    send.setAttribute("aria-label", "Stop generating");
+    send.setAttribute("data-testid", "stop-button");
+    send.textContent = "Stop";
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const assistant = document.createElement("li");
+    assistant.dataset.messageRole = "assistant";
+    assistant.dataset.messageAuthorRole = "assistant";
+    assistant.dataset.messageId = ${JSON.stringify(`assistant-${nonce}`)};
+    const markdown = document.createElement("div");
+    markdown.setAttribute("data-assistant-markdown", "true");
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.className = "language-text";
+    const lines = ${JSON.stringify(String(helperText || ""))}.split("\\n");
+    code.textContent = lines.slice(0, Math.min(2, lines.length)).join("\\n");
+    pre.appendChild(code);
+    markdown.appendChild(pre);
+    assistant.appendChild(markdown);
+    thread.appendChild(assistant);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    if (${JSON.stringify(String(routePath || ""))}) {
+      history.pushState({}, "", ${JSON.stringify(String(routePath || ""))});
+      document.querySelector("main")?.setAttribute(
+        "aria-label",
+        ${JSON.stringify(`Conversation route ${nonce}`)}
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    code.textContent = ${JSON.stringify(String(helperText || ""))};
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    send.setAttribute("aria-label", "Send message");
+    send.setAttribute("data-testid", "send-button");
+    send.textContent = "Send";
+    return true;
+  })()`);
+}
+
+async function appendLiveChatGptHelperWithComposerRemoved(page, {
+  nonce,
+  userText,
+  helperText,
+  heldFormProperty
+}) {
+  await page.evaluate(`(async () => {
+    const thread = document.getElementById("thread");
+    const form = document.getElementById("composerForm");
+    const send = document.getElementById("send");
+    thread.innerHTML = "";
+
+    const user = document.createElement("li");
+    user.dataset.messageRole = "user";
+    user.dataset.messageAuthorRole = "user";
+    user.dataset.messageId = ${JSON.stringify(`user-${nonce}`)};
+    const userCopy = document.createElement("div");
+    userCopy.setAttribute("data-user-message-copy", "true");
+    userCopy.textContent = ${JSON.stringify(userText)};
+    user.appendChild(userCopy);
+    thread.appendChild(user);
+
+    send.setAttribute("aria-label", "Stop generating");
+    send.setAttribute("data-testid", "stop-button");
+    send.textContent = "Stop";
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const assistant = document.createElement("li");
+    assistant.dataset.messageRole = "assistant";
+    assistant.dataset.messageAuthorRole = "assistant";
+    assistant.dataset.messageId = ${JSON.stringify(`assistant-${nonce}`)};
+    const markdown = document.createElement("div");
+    markdown.setAttribute("data-assistant-markdown", "true");
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.className = "language-text";
+    const lines = ${JSON.stringify(String(helperText || ""))}.split("\\n");
+    code.textContent = lines.slice(0, Math.min(2, lines.length)).join("\\n");
+    pre.appendChild(code);
+    markdown.appendChild(pre);
+    assistant.appendChild(markdown);
+    thread.appendChild(assistant);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    code.textContent = ${JSON.stringify(String(helperText || ""))};
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    send.setAttribute("aria-label", "Send message");
+    send.setAttribute("data-testid", "send-button");
+    send.textContent = "Send";
+    // Let the real content observer consume the exact Stop→Send transition,
+    // then remove the composer well before its 900ms quiet scan can dispatch.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    window[${JSON.stringify(heldFormProperty)}] = form;
+    window[${JSON.stringify(`${heldFormProperty}User`)}] = user;
+    window[${JSON.stringify(`${heldFormProperty}Assistant`)}] = assistant;
+    form.remove();
+    return true;
+  })()`);
+}
+
 function countSkillLoadRepliesExpression() {
   return `() => Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
     .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length`;
@@ -3525,6 +3986,7 @@ function buildE2eSkillSource({ revision }) {
     `revision ${revision}`,
     "home=$HOME",
     "allowed=${E2E_SKILL_ALLOWED}",
+    "env_file=${SKILL_LOAD_E2E_ENV}",
     "secret=${E2E_SKILL_SECRET}",
     "arguments=$ARGUMENTS",
     "Embedded helper documentation must remain inert:",
@@ -3533,6 +3995,19 @@ function buildE2eSkillSource({ revision }) {
     "ai-helper-skill-end",
     ""
   ].join("\n");
+}
+
+function writeE2eExecutionEnvironment(filePath, {
+  shellExecutionEnvValue,
+  skillLifecycleEnvValue,
+  skillLoadEnvValue
+}) {
+  fs.writeFileSync(filePath, [
+    `AI_SHELL_E2E_ENV=${shellExecutionEnvValue}`,
+    `SKILL_LIFECYCLE_E2E_ENV=${skillLifecycleEnvValue}`,
+    `SKILL_LOAD_E2E_ENV=${skillLoadEnvValue}`,
+    ""
+  ].join("\n"), { mode: 0o600 });
 }
 
 async function appendAssistantSkillHelper(page, lines) {

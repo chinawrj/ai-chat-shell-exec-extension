@@ -97,7 +97,7 @@ const context = {
       releaseVersion: "0.6.0",
       serverProtocolVersion: 12,
       helperProtocolVersion: 4,
-      skillProtocolVersion: 5,
+      skillProtocolVersion: 6,
       allowedOrigin: "chrome-extension://lkmeogidbglhedgekjgbpbfjkpapnhke",
       pid: 123
     })

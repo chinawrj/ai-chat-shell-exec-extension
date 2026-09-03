@@ -49,6 +49,7 @@ async function main() {
   await testDescriptionAndExpandedLoadBoundaries();
   await testFormattedSkillLoadReplyBoundaries();
   testEnvironmentExpansionIsAllowlistedAndSinglePass();
+  await testSkillLoadUsesFreshExecutionEnvironmentFile();
   await testSkillLoadRequiresCurrentCatalog();
   testCorruptStateIsRebuilt();
   console.log("server Skill catalog tests passed");
@@ -745,6 +746,114 @@ function testEnvironmentExpansionIsAllowlistedAndSinglePass() {
   assert.equal(boundedRuntimeExpansion.ok, false);
   assert.equal(boundedRuntimeExpansion.tooLarge, true);
   assert.equal(boundedRuntimeExpansion.content, "", "An oversized expansion must not retain a large partial body.");
+}
+
+async function testSkillLoadUsesFreshExecutionEnvironmentFile() {
+  const root = makeTempDir("skill-load-env-file-root-");
+  const stateDir = makeTempDir("skill-load-env-file-state-");
+  const environmentPath = path.join(stateDir, "runtime.env");
+  writeSkill(root, "env-file-load", {
+    name: "env-file-load",
+    description: "Execution environment file Skill load coverage",
+    body: [
+      "file_only=${SKILL_LOAD_FILE_ONLY}",
+      "overlap=${SKILL_LOAD_OVERLAP}",
+      "process_allowed=${PROCESS_ALLOWED}",
+      "process_secret=${PROCESS_SECRET}",
+      "one_pass=${ONE_PASS}",
+      "claude=$ARGUMENTS ${CLAUDE_SESSION_ID} ${CLAUDE_EFFORT} ${CLAUDE_PROJECT_DIR}",
+      "roots=$AI_HELPER_SKILL_ROOTS_JSON",
+      "root_source=$AI_HELPER_SKILL_ROOT_SOURCE"
+    ].join("\n")
+  });
+  fs.writeFileSync(environmentPath, [
+    "SKILL_LOAD_FILE_ONLY=file-one",
+    "SKILL_LOAD_OVERLAP=file-overlap-one",
+    "SKILL_LOAD_UNREFERENCED=must-not-be-copied",
+    "ONE_PASS='expanded-$PROCESS_SECRET'",
+    "ARGUMENTS=must-remain-runtime-placeholder",
+    "CLAUDE_SESSION_ID=must-remain-session-placeholder",
+    "CLAUDE_EFFORT=must-remain-effort-placeholder",
+    "CLAUDE_PROJECT_DIR=must-remain-project-placeholder",
+    "AI_HELPER_SKILL_ROOTS_JSON=must-not-spoof-server-roots",
+    "AI_HELPER_SKILL_ROOT_SOURCE=must-not-spoof-server-root-source",
+    ""
+  ].join("\n"), { mode: 0o600 });
+  const env = {
+    AI_HELPER_SKILL_PATHS: root,
+    AI_CHAT_SHELL_ENV_FILE: environmentPath,
+    AI_HELPER_SKILL_ENV_ALLOWLIST: "PROCESS_ALLOWED",
+    PROCESS_ALLOWED: "allowed-process-value",
+    PROCESS_SECRET: "hidden-process-value",
+    SKILL_LOAD_OVERLAP: "process-overlap"
+  };
+  const service = new SkillCatalogService({ stateDir, env, cwd: root, homeDir: root });
+  const list = await installSkillForTest(service, "env-file-load");
+  const loaded = service.load({ skillId: "env-file-load", catalogSha: list.catalogSha });
+  assert.equal(loaded.ok, true, JSON.stringify(loaded));
+  assert.ok(loaded.content.includes("file_only=file-one"), "Every env-file variable must be load-expandable without a duplicate allowlist entry.");
+  assert.ok(loaded.content.includes("overlap=file-overlap-one"), "The freshly loaded env file must override a same-named server-process value.");
+  assert.ok(loaded.content.includes("process_allowed=allowed-process-value"), "The existing process-environment allowlist must remain supported.");
+  assert.ok(loaded.content.includes("process_secret=${PROCESS_SECRET}"), "A process-only non-allowlisted variable must remain literal.");
+  assert.ok(loaded.content.includes("one_pass=expanded-$PROCESS_SECRET"), "Env-file replacement must remain single-pass.");
+  assert.ok(loaded.content.includes("claude=$ARGUMENTS ${CLAUDE_SESSION_ID} ${CLAUDE_EFFORT} ${CLAUDE_PROJECT_DIR}"),
+    "Claude runtime placeholders must remain literal even when the env file contains the same names.");
+  assert.ok(loaded.content.includes(`roots=${JSON.stringify([root])}`), "Server-owned runtime placeholders must override spoofing env-file values.");
+  assert.ok(loaded.content.includes("root_source=AI_HELPER_SKILL_PATHS"));
+  assert.deepEqual(loaded.replacedVariables, [
+    "AI_HELPER_SKILL_ROOTS_JSON",
+    "AI_HELPER_SKILL_ROOT_SOURCE",
+    "ONE_PASS",
+    "PROCESS_ALLOWED",
+    "SKILL_LOAD_FILE_ONLY",
+    "SKILL_LOAD_OVERLAP"
+  ]);
+  for (const name of ["ARGUMENTS", "CLAUDE_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_PROJECT_DIR"]) {
+    assert.ok(loaded.preservedVariables.includes(name), `${name} must remain a Claude runtime placeholder.`);
+  }
+  assert.ok(loaded.preservedVariables.includes("PROCESS_SECRET"));
+  assert.ok(!loaded.content.includes("hidden-process-value"));
+  assert.ok(!loaded.content.includes("must-not-spoof-server-roots"));
+  assert.ok(!loaded.content.includes("must-not-spoof-server-root-source"));
+  assert.ok(!JSON.stringify(loaded).includes("must-not-be-copied"),
+    "An env-file value that the Skill never references must not enter the load response.");
+
+  fs.writeFileSync(environmentPath, [
+    "SKILL_LOAD_FILE_ONLY=file-two",
+    "SKILL_LOAD_OVERLAP=file-overlap-two",
+    "SKILL_LOAD_UNREFERENCED=still-must-not-be-copied",
+    "ONE_PASS='hot-$PROCESS_SECRET'",
+    "ARGUMENTS=still-must-remain-runtime-placeholder",
+    "CLAUDE_SESSION_ID=still-must-remain-session-placeholder",
+    "CLAUDE_EFFORT=still-must-remain-effort-placeholder",
+    "CLAUDE_PROJECT_DIR=still-must-remain-project-placeholder",
+    "AI_HELPER_SKILL_ROOTS_JSON=still-must-not-spoof-server-roots",
+    "AI_HELPER_SKILL_ROOT_SOURCE=still-must-not-spoof-server-root-source",
+    ""
+  ].join("\n"), { mode: 0o600 });
+  const hotReloaded = service.load({ skillId: "env-file-load", catalogSha: list.catalogSha });
+  assert.equal(hotReloaded.ok, true, JSON.stringify(hotReloaded));
+  assert.ok(hotReloaded.content.includes("file_only=file-two"));
+  assert.ok(hotReloaded.content.includes("overlap=file-overlap-two"));
+  assert.ok(hotReloaded.content.includes("one_pass=hot-$PROCESS_SECRET"));
+  assert.ok(!JSON.stringify(hotReloaded).includes("still-must-not-be-copied"));
+  const unchangedCatalog = service.list();
+  assert.equal(unchangedCatalog.catalogSha, list.catalogSha, "Env-file changes must not create an effective/catalog SHA.");
+  assert.equal(unchangedCatalog.version, list.version, "Env-file changes alone must not increment the Skill catalog version.");
+
+  fs.writeFileSync(environmentPath, "SKILL_LOAD_FILE_ONLY=unreturned-value\nmalformed-line\n", { mode: 0o600 });
+  const malformed = service.load({ skillId: "env-file-load", catalogSha: list.catalogSha });
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.errorCode, "execution-env-file-malformed");
+  assert.equal(malformed.content, undefined);
+  assert.ok(!JSON.stringify(malformed).includes("unreturned-value"));
+  assert.ok(!JSON.stringify(malformed).includes(environmentPath));
+
+  env.AI_CHAT_SHELL_ENV_FILE = path.join(stateDir, "missing-runtime.env");
+  const missing = service.load({ skillId: "env-file-load", catalogSha: list.catalogSha });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.errorCode, "execution-env-file-unavailable");
+  assert.ok(!JSON.stringify(missing).includes(stateDir));
 }
 
 async function testSkillLoadRequiresCurrentCatalog() {
