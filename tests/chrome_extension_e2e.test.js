@@ -14,6 +14,7 @@ const EXTENSION_DIR = path.join(ROOT_DIR, "extension");
 const TEST_PAGE_URL = "https://localhost:17443/tmux-test-page.html";
 const CSP_DRAWIO_TEST_PAGE_URL = "https://localhost:17443/drawio-csp-test-page.html";
 const M365_TEST_PAGE_URL = "https://m365.cloud.microsoft:17443/tmux-test-page.html";
+const M365_NEW_CHAT_ROUTE_TEST_PAGE_URL = "https://m365.cloud.microsoft:17443/chat";
 const CHATGPT_CONTRACT_TEST_PAGE_URL = "https://chatgpt.com:17443/chatgpt-contract-test-page.html";
 const CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL = "https://chatgpt.com:17443/";
 const EXTENSION_STATUS_ID = "ai-chat-shell-exec-status";
@@ -357,6 +358,7 @@ async function main() {
   }
   if (ROUTE_ONLY) {
     await runFirstResponseRouteAssignmentE2E(debugPort);
+    await runM365FirstResponseRouteAssignmentE2E(debugPort);
     return;
   }
 
@@ -2805,6 +2807,231 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       "A Skill helper after a later ordinary user turn must not reuse the plugin sync prompt.");
   }, { baseUrl: M365_TEST_PAGE_URL });
 
+  await withFreshSkillCasePage(debugPort, "m365-outer-settings-route-load", async (page, nonce) => {
+    const helper = makeLoad(`m365-outer-settings-route-${nonce}`);
+    const routeUuid = m365RouteUuid(nonce, "8");
+    const beforeUsers = await pageUserMessageCount(page);
+    await page.evaluate(`(() => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      document.getElementById("thread").innerHTML = "";
+      return true;
+    })()`);
+    await installContentRuntimeMessageCounter(page);
+    await installContentOuterSettingsGate(page);
+    await appendLiveM365Helper(page, {
+      nonce: `skill-outer-settings-${nonce}`,
+      userText: "Load the installed E2E Skill while the completed turn waits on settings and M365 assigns its URL.",
+      helperText: helper
+    });
+    await waitForContentOuterSettingsGate(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await page.evaluate(`history.pushState({}, "", "/chat/${routeUuid}"); true`);
+    assert.equal(await page.evaluate(`(() =>
+      window.__lastM365HelperUser?.isConnected === true &&
+      window.__lastM365HelperAssistant?.isConnected === true &&
+      window.__lastM365HelperUser?.nextElementSibling === window.__lastM365HelperAssistant &&
+      document.getElementById("thread")?.lastElementChild === window.__lastM365HelperAssistant
+    )()`), true,
+    "The Skill outer-settings test must retain the exact latest M365 turn and change only the URL.");
+    await releaseContentOuterSettingsGate(page);
+
+    const reply = await waitForNewUserMessage(
+      page,
+      beforeUsers,
+      "Local Skill load result:",
+      "M365 Skill load to resume after an outer-settings pushState-only assignment"
+    );
+    assert.match(reply, /revision 2/);
+    assert.equal(await countSkillLoadReplies(page), 1,
+      "The outer-settings route handoff must submit one Skill load reply.");
+    assert.equal(await contentRuntimeMessageCount(page, "skill-load"), 1,
+      "The outer-settings route handoff must issue one Skill load request.");
+    assert.deepEqual(await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`), {
+      pathname: `/chat/${routeUuid}`,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  }, { baseUrl: M365_NEW_CHAT_ROUTE_TEST_PAGE_URL });
+
+  await withFreshSkillCasePage(debugPort, "m365-first-route-live-load", async (page, nonce) => {
+    const helper = makeLoad(`m365-first-route-${nonce}`);
+    const routeUuid = m365RouteUuid(nonce, "4");
+    const beforeUsers = await pageUserMessageCount(page);
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 2);
+    await page.evaluate(`(async () => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      const thread = document.getElementById("thread");
+      thread.innerHTML = "";
+      appendMessage("user", "Load the installed E2E Skill while M365 assigns this chat its UUID URL.");
+      window.__m365SkillRouteUser = thread.lastElementChild;
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "pre-wrap";
+      content.textContent = ${JSON.stringify(helper.split("\n").slice(0, 2).join("\n"))};
+      article.appendChild(content);
+      thread.appendChild(article);
+      window.__m365SkillRouteAssistant = article;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      history.pushState({}, "", "/chat/${routeUuid}");
+      document.querySelector("main")?.setAttribute("aria-label", "M365 Skill route ${routeUuid}");
+      window.__m365SkillExactTurnAtRoute =
+        window.__m365SkillRouteUser?.nextElementSibling === window.__m365SkillRouteAssistant &&
+        thread.lastElementChild === window.__m365SkillRouteAssistant;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      content.textContent = ${JSON.stringify(helper)};
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      stop.remove();
+      return true;
+    })()`);
+    const reply = await waitForNewUserMessage(
+      page,
+      beforeUsers,
+      "Local Skill load result:",
+      "M365 Skill load response after the first UUID route assignment"
+    );
+    assert.match(reply, /revision 2/);
+    assert.equal(await countSkillLoadReplies(page), 1,
+      "The M365 UUID assignment must dispatch and submit the Skill load exactly once.");
+    const pageState = await page.evaluate(`(() => ({
+      hostname: location.hostname,
+      pathname: location.pathname,
+      retainedUserRoot: window.__m365SkillRouteUser?.isConnected === true,
+      retainedAssistantRoot: window.__m365SkillRouteAssistant?.isConnected === true,
+      exactTurnAtRoute: window.__m365SkillExactTurnAtRoute === true,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      loadReplies: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`);
+    assert.deepEqual(pageState, {
+      hostname: "m365.cloud.microsoft",
+      pathname: `/chat/${routeUuid}`,
+      retainedUserRoot: true,
+      retainedAssistantRoot: true,
+      exactTurnAtRoute: true,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      loadReplies: 1,
+      composer: ""
+    });
+    assert.equal(await contentRuntimeMessageCount(page, "skill-load"), 1,
+      "M365 first-route Skill recovery must issue exactly one Skill load request.");
+    assert.deepEqual(await contentHelperDeliveryState(page, "skill-load"), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+    await assertIsolatedSkillDispatchState(page, { expectedLoadReplies: 1, expectForce: false });
+  }, { baseUrl: M365_NEW_CHAT_ROUTE_TEST_PAGE_URL });
+
+  await withFreshSkillCasePage(debugPort, "m365-first-route-delayed-replacement-load", async (page, nonce) => {
+    const helper = makeLoad(`m365-first-route-replaced-${nonce}`);
+    const routeUuid = m365RouteUuid(nonce, "7");
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 2);
+    await page.evaluate(`(async () => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      const thread = document.getElementById("thread");
+      thread.innerHTML = "";
+      appendMessage("user", "Load a Skill from the M365 transcript that will be replaced after URL assignment.");
+      window.__m365ReplacedSkillUser = thread.lastElementChild;
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.setAttribute("aria-label", "Stop generating");
+      stop.textContent = "Stop generating";
+      document.querySelector("main").appendChild(stop);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const article = document.createElement("div");
+      article.className = "fai-CopilotMessage";
+      article.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "pre-wrap";
+      content.textContent = ${JSON.stringify(helper.split("\n").slice(0, 2).join("\n"))};
+      article.appendChild(content);
+      thread.appendChild(article);
+      window.__m365ReplacedSkillAssistant = article;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      history.pushState({}, "", "/chat/${routeUuid}");
+      document.querySelector("main")?.setAttribute("aria-label", "M365 delayed Skill route ${routeUuid}");
+      content.textContent = ${JSON.stringify(helper)};
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      stop.remove();
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2400))");
+    assert.equal(await contentRuntimeMessageCount(page, "skill-load"), 0,
+      "A Skill helper must not dispatch from an old transcript during route reconciliation.");
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      appendMessage("user", "This is the replacement M365 conversation.");
+      document.querySelector("main")?.setAttribute("aria-label", "M365 replacement Skill route ${routeUuid}");
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 4000))");
+    const pageState = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      oldUserConnected: window.__m365ReplacedSkillUser?.isConnected === true,
+      oldAssistantConnected: window.__m365ReplacedSkillAssistant?.isConnected === true,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      loadReplies: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`);
+    assert.deepEqual(pageState, {
+      pathname: `/chat/${routeUuid}`,
+      oldUserConnected: false,
+      oldAssistantConnected: false,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      userMessages: 1,
+      loadReplies: 0,
+      composer: ""
+    }, "A replaced M365 Skill turn must remain inert after the route settles.");
+    assert.equal(await contentRuntimeMessageCount(page, "skill-load"), 0,
+      "A replaced M365 Skill turn must never reach the local Skill backend.");
+    assert.deepEqual(await contentHelperDeliveryState(page, "skill-load"), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  }, { baseUrl: M365_NEW_CHAT_ROUTE_TEST_PAGE_URL });
+
   await withFreshSkillCasePage(debugPort, "new-chat-live-load", async (page, nonce) => {
     const helper = makeLoad(`new-chat-live-${nonce}`);
     await page.evaluate(`(async () => {
@@ -2923,7 +3150,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       stop.textContent = "Stop generating";
       document.querySelector("main").appendChild(stop);
       await new Promise((resolve) => setTimeout(resolve, 120));
-      history.pushState({}, "", "/tmux-test-page.html?skill-case=route-completion&route=${nonce}");
+      history.pushState({}, "", "/tmux-test-page.html/${nonce}");
       article.querySelector("code").textContent = ${JSON.stringify(helper)};
       stop.remove();
       return true;
@@ -2958,7 +3185,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       return true;
     })()`);
     await page.evaluate("new Promise((resolve) => setTimeout(resolve, 120))");
-    await page.evaluate(`history.pushState({}, "", "/tmux-test-page.html?skill-case=slow-route&route=${nonce}"); true`);
+    await page.evaluate(`history.pushState({}, "", "/tmux-test-page.html/${nonce}"); true`);
     await new Promise((resolve) => setTimeout(resolve, 3400));
     await page.evaluate(`(() => {
       document.querySelector("#slow-route-assistant code").textContent = ${JSON.stringify(helper)};
@@ -3729,6 +3956,849 @@ async function runFirstResponseRouteAssignmentE2E(debugPort) {
   });
 }
 
+async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
+  await withFreshM365RouteCasePage(debugPort, "outer-settings-pushstate-only", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "0");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-outer-settings-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_ROUTE_OUTER_SETTINGS_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'executed\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await installContentRuntimeMessageCounter(page);
+    await installContentOuterSettingsGate(page);
+    await appendLiveM365Helper(page, {
+      nonce: `outer-settings-${nonce}`,
+      userText: "Run this complete helper while the outer scan is waiting and M365 assigns its URL.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-outer-settings-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitForContentOuterSettingsGate(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await page.evaluate(`history.pushState({}, "", "/chat/${routeUuid}"); true`);
+    const exactTurnAtRoute = await page.evaluate(`(() =>
+      window.__lastM365HelperUser?.isConnected === true &&
+      window.__lastM365HelperAssistant?.isConnected === true &&
+      window.__lastM365HelperUser?.nextElementSibling === window.__lastM365HelperAssistant &&
+      document.getElementById("thread")?.lastElementChild === window.__lastM365HelperAssistant
+    )()`);
+    assert.equal(exactTurnAtRoute, true,
+      "The outer-settings test must change only the URL while retaining the exact completed turn.");
+    await releaseContentOuterSettingsGate(page);
+
+    const submitted = await waitForNewUserMessage(
+      page,
+      beforeUsers,
+      outputToken,
+      "M365 completed helper to resume after an outer-settings pushState-only assignment"
+    );
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "executed\n",
+      "The outer-settings route handoff must execute the completed helper exactly once.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "The outer-settings route handoff must issue exactly one backend run request.");
+    assert.deepEqual(await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`), {
+      pathname: `/chat/${routeUuid}`,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      submittedMatches: 1,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "outer-settings-same-text-replacement", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "9");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-copied-roots-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_ROUTE_COPIED_ROOTS_E2E_${nonce}`;
+    const userText = "Run this helper only for the exact originating M365 authored roots.";
+    const command = [
+      `printf 'executed\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const helperText = [
+      `ai-helper-shell-start:m365-route-copied-roots-${nonce}`,
+      command,
+      "ai-helper-shell-end"
+    ].join("\n");
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    await installContentRuntimeMessageCounter(page);
+    await installContentOuterSettingsGate(page);
+    await appendLiveM365Helper(page, {
+      nonce: `copied-roots-${nonce}`,
+      userText,
+      helperText
+    });
+    await waitForContentOuterSettingsGate(page);
+    await page.evaluate(`(() => {
+      const oldUser = window.__lastM365HelperUser;
+      const oldAssistant = window.__lastM365HelperAssistant;
+      const thread = document.getElementById("thread");
+      thread.innerHTML = "";
+      appendMessage("user", ${JSON.stringify(userText)});
+      window.__m365CopiedRouteUser = thread.lastElementChild;
+      const assistant = document.createElement("div");
+      assistant.className = "fai-CopilotMessage";
+      assistant.setAttribute("role", "article");
+      const content = document.createElement("div");
+      content.className = "fai-CopilotMessage__content";
+      content.style.whiteSpace = "pre-wrap";
+      content.textContent = ${JSON.stringify(helperText)};
+      assistant.appendChild(content);
+      thread.appendChild(assistant);
+      window.__m365CopiedRouteAssistant = assistant;
+      history.pushState({}, "", "/chat/${routeUuid}");
+      window.__m365CopiedOldRootsDetached =
+        oldUser?.isConnected === false && oldAssistant?.isConnected === false;
+      return true;
+    })()`);
+    await installM365UnexpectedUserSubmissionObserver(page, 0);
+    await releaseContentOuterSettingsGate(page);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 6500))");
+
+    assert.deepEqual(await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      oldRootsDetached: window.__m365CopiedOldRootsDetached === true,
+      exactReplacementTurn:
+        window.__m365CopiedRouteUser?.isConnected === true &&
+        window.__m365CopiedRouteAssistant?.isConnected === true &&
+        window.__m365CopiedRouteUser?.nextElementSibling === window.__m365CopiedRouteAssistant &&
+        document.getElementById("thread")?.lastElementChild === window.__m365CopiedRouteAssistant,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`), {
+      pathname: `/chat/${routeUuid}`,
+      oldRootsDetached: true,
+      exactReplacementTurn: true,
+      unexpectedUserInsertions: 0,
+      userMessages: 1,
+      submittedMatches: 0,
+      composer: ""
+    }, "Same text in replacement M365 roots must not inherit generation-time execution proof.");
+    assert.equal(fs.existsSync(markerPath), false,
+      "Same-text replacement M365 roots must not execute the copied helper.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 0,
+      "Same-text replacement M365 roots must issue no backend run request.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "inflight-retained-transcript", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "1");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-retained-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_ROUTE_RETAINED_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await installContentRuntimeMessageCounter(page);
+    await appendLiveM365Helper(page, {
+      nonce: `retained-${nonce}`,
+      userText: "Run this helper while M365 assigns the new conversation URL.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-retained-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "M365 route helper backend execution to start"
+    );
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/chat/${routeUuid}");
+      return true;
+    })()`);
+    const exactTurnAtRoute = await page.evaluate(`(() =>
+      window.__lastM365HelperUser?.isConnected === true &&
+      window.__lastM365HelperAssistant?.isConnected === true &&
+      window.__lastM365HelperUser?.nextElementSibling === window.__lastM365HelperAssistant &&
+      document.getElementById("thread")?.lastElementChild === window.__lastM365HelperAssistant
+    )()`);
+    assert.equal(exactTurnAtRoute, true,
+      "Route-only assignment must retain the exact latest adjacent M365 user/assistant turn.");
+    const submitted = await waitForNewUserMessage(
+      page,
+      beforeUsers,
+      outputToken,
+      "M365 in-flight result to survive the first UUID route assignment"
+    );
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    const pageState = await page.evaluate(`(() => ({
+      hostname: location.hostname,
+      pathname: location.pathname,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      composer: document.getElementById("composer")?.innerText || ""
+    }))()`);
+    assert.deepEqual(pageState, {
+      hostname: "m365.cloud.microsoft",
+      pathname: `/chat/${routeUuid}`,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      submittedMatches: 1,
+      composer: ""
+    });
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n",
+      "The M365 first-route helper must execute exactly once.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "The M365 first-route helper must issue exactly one backend run request.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "inserted-send-only", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "2");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-inserted-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_ROUTE_INSERTED_E2E_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'executed\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    const beforeUsers = await pageUserMessageCount(page);
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 2);
+    await page.evaluate(`(() => {
+      const originalComposer = document.getElementById("composer");
+      const send = document.getElementById("send");
+      let releaseSend = false;
+      window.__m365RouteWriteCount = 0;
+      window.__m365RouteFixtureInput = false;
+      window.__m365RouteComposerRedrawn = false;
+      window.__m365RouteAssigned = false;
+      window.__m365RouteWrittenText = "";
+      const pluginWrittenComposers = new WeakSet();
+      const countPluginWrite = (event) => {
+        const composer = event.target instanceof Element
+          ? event.target.closest("#composer")
+          : null;
+        const text = composer?.innerText || composer?.textContent || "";
+        if (window.__m365RouteFixtureInput !== true &&
+            text.includes(${JSON.stringify(outputToken)}) &&
+            !pluginWrittenComposers.has(composer)) {
+          pluginWrittenComposers.add(composer);
+          window.__m365RouteWriteCount += 1;
+        }
+      };
+      document.addEventListener("input", countPluginWrite, true);
+      const blockEarlySend = (event) => {
+        const currentComposer = document.getElementById("composer");
+        const blocksClick = event.type === "click" &&
+          (event.target === send || send.contains(event.target));
+        const blocksSubmit = event.type === "submit";
+        const blocksEnter = event.type === "keydown" && event.key === "Enter" &&
+          currentComposer && (event.target === currentComposer || currentComposer.contains(event.target));
+        if (!releaseSend && (blocksClick || blocksSubmit || blocksEnter)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      };
+      document.addEventListener("click", blockEarlySend, true);
+      document.addEventListener("submit", blockEarlySend, true);
+      document.addEventListener("keydown", blockEarlySend, true);
+      const onPluginWrite = () => {
+        const text = originalComposer.innerText || originalComposer.textContent || "";
+        if (!text.includes(${JSON.stringify(outputToken)}) || window.__m365RouteWrittenText) return;
+        window.__m365RouteWrittenText = text;
+        originalComposer.removeEventListener("input", onPluginWrite);
+        window.setTimeout(() => {
+          const replacement = originalComposer.cloneNode(false);
+          originalComposer.replaceWith(replacement);
+          replacement.innerText = text;
+          window.__m365RouteFixtureInput = true;
+          replacement.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            composed: true,
+            inputType: "insertText",
+            data: text
+          }));
+          window.__m365RouteFixtureInput = false;
+          window.__m365RouteComposerRedrawn = true;
+        }, 50);
+        window.setTimeout(() => {
+          history.pushState({}, "", "/chat/${routeUuid}");
+          document.querySelector("main")?.setAttribute("aria-label", "M365 inserted route ${routeUuid}");
+          window.__m365RouteAssigned = true;
+        }, 180);
+        window.setTimeout(() => {
+          releaseSend = true;
+          document.removeEventListener("click", blockEarlySend, true);
+          document.removeEventListener("submit", blockEarlySend, true);
+          document.removeEventListener("keydown", blockEarlySend, true);
+        }, 800);
+      };
+      originalComposer.addEventListener("input", onPluginWrite);
+      return true;
+    })()`);
+    await appendLiveM365Helper(page, {
+      nonce: `inserted-${nonce}`,
+      userText: "Run this helper while its exact M365 composer result survives URL assignment.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-inserted-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    let submitted;
+    try {
+      submitted = await waitForEvaluateValue(page, `(() => {
+      const matches = Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .slice(${Number(beforeUsers)})
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+      if (window.__m365RouteWriteCount !== 1 ||
+          window.__m365RouteComposerRedrawn !== true ||
+          window.__m365RouteAssigned !== true ||
+          location.pathname !== "/chat/${routeUuid}" ||
+          window.__m365UnexpectedUserInsertions !== 0 ||
+          window.__m365ExpectedUserInsertions !== 0 ||
+          matches.length !== 1 ||
+          (document.getElementById("composer")?.innerText || "")) {
+        return "";
+      }
+      return matches[0].innerText || matches[0].textContent || "";
+      })()`, "M365 exact inserted result to resume send-only after route assignment");
+    } catch (error) {
+      console.error("M365 inserted-route diagnostic", await page.evaluate(`(() => ({
+        pathname: location.pathname,
+        writeCount: window.__m365RouteWriteCount,
+        composerRedrawn: window.__m365RouteComposerRedrawn,
+        routeAssigned: window.__m365RouteAssigned,
+        unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+        expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+        composer: document.getElementById("composer")?.innerText || "",
+        userMessages: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+          .map((node) => node.innerText || node.textContent || "")
+      }))()`));
+      throw error;
+    }
+    assert.match(submitted, new RegExp(escapeRegExp(outputToken)));
+    assert.equal(await page.evaluate("window.__m365RouteWriteCount"), 1,
+      "M365 route recovery must transfer send ownership without a second composer write.");
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "executed\n",
+      "M365 send-only recovery must not replay the backend command.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "M365 send-only recovery must issue exactly one backend run request.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "delayed-transcript-replacement", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "5");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-delayed-replace-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_DELAYED_OLD_CHAT_RESULT_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await page.evaluate(`(() => {
+      window.__m365DelayedRouteLeakObserved = false;
+      window.__m365DelayedComposerLeakObserved = false;
+      window.__m365DelayedComposerWriteCount = 0;
+      const observeSubmittedOutput = () => {
+        const leaked = Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+          .some((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+        window.__m365DelayedRouteLeakObserved ||= leaked;
+      };
+      const observeComposerOutput = () => {
+        const text = document.getElementById("composer")?.innerText ||
+          document.getElementById("composer")?.textContent || "";
+        window.__m365DelayedComposerLeakObserved ||= text.includes(${JSON.stringify(outputToken)});
+      };
+      document.addEventListener("input", (event) => {
+        const composer = event.target instanceof Element ? event.target.closest("#composer") : null;
+        const text = composer?.innerText || composer?.textContent || "";
+        if (text.includes(${JSON.stringify(outputToken)})) {
+          window.__m365DelayedComposerWriteCount += 1;
+          window.__m365DelayedComposerLeakObserved = true;
+        }
+      }, true);
+      new MutationObserver(observeSubmittedOutput).observe(document.getElementById("thread"), {
+        childList: true,
+        subtree: true,
+        characterData: true
+      });
+      new MutationObserver(observeComposerOutput).observe(document.getElementById("composerForm"), {
+        childList: true,
+        subtree: true,
+        characterData: true
+      });
+      return true;
+    })()`);
+    await appendLiveM365Helper(page, {
+      nonce: `delayed-replace-${nonce}`,
+      userText: "Run a helper while the old M365 transcript remains mounted briefly after URL assignment.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-delayed-replace-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "delayed-replacement M365 backend execution to start"
+    );
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/chat/${routeUuid}");
+      document.querySelector("main")?.setAttribute("aria-label", "Delayed M365 route ${routeUuid}");
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2800))");
+    assert.equal(await page.evaluate("window.__m365DelayedRouteLeakObserved"), false,
+      "A result must not be submitted from the still-mounted old transcript during route reconciliation.");
+    const intermediatePageState = await page.evaluate(`(() => ({
+      composer: document.getElementById("composer")?.innerText || "",
+      composerLeakObserved: window.__m365DelayedComposerLeakObserved,
+      composerWriteCount: window.__m365DelayedComposerWriteCount,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions
+    }))()`);
+    assert.deepEqual(intermediatePageState, {
+      composer: "",
+      composerLeakObserved: false,
+      composerWriteCount: 0,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0
+    }, "The old transcript may retain exactly one queued result, but it must not write or submit during reconciliation.");
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n",
+      "The backend should finish once while route delivery remains quarantined.");
+    const quarantinedDeliveryState = await waitForValue(async () => {
+      const state = await contentHelperDeliveryState(page);
+      return state.pending === 1 ? state : undefined;
+    }, "completed delayed-route result to remain queued during reconciliation");
+    assert.deepEqual(quarantinedDeliveryState, {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 1,
+      composer: ""
+    });
+    await page.evaluate(`(() => {
+      document.getElementById("thread").innerHTML = "";
+      window.__m365ExpectedUserInsertions += 1;
+      appendMessage("user", "This delayed render is a different M365 conversation.");
+      const replacement = document.getElementById("composer").cloneNode(false);
+      document.getElementById("composer").replaceWith(replacement);
+      document.querySelector("main")?.setAttribute("aria-label", "Delayed replacement ${routeUuid}");
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3800))");
+    const pageState = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      leakObserved: window.__m365DelayedRouteLeakObserved,
+      composerLeakObserved: window.__m365DelayedComposerLeakObserved,
+      composerWriteCount: window.__m365DelayedComposerWriteCount,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      composer: document.getElementById("composer")?.innerText || "",
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
+    }))()`);
+    assert.deepEqual(pageState, {
+      pathname: `/chat/${routeUuid}`,
+      leakObserved: false,
+      composerLeakObserved: false,
+      composerWriteCount: 0,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      userMessages: 1,
+      composer: "",
+      submittedMatches: 0,
+      bodyContainsOldResult: false
+    }, "A delayed replacement transcript must never receive or briefly submit the old result.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "Delayed transcript replacement must not replay the backend command.");
+    const settledDeliveryState = await waitForValue(async () => {
+      const state = await contentHelperDeliveryState(page);
+      return state.pending === 0 ? state : undefined;
+    }, "delayed replacement pending result to be discarded after route settlement");
+    assert.deepEqual(settledDeliveryState, {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "post-write-transcript-replacement", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "6");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-post-write-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_POST_WRITE_OLD_RESULT_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'executed\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await page.evaluate(`(() => {
+      const send = document.getElementById("send");
+      let releaseSend = false;
+      window.__m365PostWriteCount = 0;
+      window.__m365PostWriteRouteAssigned = false;
+      window.__m365PostWriteLeakObserved = false;
+      const pluginWrittenComposers = new WeakSet();
+      const blockSend = (event) => {
+        const composer = document.getElementById("composer");
+        const blocksClick = event.type === "click" &&
+          (event.target === send || send.contains(event.target));
+        const blocksSubmit = event.type === "submit";
+        const blocksEnter = event.type === "keydown" && event.key === "Enter" &&
+          composer && (event.target === composer || composer.contains(event.target));
+        if (!releaseSend && (blocksClick || blocksSubmit || blocksEnter)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      };
+      document.addEventListener("click", blockSend, true);
+      document.addEventListener("submit", blockSend, true);
+      document.addEventListener("keydown", blockSend, true);
+      const observeSubmittedOutput = () => {
+        const leaked = Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+          .some((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)}));
+        window.__m365PostWriteLeakObserved ||= leaked;
+      };
+      new MutationObserver(observeSubmittedOutput).observe(document.getElementById("thread"), {
+        childList: true,
+        subtree: true,
+        characterData: true
+      });
+      const onPluginWrite = (event) => {
+        const composer = event.target instanceof Element
+          ? event.target.closest("#composer")
+          : null;
+        const text = composer?.innerText || composer?.textContent || "";
+        if (!text.includes(${JSON.stringify(outputToken)}) || pluginWrittenComposers.has(composer)) return;
+        pluginWrittenComposers.add(composer);
+        window.__m365PostWriteCount += 1;
+        if (window.__m365PostWriteCount !== 1) return;
+        window.setTimeout(() => {
+          history.pushState({}, "", "/chat/${routeUuid}");
+          document.getElementById("thread").innerHTML = "";
+          window.__m365ExpectedUserInsertions += 1;
+          appendMessage("user", "This is a different M365 conversation after the old result was written.");
+          const replacement = composer.cloneNode(false);
+          composer.replaceWith(replacement);
+          document.querySelector("main")?.setAttribute("aria-label", "Post-write replacement ${routeUuid}");
+          window.__m365PostWriteRouteAssigned = true;
+        }, 75);
+        window.setTimeout(() => {
+          releaseSend = true;
+          document.removeEventListener("click", blockSend, true);
+          document.removeEventListener("submit", blockSend, true);
+          document.removeEventListener("keydown", blockSend, true);
+        }, 900);
+      };
+      document.addEventListener("input", onPluginWrite, true);
+      return true;
+    })()`);
+    await appendLiveM365Helper(page, {
+      nonce: `post-write-${nonce}`,
+      userText: "Run a helper whose written result loses ownership during M365 URL assignment.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-post-write-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitForEvaluate(page, "window.__m365PostWriteRouteAssigned === true",
+      "post-write M365 route and transcript replacement");
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 5000))");
+    const pageState = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      writeCount: window.__m365PostWriteCount,
+      leakObserved: window.__m365PostWriteLeakObserved,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      composer: document.getElementById("composer")?.innerText || "",
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
+    }))()`);
+    assert.deepEqual(pageState, {
+      pathname: `/chat/${routeUuid}`,
+      writeCount: 1,
+      leakObserved: false,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      userMessages: 1,
+      composer: "",
+      submittedMatches: 0,
+      bodyContainsOldResult: false
+    }, "A route replacement after the first write must cancel send ownership without reinsertion.");
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "executed\n");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "Post-write route cancellation must not replay the backend command.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "inflight-replaced-transcript", async (page, nonce) => {
+    const routeUuid = m365RouteUuid(nonce, "3");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-replaced-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_OLD_CHAT_RESULT_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await appendLiveM365Helper(page, {
+      nonce: `replaced-${nonce}`,
+      userText: "Run a helper in the M365 chat that will be replaced.",
+      helperText: [
+        `ai-helper-shell-start:m365-route-replaced-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "M365 replacement-route backend execution to start"
+    );
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/chat/${routeUuid}");
+      document.getElementById("thread").innerHTML = "";
+      window.__m365ExpectedUserInsertions += 1;
+      appendMessage("user", "This is a different M365 conversation.");
+      document.querySelector("main")?.setAttribute("aria-label", "Different M365 route ${routeUuid}");
+      return true;
+    })()`);
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("done\n"),
+      "old M365 helper execution to finish after transcript replacement"
+    );
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3500))");
+    const pageState = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      composer: document.getElementById("composer")?.innerText || "",
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
+      bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
+    }))()`);
+    assert.deepEqual(pageState, {
+      pathname: `/chat/${routeUuid}`,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      userMessages: 1,
+      composer: "",
+      submittedMatches: 0,
+      bodyContainsOldResult: false
+    },
+      "An old M365 result must never enter a replacement transcript or composer.");
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "Immediate transcript replacement must not replay the backend command.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+
+  await withFreshM365RouteCasePage(debugPort, "permanent-to-permanent-rejected", async (page, nonce) => {
+    const routeUuidA = m365RouteUuid(nonce, "a");
+    const routeUuidB = m365RouteUuid(nonce, "b");
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/chat/${routeUuidA}");
+      document.querySelector("main")?.setAttribute("aria-label", "Existing M365 route ${routeUuidA}");
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2600))");
+    const markerPath = path.join(os.tmpdir(), `ai-chat-shell-m365-route-existing-${process.pid}-${nonce}.txt`);
+    const outputToken = `M365_EXISTING_CHAT_RESULT_${nonce}`;
+    cleanup.push(() => fs.rmSync(markerPath, { force: true }));
+    const command = [
+      `printf 'started\\n' >> ${shellQuote(markerPath)}`,
+      "sleep 2",
+      `printf 'done\\n' >> ${shellQuote(markerPath)}`,
+      `printf ${shellQuote(outputToken)}`
+    ].join("; ");
+    await installContentRuntimeMessageCounter(page);
+    await installM365UnexpectedUserSubmissionObserver(page, 1);
+    await appendLiveM365Helper(page, {
+      nonce: `existing-${nonce}`,
+      userText: "Run a helper in an already permanent M365 conversation.",
+      helperText: [
+        `ai-helper-shell-start:m365-existing-route-${nonce}`,
+        command,
+        "ai-helper-shell-end"
+      ].join("\n")
+    });
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("started\n"),
+      "existing M365 route backend execution to start"
+    );
+    await page.evaluate(`(() => {
+      history.pushState({}, "", "/chat/${routeUuidB}");
+      document.querySelector("main")?.setAttribute("aria-label", "Other permanent M365 route ${routeUuidB}");
+      return true;
+    })()`);
+    await waitFor(
+      () => fs.existsSync(markerPath) && fs.readFileSync(markerPath, "utf8").includes("done\n"),
+      "existing-route M365 helper execution to finish locally"
+    );
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 3500))");
+    const pageState = await page.evaluate(`(() => ({
+      pathname: location.pathname,
+      unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
+      expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
+      userMessages: document.querySelectorAll('.fai-UserMessage[role="article"]').length,
+      composer: document.getElementById("composer")?.innerText || "",
+      submittedMatches: Array.from(document.querySelectorAll('.fai-UserMessage[role="article"]'))
+        .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length
+    }))()`);
+    assert.deepEqual(pageState, {
+      pathname: `/chat/${routeUuidB}`,
+      unexpectedUserInsertions: 0,
+      expectedUserInsertionsRemaining: 0,
+      userMessages: 1,
+      composer: "",
+      submittedMatches: 0
+    },
+      "A permanent M365 conversation route must never hand its result to a second permanent conversation URL.");
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "started\ndone\n",
+      "Rejecting a permanent-to-permanent handoff must not replay the backend command.");
+    assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
+      "Permanent-to-permanent rejection must not replay the backend command.");
+    assert.deepEqual(await contentHelperDeliveryState(page), {
+      contentWorld: true,
+      activeCallId: "",
+      pending: 0,
+      composer: ""
+    });
+    await assertContentOperationLocksClear(page);
+  });
+}
+
+async function withFreshM365RouteCasePage(debugPort, caseName, task) {
+  const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`.replace(/[^a-z0-9]/gi, "").slice(-24);
+  const url = `${M365_NEW_CHAT_ROUTE_TEST_PAGE_URL}?isolated-m365-route-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
+  const page = await openChromePage(debugPort, url);
+  try {
+    await page.send("Page.enable");
+    await page.send("Runtime.enable");
+    await page.send("Page.bringToFront");
+    await waitForEvaluate(page, "document.readyState === 'complete'", `${caseName} M365 route page load`);
+    await waitForEvaluate(page, `Boolean(document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)}))`,
+      `${caseName} M365 route extension panel`);
+    await page.evaluate(`(() => {
+      window.__m365DomMode = true;
+      window.__flattenSubmittedPluginText = true;
+      window.__m365LexicalComposerMode = true;
+      document.getElementById("thread").innerHTML = "";
+      document.getElementById("composer")?.setAttribute("aria-label", "Message Copilot");
+      return true;
+    })()`);
+    await page.evaluate("new Promise((resolve) => setTimeout(resolve, 2600))");
+    await task(page, nonce);
+  } finally {
+    await page.send("Page.close").catch(() => null);
+    page.close();
+  }
+}
+
+async function appendLiveM365Helper(page, { nonce, userText, helperText }) {
+  await page.evaluate(`(async () => {
+    const thread = document.getElementById("thread");
+    appendMessage("user", ${JSON.stringify(userText)});
+    window.__lastM365HelperUser = thread.lastElementChild;
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.setAttribute("aria-label", "Stop generating");
+    stop.textContent = "Stop generating";
+    document.querySelector("main").appendChild(stop);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const article = document.createElement("div");
+    article.className = "fai-CopilotMessage";
+    article.setAttribute("role", "article");
+    const content = document.createElement("div");
+    content.className = "fai-CopilotMessage__content";
+    content.style.whiteSpace = "pre-wrap";
+    const lines = ${JSON.stringify(String(helperText || ""))}.split("\\n");
+    content.textContent = lines.slice(0, Math.min(2, lines.length)).join("\\n");
+    article.appendChild(content);
+    thread.appendChild(article);
+    window.__lastM365HelperAssistant = article;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    content.textContent = ${JSON.stringify(String(helperText || ""))};
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    stop.remove();
+    return ${JSON.stringify(String(nonce || ""))};
+  })()`);
+}
+
+function m365RouteUuid(nonce, discriminator) {
+  const tail = Buffer.from(`${nonce}-${discriminator}`, "utf8")
+    .toString("hex")
+    .padEnd(12, "0")
+    .slice(-12);
+  const nibble = /^[ab]$/i.test(String(discriminator || ""))
+    ? String(discriminator).toLowerCase()
+    : String(discriminator || "1").replace(/[^a-f0-9]/gi, "").slice(-1) || "1";
+  return `${nibble.repeat(8)}-${nibble.repeat(4)}-4${nibble.repeat(3)}-8${nibble.repeat(3)}-${tail}`;
+}
+
 async function withFreshRouteCasePage(debugPort, caseName, task) {
   const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`.replace(/[^a-z0-9]/gi, "").slice(-24);
   const url = `${CHATGPT_NEW_CHAT_ROUTE_TEST_PAGE_URL}?isolated-route-case=${encodeURIComponent(caseName)}&run=${encodeURIComponent(nonce)}`;
@@ -3864,7 +4934,7 @@ async function appendLiveChatGptHelperWithComposerRemoved(page, {
 }
 
 function countSkillLoadRepliesExpression() {
-  return `() => Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+  return `() => Array.from(document.querySelectorAll('[data-message-author-role="user"], .fai-UserMessage[role="article"]'))
     .filter((node) => (node.innerText || node.textContent || "").includes("Local Skill load result:")).length`;
 }
 
@@ -4020,6 +5090,209 @@ async function appendLiveAssistantHelper(page, complete) {
 
 function pageUserMessageCount(page) {
   return page.evaluate(`document.querySelectorAll('[data-message-author-role="user"], .fai-UserMessage[role="article"]').length`);
+}
+
+async function installContentRuntimeMessageCounter(page) {
+  const worlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof scanForShellCall !== "function" || !globalThis.chrome?.runtime?.sendMessage) {
+      return null;
+    }
+    if (!globalThis.__e2eRuntimeMessageCounts) {
+      const originalSendMessage = chrome.runtime.sendMessage.bind(chrome.runtime);
+      const counts = Object.create(null);
+      globalThis.__e2eRuntimeMessageCounts = counts;
+      chrome.runtime.sendMessage = (message, ...args) => {
+        const type = String(message?.type || "");
+        counts[type] = Number(counts[type] || 0) + 1;
+        return originalSendMessage(message, ...args);
+      };
+    }
+    return { contentWorld: true, installed: true };
+  })()`);
+  assert.equal(
+    worlds.filter((entry) => entry.value?.contentWorld && entry.value?.installed).length,
+    1,
+    `Expected one instrumented content-script world: ${JSON.stringify(worlds)}`
+  );
+}
+
+async function installContentOuterSettingsGate(page) {
+  const worlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof scanForShellCall !== "function" || !globalThis.chrome?.storage?.sync?.get) {
+      return null;
+    }
+    if (!globalThis.__e2eOuterSettingsGateInstalled) {
+      const originalGet = chrome.storage.sync.get.bind(chrome.storage.sync);
+      let releaseGate = null;
+      globalThis.__e2eOuterSettingsGateInstalled = true;
+      globalThis.__e2eOuterSettingsGateEntered = false;
+      globalThis.__e2eReleaseOuterSettingsGate = () => {
+        if (typeof releaseGate !== "function") return false;
+        const release = releaseGate;
+        releaseGate = null;
+        release();
+        return true;
+      };
+      chrome.storage.sync.get = (keys, ...args) => {
+        const result = originalGet(keys, ...args);
+        const isOuterScanSettings = Array.isArray(keys) &&
+          keys.includes("enabled") &&
+          keys.includes("enabledHosts") &&
+          keys.includes("maxChainCalls");
+        if (!globalThis.__e2eOuterSettingsGateEntered && isOuterScanSettings) {
+          globalThis.__e2eOuterSettingsGateEntered = true;
+          return new Promise((resolve, reject) => {
+            releaseGate = () => Promise.resolve(result).then(resolve, reject);
+          });
+        }
+        return result;
+      };
+    }
+    return { contentWorld: true, installed: true };
+  })()`);
+  assert.equal(
+    worlds.filter((entry) => entry.value?.contentWorld && entry.value?.installed).length,
+    1,
+    `Expected one outer-settings gate in the content-script world: ${JSON.stringify(worlds)}`
+  );
+}
+
+async function waitForContentOuterSettingsGate(page) {
+  await waitForValue(async () => {
+    const worlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof scanForShellCall !== "function") return null;
+      return { contentWorld: true, entered: globalThis.__e2eOuterSettingsGateEntered === true };
+    })()`);
+    return worlds.find((entry) => entry.value?.contentWorld)?.value?.entered || undefined;
+  }, "content scan to pause on its outer settings read");
+}
+
+async function releaseContentOuterSettingsGate(page) {
+  const worlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof scanForShellCall !== "function") return null;
+    return {
+      contentWorld: true,
+      released: globalThis.__e2eReleaseOuterSettingsGate?.() === true
+    };
+  })()`);
+  const state = worlds.find((entry) => entry.value?.contentWorld)?.value;
+  assert.equal(state?.released, true,
+    `The content-script outer-settings gate was not releasable: ${JSON.stringify(worlds)}`);
+}
+
+async function installM365UnexpectedUserSubmissionObserver(page, expectedNextInsertions = 0) {
+  await page.evaluate(`(() => {
+    window.__m365ExpectedUserInsertions = ${Number(expectedNextInsertions)};
+    window.__m365UnexpectedUserInsertions = 0;
+    const observed = new WeakSet(document.querySelectorAll('.fai-UserMessage[role="article"]'));
+    const inspect = (root) => {
+      const candidates = [];
+      if (root instanceof Element && root.matches('.fai-UserMessage[role="article"]')) {
+        candidates.push(root);
+      }
+      if (root instanceof Element) {
+        candidates.push(...root.querySelectorAll('.fai-UserMessage[role="article"]'));
+      }
+      for (const node of candidates) {
+        if (observed.has(node)) continue;
+        observed.add(node);
+        if (window.__m365ExpectedUserInsertions > 0) {
+          window.__m365ExpectedUserInsertions -= 1;
+        } else {
+          window.__m365UnexpectedUserInsertions += 1;
+        }
+      }
+    };
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) inspect(node);
+      }
+    }).observe(document.getElementById("thread"), { childList: true, subtree: true });
+    return true;
+  })()`);
+}
+
+async function contentRuntimeMessageCount(page, type) {
+  const worlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof scanForShellCall !== "function") return null;
+    return {
+      contentWorld: true,
+      count: Number(globalThis.__e2eRuntimeMessageCounts?.[${JSON.stringify(String(type || ""))}] || 0)
+    };
+  })()`);
+  const state = worlds.find((entry) => entry.value?.contentWorld)?.value;
+  assert.ok(state, `Missing content-script runtime counter for ${type}: ${JSON.stringify(worlds)}`);
+  return state.count;
+}
+
+async function contentHelperDeliveryState(page, kind = "") {
+  const worlds = await page.evaluateAcrossContexts(`(() => {
+    if (typeof pendingHelperDeliveries === "undefined") return null;
+    const entries = Array.from(pendingHelperDeliveries.values());
+    return {
+      contentWorld: true,
+      activeCallId: typeof activeCallId === "string" ? activeCallId : "",
+      pending: ${JSON.stringify(String(kind || ""))}
+        ? entries.filter((entry) => entry.kind === ${JSON.stringify(String(kind || ""))}).length
+        : entries.length,
+      composer: document.getElementById("composer")?.innerText || ""
+    };
+  })()`);
+  const state = worlds.find((entry) => entry.value?.contentWorld)?.value;
+  assert.ok(state, `Missing content-script delivery state: ${JSON.stringify(worlds)}`);
+  return state;
+}
+
+async function assertContentOperationLocksClear(page) {
+  const state = await waitForValue(async () => {
+    const worlds = await page.evaluateAcrossContexts(`(() => {
+      if (typeof pendingHelperDeliveries === "undefined") return null;
+      return {
+        contentWorld: true,
+        activeCallId: typeof activeCallId === "string" ? activeCallId : "",
+        activeCallToken: Boolean(activeCallToken),
+        preparingRunnableDispatch: Boolean(preparingRunnableDispatchToken),
+        activeComposerDelivery: Boolean(activeComposerDeliveryToken),
+        pendingDeliveryRetryInFlight: Boolean(pendingHelperDeliveryRetryInFlight),
+        skillHelperInFlight: Boolean(skillHelperInFlight),
+        activeSkillHelperCallKey: String(activeSkillHelperCallKey || ""),
+        skillRecoveryInFlight: Boolean(skillRecoveryInFlight),
+        forceRunInFlight: Boolean(forceRunInFlight),
+        panelShellHelperActive: Boolean(panelShellHelperActive),
+        routeReconciliationPending: Boolean(
+          routeReconciliationNotBefore && Date.now() < routeReconciliationNotBefore
+        )
+      };
+    })()`);
+    const current = worlds.find((entry) => entry.value?.contentWorld)?.value;
+    if (!current) return undefined;
+    const clear = current.activeCallId === "" &&
+      current.activeCallToken === false &&
+      current.preparingRunnableDispatch === false &&
+      current.activeComposerDelivery === false &&
+      current.pendingDeliveryRetryInFlight === false &&
+      current.skillHelperInFlight === false &&
+      current.activeSkillHelperCallKey === "" &&
+      current.skillRecoveryInFlight === false &&
+      current.forceRunInFlight === false &&
+      current.panelShellHelperActive === false &&
+      current.routeReconciliationPending === false;
+    return clear ? current : undefined;
+  }, "isolated route case operation locks to clear");
+  assert.deepEqual(state, {
+    contentWorld: true,
+    activeCallId: "",
+    activeCallToken: false,
+    preparingRunnableDispatch: false,
+    activeComposerDelivery: false,
+    pendingDeliveryRetryInFlight: false,
+    skillHelperInFlight: false,
+    activeSkillHelperCallKey: "",
+    skillRecoveryInFlight: false,
+    forceRunInFlight: false,
+    panelShellHelperActive: false,
+    routeReconciliationPending: false
+  }, "The isolated route case must leave no helper, composer, recovery, or quarantine lock behind.");
 }
 
 function waitForNewUserMessage(page, previousCount, includedText, description) {

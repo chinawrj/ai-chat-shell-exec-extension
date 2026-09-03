@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.11.15] - 2026-09-03
+
+- Generalizes first-conversation URL assignment recovery beyond ChatGPT. A same-origin provisional route that gains one opaque conversation-id segment, including M365 `/chat` to `/chat/<UUID>`, may retain a live helper only while its exact latest user-to-assistant turn, helper semantic payload, and user-text fingerprint all remain current. DOM ownership must also remain exact, except that ChatGPT may rebind one uniquely matching replacement turn through its stable user/assistant message IDs.
+- Preserves shell/board/file/agent, Skill, and Draw.io ownership through that proven assignment while retaining exactly-once backend, composer-write, and submission behavior. An M365 Lexical composer redraw containing the exact plugin-owned result resumes send-only and never causes another write or helper execution.
+- Keeps URL changes non-authoritative: query/hash-only changes, cross-origin changes, permanent conversation A-to-B navigation, transcript replacement, detached/reordered turns, copied text in replacement DOM, and persisted unsubmitted entries fail closed. Force remains bound to its original lifecycle, and the v0.8.6/v0.8.9 send actuator is unchanged.
+- Quarantines a recognized assignment for at least four seconds of route stability as well as scan settlement. No automatic backend start, local preview commit, composer write, or send can use the temporarily retained old transcript during that window.
+- Captures candidate-bound live-generation proof before asynchronous scan preflights. If the completed helper is already visible when an outer pending-state/settings read overlaps a URL-only `pushState`, the assigned route schedules its own settled rescan even when the host emits no later DOM mutation; changed user text or unproved replacement roots invalidate that proof. Exact same-semantic observer redraws and unique ChatGPT stable-ID replacement roots transfer both result ownership and the processed claim only after the route/turn proof succeeds, preventing both a lost result and a second dispatch after backend locks release.
+- Separates completed claims from tentative pre-backend claims during route reconciliation. A helper paused on settings, approval, profile, or pending-state work before any backend request is released back to the settled scanner instead of inheriting a stale processed bit; runtime-dispatched and completed helpers retain exactly-once ownership.
+- Adds focused positive/negative route-proof tests and independent real-Chrome M365 pages for helper completion after URL assignment, backend-in-flight retention, post-write composer redraw/send-only recovery, delayed old-transcript replacement, post-write transcript replacement, permanent UUID conversation navigation, and Skill-load zero-dispatch after replacement. The tests count runtime requests, composer writes, submitted messages, pending entries, and real tmux marker executions exactly. The test server now serves the exact M365 `/chat` and `/chat/<UUID>` route shapes.
+
 ## [0.11.14] - 2026-09-03
 
 - Extends `AI_CHAT_SHELL_ENV_FILE` to exact-SHA Skill loads. Every valid variable declared in the freshly reread file is automatically eligible for `$NAME`/`${NAME}` expansion and overrides the same shell-server process variable without requiring a duplicate `AI_HELPER_SKILL_ENV_ALLOWLIST` entry.

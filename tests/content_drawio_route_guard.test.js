@@ -234,7 +234,7 @@ function navigate(context, pathname) {
   context.location.pathname = pathname;
   context.location.href = `https://chatgpt.com${pathname}`;
   assert.equal(context.refreshPageLifecycle(), true);
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
 }
 
 function replaceTranscript(context, turn, pathname) {

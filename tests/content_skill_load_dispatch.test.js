@@ -41,9 +41,12 @@ testColdHistoryRequiresExplicitSkillRecovery()
   .then(() => testOwnedSyncRecoveryAwaitRacesStayLocal())
   .then(() => testUnknownRoleAtomicSkillFailsClosed())
   .then(() => testColdBaselineSurvivesRedrawButYieldsToLiveGeneration())
-  .then(() => testStaleBackendResultCannotEnterAnotherChat())
-  .then(() => testRetainedRouteRedrawKeepsExactlyOneBackendDispatch())
-  .then(() => testDetachAfterRouteAcceptanceCannotQueueResult())
+    .then(() => testStaleBackendResultCannotEnterAnotherChat())
+    .then(() => testRetainedRouteRedrawKeepsExactlyOneBackendDispatch())
+    .then(() => testChatGptStableIdRouteReplacementKeepsExactlyOneSkillDispatch())
+    .then(() => testSkillRejectionQueueRouteAwaitBoundaries())
+    .then(() => testSkillAckBackendRouteAwaitBoundaries())
+    .then(() => testDetachAfterRouteAcceptanceCannotQueueResult())
   .then(() => testSameRootGenerationChangeRejectsBackendResult())
   .then(() => testDetachedBackendResultRemainsManuallyRecoverable())
   .then(() => testQueuedSkillResultRejectsSameUrlTranscriptReplacement())
@@ -769,12 +772,14 @@ function testChatGptSkillDispatchSurvivesAuthoredBodyRedraw() {
   ].join("\n");
   const conversation = new local.Element();
   const user = new local.Element({ messageRole: "user", id: "chatgpt-user-1" });
+  setDataMessageId(user, "chatgpt-user-1");
   const userCopy = new local.Element();
   userCopy.hasUserMessageCopy = true;
   userCopy.textContent = prompt;
   userCopy.innerText = prompt;
   user.append(userCopy);
   const assistant = new local.Element({ messageRole: "assistant", id: "chatgpt-assistant-1" });
+  setDataMessageId(assistant, "chatgpt-assistant-1");
   const oldContent = new local.Element();
   oldContent.hasAssistantMarkdown = true;
   oldContent.textContent = helperText;
@@ -793,6 +798,8 @@ function testChatGptSkillDispatchSurvivesAuthoredBodyRedraw() {
     pageLifecycleGeneration = 10;
   `, local);
   const dispatchContext = local.createSkillDispatchContext(oldCandidate);
+  const semanticCallKey = local.buildSemanticCallKey(call);
+  local.markCallProcessed(oldCandidate, "chatgpt-redraw-original", semanticCallKey);
   const storedProof = local.createStoredSkillOriginProof(dispatchContext);
   assert.ok(dispatchContext.chatGptTurnProof,
     "A strict ChatGPT Skill dispatch must capture stable user/assistant message identities.");
@@ -812,6 +819,35 @@ function testChatGptSkillDispatchSurvivesAuthoredBodyRedraw() {
     "An exact assistant-body redraw under the same canonical message id must rebind without discarding the queued result.");
   assert.equal(dispatchContext.renderRoot, newContent,
     "The delivery guard must transfer to the exact replacement helper root.");
+  assert.equal(
+    local.getHandledHelperReason(newCandidate, "chatgpt-redraw-retry", semanticCallKey, call),
+    "processed rendered helper",
+    "Stable-ID rebinding must transfer the processed claim so releasing the Skill single-flight lock cannot dispatch the replacement root again."
+  );
+
+  const duplicateUser = new local.Element({ messageRole: "user" });
+  setDataMessageId(duplicateUser, "chatgpt-user-1");
+  const duplicateUserCopy = new local.Element();
+  duplicateUserCopy.hasUserMessageCopy = true;
+  duplicateUserCopy.textContent = prompt;
+  duplicateUserCopy.innerText = prompt;
+  duplicateUser.append(duplicateUserCopy);
+  duplicateUser.parentElement = conversation;
+  conversation.children.unshift(duplicateUser);
+  assert.equal(
+    local.getUniqueChatGptRouteMessageRoot(
+      local.getExplicitMessageRoots(conversation),
+      "user",
+      "chatgpt-user-1"
+    ),
+    null,
+    "Two matching stable user IDs must be rejected as ambiguous."
+  );
+  assert.equal(local.isSkillDispatchContextCurrent(dispatchContext), false,
+    "Duplicate ChatGPT message IDs must fail closed instead of ambiguously inheriting Skill ownership.");
+  conversation.children.shift();
+  duplicateUser.parentElement = null;
+  duplicateUser.isConnected = false;
 
   const sponsored = new local.Element();
   sponsored.textContent = "Sponsored content changed";
@@ -921,8 +957,22 @@ function testChatGptNewConversationRouteAssignmentCarriesUnboundGeneration() {
   local.location.href = "https://chatgpt.com/uc/assigned-conversation";
   assert.equal(local.refreshPageLifecycle(), true,
     "Assigning the permanent ChatGPT new-conversation URL must start a page lifecycle handoff.");
-  assert.equal(vm.runInContext("assistantGenerationEpoch?.routeCarryOnly", local), false,
-    "The exact root-to-/uc assignment must keep the unbound current generation eligible for its first response root.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch?.routeCarryOnly", local), true,
+    "The exact root-to-/uc assignment must freeze the originating user text while retaining the unbound generation.");
+
+  const recycledProbe = new local.Element({ messageRole: "assistant" });
+  recycledProbe.textContent = "ai-helper-skill-start:recycled-probe\ncmd: list\nai-helper-skill-end";
+  recycledProbe.innerText = recycledProbe.textContent;
+  userCopy.textContent = "A different conversation reused this user element.";
+  userCopy.innerText = userCopy.textContent;
+  conversation.append(recycledProbe);
+  assert.equal(local.isCurrentAssistantResponseRoot(recycledProbe), false,
+    "Reusing the same user Element with changed text must not inherit pre-route generation evidence.");
+  conversation.children = conversation.children.filter((child) => child !== recycledProbe);
+  recycledProbe.parentElement = null;
+  recycledProbe.isConnected = false;
+  userCopy.textContent = "Create the first helper in this new chat.";
+  userCopy.innerText = userCopy.textContent;
 
   const helperText = [
     "ai-helper-skill-start:chatgpt-assigned",
@@ -968,8 +1018,8 @@ function testChatGptNewConversationRouteAssignmentCarriesUnboundGeneration() {
   `, unrelated);
   unrelated.location.href = "https://chatgpt.com/settings";
   unrelated.refreshPageLifecycle();
-  assert.equal(vm.runInContext("assistantGenerationEpoch?.routeCarryOnly", unrelated), true,
-    "An unrelated ChatGPT route must retain the restrictive carry mode and cannot authorize a new response root.");
+  assert.equal(vm.runInContext("assistantGenerationEpoch", unrelated), null,
+    "An unrelated ChatGPT route must discard generation evidence and cannot authorize a new response root.");
 }
 
 function testUnrelatedGenerationCannotReviveKnownHistory() {
@@ -2472,7 +2522,11 @@ async function testStaleBackendResultCannotEnterAnotherChat() {
 async function testRetainedRouteRedrawKeepsExactlyOneBackendDispatch() {
   const local = createContentContext();
   const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "Load the example Skill in this new conversation.";
+  user.innerText = user.textContent;
   const assistant = new local.Element({ author: "assistant" });
+  conversation.append(user);
   conversation.append(assistant);
   local.__conversation = conversation;
   const call = local.parseCallPayload([
@@ -2513,10 +2567,312 @@ async function testRetainedRouteRedrawKeepsExactlyOneBackendDispatch() {
     "A retained exact helper redrawn during its route handoff must be reclaimed in the new generation, not loaded twice.");
 }
 
+async function testChatGptStableIdRouteReplacementKeepsExactlyOneSkillDispatch() {
+  const local = createContentContext();
+  local.location.hostname = "chatgpt.com";
+  local.location.origin = "https://chatgpt.com";
+  local.location.pathname = "/";
+  local.location.href = "https://chatgpt.com/";
+  const helperText = [
+    "ai-helper-skill-start:stable-route-backend",
+    "cmd: load",
+    "skill-id: example",
+    `catalog-sha: ${"7".repeat(64)}`,
+    "ai-helper-skill-end"
+  ].join("\n");
+  const call = local.parseCallPayload(helperText);
+
+  const createTurn = () => {
+    const conversation = new local.Element();
+    const user = new local.Element({ messageRole: "user" });
+    setDataMessageId(user, "stable-route-backend-user");
+    const userCopy = new local.Element();
+    userCopy.hasUserMessageCopy = true;
+    userCopy.textContent = "Load this exact Skill while ChatGPT assigns the conversation URL.";
+    userCopy.innerText = userCopy.textContent;
+    user.append(userCopy);
+    const assistant = new local.Element({ messageRole: "assistant" });
+    setDataMessageId(assistant, "stable-route-backend-assistant");
+    const content = new local.Element();
+    content.hasAssistantMarkdown = true;
+    content.textContent = helperText;
+    content.innerText = helperText;
+    assistant.append(content);
+    conversation.append(user);
+    conversation.append(assistant);
+    return {
+      conversation,
+      user,
+      assistant,
+      content,
+      candidate: { call, node: assistant, textRoot: content, source: "text", blockIndex: 0 }
+    };
+  };
+
+  const original = createTurn();
+  local.__stableRouteConversation = original.conversation;
+  local.__stableRouteCandidate = original.candidate;
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 60;
+    initialThreadSettled = true;
+    getConversationRoot = () => globalThis.__stableRouteConversation;
+    extractShellCallCandidates = () => [globalThis.__stableRouteCandidate];
+    queueSkillComposerReply = async () => {
+      globalThis.__stableRouteReplies += 1;
+      return true;
+    };
+    globalThis.__stableRouteReplies = 0;
+    scheduleScan = () => {};
+  `, local);
+  let backendCalls = 0;
+  let resolveBackend;
+  let backendStarted;
+  const started = new Promise((resolve) => { backendStarted = resolve; });
+  local.chrome.runtime.sendMessage = () => {
+    backendCalls += 1;
+    backendStarted();
+    return new Promise((resolve) => { resolveBackend = resolve; });
+  };
+
+  const processing = local.processLatestSkillCandidate(
+    [original.candidate],
+    { maxChainCalls: 100 }
+  );
+  await started;
+  const replacement = createTurn();
+  for (const node of [
+    original.conversation,
+    original.user,
+    original.assistant,
+    original.content
+  ]) {
+    node.isConnected = false;
+  }
+  local.__stableRouteConversation = replacement.conversation;
+  local.__stableRouteCandidate = replacement.candidate;
+  local.location.pathname = "/c/stable-route-backend-1234";
+  local.location.href = `https://chatgpt.com${local.location.pathname}`;
+  resolveBackend({
+    ok: true,
+    catalogSha: "7".repeat(64),
+    skill: { id: "example", sha: "8".repeat(64) },
+    content: "# Exact replacement-root Skill result"
+  });
+
+  assert.equal(await processing, true,
+    "A Skill backend result must survive one ChatGPT route assignment plus a unique stable-ID turn replacement.");
+  assert.equal(backendCalls, 1);
+  assert.equal(vm.runInContext("globalThis.__stableRouteReplies", local), 1);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", local);
+  assert.equal(
+    await local.processLatestSkillCandidate([replacement.candidate], { maxChainCalls: 100 }),
+    false,
+    "The replacement root must retain the first request's processed claim after the Skill lock is released."
+  );
+  assert.equal(backendCalls, 1,
+    "ChatGPT stable-ID route rebinding must never issue a second Skill backend request.");
+  assert.equal(vm.runInContext("globalThis.__stableRouteReplies", local), 1,
+    "ChatGPT stable-ID route rebinding must queue exactly one Skill reply.");
+}
+
+async function testSkillRejectionQueueRouteAwaitBoundaries() {
+  const cases = [
+    { name: "validation retained", rejection: "validation", replacement: false, expectedPending: 1 },
+    { name: "validation replacement", rejection: "validation", replacement: true, expectedPending: 0 },
+    { name: "chain-limit retained", rejection: "chain-limit", replacement: false, expectedPending: 1 },
+    { name: "chain-limit replacement", rejection: "chain-limit", replacement: true, expectedPending: 0 },
+    { name: "manual validation retained", rejection: "validation", replacement: false, manual: true, expectedPending: 0 },
+    { name: "manual chain-limit retained", rejection: "chain-limit", replacement: false, manual: true, expectedPending: 0 }
+  ];
+  for (const routeCase of cases) {
+    const local = createContentContext();
+    const conversation = new local.Element();
+    const user = new local.Element({ author: "user" });
+    user.textContent = `Exercise ${routeCase.name} while assigning the conversation URL.`;
+    user.innerText = user.textContent;
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = routeCase.rejection === "validation"
+      ? [
+          `ai-helper-skill-start:route-rejection-${routeCase.name.replaceAll(" ", "-")}`,
+          "cmd: load",
+          "skill-id: example",
+          "ai-helper-skill-end"
+        ].join("\n")
+      : [
+          `ai-helper-skill-start:route-limit-${routeCase.name.replaceAll(" ", "-")}`,
+          "cmd: load",
+          "skill-id: example",
+          `catalog-sha: ${"8".repeat(64)}`,
+          "ai-helper-skill-end"
+        ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    assistant.innerText = helperText;
+    conversation.append(user);
+    conversation.append(assistant);
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__routeRejectionConversation = conversation;
+    local.__routeRejectionCandidates = [candidate];
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      pageLifecycleGeneration = 120;
+      initialThreadSettled = true;
+      getConversationRoot = () => globalThis.__routeRejectionConversation;
+      extractShellCallCandidates = () => globalThis.__routeRejectionCandidates;
+      scheduleScan = () => {};
+      schedulePendingHelperDeliveryRetry = () => {};
+    `, local);
+    if (routeCase.rejection === "chain-limit") {
+      vm.runInContext("chainCallCount = 1", local);
+    }
+
+    let resolveSettings;
+    let settingsRequested = false;
+    local.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("autoSend")) {
+        settingsRequested = true;
+        return new Promise((resolve) => { resolveSettings = resolve; });
+      }
+      return { enabled: true };
+    };
+    const processing = local.processLatestSkillCandidate(
+      [candidate],
+      { maxChainCalls: 1, autoSend: true },
+      routeCase.manual ? { forceDetected: true } : {}
+    );
+    for (let attempt = 0; attempt < 20 && !settingsRequested; attempt += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(settingsRequested, true, `${routeCase.name}: rejection queue must reach its settings await.`);
+
+    local.location.pathname = "/c/route-rejection-opaque-12345678";
+    local.location.href = `https://chatgpt.com${local.location.pathname}`;
+    assert.equal(local.refreshPageLifecycle(), true);
+    if (routeCase.replacement) {
+      assistant.isConnected = false;
+      user.isConnected = false;
+      local.__routeRejectionConversation = new local.Element();
+      local.__routeRejectionCandidates = [];
+    }
+    resolveSettings({ autoSend: true });
+    await processing;
+
+    const queued = vm.runInContext(`Array.from(pendingHelperDeliveries.values()).map((entry) => ({
+      kind: entry.kind,
+      phase: entry.phase,
+      reply: entry.reply
+    }))`, local);
+    assert.equal(queued.length, routeCase.expectedPending,
+      `${routeCase.name}: only an exact retained first-route turn may keep its one protocol rejection.`);
+    if (routeCase.expectedPending === 1) {
+      assert.equal(queued[0].kind, "skill-error");
+      assert.equal(queued[0].phase, "queued");
+      assert.match(queued[0].reply, /Local Skill helper response:/);
+    }
+    assert.equal(vm.runInContext("skillHelperInFlight", local), false);
+    assert.equal(vm.runInContext("activeSkillHelperCallKey", local), "");
+  }
+}
+
+async function testSkillAckBackendRouteAwaitBoundaries() {
+  const routeCases = [
+    { name: "retained provisional assignment", start: "/", next: "/c/ack-route-opaque-12345678", replacement: false, expected: true },
+    { name: "replacement transcript", start: "/", next: "/c/ack-replaced-opaque-12345678", replacement: true, expected: false },
+    { name: "permanent conversation navigation", start: "/c/ack-existing-a", next: "/c/ack-existing-b", replacement: false, expected: false },
+    { name: "manual retained provisional assignment", start: "/", next: "/c/ack-manual-opaque-12345678", replacement: false, manual: true, expected: false }
+  ];
+  for (const routeCase of routeCases) {
+    const local = createContentContext();
+    local.location.pathname = routeCase.start;
+    local.location.href = `https://chatgpt.com${routeCase.start}`;
+    const conversation = new local.Element();
+    const user = new local.Element({ author: "user" });
+    user.textContent = `Acknowledge the catalog during ${routeCase.name}.`;
+    user.innerText = user.textContent;
+    const assistant = new local.Element({ author: "assistant" });
+    const helperText = [
+      `ai-helper-skill-start:ack-route-${routeCase.name.replaceAll(" ", "-")}`,
+      "cmd: list-updated",
+      `challenge: ${"a".repeat(32)}`,
+      `catalog-sha: ${"b".repeat(64)}`,
+      "catalog-version: 7",
+      "memory-entry: AI_CHAT_SHELL_SKILLS_CATALOG",
+      "ai-helper-skill-end"
+    ].join("\n");
+    const call = local.parseCallPayload(helperText);
+    assistant.textContent = helperText;
+    assistant.innerText = helperText;
+    conversation.append(user);
+    conversation.append(assistant);
+    const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
+    local.__ackRouteConversation = conversation;
+    local.__ackRouteCandidates = [candidate];
+    vm.runInContext(`
+      extensionActive = true;
+      skillStatePollInFlight = false;
+      observedPageIdentity = location.href;
+      pageLifecycleGeneration = 140;
+      initialThreadSettled = true;
+      getConversationRoot = () => globalThis.__ackRouteConversation;
+      extractShellCallCandidates = () => globalThis.__ackRouteCandidates;
+      scheduleScan = () => {};
+      updateSkillPanelState = () => {};
+      refreshOpenSkillCatalogDialogIfStale = async () => {};
+      globalThis.__ackRouteStateRefreshes = 0;
+      refreshSkillState = async () => {
+        globalThis.__ackRouteStateRefreshes += 1;
+        return { ok: true, version: 7, catalogSha: "${"b".repeat(64)}" };
+      };
+    `, local);
+
+    let resolveAck;
+    let ackCalls = 0;
+    local.chrome.runtime.sendMessage = (message) => {
+      if (message?.type === "skill-sync-ack") {
+        ackCalls += 1;
+        return new Promise((resolve) => { resolveAck = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    };
+    const processing = local.processLatestSkillCandidate(
+      [candidate],
+      { maxChainCalls: 100 },
+      routeCase.manual ? { forceDetected: true } : {}
+    );
+    await Promise.resolve();
+    assert.equal(ackCalls, 1, `${routeCase.name}: ACK backend request must start exactly once.`);
+
+    local.location.pathname = routeCase.next;
+    local.location.href = `https://chatgpt.com${routeCase.next}`;
+    assert.equal(local.refreshPageLifecycle(), true);
+    if (routeCase.replacement) {
+      assistant.isConnected = false;
+      user.isConnected = false;
+      local.__ackRouteConversation = new local.Element();
+      local.__ackRouteCandidates = [];
+    }
+    resolveAck({ ok: true, version: 7, catalogSha: "b".repeat(64) });
+    assert.equal(await processing, routeCase.expected,
+      `${routeCase.name}: ACK completion crossed an invalid route ownership boundary.`);
+    assert.equal(ackCalls, 1);
+    assert.equal(vm.runInContext("globalThis.__ackRouteStateRefreshes", local), routeCase.expected ? 1 : 0,
+      `${routeCase.name}: only the retained provisional route may refresh acknowledged Skill state.`);
+    assert.equal(vm.runInContext("skillHelperInFlight", local), false);
+    assert.equal(vm.runInContext("activeSkillHelperCallKey", local), "");
+  }
+}
+
 async function testDetachAfterRouteAcceptanceCannotQueueResult() {
   const local = createContentContext();
   const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "Load the example Skill while this conversation receives its permanent URL.";
+  user.innerText = user.textContent;
   const assistant = new local.Element({ author: "assistant" });
+  conversation.append(user);
   conversation.append(assistant);
   const call = local.parseCallPayload([
     "ai-helper-skill-start:detach-after-route-accept",
@@ -2821,6 +3177,9 @@ async function testQueuedSkillWriteAbortsDuringSameUrlReplacement() {
 async function testQueuedSkillResultSurvivesOneRouteHandoff() {
   const local = createContentContext();
   const conversation = new local.Element();
+  const user = new local.Element({ author: "user" });
+  user.textContent = "Load the example Skill and return its local instructions.";
+  user.innerText = user.textContent;
   const assistant = new local.Element({ author: "assistant" });
   const helperText = [
     "ai-helper-skill-start:queued-route-handoff",
@@ -2831,6 +3190,7 @@ async function testQueuedSkillResultSurvivesOneRouteHandoff() {
   ].join("\n");
   const call = local.parseCallPayload(helperText);
   assistant.textContent = helperText;
+  conversation.append(user);
   conversation.append(assistant);
   conversation.textContent = helperText;
   const candidate = { call, node: assistant, textRoot: assistant, source: "text", blockIndex: 0 };
@@ -2862,7 +3222,7 @@ async function testQueuedSkillResultSurvivesOneRouteHandoff() {
   assert.equal(migrated.skillRouteHandoffPending, true);
   assert.equal(typeof migrated.volatileLifecycleGuard, "function");
   migrated.restored = true;
-  vm.runInContext("initialThreadSettled = true", local);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", local);
   vm.runInContext(`
     globalThis.__queuedRouteWrites = 0;
     deliverHelperReply = async () => {
@@ -2918,14 +3278,9 @@ async function testQueuedSkillResultCannotCrossIntoAnotherChat() {
   local.location.href = "https://chatgpt.com/c/unrelated-existing-chat";
   assert.equal(local.refreshPageLifecycle(), true);
   const migrated = vm.runInContext("Array.from(pendingHelperDeliveries.values())[0]", local);
-  assert.ok(migrated);
-  migrated.restored = true;
-  vm.runInContext(`
-    initialThreadSettled = true;
-    globalThis.__crossChatWrites = 0;
-    deliverHelperReply = async () => { globalThis.__crossChatWrites += 1; return false; };
-  `, local);
-  assert.equal(await local.attemptPendingHelperDelivery(migrated, { autoSend: true }), false);
+  assert.equal(migrated, undefined,
+    "A detached originating turn must be rejected during route migration itself.");
+  vm.runInContext("globalThis.__crossChatWrites = 0", local);
   assert.deepEqual({
     writes: vm.runInContext("globalThis.__crossChatWrites", local),
     pending: vm.runInContext("pendingHelperDeliveries.size", local)

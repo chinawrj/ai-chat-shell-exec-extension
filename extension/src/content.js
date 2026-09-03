@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.14";
+const CONTENT_SCRIPT_VERSION = "0.11.15";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -106,12 +106,15 @@ const PENDING_HELPER_DELIVERY_RETRY_MS = 2000;
 const RECENT_SUBMITTED_PLUGIN_REPLY_MAX_AGE_MS = 60_000;
 const COMPOSER_HANDOFF_SETTLE_ATTEMPTS = 12;
 const COMPOSER_HANDOFF_SETTLE_DELAY_MS = 125;
+const ROUTE_RECONCILIATION_MIN_SETTLE_MS = 4000;
 let helperRenderRootSequence = 0;
 const helperRenderRootIds = new WeakMap();
 const helperRenderRootGenerations = new WeakMap();
 const processedRenderedHelpers = new WeakMap();
 const baselineIgnoredRenderedHelpers = new WeakMap();
 const liveGeneratedRenderedHelpers = new WeakMap();
+const liveGeneratedHelperRouteProofs = new WeakMap();
+const liveGeneratedHelperRouteProofRecords = new Map();
 const knownRenderedHelperSemantics = new WeakMap();
 const rejectedOwnedSkillSyncRecoveries = new WeakMap();
 const committedOwnedSkillSyncRecoveries = new WeakMap();
@@ -130,6 +133,7 @@ let preparingRunnableDispatchToken = null;
 let pageLifecycleGeneration = 0;
 let observedPageIdentity = "";
 let routeHandoffPreviousPageIdentity = "";
+let routeReconciliationNotBefore = 0;
 let composerDeliverySequence = 0;
 let pendingHelperDeliveryAttemptSequence = 0;
 let composerDeliveryTail = Promise.resolve();
@@ -798,7 +802,7 @@ async function scanForShellCall(options = {}) {
   }
   refreshPageLifecycle();
   await loadPendingHelperDeliveriesForCurrentPage();
-  // Loading pending state may yield while a new ChatGPT conversation receives
+  // Loading pending state may yield while a new chat receives
   // its permanent SPA URL. Reconcile before inspecting the current DOM.
   refreshPageLifecycle();
   schedulePendingHelperDeliveryRetry();
@@ -852,6 +856,16 @@ async function scanForShellCall(options = {}) {
     return;
   }
 
+  if (!force && routeReconciliationNotBefore &&
+      Date.now() < routeReconciliationNotBefore) {
+    // A SPA can publish the permanent conversation URL before replacing its
+    // transcript. During this quarantine, the still-mounted old DOM is not
+    // authority to start a backend operation, write a composer, or commit a
+    // local preview. A later quiet scan must adjudicate the final transcript.
+    scheduleScan();
+    return;
+  }
+
   if (!force && isAssistantGenerating()) {
     initializeAssistantGenerationEpochFromVisibleControls();
     assistantGenerationObservedForLifecycle = true;
@@ -863,6 +877,11 @@ async function scanForShellCall(options = {}) {
   // Keep the candidate URL and lifecycle generation on the same side of this
   // second storage await before creating any candidate-bound dispatch state.
   refreshPageLifecycle();
+  if (!force && routeReconciliationNotBefore &&
+      Date.now() < routeReconciliationNotBefore) {
+    scheduleScan();
+    return;
+  }
   if (!force && isManualHelperDispatchInFlight()) {
     scheduleScan();
     return;
@@ -1247,6 +1266,11 @@ function getCurrentPageIdentity() {
   return location.href || `${location.origin}${location.pathname || ""}`;
 }
 
+function isRouteReconciliationSettled() {
+  return initialThreadSettled &&
+    (!routeReconciliationNotBefore || Date.now() >= routeReconciliationNotBefore);
+}
+
 function beginPageLifecycle(options = {}) {
   const routeHandoffEntries = Array.isArray(options.routeHandoffEntries)
     ? options.routeHandoffEntries
@@ -1255,31 +1279,74 @@ function beginPageLifecycle(options = {}) {
     ? options.routeHandoffPresentedExecutions
     : [];
   const previousStorageKey = String(options.previousStorageKey || "");
+  const liveGeneratedRouteHandoff = options.routeTransition === true
+    ? captureLiveGeneratedHelperRouteHandoff(
+      options.previousPageIdentity,
+      getCurrentPageIdentity()
+    )
+    : [];
+  liveGeneratedHelperRouteProofRecords.clear();
   routeHandoffPreviousPageIdentity = options.routeTransition === true
     ? String(options.previousPageIdentity || "")
     : "";
-  const activeRunnableCallRouteHandoff = options.routeTransition === true
+  routeReconciliationNotBefore = options.routeTransition === true &&
+      isProvisionalConversationRouteAssignment(
+        options.previousPageIdentity,
+        getCurrentPageIdentity()
+      )
+    ? Date.now() + ROUTE_RECONCILIATION_MIN_SETTLE_MS
+    : 0;
+  const activeRunnableCallRouteTransition = options.routeTransition === true
     ? prepareActiveRunnableCallRouteHandoff(
       activeCallToken,
       options.previousPageIdentity,
       getCurrentPageIdentity()
     )
     : null;
-  const preparingRunnableDispatchRouteHandoff = options.routeTransition === true
+  const activeRunnableCallRouteHandoff = activeRunnableCallRouteTransition?.runtimeDispatched === true
+    ? activeRunnableCallRouteTransition
+    : null;
+  const activeRunnableRouteRetry = activeRunnableCallRouteTransition?.runtimeDispatched === false
+    ? activeRunnableCallRouteTransition
+    : null;
+  const preparingRunnableRouteRetry = options.routeTransition === true
     ? preparePreparingRunnableDispatchRouteHandoff(
       preparingRunnableDispatchToken,
       options.previousPageIdentity,
       getCurrentPageIdentity()
     )
     : null;
-  // ChatGPT assigns a permanent /c or /uc URL after beginning the first
-  // response. Keep the execution lock only when the exact candidate-bound
-  // origin survives that one assignment; ordinary chat navigation still
-  // clears the token and prevents a stale result from entering the new chat.
-  const preservesChatGptNewConversationGeneration = options.routeTransition === true &&
-    (Boolean(activeRunnableCallRouteHandoff) ||
-      Boolean(preparingRunnableDispatchRouteHandoff) ||
-      isChatGptNewConversationRouteAssignment(
+  const releasedRunnableRouteRetries = [
+    activeRunnableRouteRetry,
+    preparingRunnableRouteRetry
+  ].filter(Boolean);
+  if (releasedRunnableRouteRetries.length > 0) {
+    for (const proof of liveGeneratedRouteHandoff) {
+      const belongsToReleasedPreBackendClaim = releasedRunnableRouteRetries.some((retry) => {
+        const candidate = retry?.candidate;
+        const context = retry?.context;
+        return candidate && context &&
+          proof.semanticCallKey === context.semanticCallKey &&
+          proof.semanticCallKey === buildSemanticCallKey(candidate.call) &&
+          proof.source === (candidate.source || "") &&
+          proof.blockIndex === (candidate.blockIndex ?? candidate.index ?? "") &&
+          isRouteHandoffTurnProofCurrent(proof.routeTurnProof, candidate);
+      });
+      if (belongsToReleasedPreBackendClaim) {
+        // The snapshot was captured before the tentative pre-backend claim is
+        // released below. Do not restore that stale processed bit on the new
+        // route; the settled scanner must still get exactly one real attempt.
+        proof.processed = false;
+      }
+    }
+  }
+  // A chat host may assign a permanent URL after beginning the first
+  // response. Keep generation evidence only for a host-independent
+  // provisional-to-opaque-id assignment whose exact current turn survives;
+  // ordinary chat navigation still clears it.
+  const preservesAssignedConversationGeneration = options.routeTransition === true &&
+    (Boolean(activeRunnableCallRouteTransition) ||
+      isNewConversationRouteAssignment(
         options.previousPageIdentity,
         getCurrentPageIdentity(),
         assistantGenerationEpoch
@@ -1293,13 +1360,27 @@ function beginPageLifecycle(options = {}) {
   observedPageIdentity = getCurrentPageIdentity();
   activeCallId = "";
   activeCallToken = null;
+  if (activeRunnableRouteRetry) {
+    releaseRunnableHelperDispatchClaimForRouteRetry(
+      activeRunnableRouteRetry.context,
+      activeRunnableRouteRetry.candidate
+    );
+  }
+  if (preparingRunnableRouteRetry) {
+    releaseRunnableHelperDispatchClaimForRouteRetry(
+      preparingRunnableRouteRetry.context,
+      preparingRunnableRouteRetry.candidate
+    );
+  }
   preparingRunnableDispatchToken = null;
   initialThreadSettled = false;
+  restoreLiveGeneratedHelperRouteHandoff(liveGeneratedRouteHandoff);
   staleRouteGenerationControls = options.routeTransition === true &&
-      !preservesChatGptNewConversationGeneration
+      !preservesAssignedConversationGeneration
     ? new WeakSet(getAssistantGenerationControls())
     : new WeakSet();
-  if (options.routeTransition === true && assistantGenerationEpoch &&
+  if (options.routeTransition === true && preservesAssignedConversationGeneration &&
+      assistantGenerationEpoch &&
       assistantGenerationEpoch.routeCarryOnly !== true) {
     assistantGenerationEpoch.routeCarryUserText = getGenerationRouteText(
       assistantGenerationEpoch.userAnchor
@@ -1307,7 +1388,10 @@ function beginPageLifecycle(options = {}) {
     assistantGenerationEpoch.routeCarryResponsePrefix = getGenerationRouteText(
       assistantGenerationEpoch.responseMessageRoot
     );
-    assistantGenerationEpoch.routeCarryOnly = !preservesChatGptNewConversationGeneration;
+    // Any route transition weakens DOM object identity, including when the
+    // host reuses the same nodes. Freeze the originating user text and any
+    // already-observed assistant prefix for every carried generation epoch.
+    assistantGenerationEpoch.routeCarryOnly = true;
     assistantGenerationObservedForLifecycle = true;
   } else {
     assistantGenerationObservedForLifecycle = false;
@@ -1320,8 +1404,11 @@ function beginPageLifecycle(options = {}) {
   lastUserMessageText = "";
   pendingSelfTest = null;
   cancelAgentDeliveryLifecycle();
+  // An inbound agent prompt has no authored-turn proof. Navigation after its
+  // first composer write therefore always cancels send ownership instead of
+  // allowing exact text left in a new chat to authorize submission.
   migratePendingAgentDeliveryToCurrentPage({
-    preserveInsertedOwnership: options.routeTransition === true
+    preserveInsertedOwnership: false
   });
   clearPendingForceRun();
   panelForceRunAvailable = false;
@@ -1332,9 +1419,6 @@ function beginPageLifecycle(options = {}) {
   committedOwnedSkillSyncSemanticKeys.clear();
   if (activeRunnableCallRouteHandoff) {
     commitActiveRunnableCallRouteHandoff(activeRunnableCallRouteHandoff);
-  }
-  if (preparingRunnableDispatchRouteHandoff) {
-    commitPreparingRunnableDispatchRouteHandoff(preparingRunnableDispatchRouteHandoff);
   }
   updateContextualPanelActions();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
@@ -1372,28 +1456,23 @@ function beginPageLifecycle(options = {}) {
         entry.runnableRouteHandoffPending = ["queued", "inserted", "submitted-unconfirmed"]
           .includes(entry.phase);
       } else {
-        entry.pageIdentity = nextPageIdentity;
-        // A URL change is not proof of a provisional-to-permanent route
-        // assignment: it can also be a user navigating to another chat. Carry
-        // local Skill content only while the exact originating helper root is
-        // still owned by this route lifecycle. The volatile guard reclaims the
-        // retained candidate through isSkillDispatchContextCurrent; the stored
-        // proof then protects reload recovery on the assigned URL.
-        // Do not validate while the old route's DOM may still be mounted.
-        // attemptPendingHelperDelivery waits for the new thread to settle and
-        // then requires exact runtime root continuity before rebasing proof.
-        entry.skillRouteRevision = Number(entry.skillRouteRevision || 0) + 1;
-        entry.activeDeliveryAttemptToken = null;
-        const handoffCount = Number(entry.skillRouteHandoffCount || 0);
-        if (["inserted", "submitted-unconfirmed"].includes(entry.phase) || handoffCount >= 1) {
-          // Text already written to a composer must never acquire send
-          // authority in another route. A second route is likewise ambiguous,
-          // even if React temporarily retains the same DOM objects.
-          entry.volatileStaleHandler?.();
+        // Skill results use the same live, candidate-bound route guard as
+        // ordinary results. This also permits an already-written result to
+        // resume send-only after an assigned URL, without granting a second
+        // composer write. Persisted/reloaded entries have no volatile guard
+        // and therefore remain fail-closed across routes.
+        if (typeof entry.volatileLifecycleGuard !== "function" ||
+            !isRememberedPendingHelperLifecycleCurrent({
+              lifecycleGuard: entry.volatileLifecycleGuard
+            })) {
           continue;
         }
-        entry.skillRouteHandoffCount = handoffCount + 1;
-        entry.skillRouteHandoffPending = entry.phase === "queued";
+        entry.pageIdentity = nextPageIdentity;
+        entry.skillRouteRevision = Number(entry.skillRouteRevision || 0) + 1;
+        entry.activeDeliveryAttemptToken = null;
+        entry.skillRouteHandoffCount = Number(entry.skillRouteHandoffCount || 0) + 1;
+        entry.skillRouteHandoffPending = ["queued", "inserted", "submitted-unconfirmed"]
+          .includes(entry.phase);
       }
       entry.restored = false;
       entry.deliveryInFlight = false;
@@ -1422,39 +1501,74 @@ function beginPageLifecycle(options = {}) {
       schedulePendingHelperDeliveryRetry(0);
     }
   }
+  if (routeReconciliationNotBefore) {
+    // pushState/replaceState can be the only observable host change. Drive the
+    // quiet-scan clock ourselves so a retained result cannot wait forever for
+    // a DOM mutation that never comes.
+    scheduleScan();
+  }
 }
 
 function isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity) {
-  if (location.hostname !== "chatgpt.com") {
-    return false;
-  }
+  return location.hostname === "chatgpt.com" &&
+    isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity);
+}
+
+function isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity) {
   try {
     const previous = new URL(String(previousIdentity || ""));
     const next = new URL(String(nextIdentity || ""));
-    return previous.origin === next.origin &&
-      previous.hostname === "chatgpt.com" &&
-      next.hostname === previous.hostname &&
-      previous.pathname === "/" &&
-      /^\/(?:c|uc)\/[^/]+/.test(next.pathname);
+    if (previous.origin !== next.origin || previous.href === next.href) {
+      return false;
+    }
+    const previousSegments = previous.pathname.split("/").filter(Boolean);
+    const nextSegments = next.pathname.split("/").filter(Boolean);
+    const nextConversationId = nextSegments.at(-1) || "";
+    const previousTail = previousSegments.at(-1) || "";
+    const isOpaqueConversationId = (value) =>
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5a-f0-9][a-f0-9]{3}-[89ab0-9][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value) ||
+      /^[a-z0-9_-]{12,}$/i.test(value);
+    if (!isOpaqueConversationId(nextConversationId) ||
+        isOpaqueConversationId(previousTail)) {
+      return false;
+    }
+    const previousIsExactPrefix = previousSegments.every(
+      (segment, index) => nextSegments[index] === segment
+    );
+    if (previousIsExactPrefix && nextSegments.length === previousSegments.length + 1) {
+      return true;
+    }
+    // Hosts such as ChatGPT insert a short route namespace together with the
+    // opaque id when assigning the first permanent conversation URL.
+    return previousSegments.length === 0 &&
+      nextSegments.length === 2 &&
+      /^[a-z][a-z0-9_-]{0,15}$/i.test(nextSegments[0]);
+  } catch (_unused) {
+    return false;
+  }
+}
+
+function isNewConversationRouteAssignment(previousIdentity, nextIdentity, epoch) {
+  if (!(epoch?.userAnchor instanceof Element) ||
+      epoch.userAnchor.isConnected !== true ||
+      assistantGenerationObservedForLifecycle !== true ||
+      getLastExplicitUserMessageRoot(getConversationRoot()) !== epoch.userAnchor) {
+    return false;
+  }
+  if (epoch.responseMessageRoot instanceof Element &&
+      !isCurrentAssistantResponseRoot(epoch.responseMessageRoot, epoch)) {
+    return false;
+  }
+  try {
+    return isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity);
   } catch (_unused) {
     return false;
   }
 }
 
 function isChatGptNewConversationRouteAssignment(previousIdentity, nextIdentity, epoch) {
-  if (location.hostname !== "chatgpt.com" ||
-      !(epoch?.userAnchor instanceof Element) ||
-      epoch.userAnchor.isConnected !== true ||
-      epoch.responseMessageRoot ||
-      assistantGenerationObservedForLifecycle !== true ||
-      getLastExplicitUserMessageRoot(getConversationRoot()) !== epoch.userAnchor) {
-    return false;
-  }
-  try {
-    return isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity);
-  } catch (_unused) {
-    return false;
-  }
+  return location.hostname === "chatgpt.com" &&
+    isNewConversationRouteAssignment(previousIdentity, nextIdentity, epoch);
 }
 
 function refreshPageLifecycle() {
@@ -1769,7 +1883,9 @@ async function rememberPendingHelperDelivery(callId, call, response, reply, sett
       ? options.staleHandler
       : null,
     runnableRouteHandoffPending: options.runnableRouteHandoffPending === true,
-    runnableRouteRevision: 0
+    runnableRouteRevision: 0,
+    skillRouteHandoffPending: options.skillRouteHandoffPending === true,
+    skillRouteRevision: 0
   };
   pendingHelperDeliveries.set(callId, entry);
   const pruned = prunePendingHelperDeliveryEntries(Array.from(pendingHelperDeliveries.values()));
@@ -2295,7 +2411,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       return await finishRouteReceiptCleanup(entry);
     }
     if (entry.runnableRouteHandoffPending === true) {
-      if (!initialThreadSettled) {
+      if (!isRouteReconciliationSettled()) {
         setPendingHelperDeliveryStatus(entry);
         schedulePendingHelperDeliveryRetry();
         return false;
@@ -2321,7 +2437,7 @@ async function attemptPendingHelperDelivery(entry, settings = null) {
       return false;
     }
     if (entry.skillRouteHandoffPending === true) {
-      if (!initialThreadSettled) {
+      if (!isRouteReconciliationSettled()) {
         setPendingHelperDeliveryStatus(entry);
         schedulePendingHelperDeliveryRetry();
         return false;
@@ -2690,19 +2806,25 @@ function createRunnableHelperDispatchContext(candidate) {
     source: candidate?.source || "",
     blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
     routeHandoffCount: 0,
+    routeTurnProof: createRouteHandoffTurnProof(candidate),
     chatGptTurnProof: createChatGptRunnableDispatchTurnProof(candidate)
   };
 }
 
-function isRunnableHelperDispatchContextCurrent(context) {
+function isRunnableHelperDispatchContextCurrent(context, options = {}) {
   if (!context) {
     return true;
+  }
+  if (context.routeRetryReleased === true) {
+    return false;
   }
   refreshPageLifecycle();
   const currentPageIdentity = getCurrentPageIdentity();
   let candidate = findRetainedRunnableHelperDispatchCandidate(context);
+  let reboundChatGptCandidate = false;
   if (!candidate && location.hostname === "chatgpt.com" && context.chatGptTurnProof) {
     candidate = rebindChatGptRunnableDispatchCandidate(context);
+    reboundChatGptCandidate = Boolean(candidate);
   }
   if (!candidate) {
     return false;
@@ -2713,21 +2835,51 @@ function isRunnableHelperDispatchContextCurrent(context) {
   }
   if (context.pageIdentity === currentPageIdentity &&
       context.generation === pageLifecycleGeneration) {
+    if (reboundChatGptCandidate) {
+      // A React body redraw can replace the helper root while the backend is
+      // still running. Transfer the processed claim together with exact
+      // stable-message ownership so the replacement cannot dispatch again
+      // after the active-call lock is released.
+      markCallProcessed(candidate, "runnable-chatgpt-rebind", context.semanticCallKey);
+    }
+    if (context.routeSettlementRequired === true) {
+      if (!context.routeTurnProof ||
+          !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
+        return false;
+      }
+      // refreshPageLifecycle runs before the route MutationObserver batch is
+      // invalidated. An equivalent helper-subtree redraw in that same batch
+      // can therefore advance the render generation after the active runtime
+      // call was rebased. Reclaim only the still-exact semantic candidate and
+      // originating turn; changed content or ownership already failed above.
+      const renderRoot = getCandidateRenderRoot(candidate);
+      context.renderRoot = renderRoot;
+      context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+      context.source = candidate?.source || "";
+      context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
+      context.renderedHelperKey = buildRenderedHelperKey(candidate, context.semanticCallKey);
+      markCallProcessed(candidate, "runnable-route-redraw", context.semanticCallKey);
+      if (!isRouteReconciliationSettled()) {
+        return options.allowRoutePending === true;
+      }
+      context.routeSettlementRequired = false;
+    }
     return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
   }
   if (Number(context.routeHandoffCount || 0) >= 1 ||
       routeHandoffPreviousPageIdentity !== context.pageIdentity ||
-      !isChatGptProvisionalConversationRouteAssignment(
+      !isProvisionalConversationRouteAssignment(
         context.pageIdentity,
-        currentPageIdentity
-      )) {
+        currentPageIdentity) ||
+      !context.routeTurnProof ||
+      !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
     return false;
   }
   // Claim the equivalent helper under the assigned route before any backend
   // side effect or composer work continues. This also keeps later scans from
   // treating a React-redrawn copy as a fresh request.
   rebaseRunnableHelperDispatchContext(context, candidate);
-  return true;
+  return isRouteReconciliationSettled() || options.allowRoutePending === true;
 }
 
 function prepareActiveRunnableCallRouteHandoff(callToken, previousIdentity, nextIdentity) {
@@ -2738,7 +2890,7 @@ function prepareActiveRunnableCallRouteHandoff(callToken, previousIdentity, next
       context.pageIdentity !== String(previousIdentity || "") ||
       context.generation !== callToken.generation ||
       Number(context.routeHandoffCount || 0) >= 1 ||
-      !isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
+      !isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
     return null;
   }
   let candidate = findRetainedRunnableHelperDispatchCandidate(context);
@@ -2747,10 +2899,17 @@ function prepareActiveRunnableCallRouteHandoff(callToken, previousIdentity, next
   }
   if (!candidate ||
       (context.chatGptTurnProof &&
-        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate))) {
+        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate)) ||
+      !context.routeTurnProof ||
+      !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
     return null;
   }
-  return { callToken, context, candidate };
+  return {
+    callToken,
+    context,
+    candidate,
+    runtimeDispatched: callToken.phase !== "created"
+  };
 }
 
 function preparePreparingRunnableDispatchRouteHandoff(callToken, previousIdentity, nextIdentity) {
@@ -2760,7 +2919,7 @@ function preparePreparingRunnableDispatchRouteHandoff(callToken, previousIdentit
       context.pageIdentity !== String(previousIdentity || "") ||
       context.generation !== callToken.generation ||
       Number(context.routeHandoffCount || 0) >= 1 ||
-      !isChatGptProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
+      !isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
     return null;
   }
   let candidate = findRetainedRunnableHelperDispatchCandidate(context);
@@ -2769,7 +2928,9 @@ function preparePreparingRunnableDispatchRouteHandoff(callToken, previousIdentit
   }
   if (!candidate ||
       (context.chatGptTurnProof &&
-        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate))) {
+        !isChatGptRunnableDispatchTurnProofCurrent(context.chatGptTurnProof, candidate)) ||
+      !context.routeTurnProof ||
+      !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
     return null;
   }
   return { callToken, context, candidate };
@@ -2847,6 +3008,168 @@ function releasePreparingRunnableDispatch(token) {
   return true;
 }
 
+function releaseRunnableHelperDispatchClaimForRouteRetry(context, candidate) {
+  if (context) {
+    // Once the route lifecycle returns this exact claim to the scanner, the
+    // old async continuation cannot rebase itself and mark the helper handled again.
+    context.routeRetryReleased = true;
+  }
+  const renderRoot = context?.renderRoot;
+  const renderedHelperKey = String(context?.renderedHelperKey || "");
+  if (!(renderRoot instanceof Element) || !renderedHelperKey) {
+    return;
+  }
+  const handled = processedRenderedHelpers.get(renderRoot);
+  handled?.delete(renderedHelperKey);
+  if (handled?.size === 0) {
+    processedRenderedHelpers.delete(renderRoot);
+  }
+  if (candidate) {
+    markLiveGeneratedHelperCandidate(candidate, context.semanticCallKey, {
+      routeTurnProof: context.routeTurnProof
+    });
+  }
+}
+
+function markLiveGeneratedHelperCandidate(candidate, semanticCallKey = "", options = {}) {
+  const renderRoot = getCandidateRenderRoot(candidate);
+  if (!(renderRoot instanceof Element)) {
+    return false;
+  }
+  const semanticKey = semanticCallKey || buildSemanticCallKey(candidate.call);
+  const renderedKey = buildRenderedHelperKey(candidate, semanticKey);
+  const liveKeys = liveGeneratedRenderedHelpers.get(renderRoot) || new Set();
+  liveKeys.add(renderedKey);
+  liveGeneratedRenderedHelpers.set(renderRoot, liveKeys);
+  const routeTurnProof = options.routeTurnProof || createRouteHandoffTurnProof(candidate);
+  if (routeTurnProof) {
+    const proofs = liveGeneratedHelperRouteProofs.get(renderRoot) || new Map();
+    const proofRecord = {
+      pageIdentity: getCurrentPageIdentity(),
+      semanticCallKey: semanticKey,
+      source: candidate?.source || "",
+      blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
+      renderGeneration: getHelperRenderRootGeneration(renderRoot),
+      routeTurnProof,
+      renderRoot,
+      renderedKey,
+      processed: options.processed === true
+    };
+    proofs.set(renderedKey, proofRecord);
+    liveGeneratedHelperRouteProofs.set(renderRoot, proofs);
+    liveGeneratedHelperRouteProofRecords.delete(renderedKey);
+    liveGeneratedHelperRouteProofRecords.set(renderedKey, proofRecord);
+    while (liveGeneratedHelperRouteProofRecords.size > 128) {
+      liveGeneratedHelperRouteProofRecords.delete(
+        liveGeneratedHelperRouteProofRecords.keys().next().value
+      );
+    }
+  }
+  return true;
+}
+
+function captureLiveGeneratedHelperRouteHandoff(previousIdentity, nextIdentity) {
+  if (!isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity)) {
+    return [];
+  }
+  let candidates = [];
+  try {
+    candidates = extractShellCallCandidates(getConversationRoot());
+  } catch (_unused) {
+    return [];
+  }
+  const captured = [];
+  for (const candidate of candidates) {
+    if (!(isRunnableHelperCall(candidate.call) ||
+        isSkillHelperCall(candidate.call) ||
+        isDrawioHelperCall(candidate.call)) ||
+        getMessageAuthorRole(candidate.node) === "user" ||
+        isM365SubmittedUserMessageNode(candidate.node) ||
+        isShellOutputCandidate(candidate)) {
+      continue;
+    }
+    const renderRoot = getCandidateRenderRoot(candidate);
+    const semanticCallKey = buildSemanticCallKey(candidate.call);
+    const previousRenderedKey = buildRenderedHelperKey(
+      candidate,
+      semanticCallKey,
+      String(previousIdentity || "")
+    );
+    let proof = liveGeneratedHelperRouteProofs.get(renderRoot)?.get(previousRenderedKey);
+    const exactRootProofInvalid = !proof ||
+      proof.pageIdentity !== String(previousIdentity || "") ||
+      proof.semanticCallKey !== semanticCallKey ||
+      proof.renderGeneration !== getHelperRenderRootGeneration(renderRoot) ||
+      !liveGeneratedRenderedHelpers.get(renderRoot)?.has(previousRenderedKey) ||
+      !isRouteHandoffTurnProofCurrent(proof.routeTurnProof, candidate);
+    if (exactRootProofInvalid) {
+      proof = null;
+    }
+    if (!proof && location.hostname === "chatgpt.com") {
+      const stableMatches = Array.from(liveGeneratedHelperRouteProofRecords.values())
+        .filter((record) =>
+          record.pageIdentity === String(previousIdentity || "") &&
+          record.semanticCallKey === semanticCallKey &&
+          record.source === (candidate?.source || "") &&
+          record.blockIndex === (candidate?.blockIndex ?? candidate?.index ?? "") &&
+          record.routeTurnProof?.userRootIdentity &&
+          record.routeTurnProof?.assistantRootIdentity &&
+          record.renderRoot instanceof Element &&
+          liveGeneratedRenderedHelpers.get(record.renderRoot)?.has(record.renderedKey) === true &&
+          isRouteHandoffTurnProofCurrent(record.routeTurnProof, candidate)
+        );
+      if (stableMatches.length === 1) {
+        proof = {
+          ...stableMatches[0],
+          renderRoot,
+          renderGeneration: getHelperRenderRootGeneration(renderRoot)
+        };
+      }
+    }
+    if (!proof) {
+      continue;
+    }
+    captured.push({ ...proof, renderRoot });
+  }
+  return captured;
+}
+
+function restoreLiveGeneratedHelperRouteHandoff(captured = []) {
+  if (!Array.isArray(captured) || captured.length === 0) {
+    return;
+  }
+  let candidates = [];
+  try {
+    candidates = extractShellCallCandidates(getConversationRoot());
+  } catch (_unused) {
+    return;
+  }
+  for (const proof of captured) {
+    const matches = candidates.filter((candidate) =>
+      getCandidateRenderRoot(candidate) === proof.renderRoot &&
+      getHelperRenderRootGeneration(proof.renderRoot) === proof.renderGeneration &&
+      buildSemanticCallKey(candidate.call) === proof.semanticCallKey &&
+      (candidate.source || "") === proof.source &&
+      (candidate.blockIndex ?? candidate.index ?? "") === proof.blockIndex &&
+      isRouteHandoffTurnProofCurrent(proof.routeTurnProof, candidate)
+    );
+    if (matches.length !== 1) {
+      continue;
+    }
+    markLiveGeneratedHelperCandidate(matches[0], proof.semanticCallKey, {
+      routeTurnProof: proof.routeTurnProof,
+      processed: proof.processed === true
+    });
+    if (proof.processed === true) {
+      // A completed helper may receive its permanent URL only after the
+      // backend lock has already been released. Transfer its consumed claim
+      // with the unique ChatGPT stable-ID proof; restoring only "live" would
+      // make the replacement DOM root dispatch the same helper again.
+      markCallProcessed(matches[0], "route-processed-handoff", proof.semanticCallKey);
+    }
+  }
+}
+
 function rebaseRunnableHelperDispatchContext(context, candidate) {
   const renderRoot = getCandidateRenderRoot(candidate);
   context.pageIdentity = getCurrentPageIdentity();
@@ -2857,6 +3180,7 @@ function rebaseRunnableHelperDispatchContext(context, candidate) {
   context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
   context.renderedHelperKey = buildRenderedHelperKey(candidate, context.semanticCallKey);
   context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
+  context.routeSettlementRequired = true;
   markCallProcessed(candidate, "runnable-route-handoff", context.semanticCallKey);
 }
 
@@ -2882,6 +3206,102 @@ function findRetainedRunnableHelperDispatchCandidate(context) {
   }
 }
 
+function getRouteHandoffUserText(userRoot) {
+  if (!(userRoot instanceof Element)) {
+    return "";
+  }
+  const chatGptUserCopy = getChatGptUserCopyRoot(userRoot);
+  const payloadRoot = chatGptUserCopy instanceof Element ? chatGptUserCopy : userRoot;
+  return normalizeCommand(payloadRoot.innerText || payloadRoot.textContent || "");
+}
+
+function createRouteHandoffTurnProof(candidate) {
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const assistantRoot = getExplicitMessageContainer(renderRoot);
+  const userRoot = getLastExplicitUserMessageRoot(conversationRoot);
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const assistantIndex = authoredRoots.lastIndexOf(assistantRoot);
+  const userText = getRouteHandoffUserText(userRoot);
+  if (!(conversationRoot instanceof Element) ||
+      !(renderRoot instanceof Element) ||
+      !(assistantRoot instanceof Element) ||
+      !(userRoot instanceof Element) ||
+      getMessageAuthorRole(assistantRoot) !== "assistant" ||
+      getMessageAuthorRole(userRoot) !== "user" ||
+      userIndex < 0 ||
+      assistantIndex !== userIndex + 1 ||
+      assistantIndex !== authoredRoots.length - 1 ||
+      !userText) {
+    return null;
+  }
+  return {
+    origin: location.origin,
+    userRoot,
+    assistantRoot,
+    userRootIdentity: getChatGptRouteMessageIdentity(userRoot),
+    assistantRootIdentity: getChatGptRouteMessageIdentity(assistantRoot),
+    userTextHash: stableHash(userText),
+    userTextLength: userText.length
+  };
+}
+
+function resolveRouteHandoffTurnProofRoots(proof, authoredRoots) {
+  let userRoot = proof?.userRoot;
+  let assistantRoot = proof?.assistantRoot;
+  if (authoredRoots.includes(userRoot) && authoredRoots.includes(assistantRoot)) {
+    return { userRoot, assistantRoot };
+  }
+  // Only ChatGPT exposes an immutable message identity that is safe for a
+  // post-route React redraw. M365 and generic hosts must retain the exact
+  // authored root objects; reusable id/testid attributes are not authority.
+  if (location.hostname !== "chatgpt.com" ||
+      !proof?.userRootIdentity || !proof?.assistantRootIdentity) {
+    return { userRoot: null, assistantRoot: null };
+  }
+  const users = authoredRoots.filter((root) =>
+    getMessageAuthorRole(root) === "user" &&
+    getChatGptRouteMessageIdentity(root) === proof.userRootIdentity
+  );
+  const assistants = authoredRoots.filter((root) =>
+    getMessageAuthorRole(root) === "assistant" &&
+    getChatGptRouteMessageIdentity(root) === proof.assistantRootIdentity
+  );
+  if (users.length !== 1 || assistants.length !== 1) {
+    return { userRoot: null, assistantRoot: null };
+  }
+  userRoot = users[0];
+  assistantRoot = assistants[0];
+  return { userRoot, assistantRoot };
+}
+
+function isRouteHandoffTurnProofCurrent(proof, candidate) {
+  if (!proof || proof.origin !== location.origin) {
+    return false;
+  }
+  const conversationRoot = getConversationRoot();
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const { userRoot, assistantRoot } = resolveRouteHandoffTurnProofRoots(proof, authoredRoots);
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const assistantIndex = authoredRoots.lastIndexOf(assistantRoot);
+  const userText = getRouteHandoffUserText(userRoot);
+  return conversationRoot instanceof Element &&
+    renderRoot instanceof Element &&
+    userRoot instanceof Element &&
+    assistantRoot instanceof Element &&
+    userRoot.isConnected === true &&
+    assistantRoot.isConnected === true &&
+    getMessageAuthorRole(userRoot) === "user" &&
+    getMessageAuthorRole(assistantRoot) === "assistant" &&
+    stableHash(userText) === proof.userTextHash &&
+    userText.length === Number(proof.userTextLength) &&
+    assistantIndex === userIndex + 1 &&
+    assistantIndex === authoredRoots.length - 1 &&
+    getExplicitMessageContainer(renderRoot) === assistantRoot;
+}
+
 function createChatGptRunnableDispatchTurnProof(candidate) {
   if (location.hostname !== "chatgpt.com" || !isRunnableHelperCall(candidate?.call)) {
     return null;
@@ -2895,8 +3315,8 @@ function createChatGptRunnableDispatchTurnProof(candidate) {
   const responseIndex = authoredRoots.lastIndexOf(messageRoot);
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const assistantContent = getChatGptAssistantContentRoot(messageRoot);
-  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
-  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userRootIdentity = getChatGptRouteMessageIdentity(userRoot);
+  const assistantRootIdentity = getChatGptRouteMessageIdentity(messageRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
   if (!(conversationRoot instanceof Element) ||
       !(renderRoot instanceof Element) ||
@@ -2926,13 +3346,15 @@ function isChatGptRunnableDispatchTurnProofCurrent(proof, candidate) {
   }
   const conversationRoot = getConversationRoot();
   const authoredRoots = getExplicitMessageRoots(conversationRoot);
-  const userRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "user" &&
-    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  const userRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "user",
+    proof.userRootIdentity
   );
-  const messageRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "assistant" &&
-    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
   );
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
@@ -2955,9 +3377,10 @@ function rebindChatGptRunnableDispatchCandidate(context) {
   }
   const conversationRoot = getConversationRoot();
   const authoredRoots = getExplicitMessageRoots(conversationRoot);
-  const messageRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "assistant" &&
-    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
   );
   if (!(messageRoot instanceof Element)) {
     return null;
@@ -3017,11 +3440,12 @@ function createSkillDispatchContext(candidate) {
     source: candidate?.source || "",
     blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
     routeHandoffCount: 0,
+    routeTurnProof: createRouteHandoffTurnProof(candidate),
     chatGptTurnProof: createChatGptSkillDispatchTurnProof(candidate)
   };
 }
 
-function isSkillDispatchContextCurrent(context) {
+function isSkillDispatchContextCurrent(context, options = {}) {
   if (!context) {
     return true;
   }
@@ -3031,12 +3455,20 @@ function isSkillDispatchContextCurrent(context) {
   refreshPageLifecycle();
   const currentPageIdentity = getCurrentPageIdentity();
   let retainedCandidate = findRetainedSkillDispatchCandidate(context);
-  if (!retainedCandidate &&
-      context.pageIdentity === currentPageIdentity &&
-      context.generation === pageLifecycleGeneration) {
+  let reboundChatGptCandidate = false;
+  if (!retainedCandidate && location.hostname === "chatgpt.com" && context.chatGptTurnProof) {
     retainedCandidate = rebindChatGptSkillDispatchCandidate(context);
+    reboundChatGptCandidate = Boolean(retainedCandidate);
   }
   if (!retainedCandidate) {
+    return false;
+  }
+  if (context.chatGptTurnProof &&
+      !isChatGptSkillDispatchTurnProofCurrent(
+        context.chatGptTurnProof,
+        retainedCandidate,
+        { requireExactWholeEnvelope: reboundChatGptCandidate }
+      )) {
     return false;
   }
   if (context.skillSyncTurnProof &&
@@ -3045,6 +3477,36 @@ function isSkillDispatchContextCurrent(context) {
   }
   if (context.pageIdentity === currentPageIdentity &&
       context.generation === pageLifecycleGeneration) {
+    if (reboundChatGptCandidate) {
+      // Keep a stable-ID assistant-body redraw under the same one-shot Skill
+      // claim. Otherwise the replacement root becomes eligible again as soon
+      // as skillHelperInFlight is released.
+      markCallProcessed(retainedCandidate, "skill-chatgpt-rebind", context.semanticCallKey);
+    }
+    if (context.routeSettlementRequired === true) {
+      if (context.skillSyncTurnProof ||
+          !context.routeTurnProof ||
+          !isRouteHandoffTurnProofCurrent(context.routeTurnProof, retainedCandidate)) {
+        return false;
+      }
+      // Match runnable ownership across the route observer's exact semantic
+      // redraw. The route/turn proof above remains the authority; this only
+      // adopts the render generation invalidated after the route rebase.
+      const renderRoot = getCandidateRenderRoot(retainedCandidate);
+      context.renderRoot = renderRoot;
+      context.renderGeneration = getHelperRenderRootGeneration(renderRoot);
+      context.source = retainedCandidate?.source || "";
+      context.blockIndex = retainedCandidate?.blockIndex ?? retainedCandidate?.index ?? "";
+      context.renderedHelperKey = buildRenderedHelperKey(
+        retainedCandidate,
+        context.semanticCallKey
+      );
+      markCallProcessed(retainedCandidate, "skill-route-redraw", context.semanticCallKey);
+      if (!isRouteReconciliationSettled()) {
+        return options.allowRoutePending === true;
+      }
+      context.routeSettlementRequired = false;
+    }
     return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
   }
   // Chat hosts commonly assign the permanent conversation URL while keeping
@@ -3053,10 +3515,11 @@ function isSkillDispatchContextCurrent(context) {
   // A result from a removed/older chat therefore cannot enter the new chat.
   if (Number(context.routeHandoffCount || 0) >= 1 ||
       routeHandoffPreviousPageIdentity !== context.pageIdentity ||
-      !isChatGptProvisionalConversationRouteAssignment(
+      !isProvisionalConversationRouteAssignment(
         context.pageIdentity,
-        currentPageIdentity
-      )) {
+        currentPageIdentity) ||
+      !context.routeTurnProof ||
+      !isRouteHandoffTurnProofCurrent(context.routeTurnProof, retainedCandidate)) {
     return false;
   }
   if (context.skillSyncTurnProof) {
@@ -3075,7 +3538,8 @@ function isSkillDispatchContextCurrent(context) {
   context.renderGeneration = getHelperRenderRootGeneration(context.renderRoot);
   context.renderedHelperKey = buildRenderedHelperKey(retainedCandidate, context.semanticCallKey);
   context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
-  return true;
+  context.routeSettlementRequired = true;
+  return isRouteReconciliationSettled() || options.allowRoutePending === true;
 }
 
 function createChatGptSkillDispatchTurnProof(candidate) {
@@ -3091,8 +3555,8 @@ function createChatGptSkillDispatchTurnProof(candidate) {
   const responseIndex = authoredRoots.lastIndexOf(messageRoot);
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const assistantContent = getChatGptAssistantContentRoot(messageRoot);
-  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
-  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userRootIdentity = getChatGptRouteMessageIdentity(userRoot);
+  const assistantRootIdentity = getChatGptRouteMessageIdentity(messageRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
   if (!(conversationRoot instanceof Element) ||
       !(renderRoot instanceof Element) ||
@@ -3116,6 +3580,44 @@ function createChatGptSkillDispatchTurnProof(candidate) {
   };
 }
 
+function isChatGptSkillDispatchTurnProofCurrent(proof, candidate, options = {}) {
+  if (!proof) {
+    return true;
+  }
+  if (location.hostname !== "chatgpt.com" || !isSkillHelperCall(candidate?.call)) {
+    return false;
+  }
+  const conversationRoot = getConversationRoot();
+  const authoredRoots = getExplicitMessageRoots(conversationRoot);
+  const userRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "user",
+    proof.userRootIdentity
+  );
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
+  );
+  const renderRoot = getCandidateRenderRoot(candidate);
+  const userCopy = getChatGptUserCopyRoot(userRoot);
+  const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
+  const userIndex = authoredRoots.lastIndexOf(userRoot);
+  const responseIndex = authoredRoots.lastIndexOf(messageRoot);
+  return userRoot instanceof Element &&
+    messageRoot instanceof Element &&
+    renderRoot instanceof Element &&
+    userCopy instanceof Element &&
+    getChatGptMessageRoot(renderRoot, "assistant") === messageRoot &&
+    getChatGptAssistantContentRoot(renderRoot) instanceof Element &&
+    stableHash(userText) === proof.userTextHash &&
+    userText.length === Number(proof.userTextLength) &&
+    responseIndex === userIndex + 1 &&
+    responseIndex === authoredRoots.length - 1 &&
+    (options.requireExactWholeEnvelope !== true ||
+      isExactWholeSkillEnvelopeSyntax(renderRoot, candidate.call));
+}
+
 function rebindChatGptSkillDispatchCandidate(context) {
   const proof = context?.chatGptTurnProof;
   if (location.hostname !== "chatgpt.com" || !proof) {
@@ -3123,13 +3625,15 @@ function rebindChatGptSkillDispatchCandidate(context) {
   }
   const conversationRoot = getConversationRoot();
   const authoredRoots = getExplicitMessageRoots(conversationRoot);
-  const userRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "user" &&
-    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  const userRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "user",
+    proof.userRootIdentity
   );
-  const messageRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "assistant" &&
-    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
   );
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
@@ -3151,12 +3655,15 @@ function rebindChatGptSkillDispatchCandidate(context) {
       getChatGptMessageRoot(getCandidateRenderRoot(candidate), "assistant") === messageRoot &&
       getChatGptAssistantContentRoot(getCandidateRenderRoot(candidate)) instanceof Element &&
       buildSemanticCallKey(candidate.call) === context.semanticCallKey &&
-      isExactWholeSkillEnvelope(getCandidateRenderRoot(candidate), candidate.call)
+      isExactWholeSkillEnvelopeSyntax(getCandidateRenderRoot(candidate), candidate.call)
     );
   } catch (_unused) {
     return null;
   }
-  if (matches.length !== 1) {
+  if (matches.length !== 1 ||
+      !isChatGptSkillDispatchTurnProofCurrent(proof, matches[0], {
+        requireExactWholeEnvelope: true
+      })) {
     return null;
   }
   const candidate = matches[0];
@@ -3406,9 +3913,18 @@ function buildForceCallKey(semanticCallKey) {
 function markCallProcessed(candidate, callKey, semanticCallKey) {
   const renderRoot = getCandidateRenderRoot(candidate);
   if (renderRoot instanceof Element) {
+    const renderedKey = buildRenderedHelperKey(candidate, semanticCallKey);
     const handled = processedRenderedHelpers.get(renderRoot) || new Set();
-    handled.add(buildRenderedHelperKey(candidate, semanticCallKey));
+    handled.add(renderedKey);
     processedRenderedHelpers.set(renderRoot, handled);
+    const routeProof = liveGeneratedHelperRouteProofs.get(renderRoot)?.get(renderedKey);
+    if (routeProof) {
+      routeProof.processed = true;
+    }
+    const fallbackProof = liveGeneratedHelperRouteProofRecords.get(renderedKey);
+    if (fallbackProof?.renderRoot === renderRoot) {
+      fallbackProof.processed = true;
+    }
   }
 }
 
@@ -3499,13 +4015,21 @@ function unmarkCallProcessed(candidate, semanticCallKey) {
   if (!(renderRoot instanceof Element)) {
     return;
   }
+  const renderedKey = buildRenderedHelperKey(candidate, semanticCallKey);
   const handled = processedRenderedHelpers.get(renderRoot);
-  if (!handled) {
-    return;
+  if (handled) {
+    handled.delete(renderedKey);
+    if (handled.size === 0) {
+      processedRenderedHelpers.delete(renderRoot);
+    }
   }
-  handled.delete(buildRenderedHelperKey(candidate, semanticCallKey));
-  if (handled.size === 0) {
-    processedRenderedHelpers.delete(renderRoot);
+  const routeProof = liveGeneratedHelperRouteProofs.get(renderRoot)?.get(renderedKey);
+  if (routeProof) {
+    routeProof.processed = false;
+  }
+  const fallbackProof = liveGeneratedHelperRouteProofRecords.get(renderedKey);
+  if (fallbackProof?.renderRoot === renderRoot) {
+    fallbackProof.processed = false;
   }
 }
 
@@ -3748,10 +4272,10 @@ function observeAssistantGenerationEvidence(records = [], options = {}) {
     if (!assistantGenerationEpoch || Date.now() > assistantGenerationEvidenceUntil || freshAddedControl) {
       assistantGenerationEpoch = createAssistantGenerationEpoch();
       createdEpoch = true;
-    } else if (visibleControl || addedControl) {
+    } else if ((visibleControl || addedControl) && !routeHandoffPreviousPageIdentity) {
       // A still-visible or newly added Stop control proves generation in the
-      // current lifecycle, so new helper roots may be attributed here. A route
-      // carried only by a removed old Stop remains restricted to pre-route roots.
+      // current lifecycle, so new helper roots may be attributed here. Route-
+      // carried generation always keeps its frozen authored-turn boundary.
       assistantGenerationEpoch.routeCarryOnly = false;
     }
     if (!(assistantGenerationEpoch.generationControls instanceof WeakSet)) {
@@ -3827,9 +4351,12 @@ function createAssistantGenerationEpoch() {
 }
 
 function getGenerationRouteText(root) {
-  return root instanceof Element
-    ? normalizeText(root.innerText || root.textContent || "")
-    : "";
+  if (!(root instanceof Element)) {
+    return "";
+  }
+  const userCopy = getChatGptUserCopyRoot(root);
+  const payloadRoot = userCopy instanceof Element ? userCopy : root;
+  return normalizeText(payloadRoot.innerText || payloadRoot.textContent || "");
 }
 
 function getExplicitMessageRoots(conversationRoot) {
@@ -3893,7 +4420,6 @@ function isCurrentAssistantResponseRoot(root, epoch = assistantGenerationEpoch) 
     const currentUserText = getGenerationRouteText(epoch.userAnchor);
     const currentResponseText = getGenerationRouteText(root);
     if (!epoch.routeCarryUserText ||
-        !epoch.routeCarryResponsePrefix ||
         currentUserText !== epoch.routeCarryUserText ||
         !currentResponseText.startsWith(epoch.routeCarryResponsePrefix)) {
       // React may recycle the same authored-message Elements for a different
@@ -3953,7 +4479,7 @@ function collectCurrentAssistantResponseRoots(records = []) {
 
 function bindAssistantGenerationResponseRoot(responseRoots = []) {
   const epoch = assistantGenerationEpoch;
-  if (!epoch || epoch.routeCarryOnly === true || epoch.responseMessageRoot) {
+  if (!epoch || epoch.responseMessageRoot) {
     return;
   }
   const unique = Array.from(new Set(responseRoots || []));
@@ -4124,9 +4650,7 @@ function markLiveGeneratedHelperCandidates(records = []) {
       // observer batches; an unrelated response cannot revive historical Skill.
       continue;
     }
-    const keys = liveGeneratedRenderedHelpers.get(renderRoot) || new Set();
-    keys.add(buildRenderedHelperKey(candidate, semanticCallKey));
-    liveGeneratedRenderedHelpers.set(renderRoot, keys);
+    markLiveGeneratedHelperCandidate(candidate, semanticCallKey);
     // A host can recycle the same React message root. Generation evidence is
     // deliberately candidate-bound, so it is safe to release only this exact
     // helper from a cold-history baseline when the assistant later emits the
@@ -4220,16 +4744,13 @@ function markCurrentLifecycleCompletedHelperCandidate(candidate) {
   }
   const renderRoot = getCandidateRenderRoot(candidate);
   const semanticCallKey = buildSemanticCallKey(candidate.call);
-  const keys = liveGeneratedRenderedHelpers.get(renderRoot) || new Set();
-  keys.add(buildRenderedHelperKey(candidate, semanticCallKey));
-  liveGeneratedRenderedHelpers.set(renderRoot, keys);
+  markLiveGeneratedHelperCandidate(candidate, semanticCallKey);
   clearBaselineIgnoredHelperCandidate(candidate, semanticCallKey);
   return true;
 }
 
 function trackAssistantGenerationHelperRoots(records = []) {
-  if (!assistantGenerationEpoch || assistantGenerationEpoch.routeCarryOnly === true ||
-      assistantGenerationEpoch.responseMessageRoot) {
+  if (!assistantGenerationEpoch || assistantGenerationEpoch.responseMessageRoot) {
     return;
   }
   bindAssistantGenerationResponseRoot(collectCurrentAssistantResponseRoots(records));
@@ -4306,9 +4827,24 @@ function isLiveGeneratedHelperCandidate(candidate) {
     return false;
   }
   const semanticCallKey = buildSemanticCallKey(candidate.call);
-  return liveGeneratedRenderedHelpers.get(renderRoot)?.has(
-    buildRenderedHelperKey(candidate, semanticCallKey)
-  ) === true;
+  const renderedKey = buildRenderedHelperKey(candidate, semanticCallKey);
+  if (liveGeneratedRenderedHelpers.get(renderRoot)?.has(renderedKey) !== true) {
+    return false;
+  }
+  const routeProof = liveGeneratedHelperRouteProofs.get(renderRoot)?.get(renderedKey);
+  if (!routeProof) {
+    return true;
+  }
+  // A route handoff can be accepted while the host still has the originating
+  // transcript mounted, then rewritten during the reconciliation quarantine.
+  // Keep the generation-time user/turn proof authoritative through every
+  // later live check instead of treating the restored route key as final proof.
+  return routeProof.pageIdentity === getCurrentPageIdentity() &&
+    routeProof.semanticCallKey === semanticCallKey &&
+    routeProof.renderGeneration === getHelperRenderRootGeneration(renderRoot) &&
+    routeProof.source === (candidate?.source || "") &&
+    routeProof.blockIndex === (candidate?.blockIndex ?? candidate?.index ?? "") &&
+    isRouteHandoffTurnProofCurrent(routeProof.routeTurnProof, candidate);
 }
 
 function getLastShellCallCandidate(root) {
@@ -4584,11 +5120,12 @@ function createDrawioDispatchContext(candidate) {
     source: candidate?.source || "",
     blockIndex: candidate?.blockIndex ?? candidate?.index ?? "",
     routeHandoffCount: 0,
+    routeTurnProof: createRouteHandoffTurnProof(candidate),
     chatGptTurnProof: createChatGptDrawioDispatchTurnProof(candidate)
   };
 }
 
-function isDrawioDispatchContextCurrent(context) {
+function isDrawioDispatchContextCurrent(context, options = {}) {
   if (!context) {
     return true;
   }
@@ -4605,15 +5142,25 @@ function isDrawioDispatchContextCurrent(context) {
   }
   if (context.pageIdentity === currentPageIdentity &&
       context.generation === pageLifecycleGeneration) {
+    if (context.routeSettlementRequired === true) {
+      if (!context.routeTurnProof ||
+          !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
+        return false;
+      }
+      if (!isRouteReconciliationSettled()) {
+        return options.allowRoutePending === true;
+      }
+      context.routeSettlementRequired = false;
+    }
     return context.renderGeneration === getHelperRenderRootGeneration(context.renderRoot);
   }
   if (Number(context.routeHandoffCount || 0) >= 1 ||
-      !context.chatGptTurnProof ||
       routeHandoffPreviousPageIdentity !== context.pageIdentity ||
-      !isChatGptProvisionalConversationRouteAssignment(
+      !isProvisionalConversationRouteAssignment(
         context.pageIdentity,
-        currentPageIdentity
-      )) {
+        currentPageIdentity) ||
+      !context.routeTurnProof ||
+      !isRouteHandoffTurnProofCurrent(context.routeTurnProof, candidate)) {
     return false;
   }
   const renderRoot = getCandidateRenderRoot(candidate);
@@ -4624,7 +5171,8 @@ function isDrawioDispatchContextCurrent(context) {
   context.source = candidate?.source || "";
   context.blockIndex = candidate?.blockIndex ?? candidate?.index ?? "";
   context.routeHandoffCount = Number(context.routeHandoffCount || 0) + 1;
-  return true;
+  context.routeSettlementRequired = true;
+  return isRouteReconciliationSettled() || options.allowRoutePending === true;
 }
 
 function findRetainedDrawioDispatchCandidate(context) {
@@ -4662,8 +5210,8 @@ function createChatGptDrawioDispatchTurnProof(candidate) {
   const responseIndex = authoredRoots.lastIndexOf(messageRoot);
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const assistantContent = getChatGptAssistantContentRoot(messageRoot);
-  const userRootIdentity = getSubmittedMessageRootIdentity(userRoot);
-  const assistantRootIdentity = getSubmittedMessageRootIdentity(messageRoot);
+  const userRootIdentity = getChatGptRouteMessageIdentity(userRoot);
+  const assistantRootIdentity = getChatGptRouteMessageIdentity(messageRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
   if (!(conversationRoot instanceof Element) ||
       !(renderRoot instanceof Element) ||
@@ -4693,13 +5241,15 @@ function isChatGptDrawioDispatchTurnProofCurrent(proof, candidate) {
   }
   const conversationRoot = getConversationRoot();
   const authoredRoots = getExplicitMessageRoots(conversationRoot);
-  const userRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "user" &&
-    getSubmittedMessageRootIdentity(root) === proof.userRootIdentity
+  const userRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "user",
+    proof.userRootIdentity
   );
-  const messageRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "assistant" &&
-    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
   );
   const userCopy = getChatGptUserCopyRoot(userRoot);
   const userText = normalizeCommand(userCopy?.innerText || userCopy?.textContent || "");
@@ -4722,9 +5272,10 @@ function rebindChatGptDrawioDispatchCandidate(context) {
   }
   const conversationRoot = getConversationRoot();
   const authoredRoots = getExplicitMessageRoots(conversationRoot);
-  const messageRoot = authoredRoots.find((root) =>
-    getMessageAuthorRole(root) === "assistant" &&
-    getSubmittedMessageRootIdentity(root) === proof.assistantRootIdentity
+  const messageRoot = getUniqueChatGptRouteMessageRoot(
+    authoredRoots,
+    "assistant",
+    proof.assistantRootIdentity
   );
   if (!(messageRoot instanceof Element)) {
     return null;
@@ -4798,11 +5349,17 @@ async function queueDrawioErrorReply(candidate, result, dispatchContext = null) 
   if (!result || result.ok === true || result.cancelled === true || result.newError !== true) {
     return false;
   }
-  if (dispatchContext && !isDrawioDispatchContextCurrent(dispatchContext)) {
+  if (dispatchContext && !isDrawioDispatchContextCurrent(
+    dispatchContext,
+    { allowRoutePending: true }
+  )) {
     return false;
   }
   const settings = await chrome.storage.sync.get(["autoSend", "maxChainCalls"]);
-  if (dispatchContext && !isDrawioDispatchContextCurrent(dispatchContext)) {
+  if (dispatchContext && !isDrawioDispatchContextCurrent(
+    dispatchContext,
+    { allowRoutePending: true }
+  )) {
     return false;
   }
   const maxChainCalls = Math.max(1, Number(settings.maxChainCalls || DEFAULT_MAX_CHAIN_CALLS));
@@ -4831,7 +5388,10 @@ async function queueDrawioErrorReply(candidate, result, dispatchContext = null) 
     reply,
     settings,
     dispatchContext ? {
-      lifecycleGuard: () => isDrawioDispatchContextCurrent(dispatchContext),
+      lifecycleGuard: () => isDrawioDispatchContextCurrent(
+        dispatchContext,
+        { allowRoutePending: true }
+      ),
       staleHandler: () => {
         console.warn("[AI Chat Draw.io] Discarded an error reply after its originating response changed.");
       },
@@ -4847,6 +5407,7 @@ async function queueDrawioErrorReply(candidate, result, dispatchContext = null) 
 
 async function processLatestSkillCandidate(allCandidates, settings = {}, options = {}) {
   const manualRecovery = options.allowBaselineRecovery === true || options.forceDetected === true;
+  const allowAutomaticRouteHandoff = !manualRecovery;
   if (!manualRecovery && isManualHelperDispatchInFlight()) {
     scheduleScan();
     return false;
@@ -4910,7 +5471,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: validation.reason },
       reply: formatSkillProtocolError(validation.reason),
-      dispatchContext
+      dispatchContext,
+      allowRoutePending: allowAutomaticRouteHandoff
     });
     return false;
   }
@@ -4929,7 +5491,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: `Chain limit reached (${maxChainCalls}).` },
       reply: formatSkillProtocolError(`Chain limit reached (${maxChainCalls}). Ask the user before making more Skill requests.`),
-      dispatchContext
+      dispatchContext,
+      allowRoutePending: allowAutomaticRouteHandoff
     });
     return false;
   }
@@ -4949,7 +5512,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         type: "skill-sync-list",
         challenge: call.challenge || ""
       });
-      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      if (!isSkillDispatchContextCurrent(dispatchContext, {
+        allowRoutePending: allowAutomaticRouteHandoff
+      })) {
         return reportStaleSkillDispatch(dispatchContext);
       }
       if (ownedSyncRecovery) {
@@ -4980,7 +5545,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         call: { ...call, kind: "skill-list" },
         response,
         reply: catalogReply,
-        dispatchContext
+        dispatchContext,
+        allowRoutePending: allowAutomaticRouteHandoff
       });
       return response?.ok === true;
     }
@@ -4990,7 +5556,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         skillId: call.skillId,
         catalogSha: call.catalogSha
       });
-      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      if (!isSkillDispatchContextCurrent(dispatchContext, {
+        allowRoutePending: allowAutomaticRouteHandoff
+      })) {
         return reportStaleSkillDispatch(dispatchContext);
       }
       await queueSkillComposerReply({
@@ -5000,7 +5568,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         reply: response?.ok === true
           ? formatSkillLoadReply(response)
           : formatSkillProtocolError(response?.error || `Skill ${call.skillId} could not be loaded.`, response),
-        dispatchContext
+        dispatchContext,
+        allowRoutePending: allowAutomaticRouteHandoff
       });
       return response?.ok === true;
     }
@@ -5012,7 +5581,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         catalogVersion: Number(call.catalogVersion),
         memoryEntry: call.memoryEntry
       });
-      if (!isSkillDispatchContextCurrent(dispatchContext)) {
+      if (!isSkillDispatchContextCurrent(dispatchContext, {
+        allowRoutePending: allowAutomaticRouteHandoff
+      })) {
         return reportStaleSkillDispatch(dispatchContext);
       }
       if (response?.ok === true) {
@@ -5021,7 +5592,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
           return false;
         }
         await refreshSkillState({ quiet: true });
-        if (!isSkillDispatchContextCurrent(dispatchContext)) {
+        if (!isSkillDispatchContextCurrent(dispatchContext, {
+          allowRoutePending: allowAutomaticRouteHandoff
+        })) {
           return reportStaleSkillDispatch(dispatchContext);
         }
         setStatus(`Skills v${response.version || skillPanelState?.version || "?"} acknowledged in ${SKILL_MEMORY_ENTRY}`, "ok");
@@ -5036,7 +5609,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
         call: { ...call, kind: "skill-error" },
         response,
         reply: formatSkillProtocolError(response?.error || "The Skill catalog acknowledgement was rejected.", response),
-        dispatchContext
+        dispatchContext,
+        allowRoutePending: allowAutomaticRouteHandoff
       });
       return false;
     }
@@ -5048,7 +5622,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       catalogVersion: Number(call.catalogVersion),
       reason: call.reason
     });
-    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+    if (!isSkillDispatchContextCurrent(dispatchContext, {
+      allowRoutePending: allowAutomaticRouteHandoff
+    })) {
       return reportStaleSkillDispatch(dispatchContext);
     }
     if (ownedSyncRecovery) {
@@ -5061,7 +5637,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       }
     }
     await refreshSkillState({ quiet: true });
-    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+    if (!isSkillDispatchContextCurrent(dispatchContext, {
+      allowRoutePending: allowAutomaticRouteHandoff
+    })) {
       return reportStaleSkillDispatch(dispatchContext);
     }
     setStatus(
@@ -5072,7 +5650,9 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
     );
     return response?.ok === true;
   } catch (error) {
-    if (!isSkillDispatchContextCurrent(dispatchContext)) {
+    if (!isSkillDispatchContextCurrent(dispatchContext, {
+      allowRoutePending: allowAutomaticRouteHandoff
+    })) {
       return reportStaleSkillDispatch(dispatchContext);
     }
     if (ownedSyncRecovery) {
@@ -5088,7 +5668,8 @@ async function processLatestSkillCandidate(allCandidates, settings = {}, options
       call: { ...call, kind: "skill-error" },
       response: { ok: false, error: error.message || String(error) },
       reply: formatSkillProtocolError(error.message || String(error)),
-      dispatchContext
+      dispatchContext,
+      allowRoutePending: allowAutomaticRouteHandoff
     });
     return false;
   } finally {
@@ -5247,12 +5828,16 @@ function isActiveOwnedSkillSyncCandidate(candidate) {
 }
 
 function isExactWholeSkillEnvelope(renderRoot, call) {
+  return isExactWholeSkillEnvelopeSyntax(renderRoot, call) &&
+    validateSkillHelperCall(call).ok;
+}
+
+function isExactWholeSkillEnvelopeSyntax(renderRoot, call) {
   const lines = splitShellCallLines(renderRoot?.textContent || "");
   const calls = parsePlainTextHelperBlocks(lines.join("\n"));
   return calls.length === 1 &&
     calls[0].sourceStartLine === 0 &&
     calls[0].sourceEndLine === lines.length - 1 &&
-    validateSkillHelperCall(calls[0]).ok &&
     buildSemanticCallKey(calls[0]) === buildSemanticCallKey(call);
 }
 
@@ -5495,9 +6080,19 @@ function wrapSkillOutput(content) {
   return `${fence}skill-output\n${text}\n${fence}`;
 }
 
-async function queueSkillComposerReply({ callId, call, response, reply, dispatchContext }) {
+async function queueSkillComposerReply({
+  callId,
+  call,
+  response,
+  reply,
+  dispatchContext,
+  allowRoutePending = false
+}) {
   const settings = await chrome.storage.sync.get(["autoSend"]);
-  if (dispatchContext && !isSkillDispatchContextCurrent(dispatchContext)) {
+  if (dispatchContext && !isSkillDispatchContextCurrent(
+    dispatchContext,
+    { allowRoutePending }
+  )) {
     return reportStaleSkillDispatch(dispatchContext);
   }
   const pending = await rememberPendingHelperDelivery(
@@ -5508,12 +6103,19 @@ async function queueSkillComposerReply({ callId, call, response, reply, dispatch
     settings,
     {
       lifecycleGuard: dispatchContext
-        ? () => isSkillDispatchContextCurrent(dispatchContext)
+        ? () => isSkillDispatchContextCurrent(
+          dispatchContext,
+          { allowRoutePending }
+        )
         : null,
       staleHandler: dispatchContext
         ? () => releaseStaleSkillDispatchForRecovery(dispatchContext)
         : null,
-      skillOriginProof: createStoredSkillOriginProof(dispatchContext)
+      skillOriginProof: createStoredSkillOriginProof(dispatchContext),
+      skillRouteHandoffPending: Boolean(
+        allowRoutePending && dispatchContext &&
+        Number(dispatchContext.routeHandoffCount || 0) > 0
+      )
     }
   );
   if (!pending) {
@@ -6965,7 +7567,7 @@ async function runAndReply(callId, call, options = {}) {
   lastExecutedSemanticKey = buildSemanticCallKey(call);
   try {
     const response = isFileHelperCall(call) ?
-      await sendWriteFileMessage(callId, call, force) :
+      await sendWriteFileMessage(callId, call, force, callToken) :
       isBoardHelperCall(call) ?
       await sendRunBoardMessage(callId, call, force, dispatchContext, callToken) :
       isAgentMessageHelperCall(call) ?
@@ -6976,7 +7578,10 @@ async function runAndReply(callId, call, options = {}) {
       await sendAgentTaskStatusQuery(callId, call, force, dispatchContext, callToken) :
       await sendRunShellMessage(callId, call, force, dispatchContext, callToken);
     callToken.phase = "response-received";
-    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(dispatchContext)) {
+    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(
+      dispatchContext,
+      { allowRoutePending: true }
+    )) {
       return reportStaleRunnableHelperDispatch(dispatchContext, "after backend execution", {
         response
       });
@@ -7073,7 +7678,10 @@ async function runAndReply(callId, call, options = {}) {
       deliveryFailed: !delivered
     };
   } catch (error) {
-    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(dispatchContext)) {
+    if (dispatchContext && !isRunnableHelperDispatchContextCurrent(
+      dispatchContext,
+      { allowRoutePending: true }
+    )) {
       return reportStaleRunnableHelperDispatch(dispatchContext, "after backend failure", {
         error: error.message || String(error)
       });
@@ -7170,7 +7778,10 @@ function createRunnablePendingDeliveryOptions(
   stalePhase
 ) {
   const lifecycleGuard = dispatchContext
-    ? () => isRunnableHelperDispatchContextCurrent(dispatchContext)
+    ? () => isRunnableHelperDispatchContextCurrent(
+      dispatchContext,
+      { allowRoutePending: true }
+    )
     : force === true && callToken
       ? () => isCallLifecycleCurrent(callToken)
       : null;
@@ -7415,6 +8026,7 @@ async function sendRunShellMessage(callId, call, force, dispatchContext = null, 
     }
   };
   try {
+    markRunnableRuntimeDispatchStarted(callToken);
     const response = await chrome.runtime.sendMessage(payload);
     if (response?.ok === false && isRecoverableRuntimeChannelError(response.error)) {
       return recoverRunShellResult(callId, new Error(response.error || "Shell transport failed."), recoveryLifecycle);
@@ -7520,6 +8132,8 @@ async function recoverRunShellResult(callKey, originalError, lifecycle = {}) {
           idleForMs: status.idleForMs || 0,
           idleTimeoutMs: status.idleTimeoutMs || 180000,
           lastOutputAt: status.lastOutputAt || 0
+        }, {
+          isCurrent: () => isRunnableBackendRecoveryLifecycleCurrent(lifecycle)
         });
       }
       await sleep(RUN_STATUS_POLL_INTERVAL_MS);
@@ -7542,7 +8156,8 @@ function createNonRetryableShellRecoveryError(message) {
   return error;
 }
 
-function sendWriteFileMessage(callId, call, force) {
+function sendWriteFileMessage(callId, call, force, callToken = null) {
+  markRunnableRuntimeDispatchStarted(callToken);
   return chrome.runtime.sendMessage({
     type: "write-file",
     id: callId,
@@ -7580,6 +8195,7 @@ async function sendRunBoardMessage(callId, call, force, dispatchContext = null, 
     }
   };
   try {
+    markRunnableRuntimeDispatchStarted(callToken);
     const response = await chrome.runtime.sendMessage(payload);
     if (response?.ok === false && isRecoverableRuntimeChannelError(response.error)) {
       return recoverRunBoardResult(callId, new Error(response.error || "Board transport failed."), recoveryLifecycle);
@@ -7668,7 +8284,10 @@ async function recoverRunBoardResult(callKey, originalError, lifecycle = {}) {
 function createRunnableBackendRecoveryLifecycle(dispatchContext) {
   if (dispatchContext) {
     return {
-      isCurrent: () => isRunnableHelperDispatchContextCurrent(dispatchContext)
+      isCurrent: () => isRunnableHelperDispatchContextCurrent(
+        dispatchContext,
+        { allowRoutePending: true }
+      )
     };
   }
   // Force runs and direct callers intentionally retain the original strict
@@ -7707,6 +8326,14 @@ function requireRunnableDispatchCurrentBeforeRuntime(dispatchContext, callToken 
   throw error;
 }
 
+function markRunnableRuntimeDispatchStarted(callToken = null) {
+  if (callToken) {
+    // This assignment and the immediately following sendMessage call run in
+    // one JavaScript task. A route observer cannot interleave between them.
+    callToken.phase = "runtime-dispatched";
+  }
+}
+
 function createNonRetryableBoardRecoveryError(message) {
   const error = new Error(message);
   error.helperRetryable = false;
@@ -7720,6 +8347,7 @@ async function sendAgentMessage(callId, call, force, dispatchContext = null, cal
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before sending agent messages.");
   }
+  markRunnableRuntimeDispatchStarted(callToken);
   return chrome.runtime.sendMessage({
     type: "agent-send",
     id: callId,
@@ -7744,6 +8372,7 @@ async function sendAgentRosterQuery(_callId, call, _force, dispatchContext = nul
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying the agent roster.");
   }
+  markRunnableRuntimeDispatchStarted(callToken);
   const response = await chrome.runtime.sendMessage({ type: "agent-list" });
   if (!response?.ok) {
     return response;
@@ -7771,6 +8400,7 @@ async function sendAgentTaskStatusQuery(_callId, call, _force, dispatchContext =
   if (!profile.agentId || !profile.role || profile.role === "none") {
     throw new Error("Current page is not configured as an agent. Set this tab to master or slave before querying task status.");
   }
+  markRunnableRuntimeDispatchStarted(callToken);
   return chrome.runtime.sendMessage({
     type: "agent-task-status",
     agentId: profile.agentId,
@@ -9935,6 +10565,26 @@ function getSubmittedMessageRootIdentity(node) {
   return "";
 }
 
+function getChatGptRouteMessageIdentity(node) {
+  if (location.hostname !== "chatgpt.com") {
+    return "";
+  }
+  const root = getChatGptMessageRoot(node);
+  const value = String(root?.getAttribute?.("data-message-id") || "");
+  return value ? `data-message-id:${value}` : "";
+}
+
+function getUniqueChatGptRouteMessageRoot(authoredRoots, role, identity) {
+  if (!identity) {
+    return null;
+  }
+  const matches = Array.from(authoredRoots || []).filter((root) =>
+    getMessageAuthorRole(root) === role &&
+    getChatGptRouteMessageIdentity(root) === identity
+  );
+  return matches.length === 1 ? matches[0] : null;
+}
+
 function hasPendingHelperSubmissionProof(entry) {
   const observedCount = countSubmittedMessagesMatching(entry?.reply || "");
   const baselineCount = Number(entry?.submittedMessageCountBefore || 0);
@@ -11734,12 +12384,13 @@ function applyPanelStateTheme(panel, state) {
   return theme;
 }
 
-async function handleShellRunProgress(message) {
-  if (!extensionActive) {
+async function handleShellRunProgress(message, options = {}) {
+  const isCurrent = () => typeof options.isCurrent !== "function" || options.isCurrent() === true;
+  if (!extensionActive || !isCurrent()) {
     return;
   }
   const agentId = await getCurrentShellRoleAgentId();
-  if (String(message.agentId || "") !== agentId) {
+  if (!extensionActive || !isCurrent() || String(message.agentId || "") !== agentId) {
     return;
   }
   // Role-level progress remains useful when recovering a task after refresh,

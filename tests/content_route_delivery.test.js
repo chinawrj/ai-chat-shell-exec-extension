@@ -266,7 +266,7 @@ async function testExactPluginTextMigratesAcrossRouteChange() {
   assert.notEqual(context.getCurrentPageIdentity(), oldIdentity);
 
   await context.retryPendingHelperDeliveries();
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.ok(
@@ -342,7 +342,7 @@ async function testDifferentUserDraftDoesNotMigrateOrSend() {
   installSyntheticLiveRouteProof(context);
   navigateWithoutLifecycleRefresh(context, "/c/user-draft");
   await context.retryPendingHelperDeliveries();
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.equal(backendRuns, 1);
@@ -413,7 +413,7 @@ async function testSubmittedUnconfirmedExactComposerSurvivesRouteAndResumesSendO
 
   navigateWithoutLifecycleRefresh(context, "/c/submitted-unconfirmed-exact");
   await context.retryPendingHelperDeliveries();
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   await context.retryPendingHelperDeliveries();
 
   assert.equal(backendRuns, 1, "Route recovery must never replay the backend operation.");
@@ -481,7 +481,7 @@ async function testSubmittedUnconfirmedChangedComposerCancelsAcrossRoute() {
 
     navigateWithoutLifecycleRefresh(context, `/c/submitted-unconfirmed-cancel-${replacement.length}`);
     await context.retryPendingHelperDeliveries();
-    vm.runInContext("initialThreadSettled = true;", context);
+    vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
     await context.retryPendingHelperDeliveries();
 
     assert.equal(backendRuns, 1);
@@ -575,7 +575,7 @@ async function testQueuedFileResultSurvivesRouteWithoutBackendReplay() {
 
   navigateWithoutLifecycleRefresh(context, "/c/queued-file-route");
   context.refreshPageLifecycle();
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1, "Queued backend results must survive a route handoff.");
   assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].phase", context), "queued");
   const secondCallKey = context.buildCandidateCallKey(candidate, semanticCallKey);
@@ -732,7 +732,7 @@ async function testRestoredUnsubmittedPendingCannotCrossAnyRoute() {
           0,
           `${transition.name} ${kind} ${phase} must fail closed without a live exact origin proof.`
         );
-        vm.runInContext("initialThreadSettled = true;", context);
+        vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
         await context.retryPendingHelperDeliveries();
         await vm.runInContext("pendingHelperDeliveryStorageTail", context);
         await Promise.resolve();
@@ -785,7 +785,7 @@ async function testRestoredSubmittedPendingCrossesOnlyForReceiptCleanup() {
     navigate(context, "/c/receipt-new");
     assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 1);
     assert.equal(vm.runInContext("Array.from(pendingHelperDeliveries.values())[0].routeReceiptCleanupOnly", context), true);
-    vm.runInContext("initialThreadSettled = true;", context);
+    vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
     await context.retryPendingHelperDeliveries();
 
     assert.equal(receiptAttempts, 1);

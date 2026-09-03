@@ -89,6 +89,14 @@ function createSkillLoadBlock({ helperId, skillId, catalogSha }) {
   ].join("\n");
 }
 
+function createDrawioBlock({ helperId }) {
+  return [
+    `ai-helper-drawio-start:${helperId}`,
+    '<mxfile><diagram id="route-proof"><mxGraphModel><root/></mxGraphModel></diagram></mxfile>',
+    "ai-helper-drawio-end"
+  ].join("\n");
+}
+
 function createAgentRosterBlock() {
   return [
     "ai-helper-agent-roster-start",
@@ -809,7 +817,7 @@ async function verifyFirstResponseRouteAssignmentCarriesInFlightShellResult() {
   context.location.pathname = "/c/first-response-permanent";
   context.location.href = "https://chatgpt.com/c/first-response-permanent";
   assert.equal(context.refreshPageLifecycle(), true, "The test must cross a real content-script route lifecycle.");
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   resolveBackend({
     ok: true,
     executed: true,
@@ -912,7 +920,7 @@ async function verifyInFlightShellResultCannotCrossRouteAfterTranscriptReplaceme
   context.location.pathname = "/c/unrelated-existing-chat";
   context.location.href = "https://chatgpt.com/c/unrelated-existing-chat";
   assert.equal(context.refreshPageLifecycle(), true);
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   resolveBackend({
     ok: true,
     executed: true,
@@ -1031,11 +1039,7 @@ async function verifySettingsAwaitRouteAdjudication() {
       lastThreadText = normalizeText(globalThis.__settingsRouteRoot.innerText || globalThis.__settingsRouteRoot.textContent || "");
       lastThreadTextAt = Date.now() - 5000;
       const settingsCandidate = globalThis.__settingsRouteCandidate;
-      const settingsSemanticKey = buildSemanticCallKey(settingsCandidate.call);
-      liveGeneratedRenderedHelpers.set(
-        getCandidateRenderRoot(settingsCandidate),
-        new Set([buildRenderedHelperKey(settingsCandidate, settingsSemanticKey)])
-      );
+      markLiveGeneratedHelperCandidate(settingsCandidate);
       deliverHelperReply = async () => false;
     `, context);
 
@@ -1054,9 +1058,15 @@ async function verifySettingsAwaitRouteAdjudication() {
     context.location.pathname = testCase.nextPath;
     context.location.href = `https://chatgpt.com${testCase.nextPath}`;
     assert.equal(context.refreshPageLifecycle(), true, `${testCase.name} must create a new lifecycle.`);
-    vm.runInContext("initialThreadSettled = true;", context);
+    vm.runInContext(`
+      initialThreadSettled = true;
+      routeReconciliationNotBefore = 0;
+      lastThreadText = normalizeText(globalThis.__settingsRouteRoot.innerText || globalThis.__settingsRouteRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+    `, context);
     releaseSettings({ requireApproval: false, autoSend: true });
     await scan;
+    await context.scanForShellCall();
 
     assert.equal(
       backendRuns,
@@ -1093,7 +1103,11 @@ function createStableChatGptRouteTurn(context, {
       if (name === "data-message-id") return id;
       return "";
     };
-    node.matches = (selector) => String(selector).includes(`li[data-message-role="${role}"]`);
+    node.matches = (selector) => {
+      const value = String(selector);
+      return value.includes(`li[data-message-role="${role}"]`) ||
+        value.includes("[data-message-author-role]");
+    };
     node.closest = (selector) => node.matches(selector)
       ? node
       : node.parentElement?.closest?.(selector) || null;
@@ -1257,11 +1271,7 @@ async function verifyRouteRedrawDuringSettingsAwaitIsSingleFlight() {
     lastThreadText = normalizeText(globalThis.__settingsRedrawRoot.innerText || globalThis.__settingsRedrawRoot.textContent || "");
     lastThreadTextAt = Date.now() - 5000;
     const firstCandidate = globalThis.__settingsRedrawCandidate;
-    const firstSemanticKey = buildSemanticCallKey(firstCandidate.call);
-    liveGeneratedRenderedHelpers.set(
-      getCandidateRenderRoot(firstCandidate),
-      new Set([buildRenderedHelperKey(firstCandidate, firstSemanticKey)])
-    );
+    markLiveGeneratedHelperCandidate(firstCandidate);
   `, context);
 
   const firstScan = context.scanForShellCall();
@@ -1281,6 +1291,7 @@ async function verifyRouteRedrawDuringSettingsAwaitIsSingleFlight() {
   assert.equal(context.refreshPageLifecycle(), true);
   vm.runInContext(`
     initialThreadSettled = true;
+    routeReconciliationNotBefore = 0;
     lastThreadText = normalizeText(globalThis.__settingsRedrawRoot.innerText || globalThis.__settingsRedrawRoot.textContent || "");
     lastThreadTextAt = Date.now() - 5000;
     const secondCandidate = globalThis.__settingsRedrawCandidate;
@@ -1431,9 +1442,16 @@ async function verifyRejectedHelperRouteSettingsGuard() {
     context.location.pathname = `/c/rejected-route-${testCase.replaceTranscript ? "negative" : "positive"}`;
     context.location.href = `https://chatgpt.com${context.location.pathname}`;
     assert.equal(context.refreshPageLifecycle(), true);
-    vm.runInContext("initialThreadSettled = true;", context);
+    vm.runInContext(`
+      initialThreadSettled = true;
+      routeReconciliationNotBefore = 0;
+      chainCallCount = ${testCase.rejectionKind === "chain" ? 1 : 0};
+      lastThreadText = normalizeText(globalThis.__rejectedRouteRoot.innerText || globalThis.__rejectedRouteRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+    `, context);
     releaseSettings({ autoSend: true });
     await scan;
+    await context.scanForShellCall();
     await context.retryPendingHelperDeliveries();
 
     assert.equal(composerWrites, testCase.expectedWrites,
@@ -1657,6 +1675,7 @@ async function verifyChangedRouteClaimUsesExactTokenRelease() {
   assert.equal(context.refreshPageLifecycle(), true);
   vm.runInContext(`
     initialThreadSettled = true;
+    routeReconciliationNotBefore = 0;
     lastThreadText = normalizeText(globalThis.__claimRouteRoot.innerText || globalThis.__claimRouteRoot.textContent || "");
     lastThreadTextAt = Date.now() - 5000;
     const newClaimCandidate = globalThis.__claimRouteCandidate;
@@ -1963,7 +1982,13 @@ async function verifyDeferredProfileDispatchRouteGuards() {
         profileRequested();
         return profileGate;
       };
-      context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
+      context.chrome.storage.sync.get = async () => ({
+        enabled: true,
+        enabledHosts: ["chatgpt.com"],
+        maxChainCalls: 100,
+        requireApproval: false,
+        autoSend: true
+      });
       context.chrome.runtime.sendMessage = async (payload) => {
         runtimeCalls.push(payload);
         if (payload.type === "run-shell" || payload.type === "run-board") {
@@ -1982,7 +2007,9 @@ async function verifyDeferredProfileDispatchRouteGuards() {
         return { ok: true, messageId: "profile-route-message" };
       };
       context.rememberPendingHelperDelivery = async (_callId, _call, response) => ({
-        callId,
+        callId: _callId,
+        call: _call,
+        kind: context.pendingHelperDeliveryKind(_call),
         response,
         phase: "queued"
       });
@@ -1996,6 +2023,10 @@ async function verifyDeferredProfileDispatchRouteGuards() {
         observedPageIdentity = location.href;
         initialThreadSettled = true;
       `, context);
+      if (helperCase.name === "shell") {
+        context.markLiveGeneratedHelperCandidate(turn.candidate, semanticKey);
+        context.markCallProcessed(turn.candidate, callId, semanticKey);
+      }
 
       const run = context.runAndReply(callId, call, { dispatchContext });
       await profileObserved;
@@ -2029,6 +2060,26 @@ async function verifyDeferredProfileDispatchRouteGuards() {
 
       assert.equal(
         runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+        0,
+        `${helperCase.name}/${routeCase.name}: the stale pre-runtime continuation must never dispatch during route quarantine.`
+      );
+      if (!routeCase.replacement && routeCase.startPath === "/") {
+        vm.runInContext(`
+          routeReconciliationNotBefore = 0;
+          initialThreadSettled = true;
+          lastThreadText = normalizeText(getConversationRoot().innerText || getConversationRoot().textContent || "");
+          lastThreadTextAt = Date.now() - 2000;
+        `, context);
+        // beginPageLifecycle owns the route-only rescan timer. Let that single
+        // owner retry the helper instead of racing it with an artificial manual
+        // scan (which would legitimately repeat read-only roster queries).
+        await waitForRealTestCondition(() =>
+          runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length >= 1
+        , 7000, `${helperCase.name}/${routeCase.name}`);
+      }
+
+      assert.equal(
+        runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
         routeCase.expectedRuntimeCalls,
         `${helperCase.name}/${routeCase.name}: runtime dispatch crossed an invalid profile await route.`
       );
@@ -2037,6 +2088,8 @@ async function verifyDeferredProfileDispatchRouteGuards() {
         0,
         `${helperCase.name}/${routeCase.name}: no unrelated runtime message is expected.`
       );
+      assert.equal(vm.runInContext("activeCallToken", context), null);
+      assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
     }
   }
 }
@@ -2231,6 +2284,7 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
   const routeCases = [
     {
       name: "retained provisional assignment",
+      host: "chatgpt.com",
       startPath: "/",
       nextPath: "/c/outer-settings-retained",
       replacement: false,
@@ -2238,7 +2292,45 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
       expectedReplies: 1
     },
     {
+      name: "M365 retained pushState-only assignment",
+      host: "m365.cloud.microsoft",
+      startPath: "/chat",
+      nextPath: "/chat/11111111-1111-4111-8111-111111111111",
+      replacement: false,
+      expectedRuntimeCalls: 1,
+      expectedReplies: 1
+    },
+    {
+      name: "M365 changed originating user turn",
+      host: "m365.cloud.microsoft",
+      startPath: "/chat",
+      nextPath: "/chat/22222222-2222-4222-8222-222222222222",
+      replacement: false,
+      changedUserText: true,
+      expectedRuntimeCalls: 0,
+      expectedReplies: 0
+    },
+    {
+      name: "M365 same-text replacement roots",
+      host: "m365.cloud.microsoft",
+      startPath: "/chat",
+      nextPath: "/chat/44444444-4444-4444-8444-444444444444",
+      copiedReplacement: true,
+      expectedRuntimeCalls: 0,
+      expectedReplies: 0
+    },
+    {
+      name: "ChatGPT stable-id replacement roots",
+      host: "chatgpt.com",
+      startPath: "/",
+      nextPath: "/c/outer-settings-stable-replacement",
+      copiedReplacement: true,
+      expectedRuntimeCalls: 1,
+      expectedReplies: 1
+    },
+    {
       name: "replacement transcript",
+      host: "chatgpt.com",
       startPath: "/",
       nextPath: "/c/outer-settings-replaced",
       replacement: true,
@@ -2247,6 +2339,7 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
     },
     {
       name: "second permanent route",
+      host: "chatgpt.com",
       startPath: "/c/outer-settings-a",
       nextPath: "/c/outer-settings-b",
       replacement: false,
@@ -2262,8 +2355,10 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
       await Promise.resolve();
       await Promise.resolve();
       installPersistentLocalStorage(context);
+      context.location.hostname = routeCase.host;
+      context.location.origin = `https://${routeCase.host}`;
       context.location.pathname = routeCase.startPath;
-      context.location.href = `https://chatgpt.com${routeCase.startPath}`;
+      context.location.href = `${context.location.origin}${routeCase.startPath}`;
       const stableIds = {
         userId: `outer-settings-user-${helperCase.name}`,
         assistantId: `outer-settings-assistant-${helperCase.name}`
@@ -2300,7 +2395,7 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
             outerSettingsRequested();
             return outerSettingsGate;
           }
-          return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+          return { enabled: true, enabledHosts: [routeCase.host], maxChainCalls: 100 };
         }
         return { requireApproval: false, autoSend: true };
       };
@@ -2353,11 +2448,7 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
         lastThreadText = normalizeText(globalThis.__outerSettingsRoot.innerText || globalThis.__outerSettingsRoot.textContent || "");
         lastThreadTextAt = Date.now() - 5000;
         const outerSettingsCandidate = globalThis.__outerSettingsCandidate;
-        const outerSettingsSemanticKey = buildSemanticCallKey(outerSettingsCandidate.call);
-        liveGeneratedRenderedHelpers.set(
-          getCandidateRenderRoot(outerSettingsCandidate),
-          new Set([buildRenderedHelperKey(outerSettingsCandidate, outerSettingsSemanticKey)])
-        );
+        markLiveGeneratedHelperCandidate(outerSettingsCandidate);
       `, context);
 
       const firstScan = context.scanForShellCall();
@@ -2371,31 +2462,30 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
         context.__outerSettingsRoot = replacement;
         context.__outerSettingsCandidate = null;
         context.document.body = replacement;
-      } else if (routeCase.startPath === "/") {
-        const redraw = createStableChatGptRouteTurn(context, {
+      } else if (routeCase.copiedReplacement) {
+        setMockTreeConnected(turn.root, false);
+        const copied = createStableChatGptRouteTurn(context, {
           userText: `Run the ${helperCase.name} helper after assigning this chat URL.`,
           helperText: helperCase.helperText,
           ...stableIds
         });
-        setMockTreeConnected(turn.root, false);
-        context.__outerSettingsRoot = redraw.root;
-        context.__outerSettingsCandidate = redraw.candidate;
-        context.document.body = redraw.root;
+        context.__outerSettingsRoot = copied.root;
+        context.__outerSettingsCandidate = copied.candidate;
+        context.document.body = copied.root;
+      } else if (routeCase.changedUserText) {
+        turn.user.innerText = "A different user turn replaced the originating request.";
+        turn.user.textContent = turn.user.innerText;
       }
       context.location.pathname = routeCase.nextPath;
-      context.location.href = `https://chatgpt.com${routeCase.nextPath}`;
-      if (!routeCase.replacement && routeCase.startPath === "/") {
-        vm.runInContext(`
-          const assignedCandidate = globalThis.__outerSettingsCandidate;
-          const assignedSemanticKey = buildSemanticCallKey(assignedCandidate.call);
-          liveGeneratedRenderedHelpers.set(
-            getCandidateRenderRoot(assignedCandidate),
-            new Set([buildRenderedHelperKey(assignedCandidate, assignedSemanticKey)])
-          );
-        `, context);
-      }
-      releaseOuterSettings({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+      context.location.href = `${context.location.origin}${routeCase.nextPath}`;
+      releaseOuterSettings({ enabled: true, enabledHosts: [routeCase.host], maxChainCalls: 100 });
       await firstScan;
+      vm.runInContext(`
+        initialThreadSettled = true;
+        routeReconciliationNotBefore = 0;
+        lastThreadText = normalizeText(globalThis.__outerSettingsRoot.innerText || globalThis.__outerSettingsRoot.textContent || "");
+        lastThreadTextAt = Date.now() - 5000;
+      `, context);
       for (let retry = 0; retry < 3 && scanScheduled; retry += 1) {
         scanScheduled = false;
         vm.runInContext("lastThreadTextAt = Date.now() - 5000;", context);
@@ -2411,6 +2501,553 @@ async function verifyOuterSettingsAwaitRouteReconciliation() {
         replies,
         routeCase.expectedReplies,
         `${helperCase.name}/${routeCase.name}: result delivery did not match the reconciled route.`
+      );
+    }
+  }
+}
+
+async function verifyM365LiveGenerationProofRouteHandoff() {
+  const catalogSha = "a".repeat(64);
+  const helperCases = [
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf M365_LIVE_PROOF" })
+    },
+    {
+      name: "Skill",
+      helperText: createSkillLoadBlock({
+        helperId: "m365-live-proof-skill",
+        skillId: "example",
+        catalogSha
+      })
+    },
+    {
+      name: "Draw.io",
+      helperText: createDrawioBlock({ helperId: "m365-live-proof-drawio" })
+    }
+  ];
+
+  for (const helperCase of helperCases) {
+    for (const mutationTiming of ["none", "before-route", "after-route"]) {
+      const context = loadContentContext();
+      context.location.hostname = "m365.cloud.microsoft";
+      context.location.origin = "https://m365.cloud.microsoft";
+      context.location.pathname = "/chat";
+      context.location.href = "https://m365.cloud.microsoft/chat";
+      const turn = createStableChatGptRouteTurn(context, {
+        userText: `Run the ${helperCase.name} helper in this new M365 chat.`,
+        helperText: helperCase.helperText,
+        userId: `m365-live-proof-user-${helperCase.name}`,
+        assistantId: `m365-live-proof-assistant-${helperCase.name}`
+      });
+      context.document.body = turn.root;
+      context.getConversationRoot = () => turn.root;
+      context.extractShellCallCandidates = () => [turn.candidate];
+      context.scheduleScan = () => {};
+      vm.runInContext(`
+        observedPageIdentity = location.href;
+        initialThreadSettled = true;
+        markLiveGeneratedHelperCandidate(globalThis.__m365LiveProofCandidate);
+      `, Object.assign(context, { __m365LiveProofCandidate: turn.candidate }));
+      assert.equal(context.isLiveGeneratedHelperCandidate(turn.candidate), true,
+        `${helperCase.name}: generation-time proof must begin live.`);
+
+      if (mutationTiming === "before-route") {
+        turn.user.innerText = "A replacement request now owns the latest M365 turn.";
+        turn.user.textContent = turn.user.innerText;
+      }
+      context.location.pathname = "/chat/33333333-3333-4333-8333-333333333333";
+      context.location.href = `https://m365.cloud.microsoft${context.location.pathname}`;
+      assert.equal(context.refreshPageLifecycle(), true);
+      if (mutationTiming === "after-route") {
+        assert.equal(context.isLiveGeneratedHelperCandidate(turn.candidate), true,
+          `${helperCase.name}: the exact route must initially restore live proof.`);
+        turn.user.innerText = "A replacement request arrived during route reconciliation.";
+        turn.user.textContent = turn.user.innerText;
+      }
+      assert.equal(
+        context.isLiveGeneratedHelperCandidate(turn.candidate),
+        mutationTiming === "none",
+        `${helperCase.name}: route proof must ${mutationTiming === "none" ? "survive pushState-only assignment" : `reject user text changed ${mutationTiming}`}.`
+      );
+    }
+  }
+}
+
+async function verifyStableRouteRootRebindingBoundaries() {
+  const catalogSha = "a".repeat(64);
+  const helperCases = [
+    createHelperBlock({ cmd: "printf STABLE_ROUTE_REBIND" }),
+    createSkillLoadBlock({
+      helperId: "stable-route-rebind-skill",
+      skillId: "example",
+      catalogSha
+    }),
+    createDrawioBlock({ helperId: "stable-route-rebind-drawio" })
+  ];
+  for (const helperText of helperCases) {
+    for (const routeCase of [
+      {
+        host: "chatgpt.com",
+        startPath: "/",
+        nextPath: "/c/stable-route-rebind-1234",
+        expectedLive: true
+      },
+      {
+        host: "m365.cloud.microsoft",
+        startPath: "/chat",
+        nextPath: "/chat/55555555-5555-4555-8555-555555555555",
+        expectedLive: false
+      }
+    ]) {
+      const context = loadContentContext();
+      context.location.hostname = routeCase.host;
+      context.location.origin = `https://${routeCase.host}`;
+      context.location.pathname = routeCase.startPath;
+      context.location.href = `${context.location.origin}${routeCase.startPath}`;
+      const turnOptions = {
+        userText: "Run this exact helper while the host replaces its authored roots.",
+        helperText,
+        userId: "stable-route-rebind-user",
+        assistantId: "stable-route-rebind-assistant"
+      };
+      const original = createStableChatGptRouteTurn(context, turnOptions);
+      context.__stableRouteRoot = original.root;
+      context.__stableRouteCandidate = original.candidate;
+      context.document.body = original.root;
+      context.getConversationRoot = () => context.__stableRouteRoot;
+      context.extractShellCallCandidates = () => [context.__stableRouteCandidate];
+      context.scheduleScan = () => {};
+      vm.runInContext(`
+        observedPageIdentity = location.href;
+        initialThreadSettled = true;
+        markLiveGeneratedHelperCandidate(globalThis.__stableRouteCandidate);
+      `, context);
+
+      setMockTreeConnected(original.root, false);
+      const replacement = createStableChatGptRouteTurn(context, turnOptions);
+      context.__stableRouteRoot = replacement.root;
+      context.__stableRouteCandidate = replacement.candidate;
+      context.document.body = replacement.root;
+      context.location.pathname = routeCase.nextPath;
+      context.location.href = `${context.location.origin}${routeCase.nextPath}`;
+      assert.equal(context.refreshPageLifecycle(), true);
+      assert.equal(
+        context.isLiveGeneratedHelperCandidate(replacement.candidate),
+        routeCase.expectedLive,
+        `${routeCase.host}: only ChatGPT immutable message identities may rebind replacement authored roots.`
+      );
+    }
+  }
+}
+
+async function verifyStableIdRunnableRebindClaimsReplacementRoot() {
+  const context = loadContentContext();
+  context.location.hostname = "chatgpt.com";
+  context.location.origin = "https://chatgpt.com";
+  context.location.pathname = "/c/stable-redraw";
+  context.location.href = "https://chatgpt.com/c/stable-redraw";
+  const helperText = createHelperBlock({ cmd: "printf STABLE_REDRAW_ONCE" });
+  const turnOptions = {
+    userText: "Run this helper once while React redraws the authored turn.",
+    helperText,
+    userId: "stable-redraw-user",
+    assistantId: "stable-redraw-assistant"
+  };
+  const original = createStableChatGptRouteTurn(context, turnOptions);
+  context.__stableRedrawRoot = original.root;
+  context.__stableRedrawCandidate = original.candidate;
+  context.document.body = original.root;
+  context.getConversationRoot = () => context.__stableRedrawRoot;
+  context.extractShellCallCandidates = () => [context.__stableRedrawCandidate];
+  vm.runInContext(`
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+  `, context);
+  const dispatchContext = context.createRunnableHelperDispatchContext(original.candidate);
+  context.markCallProcessed(
+    original.candidate,
+    "stable-redraw-original",
+    dispatchContext.semanticCallKey
+  );
+
+  setMockTreeConnected(original.root, false);
+  const replacement = createStableChatGptRouteTurn(context, turnOptions);
+  context.__stableRedrawRoot = replacement.root;
+  context.__stableRedrawCandidate = replacement.candidate;
+  context.document.body = replacement.root;
+  assert.equal(context.isRunnableHelperDispatchContextCurrent(dispatchContext), true,
+    "A unique same-route ChatGPT stable-ID redraw must retain the active runnable result.");
+  assert.equal(dispatchContext.renderRoot, replacement.assistantContent);
+  assert.equal(
+    context.getHandledHelperReason(
+      replacement.candidate,
+      "stable-redraw-retry",
+      dispatchContext.semanticCallKey,
+      replacement.candidate.call
+    ),
+    "processed rendered helper",
+    "Runnable stable-ID rebinding must transfer the processed claim before the active lock is released."
+  );
+}
+
+async function verifyCompletedStableIdRouteReplacementRemainsHandled() {
+  const catalogSha = "a".repeat(64);
+  const helperCases = [
+    {
+      name: "shell",
+      helperText: createHelperBlock({ cmd: "printf COMPLETED_STABLE_ROUTE" }),
+      runtimeType: "run-shell"
+    },
+    {
+      name: "skill",
+      helperText: createSkillLoadBlock({
+        helperId: "completed-stable-route-skill",
+        skillId: "example",
+        catalogSha
+      }),
+      runtimeType: "skill-load"
+    }
+  ];
+
+  for (const helperCase of helperCases) {
+    const context = loadContentContext();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    installPersistentLocalStorage(context);
+    context.location.hostname = "chatgpt.com";
+    context.location.origin = "https://chatgpt.com";
+    context.location.pathname = "/";
+    context.location.href = "https://chatgpt.com/";
+    const turnOptions = {
+      userText: `Complete the ${helperCase.name} helper before assigning the URL.`,
+      helperText: helperCase.helperText,
+      userId: `completed-stable-route-user-${helperCase.name}`,
+      assistantId: `completed-stable-route-assistant-${helperCase.name}`
+    };
+    const original = createStableChatGptRouteTurn(context, turnOptions);
+    context.__completedStableRoot = original.root;
+    context.__completedStableCandidate = original.candidate;
+    context.document.body = original.root;
+    context.getConversationRoot = () => context.__completedStableRoot;
+    context.extractShellCallCandidates = () => [context.__completedStableCandidate];
+    context.chrome.storage.sync.get = async (keys) => {
+      if (Array.isArray(keys) && keys.includes("enabled")) {
+        return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+      }
+      return { requireApproval: false, autoSend: true };
+    };
+    const runtimeCalls = [];
+    let replies = 0;
+    context.chrome.runtime.sendMessage = async (payload) => {
+      runtimeCalls.push(payload);
+      if (payload.type === "skill-load") {
+        return {
+          ok: true,
+          catalogSha,
+          skill: { id: "example", sha: "b".repeat(64) },
+          content: "# Completed stable-route Skill"
+        };
+      }
+      return {
+        ok: true,
+        executed: true,
+        executionCompleted: true,
+        executionId: "cc33dd44ee55ff66",
+        exitCode: 0,
+        stdout: "COMPLETED_STABLE_ROUTE"
+      };
+    };
+    context.getCurrentAgentProfile = async () => ({ role: "none", agentId: "" });
+    context.queueSkillComposerReply = async () => {
+      replies += 1;
+      return true;
+    };
+    context.rememberPendingHelperDelivery = async (_callId, _call, response) => {
+      replies += 1;
+      return { callId: "completed-stable-route-shell", response, phase: "queued" };
+    };
+    context.attemptPendingHelperDelivery = async () => true;
+    context.schedulePendingHelperDeliveryRetry = () => {};
+    context.scheduleScan = () => {};
+    context.updateContextualPanelActions = () => {};
+    context.updateSiteActionButton = () => {};
+    context.updateStopHelperButton = () => {};
+    context.resetChainForNewHumanPrompt = () => {};
+    context.setPendingHelperDeliveryStatus = () => {};
+    context.setStatus = () => {};
+    vm.runInContext(`
+      extensionActive = true;
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      lastThreadText = normalizeText(globalThis.__completedStableRoot.innerText || globalThis.__completedStableRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+      markLiveGeneratedHelperCandidate(globalThis.__completedStableCandidate);
+    `, context);
+
+    await context.scanForShellCall();
+    assert.equal(
+      runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+      1,
+      `${helperCase.name}: the original generated helper must dispatch once.`
+    );
+    assert.equal(replies, 1, `${helperCase.name}: the original helper must produce one reply.`);
+
+    setMockTreeConnected(original.root, false);
+    const replacement = createStableChatGptRouteTurn(context, turnOptions);
+    context.__completedStableRoot = replacement.root;
+    context.__completedStableCandidate = replacement.candidate;
+    context.document.body = replacement.root;
+    context.location.pathname = `/c/completed-stable-route-${helperCase.name}`;
+    context.location.href = `https://chatgpt.com${context.location.pathname}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    vm.runInContext(`
+      initialThreadSettled = true;
+      routeReconciliationNotBefore = 0;
+      lastThreadText = normalizeText(globalThis.__completedStableRoot.innerText || globalThis.__completedStableRoot.textContent || "");
+      lastThreadTextAt = Date.now() - 5000;
+    `, context);
+    await context.scanForShellCall();
+
+    assert.equal(
+      runtimeCalls.filter((payload) => payload.type === helperCase.runtimeType).length,
+      1,
+      `${helperCase.name}: a completed helper's stable-ID replacement must inherit its processed claim.`
+    );
+    assert.equal(replies, 1,
+      `${helperCase.name}: a completed helper's stable-ID replacement must not create another reply.`);
+    assert.equal(
+      context.getHandledHelperReason(
+        replacement.candidate,
+        "completed-stable-route-retry",
+        context.buildSemanticCallKey(replacement.candidate.call),
+        replacement.candidate.call
+      ),
+      "processed rendered helper"
+    );
+  }
+}
+
+async function verifyAssistantGenerationEpochRouteBoundaries() {
+  for (const routeCase of [
+    {
+      name: "M365 provisional assignment",
+      host: "m365.cloud.microsoft",
+      startPath: "/chat",
+      nextPath: "/chat/66666666-6666-4666-8666-666666666666",
+      expectedCarried: true
+    },
+    {
+      name: "M365 permanent A-to-B",
+      host: "m365.cloud.microsoft",
+      startPath: "/chat/77777777-7777-4777-8777-777777777777",
+      nextPath: "/chat/88888888-8888-4888-8888-888888888888",
+      expectedCarried: false
+    },
+    {
+      name: "ChatGPT provisional assignment",
+      host: "chatgpt.com",
+      startPath: "/",
+      nextPath: "/c/assistant-generation-route-1234",
+      expectedCarried: true
+    },
+    {
+      name: "ChatGPT permanent A-to-B",
+      host: "chatgpt.com",
+      startPath: "/c/assistant-generation-route-a",
+      nextPath: "/c/assistant-generation-route-b",
+      expectedCarried: false
+    }
+  ]) {
+    const context = loadContentContext();
+    context.location.hostname = routeCase.host;
+    context.location.origin = `https://${routeCase.host}`;
+    context.location.pathname = routeCase.startPath;
+    context.location.href = `${context.location.origin}${routeCase.startPath}`;
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Continue generating this exact response across URL assignment.",
+      helperText: "The assistant is still generating ordinary text.",
+      userId: `generation-route-user-${routeCase.name}`,
+      assistantId: `generation-route-assistant-${routeCase.name}`
+    });
+    context.document.body = turn.root;
+    context.getConversationRoot = () => turn.root;
+    context.extractShellCallCandidates = () => [];
+    context.scheduleScan = () => {};
+    context.__generationRouteUser = turn.user;
+    context.__generationRouteAssistant = turn.assistant;
+    vm.runInContext(`
+      observedPageIdentity = location.href;
+      assistantGenerationObservedForLifecycle = true;
+      assistantGenerationEvidenceUntil = Date.now() + 5000;
+      assistantGenerationEpoch = createAssistantGenerationEpoch();
+      assistantGenerationEpoch.userAnchor = globalThis.__generationRouteUser;
+      assistantGenerationEpoch.responseMessageRoot = globalThis.__generationRouteAssistant;
+    `, context);
+    context.location.pathname = routeCase.nextPath;
+    context.location.href = `${context.location.origin}${routeCase.nextPath}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    assert.equal(
+      vm.runInContext("Boolean(assistantGenerationEpoch)", context),
+      routeCase.expectedCarried,
+      `${routeCase.name}: generation epoch route carry boundary is incorrect.`
+    );
+    if (routeCase.expectedCarried) {
+      assert.equal(vm.runInContext("assistantGenerationEpoch.routeCarryOnly", context), true);
+    }
+  }
+}
+
+async function verifyActiveRunnableRouteObserverRedrawBoundary() {
+  for (const semanticChanged of [false, true]) {
+    const context = loadContentContext();
+    context.location.hostname = "m365.cloud.microsoft";
+    context.location.origin = "https://m365.cloud.microsoft";
+    context.location.pathname = "/chat";
+    context.location.href = "https://m365.cloud.microsoft/chat";
+    const helperText = createHelperBlock({ cmd: "printf ROUTE_OBSERVER_REDRAW" });
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Keep this active helper bound across the route observer batch.",
+      helperText,
+      userId: `route-observer-user-${semanticChanged}`,
+      assistantId: `route-observer-assistant-${semanticChanged}`
+    });
+    context.document.body = turn.root;
+    context.getConversationRoot = () => turn.root;
+    context.extractShellCallCandidates = () => [turn.candidate];
+    context.scheduleScan = () => {};
+    context.setStatus = () => {};
+    context.updateStopHelperButton = () => {};
+    context.__routeObserverCandidate = turn.candidate;
+    vm.runInContext(`
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+      const routeObserverCandidate = globalThis.__routeObserverCandidate;
+      const routeObserverContext = createRunnableHelperDispatchContext(routeObserverCandidate);
+      const routeObserverCallId = "route-observer-active";
+      markCallProcessed(routeObserverCandidate, routeObserverCallId, routeObserverContext.semanticCallKey);
+      activeCallId = routeObserverCallId;
+      activeCallToken = {
+        callId: routeObserverCallId,
+        call: routeObserverCandidate.call,
+        dispatchContext: routeObserverContext,
+        pageIdentity: routeObserverContext.pageIdentity,
+        generation: routeObserverContext.generation,
+        phase: "runtime-dispatched",
+        force: false
+      };
+      globalThis.__routeObserverContext = routeObserverContext;
+    `, context);
+
+    context.location.pathname = "/chat/99999999-9999-4999-8999-999999999999";
+    context.location.href = `https://m365.cloud.microsoft${context.location.pathname}`;
+    assert.equal(context.refreshPageLifecycle(), true);
+    if (semanticChanged) {
+      turn.candidate.call = context.parseCallPayload(
+        createHelperBlock({ cmd: "printf CHANGED_ROUTE_OBSERVER_HELPER" })
+      );
+      turn.assistantContent.innerText = createHelperBlock({ cmd: "printf CHANGED_ROUTE_OBSERVER_HELPER" });
+      turn.assistantContent.textContent = turn.assistantContent.innerText;
+    }
+    context.invalidateRenderedHelperTracking([{
+      type: "characterData",
+      target: turn.assistantContent,
+      oldValue: helperText,
+      addedNodes: [],
+      removedNodes: []
+    }]);
+    vm.runInContext(`
+      initialThreadSettled = true;
+      routeReconciliationNotBefore = 0;
+    `, context);
+    assert.equal(
+      context.isRunnableHelperDispatchContextCurrent(context.__routeObserverContext),
+      !semanticChanged,
+      `The route observer redraw must ${semanticChanged ? "reject changed semantics" : "retain exact active runtime ownership"}.`
+    );
+    if (!semanticChanged) {
+      assert.equal(
+        context.__routeObserverContext.renderGeneration,
+        context.getHelperRenderRootGeneration(turn.assistantContent),
+        "The exact active route context must adopt the observer-invalidated render generation."
+      );
+    }
+  }
+}
+
+async function verifySkillRouteObserverRedrawBoundary() {
+  const catalogSha = "a".repeat(64);
+  for (const semanticChanged of [false, true]) {
+    const context = loadContentContext();
+    context.location.hostname = "m365.cloud.microsoft";
+    context.location.origin = "https://m365.cloud.microsoft";
+    context.location.pathname = "/chat";
+    context.location.href = "https://m365.cloud.microsoft/chat";
+    const helperText = createSkillLoadBlock({
+      helperId: "skill-route-observer-redraw",
+      skillId: "example",
+      catalogSha
+    });
+    const turn = createStableChatGptRouteTurn(context, {
+      userText: "Keep this Skill load bound across the route observer batch.",
+      helperText,
+      userId: `skill-route-observer-user-${semanticChanged}`,
+      assistantId: `skill-route-observer-assistant-${semanticChanged}`
+    });
+    context.document.body = turn.root;
+    context.getConversationRoot = () => turn.root;
+    context.extractShellCallCandidates = () => [turn.candidate];
+    context.scheduleScan = () => {};
+    context.__skillRouteObserverCandidate = turn.candidate;
+    vm.runInContext(`
+      observedPageIdentity = location.href;
+      initialThreadSettled = true;
+    `, context);
+    const dispatchContext = context.createSkillDispatchContext(turn.candidate);
+    context.markCallProcessed(
+      turn.candidate,
+      "skill-route-observer-active",
+      dispatchContext.semanticCallKey
+    );
+
+    context.location.pathname = "/chat/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    context.location.href = `https://m365.cloud.microsoft${context.location.pathname}`;
+    assert.equal(
+      context.isSkillDispatchContextCurrent(dispatchContext, { allowRoutePending: true }),
+      true,
+      "The exact Skill context must initially rebase into route quarantine."
+    );
+    if (semanticChanged) {
+      turn.candidate.call = context.parseCallPayload(createSkillLoadBlock({
+        helperId: "skill-route-observer-changed",
+        skillId: "different-skill",
+        catalogSha
+      }));
+      turn.assistantContent.innerText = turn.candidate.call.raw;
+      turn.assistantContent.textContent = turn.candidate.call.raw;
+    }
+    context.invalidateRenderedHelperTracking([{
+      type: "characterData",
+      target: turn.assistantContent,
+      oldValue: helperText,
+      addedNodes: [],
+      removedNodes: []
+    }]);
+    vm.runInContext(`
+      initialThreadSettled = true;
+      routeReconciliationNotBefore = 0;
+    `, context);
+    assert.equal(
+      context.isSkillDispatchContextCurrent(dispatchContext),
+      !semanticChanged,
+      `The Skill route redraw must ${semanticChanged ? "reject changed semantics" : "retain exact result ownership"}.`
+    );
+    if (!semanticChanged) {
+      assert.equal(
+        dispatchContext.renderGeneration,
+        context.getHelperRenderRootGeneration(turn.assistantContent),
+        "The exact Skill context must adopt the observer-invalidated render generation."
       );
     }
   }
@@ -2910,6 +3547,37 @@ async function verifyShellProgressUsesExactActiveCallAfterProfileAwait() {
   assert.equal(vm.runInContext("activeShellRunNotice.callKey", context), "new-progress-call");
   assert.match(statuses.at(-1).text, /produced no output/,
     "Progress for the exact active call must remain accepted.");
+
+  let guardedProfileRequested;
+  let releaseGuardedProfile;
+  const guardedProfileObserved = new Promise((resolve) => {
+    guardedProfileRequested = resolve;
+  });
+  const guardedProfileGate = new Promise((resolve) => {
+    releaseGuardedProfile = resolve;
+  });
+  context.getCurrentAgentProfile = async () => {
+    guardedProfileRequested();
+    return guardedProfileGate;
+  };
+  let recoveryCurrent = true;
+  const statusCountBeforeRoute = statuses.length;
+  const guardedProgress = context.handleShellRunProgress({
+    state: "awaiting-user",
+    callKey: "new-progress-call",
+    executionId: "route-stale-progress-execution",
+    agentId: "",
+    idleForMs: 210000
+  }, {
+    isCurrent: () => recoveryCurrent
+  });
+  await guardedProfileObserved;
+  recoveryCurrent = false;
+  releaseGuardedProfile({ role: "none", agentId: "" });
+  await guardedProgress;
+  assert.equal(statuses.length, statusCountBeforeRoute,
+    "A recovery notice that loses route ownership during profile lookup must not mutate the new page UI.");
+  assert.notEqual(vm.runInContext("activeShellRunNotice.executionId", context), "route-stale-progress-execution");
 }
 
 async function verifyOldFinalizationCannotOverwriteNewRunnableStatus() {
@@ -3471,7 +4139,7 @@ async function verifyFirstResponseRouteAssignmentCarriesRuntimeStatusRecovery() 
         context.location.pathname = testCase.assignedPath;
         context.location.href = `https://chatgpt.com${testCase.assignedPath}`;
         assert.equal(context.refreshPageLifecycle(), true);
-        vm.runInContext("initialThreadSettled = true;", context);
+        vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
         throw new Error("The message port closed before a response was received.");
       }
       assert.equal(payload.type, testCase.statusType);
@@ -3935,7 +4603,7 @@ async function verifyRetainedRouteDuringPendingPersistenceQueuesOnce() {
   context.location.pathname = "/uc/persist-route-retained";
   context.location.href = "https://chatgpt.com/uc/persist-route-retained";
   assert.equal(context.refreshPageLifecycle(), true);
-  vm.runInContext("initialThreadSettled = true;", context);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0;", context);
   storageGate.releaseFirstSet();
   await scan;
   await context.retryPendingHelperDeliveries();
@@ -4403,6 +5071,17 @@ async function waitForTestCondition(check) {
     await Promise.resolve();
   }
   throw new Error("Timed out waiting for test condition.");
+}
+
+async function waitForRealTestCondition(check, timeoutMs = 7000, description = "condition") {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for asynchronous test condition: ${description}.`);
 }
 
 function markLatestHelperLive(context) {
@@ -6789,6 +7468,283 @@ async function verifyLaterHelperCannotOverwriteUnsentEarlierOutput() {
   assert.equal(clickCount, 1, "A pre-existing exact-text draft is never adopted or sent by a new queued delivery.");
 }
 
+async function verifyRouteQuarantineRejectsDelayedTranscriptReplacement() {
+  const context = loadContentContext();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  installPersistentLocalStorage(context);
+  const turn = createStableChatGptRouteTurn(context, {
+    userText: "Run only if this first-response transcript survives route settlement.",
+    helperText: createHelperBlock({ cmd: "printf ROUTE_QUARANTINE_OLD_DOM" }),
+    userId: "route-quarantine-user",
+    assistantId: "route-quarantine-assistant"
+  });
+  context.document.body = turn.root;
+  context.__routeQuarantineRoot = turn.root;
+  context.getConversationRoot = () => context.__routeQuarantineRoot;
+  let releaseSettings;
+  let settingsRequested;
+  const settingsObserved = new Promise((resolve) => {
+    settingsRequested = resolve;
+  });
+  const settingsGate = new Promise((resolve) => {
+    releaseSettings = resolve;
+  });
+  let settingsCalls = 0;
+  let backendRuns = 0;
+  context.chrome.storage.sync.get = async (keys) => {
+    if (Array.isArray(keys) && keys.includes("enabled")) {
+      settingsCalls += 1;
+      if (settingsCalls === 1) {
+        settingsRequested();
+        return settingsGate;
+      }
+      return { enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 };
+    }
+    return { requireApproval: false, autoSend: true };
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    if (payload.type === "run-shell") backendRuns += 1;
+    return { ok: true };
+  };
+  context.setStatus = () => {};
+  context.scheduleScan = () => {};
+  context.updateSiteActionButton = () => {};
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    initialThreadSettled = true;
+    lastThreadText = normalizeText(globalThis.__routeQuarantineRoot.innerText || globalThis.__routeQuarantineRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+    const candidate = getLastShellCallCandidate(globalThis.__routeQuarantineRoot);
+    const semanticKey = buildSemanticCallKey(candidate.call);
+    liveGeneratedRenderedHelpers.set(
+      getCandidateRenderRoot(candidate),
+      new Set([buildRenderedHelperKey(candidate, semanticKey)])
+    );
+  `, context);
+
+  const scan = context.scanForShellCall();
+  await settingsObserved;
+  context.location.pathname = "/c/route-quarantine-delayed";
+  context.location.href = "https://chatgpt.com/c/route-quarantine-delayed";
+  assert.equal(context.refreshPageLifecycle(), true);
+  assert.equal(vm.runInContext("routeReconciliationNotBefore > Date.now()", context), true);
+  releaseSettings({ enabled: true, enabledHosts: ["chatgpt.com"], maxChainCalls: 100 });
+  await scan;
+  assert.equal(backendRuns, 0,
+    "Still-mounted pre-route DOM must not authorize backend work during route quarantine.");
+  assert.equal(turn.root.isConnected, true,
+    "The negative case deliberately keeps the old transcript mounted through the stale continuation.");
+
+  setMockTreeConnected(turn.root, false);
+  const replacement = createRoot([
+    new MockNode({ order: 1, role: "user", text: "A different conversation mounted after the URL changed." })
+  ]);
+  replacement.isConnected = true;
+  context.__routeQuarantineRoot = replacement;
+  context.document.body = replacement;
+  vm.runInContext(`
+    initialThreadSettled = true;
+    routeReconciliationNotBefore = 0;
+    lastThreadText = normalizeText(globalThis.__routeQuarantineRoot.innerText || globalThis.__routeQuarantineRoot.textContent || "");
+    lastThreadTextAt = Date.now() - 5000;
+  `, context);
+  await context.scanForShellCall();
+  assert.equal(backendRuns, 0, "The delayed replacement transcript must keep the old helper inert.");
+  assert.equal(vm.runInContext("pendingHelperDeliveries.size", context), 0);
+  assert.equal(vm.runInContext("activeCallId", context), "");
+  assert.equal(vm.runInContext("preparingRunnableDispatchToken", context), null);
+}
+
+async function verifyAgentPromptWriteOwnershipCancelsOnRoute() {
+  const context = loadContentContext();
+  const backing = installPersistentLocalStorage(context);
+  vm.runInContext(`
+    extensionActive = true;
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 77;
+    pendingAgentDelivery = {
+      messageId: "agent-route-cancel",
+      profileAgentId: "agent-a",
+      message: { messageId: "agent-route-cancel", from: "agent-b", body: "Do work" },
+      promptText: "Message from agent-b:\\n\\nDo work",
+      composerText: "Message from agent-b:\\n\\nDo work",
+      composerWriteAttempted: true,
+      inserted: true,
+      sent: false,
+      cancelled: false,
+      storageKey: agentPendingDeliveryKey(),
+      pageIdentity: getCurrentPageIdentity(),
+      pageGeneration: pageLifecycleGeneration,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  `, context);
+  context.location.pathname = "/c/agent-route-cancelled";
+  context.location.href = "https://chatgpt.com/c/agent-route-cancelled";
+  assert.equal(context.refreshPageLifecycle(), true);
+  await Promise.resolve();
+  assert.equal(vm.runInContext("pendingAgentDelivery.cancelled", context), true);
+  assert.equal(vm.runInContext("pendingAgentDelivery.inserted", context), false);
+  assert.equal(vm.runInContext("pendingAgentDelivery.composerElement", context), null);
+  assert.match(JSON.stringify(backing), /automatic reinsertion was cancelled/);
+}
+
+async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
+  const uuidA = "11111111-1111-4111-8111-111111111111";
+  const uuidB = "22222222-2222-4222-8222-222222222222";
+  const installM365Location = (context, pathname) => {
+    context.location.hostname = "m365.cloud.microsoft";
+    context.location.origin = "https://m365.cloud.microsoft";
+    context.location.pathname = pathname;
+    context.location.href = `https://m365.cloud.microsoft${pathname}`;
+  };
+  const createM365Turn = (command) => {
+    const user = new MockNode({
+      order: 1,
+      role: "user",
+      text: "Load the current helper while M365 assigns this conversation URL."
+    });
+    const assistant = new MockNode({
+      order: 2,
+      role: "assistant",
+      text: createHelperBlock({ cmd: command })
+    });
+    const root = createRoot([user, assistant]);
+    root.isConnected = true;
+    user.isConnected = true;
+    assistant.isConnected = true;
+    return { root, user, assistant };
+  };
+
+  const retained = loadContentContext();
+  installM365Location(retained, "/chat");
+  const retainedTurn = createM365Turn("printf M365_ROUTE_RETAINED");
+  retained.document.body = retainedTurn.root;
+  retained.__m365RouteRoot = retainedTurn.root;
+  retained.getConversationRoot = () => retained.__m365RouteRoot;
+  const retainedCandidate = retained.getLastShellCallCandidate(retainedTurn.root);
+  retained.__m365RouteCandidate = retainedCandidate;
+  vm.runInContext(`
+    extractShellCallCandidates = () => [globalThis.__m365RouteCandidate];
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 201;
+  `, retained);
+  const retainedContext = retained.createRunnableHelperDispatchContext(retainedCandidate);
+  assert.ok(retainedContext.routeTurnProof,
+    "M365 must capture an exact user-to-assistant origin-turn proof without relying on ChatGPT adapters.");
+  installM365Location(retained, `/chat/${uuidA}`);
+  assert.equal(retained.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", retained);
+  assert.equal(retained.isRunnableHelperDispatchContextCurrent(retainedContext), true,
+    "A retained M365 turn may remain owned across its first UUID route assignment.");
+  assert.equal(retainedContext.routeHandoffCount, 1);
+
+  installM365Location(retained, `/chat/${uuidB}`);
+  assert.equal(retained.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", retained);
+  assert.equal(retained.isRunnableHelperDispatchContextCurrent(retainedContext), false,
+    "A permanent M365 conversation must not hand authority to another permanent UUID URL.");
+
+  const replaced = loadContentContext();
+  installM365Location(replaced, "/chat");
+  const originalTurn = createM365Turn("printf M365_ROUTE_REPLACED");
+  replaced.document.body = originalTurn.root;
+  replaced.__m365RouteRoot = originalTurn.root;
+  replaced.getConversationRoot = () => replaced.__m365RouteRoot;
+  const originalCandidate = replaced.getLastShellCallCandidate(originalTurn.root);
+  replaced.__m365RouteCandidate = originalCandidate;
+  vm.runInContext(`
+    extractShellCallCandidates = () => [globalThis.__m365RouteCandidate];
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 301;
+  `, replaced);
+  const replacedContext = replaced.createRunnableHelperDispatchContext(originalCandidate);
+  const sameTextReplacement = createM365Turn("printf M365_ROUTE_REPLACED");
+  originalTurn.root.isConnected = false;
+  originalTurn.user.isConnected = false;
+  originalTurn.assistant.isConnected = false;
+  replaced.__m365RouteRoot = sameTextReplacement.root;
+  replaced.document.body = sameTextReplacement.root;
+  replaced.__m365RouteCandidate = replaced.getLastShellCallCandidate(sameTextReplacement.root);
+  installM365Location(replaced, `/chat/${uuidA}`);
+  assert.equal(replaced.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", replaced);
+  assert.equal(replaced.isRunnableHelperDispatchContextCurrent(replacedContext), false,
+    "Same text in replacement M365 DOM nodes is not proof of the originating conversation.");
+
+  const partial = loadContentContext();
+  installM365Location(partial, "/chat");
+  const partialTurn = createM365Turn("printf M365_ROUTE_PARTIAL_REPLACEMENT");
+  for (const [node, role] of [
+    [partialTurn.user, "user"],
+    [partialTurn.assistant, "assistant"]
+  ]) {
+    node.getAttribute = (name) => {
+      if (name === "data-message-author-role") return role;
+      if (name === "data-message-id") return `reused-${role}`;
+      if (name === "data-testid") return `static-${role}`;
+      if (name === "id") return `static-${role}`;
+      return "";
+    };
+  }
+  partial.document.body = partialTurn.root;
+  partial.__m365RouteRoot = partialTurn.root;
+  partial.getConversationRoot = () => partial.__m365RouteRoot;
+  const partialCandidate = partial.getLastShellCallCandidate(partialTurn.root);
+  partial.__m365RouteCandidate = partialCandidate;
+  vm.runInContext(`
+    extractShellCallCandidates = () => [globalThis.__m365RouteCandidate];
+    observedPageIdentity = location.href;
+    pageLifecycleGeneration = 401;
+  `, partial);
+  const partialContext = partial.createRunnableHelperDispatchContext(partialCandidate);
+  const clonedUser = new MockNode({
+    order: 1,
+    role: "user",
+    text: "Load the current helper while M365 assigns this conversation URL."
+  });
+  clonedUser.isConnected = true;
+  clonedUser.getAttribute = partialTurn.user.getAttribute;
+  partialTurn.user.isConnected = false;
+  partialTurn.root.isConnected = false;
+  const partialReplacementRoot = createRoot([clonedUser, partialTurn.assistant]);
+  partialReplacementRoot.isConnected = true;
+  partialTurn.assistant.isConnected = true;
+  partial.__m365RouteRoot = partialReplacementRoot;
+  partial.document.body = partialReplacementRoot;
+  installM365Location(partial, `/chat/${uuidA}`);
+  assert.equal(partial.refreshPageLifecycle(), true);
+  vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", partial);
+  assert.equal(partial.isRunnableHelperDispatchContextCurrent(partialContext), false,
+    "M365 must reject a cloned user root even when reusable id/testid attributes and the old assistant root remain.");
+
+  const predicate = loadContentContext();
+  installM365Location(predicate, "/chat");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat",
+    `https://m365.cloud.microsoft/chat/${uuidA}`
+  ), true);
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    `https://m365.cloud.microsoft/chat/${uuidA}`,
+    `https://m365.cloud.microsoft/chat/${uuidB}`
+  ), false);
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat?draft=1",
+    "https://m365.cloud.microsoft/chat?draft=2"
+  ), false, "Query-only changes must never authorize helper migration.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat",
+    `https://m365.cloud.microsoft/other/${uuidA}`
+  ), false, "A different route prefix must never authorize helper migration.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat",
+    "https://m365.cloud.microsoft/chat/not-opaque"
+  ), false, "A short non-opaque path tail must never authorize helper migration.");
+}
+
 verifyForceRunUsesLatestHelper()
   .then(() => verifyDebugPanelUpdates())
   .then(() => verifyFrontendDoesNotDedupCommands())
@@ -6810,6 +7766,13 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyDeferredProfileDispatchRouteGuards())
   .then(() => verifyForceDeferredProfileDispatchRouteGuards())
   .then(() => verifyOuterSettingsAwaitRouteReconciliation())
+  .then(() => verifyM365LiveGenerationProofRouteHandoff())
+  .then(() => verifyStableRouteRootRebindingBoundaries())
+  .then(() => verifyStableIdRunnableRebindClaimsReplacementRoot())
+  .then(() => verifyCompletedStableIdRouteReplacementRemainsHandled())
+  .then(() => verifyAssistantGenerationEpochRouteBoundaries())
+  .then(() => verifyActiveRunnableRouteObserverRedrawBoundary())
+  .then(() => verifySkillRouteObserverRedrawBoundary())
   .then(() => verifySkillBackendRouteHandoffRejectsSecondPermanentRoute())
   .then(() => verifyManualForceDispatchWinsOuterScanRace())
   .then(() => verifyManualSkillRecoveryWinsOuterScanRace())
@@ -6869,6 +7832,9 @@ verifyForceRunUsesLatestHelper()
   .then(() => verifyTrackedTextareaUpdatesHostState())
   .then(() => verifyInsertReplyPreservesExistingComposerAtomically())
   .then(() => verifyLaterHelperCannotOverwriteUnsentEarlierOutput())
+  .then(() => verifyRouteQuarantineRejectsDelayedTranscriptReplacement())
+  .then(() => verifyAgentPromptWriteOwnershipCancelsOnRoute())
+  .then(() => verifyM365UuidRouteRequiresExactOriginTurnContinuity())
   .then(() => {
     console.log("content last-shell-call candidate tests passed");
   })

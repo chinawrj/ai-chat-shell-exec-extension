@@ -802,7 +802,7 @@ async function testMasterPromptIdentityPreventsHistoricalFalseAck() {
   assert.match(second, /Message id: msg-second/);
 }
 
-async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
+async function testSpaNavigationCancelsWrittenAgentPromptSendOwnership() {
   const localStore = {};
   const context = loadContentContext({ localStore });
   let releaseClick;
@@ -860,7 +860,8 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
 
   const oldGeneration = vm.runInContext("pageLifecycleGeneration", context);
   // Route-only navigation: no composer replacement and no DOM mutation to
-  // wake the scanner. The next agent poll must detect/migrate it itself.
+  // wake the scanner. The next agent poll must detect it and cancel send
+  // ownership because an inbound agent prompt has no authored-turn proof.
   context.location.pathname = "/c/agent-new";
   context.location.href = "https://chatgpt.com/c/agent-new";
   releaseClick(false);
@@ -875,9 +876,10 @@ async function testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry() {
     vm.runInContext("pageLifecycleGeneration", context) > oldGeneration,
     "Agent polling must observe a route-only navigation before loading pending state."
   );
-  assert.equal(insertCount, 1, "SPA route continuity must never rewrite the prompt.");
-  assert.equal(clickCount, 2, "The same exact composer should receive only a send retry.");
-  assert.equal(ackCount, 1, "Only the successfully submitted prompt may be acknowledged.");
+  assert.equal(insertCount, 1, "SPA navigation must never rewrite the agent prompt.");
+  assert.equal(clickCount, 1, "SPA navigation after the first write must not retry send in another route.");
+  assert.equal(submittedCount, 0, "The written old-route agent prompt must not be submitted after navigation.");
+  assert.equal(ackCount, 1, "Cancellation may retry only the local hub acknowledgement.");
   assert.equal(vm.runInContext("pendingAgentDelivery", context), null);
   assert.equal(localStore["agentPendingDelivery:https://chatgpt.com:/c/agent-test"], undefined);
 }
@@ -1570,7 +1572,7 @@ async function waitFor(predicate, label) {
   await testPreexistingUserDraftBlocksAgentInsertionAtomically();
   await testAgentAckDoesNotHoldComposerLease();
   await testMasterPromptIdentityPreventsHistoricalFalseAck();
-  await testSpaNavigationTransfersExactAgentPromptToSendOnlyRetry();
+  await testSpaNavigationCancelsWrittenAgentPromptSendOwnership();
   await testProfileSwitchCancelsOldAgentDeliveryToken();
   await testSentPendingAgentDeliverySurvivesReloadWithoutResend();
   await testProfileChangeClearsLocalPendingDelivery();
