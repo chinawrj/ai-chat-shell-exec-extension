@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.16] - 2026-09-04
+
+- Fixes M365 first-conversation helper recovery for the site's real `/chat` to `/chat/conversation/<UUID>` URL assignment. The previous direct-tail-only recognition treated this route as ordinary navigation, which could discard an in-flight result or mark an unexecuted helper as historical and later display `Already handled` without sending a response.
+- Accepts only one appended opaque id or one bounded short namespace plus that id, while keeping the same-origin, exact retained user/assistant turn, helper semantic/source position, single-handoff, and four-second reconciliation proofs unchanged. Query or hash changes, extra namespace levels, copied/replaced M365 roots, and permanent-conversation A-to-B navigation remain fail-closed.
+- Updates the host-mapped Chromium route suite to use `/chat/conversation/<UUID>` for completed, outer-settings, in-flight, inserted/send-only, transcript-replacement, and permanent-route cases. Positive cases preserve fixture query/hash state and assert one runtime request, one tmux execution, one AI reply, no `Already handled` terminal state, and no pending locks; focused boundaries retain the direct-tail form and reject query/hash changes, excessive namespace depth, and oversized namespaces.
+- Extends the local HTTPS test server to serve both direct-tail and current namespaced M365 conversation routes.
+
 ## [0.11.15] - 2026-09-03
 
 - Generalizes first-conversation URL assignment recovery beyond ChatGPT. A same-origin provisional route that gains one opaque conversation-id segment, including M365 `/chat` to `/chat/<UUID>`, may retain a live helper only while its exact latest user-to-assistant turn, helper semantic payload, and user-text fingerprint all remain current. DOM ownership must also remain exact, except that ChatGPT may rebind one uniquely matching replacement turn through its stable user/assistant message IDs.

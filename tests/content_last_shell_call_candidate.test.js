@@ -2556,7 +2556,7 @@ async function verifyM365LiveGenerationProofRouteHandoff() {
         turn.user.innerText = "A replacement request now owns the latest M365 turn.";
         turn.user.textContent = turn.user.innerText;
       }
-      context.location.pathname = "/chat/33333333-3333-4333-8333-333333333333";
+      context.location.pathname = "/chat/conversation/33333333-3333-4333-8333-333333333333";
       context.location.href = `https://m365.cloud.microsoft${context.location.pathname}`;
       assert.equal(context.refreshPageLifecycle(), true);
       if (mutationTiming === "after-route") {
@@ -2596,7 +2596,7 @@ async function verifyStableRouteRootRebindingBoundaries() {
       {
         host: "m365.cloud.microsoft",
         startPath: "/chat",
-        nextPath: "/chat/55555555-5555-4555-8555-555555555555",
+        nextPath: "/chat/conversation/55555555-5555-4555-8555-555555555555",
         expectedLive: false
       }
     ]) {
@@ -2835,14 +2835,14 @@ async function verifyAssistantGenerationEpochRouteBoundaries() {
       name: "M365 provisional assignment",
       host: "m365.cloud.microsoft",
       startPath: "/chat",
-      nextPath: "/chat/66666666-6666-4666-8666-666666666666",
+      nextPath: "/chat/conversation/66666666-6666-4666-8666-666666666666",
       expectedCarried: true
     },
     {
       name: "M365 permanent A-to-B",
       host: "m365.cloud.microsoft",
-      startPath: "/chat/77777777-7777-4777-8777-777777777777",
-      nextPath: "/chat/88888888-8888-4888-8888-888888888888",
+      startPath: "/chat/conversation/77777777-7777-4777-8777-777777777777",
+      nextPath: "/chat/conversation/88888888-8888-4888-8888-888888888888",
       expectedCarried: false
     },
     {
@@ -7635,14 +7635,14 @@ async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
   const retainedContext = retained.createRunnableHelperDispatchContext(retainedCandidate);
   assert.ok(retainedContext.routeTurnProof,
     "M365 must capture an exact user-to-assistant origin-turn proof without relying on ChatGPT adapters.");
-  installM365Location(retained, `/chat/${uuidA}`);
+  installM365Location(retained, `/chat/conversation/${uuidA}`);
   assert.equal(retained.refreshPageLifecycle(), true);
   vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", retained);
   assert.equal(retained.isRunnableHelperDispatchContextCurrent(retainedContext), true,
     "A retained M365 turn may remain owned across its first UUID route assignment.");
   assert.equal(retainedContext.routeHandoffCount, 1);
 
-  installM365Location(retained, `/chat/${uuidB}`);
+  installM365Location(retained, `/chat/conversation/${uuidB}`);
   assert.equal(retained.refreshPageLifecycle(), true);
   vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", retained);
   assert.equal(retained.isRunnableHelperDispatchContextCurrent(retainedContext), false,
@@ -7669,7 +7669,7 @@ async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
   replaced.__m365RouteRoot = sameTextReplacement.root;
   replaced.document.body = sameTextReplacement.root;
   replaced.__m365RouteCandidate = replaced.getLastShellCallCandidate(sameTextReplacement.root);
-  installM365Location(replaced, `/chat/${uuidA}`);
+  installM365Location(replaced, `/chat/conversation/${uuidA}`);
   assert.equal(replaced.refreshPageLifecycle(), true);
   vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", replaced);
   assert.equal(replaced.isRunnableHelperDispatchContextCurrent(replacedContext), false,
@@ -7715,7 +7715,7 @@ async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
   partialTurn.assistant.isConnected = true;
   partial.__m365RouteRoot = partialReplacementRoot;
   partial.document.body = partialReplacementRoot;
-  installM365Location(partial, `/chat/${uuidA}`);
+  installM365Location(partial, `/chat/conversation/${uuidA}`);
   assert.equal(partial.refreshPageLifecycle(), true);
   vm.runInContext("initialThreadSettled = true; routeReconciliationNotBefore = 0", partial);
   assert.equal(partial.isRunnableHelperDispatchContextCurrent(partialContext), false,
@@ -7725,11 +7725,19 @@ async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
   installM365Location(predicate, "/chat");
   assert.equal(predicate.isProvisionalConversationRouteAssignment(
     "https://m365.cloud.microsoft/chat",
-    `https://m365.cloud.microsoft/chat/${uuidA}`
-  ), true);
+    `https://m365.cloud.microsoft/chat/conversation/${uuidA}`
+  ), true, "M365's real first-conversation route adds a short namespace plus its UUID.");
   assert.equal(predicate.isProvisionalConversationRouteAssignment(
-    `https://m365.cloud.microsoft/chat/${uuidA}`,
-    `https://m365.cloud.microsoft/chat/${uuidB}`
+    "https://m365.cloud.microsoft/chat",
+    `https://m365.cloud.microsoft/chat/${uuidA}`
+  ), true, "A direct opaque-id tail remains a supported provisional assignment.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat?client=test#stable",
+    `https://m365.cloud.microsoft/chat/conversation/${uuidA}?client=test#stable`
+  ), true, "An unchanged query and hash do not weaken an otherwise exact route assignment.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    `https://m365.cloud.microsoft/chat/conversation/${uuidA}`,
+    `https://m365.cloud.microsoft/chat/conversation/${uuidB}`
   ), false);
   assert.equal(predicate.isProvisionalConversationRouteAssignment(
     "https://m365.cloud.microsoft/chat?draft=1",
@@ -7743,6 +7751,22 @@ async function verifyM365UuidRouteRequiresExactOriginTurnContinuity() {
     "https://m365.cloud.microsoft/chat",
     "https://m365.cloud.microsoft/chat/not-opaque"
   ), false, "A short non-opaque path tail must never authorize helper migration.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat?draft=1",
+    `https://m365.cloud.microsoft/chat/conversation/${uuidA}`
+  ), false, "A path assignment must not hide a simultaneous query change.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat#draft",
+    `https://m365.cloud.microsoft/chat/conversation/${uuidA}#assigned`
+  ), false, "A path assignment must not hide a simultaneous hash change.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat",
+    `https://m365.cloud.microsoft/chat/conversation/thread/${uuidA}`
+  ), false, "More than one inserted namespace segment must never authorize helper migration.");
+  assert.equal(predicate.isProvisionalConversationRouteAssignment(
+    "https://m365.cloud.microsoft/chat",
+    `https://m365.cloud.microsoft/chat/conversation-route-x/${uuidA}`
+  ), false, "A namespace longer than the bounded short-route form must never authorize helper migration.");
 }
 
 verifyForceRunUsesLatestHelper()

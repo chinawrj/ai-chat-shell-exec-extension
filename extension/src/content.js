@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.15";
+const CONTENT_SCRIPT_VERSION = "0.11.16";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -1518,7 +1518,8 @@ function isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity
   try {
     const previous = new URL(String(previousIdentity || ""));
     const next = new URL(String(nextIdentity || ""));
-    if (previous.origin !== next.origin || previous.href === next.href) {
+    if (previous.origin !== next.origin || previous.href === next.href ||
+        previous.search !== next.search || previous.hash !== next.hash) {
       return false;
     }
     const previousSegments = previous.pathname.split("/").filter(Boolean);
@@ -1535,14 +1536,18 @@ function isProvisionalConversationRouteAssignment(previousIdentity, nextIdentity
     const previousIsExactPrefix = previousSegments.every(
       (segment, index) => nextSegments[index] === segment
     );
-    if (previousIsExactPrefix && nextSegments.length === previousSegments.length + 1) {
+    const addedSegments = previousIsExactPrefix
+      ? nextSegments.slice(previousSegments.length)
+      : [];
+    if (addedSegments.length === 1) {
       return true;
     }
-    // Hosts such as ChatGPT insert a short route namespace together with the
-    // opaque id when assigning the first permanent conversation URL.
-    return previousSegments.length === 0 &&
-      nextSegments.length === 2 &&
-      /^[a-z][a-z0-9_-]{0,15}$/i.test(nextSegments[0]);
+    // Hosts can insert one short route namespace together with the opaque id
+    // when assigning the first permanent conversation URL. ChatGPT uses
+    // `/` -> `/c/<id>`, while current M365 uses
+    // `/chat` -> `/chat/conversation/<UUID>`.
+    return addedSegments.length === 2 &&
+      /^[a-z][a-z0-9_-]{0,15}$/i.test(addedSegments[0]);
   } catch (_unused) {
     return false;
   }

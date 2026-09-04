@@ -2828,7 +2828,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     });
     await waitForContentOuterSettingsGate(page);
     await installM365UnexpectedUserSubmissionObserver(page, 1);
-    await page.evaluate(`history.pushState({}, "", "/chat/${routeUuid}"); true`);
+    await page.evaluate(`history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search); true`);
     assert.equal(await page.evaluate(`(() =>
       window.__lastM365HelperUser?.isConnected === true &&
       window.__lastM365HelperAssistant?.isConnected === true &&
@@ -2855,7 +2855,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       expectedUserInsertionsRemaining: window.__m365ExpectedUserInsertions,
       composer: document.getElementById("composer")?.innerText || ""
     }))()`), {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       unexpectedUserInsertions: 0,
       expectedUserInsertionsRemaining: 0,
       composer: ""
@@ -2896,7 +2896,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       thread.appendChild(article);
       window.__m365SkillRouteAssistant = article;
       await new Promise((resolve) => setTimeout(resolve, 100));
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "M365 Skill route ${routeUuid}");
       window.__m365SkillExactTurnAtRoute =
         window.__m365SkillRouteUser?.nextElementSibling === window.__m365SkillRouteAssistant &&
@@ -2931,7 +2931,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
     }))()`);
     assert.deepEqual(pageState, {
       hostname: "m365.cloud.microsoft",
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       retainedUserRoot: true,
       retainedAssistantRoot: true,
       exactTurnAtRoute: true,
@@ -2983,7 +2983,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       thread.appendChild(article);
       window.__m365ReplacedSkillAssistant = article;
       await new Promise((resolve) => setTimeout(resolve, 100));
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "M365 delayed Skill route ${routeUuid}");
       content.textContent = ${JSON.stringify(helper)};
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -3012,7 +3012,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       composer: document.getElementById("composer")?.innerText || ""
     }))()`);
     assert.deepEqual(pageState, {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       oldUserConnected: false,
       oldAssistantConnected: false,
       unexpectedUserInsertions: 0,
@@ -3150,7 +3150,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       stop.textContent = "Stop generating";
       document.querySelector("main").appendChild(stop);
       await new Promise((resolve) => setTimeout(resolve, 120));
-      history.pushState({}, "", "/tmux-test-page.html/${nonce}");
+      history.pushState({}, "", "/tmux-test-page.html/${nonce}" + location.search);
       article.querySelector("code").textContent = ${JSON.stringify(helper)};
       stop.remove();
       return true;
@@ -3185,7 +3185,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       return true;
     })()`);
     await page.evaluate("new Promise((resolve) => setTimeout(resolve, 120))");
-    await page.evaluate(`history.pushState({}, "", "/tmux-test-page.html/${nonce}"); true`);
+    await page.evaluate(`history.pushState({}, "", "/tmux-test-page.html/${nonce}" + location.search); true`);
     await new Promise((resolve) => setTimeout(resolve, 3400));
     await page.evaluate(`(() => {
       document.querySelector("#slow-route-assistant code").textContent = ${JSON.stringify(helper)};
@@ -3277,7 +3277,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       helperText: helper
     }, "The queued positive must begin on the exact current ChatGPT authored turn at the provisional root URL.");
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/c/${nonce}");
+      history.pushState({}, "", "/c/${nonce}" + location.search);
       document.querySelector("main").appendChild(window.__heldPendingSkillForm);
       delete window.__heldPendingSkillForm;
       document.querySelector("main")?.setAttribute("aria-label", "Retained Skill route ${nonce}");
@@ -3305,7 +3305,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
   await withFreshSkillCasePage(debugPort, "pending-load-cross-chat-negative", async (page, nonce) => {
     const helper = makeLoad(`pending-cross-chat-${nonce}`);
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/c/${nonce}-a");
+      history.pushState({}, "", "/c/${nonce}-a" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "Skill chat A ${nonce}");
       return true;
     })()`);
@@ -3320,7 +3320,7 @@ async function runIsolatedSkillLoadDispatchE2E(debugPort, catalogSha) {
       return /result cached locally and waiting for the chat composer/i.test(panel?.innerText || "");
     })()`, "chat A Skill result to remain queued without a composer");
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/c/${nonce}-b");
+      history.pushState({}, "", "/c/${nonce}-b" + location.search);
       document.getElementById("thread").innerHTML = "";
       appendMessage("user", "This is unrelated chat B and must not receive chat A local Skill content.");
       document.querySelector("main").appendChild(window.__heldCrossChatSkillForm);
@@ -3770,7 +3770,7 @@ async function runFirstResponseRouteAssignmentE2E(debugPort) {
     );
 
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/c/${nonce}");
+      history.pushState({}, "", "/c/${nonce}" + location.search);
       // pushState itself has no DOM event. Change one attribute from the
       // content observer's explicit filter so the production lifecycle sees
       // the route exactly as it would in a host render batch, without changing
@@ -3853,7 +3853,7 @@ async function runFirstResponseRouteAssignmentE2E(debugPort) {
           window.__insertedRouteRedrawn = true;
         }, 50);
         window.setTimeout(() => {
-          history.pushState({}, "", "/c/${nonce}");
+          history.pushState({}, "", "/c/${nonce}" + location.search);
           document.querySelector("main")?.setAttribute("aria-label", "Inserted route ${nonce}");
           window.__insertedRouteAssigned = true;
         }, 180);
@@ -3924,7 +3924,7 @@ async function runFirstResponseRouteAssignmentE2E(debugPort) {
     );
 
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/c/${nonce}");
+      history.pushState({}, "", "/c/${nonce}" + location.search);
       document.getElementById("thread").innerHTML = "";
       appendMessage("user", "This is a different chat transcript.");
       document.querySelector("main")?.setAttribute("aria-label", "Different conversation route ${nonce}");
@@ -3980,7 +3980,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
     });
     await waitForContentOuterSettingsGate(page);
     await installM365UnexpectedUserSubmissionObserver(page, 1);
-    await page.evaluate(`history.pushState({}, "", "/chat/${routeUuid}"); true`);
+    await page.evaluate(`history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search); true`);
     const exactTurnAtRoute = await page.evaluate(`(() =>
       window.__lastM365HelperUser?.isConnected === true &&
       window.__lastM365HelperAssistant?.isConnected === true &&
@@ -4002,6 +4002,11 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "The outer-settings route handoff must execute the completed helper exactly once.");
     assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
       "The outer-settings route handoff must issue exactly one backend run request.");
+    assert.doesNotMatch(
+      await page.evaluate(`document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || ""`),
+      /Already handled this helper block/,
+      "The real M365 conversation route must not strand the helper as handled without a reply."
+    );
     assert.deepEqual(await page.evaluate(`(() => ({
       pathname: location.pathname,
       unexpectedUserInsertions: window.__m365UnexpectedUserInsertions,
@@ -4011,7 +4016,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
         .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
       composer: document.getElementById("composer")?.innerText || ""
     }))()`), {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       unexpectedUserInsertions: 0,
       expectedUserInsertionsRemaining: 0,
       submittedMatches: 1,
@@ -4060,7 +4065,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       assistant.appendChild(content);
       thread.appendChild(assistant);
       window.__m365CopiedRouteAssistant = assistant;
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       window.__m365CopiedOldRootsDetached =
         oldUser?.isConnected === false && oldAssistant?.isConnected === false;
       return true;
@@ -4083,7 +4088,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
         .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length,
       composer: document.getElementById("composer")?.innerText || ""
     }))()`), {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       oldRootsDetached: true,
       exactReplacementTurn: true,
       unexpectedUserInsertions: 0,
@@ -4095,13 +4100,13 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "Same-text replacement M365 roots must not execute the copied helper.");
     assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 0,
       "Same-text replacement M365 roots must issue no backend run request.");
+    await assertContentOperationLocksClear(page);
     assert.deepEqual(await contentHelperDeliveryState(page), {
       contentWorld: true,
       activeCallId: "",
       pending: 0,
       composer: ""
     });
-    await assertContentOperationLocksClear(page);
   });
 
   await withFreshM365RouteCasePage(debugPort, "inflight-retained-transcript", async (page, nonce) => {
@@ -4132,7 +4137,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "M365 route helper backend execution to start"
     );
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       return true;
     })()`);
     const exactTurnAtRoute = await page.evaluate(`(() =>
@@ -4162,7 +4167,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
     }))()`);
     assert.deepEqual(pageState, {
       hostname: "m365.cloud.microsoft",
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       unexpectedUserInsertions: 0,
       expectedUserInsertionsRemaining: 0,
       submittedMatches: 1,
@@ -4172,13 +4177,13 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "The M365 first-route helper must execute exactly once.");
     assert.equal(await contentRuntimeMessageCount(page, "run-shell"), 1,
       "The M365 first-route helper must issue exactly one backend run request.");
+    await assertContentOperationLocksClear(page);
     assert.deepEqual(await contentHelperDeliveryState(page), {
       contentWorld: true,
       activeCallId: "",
       pending: 0,
       composer: ""
     });
-    await assertContentOperationLocksClear(page);
   });
 
   await withFreshM365RouteCasePage(debugPort, "inserted-send-only", async (page, nonce) => {
@@ -4251,7 +4256,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
           window.__m365RouteComposerRedrawn = true;
         }, 50);
         window.setTimeout(() => {
-          history.pushState({}, "", "/chat/${routeUuid}");
+          history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
           document.querySelector("main")?.setAttribute("aria-label", "M365 inserted route ${routeUuid}");
           window.__m365RouteAssigned = true;
         }, 180);
@@ -4283,7 +4288,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       if (window.__m365RouteWriteCount !== 1 ||
           window.__m365RouteComposerRedrawn !== true ||
           window.__m365RouteAssigned !== true ||
-          location.pathname !== "/chat/${routeUuid}" ||
+          location.pathname !== "/chat/conversation/${routeUuid}" ||
           window.__m365UnexpectedUserInsertions !== 0 ||
           window.__m365ExpectedUserInsertions !== 0 ||
           matches.length !== 1 ||
@@ -4383,7 +4388,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "delayed-replacement M365 backend execution to start"
     );
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "Delayed M365 route ${routeUuid}");
       return true;
     })()`);
@@ -4440,7 +4445,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
     }))()`);
     assert.deepEqual(pageState, {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       leakObserved: false,
       composerLeakObserved: false,
       composerWriteCount: 0,
@@ -4519,7 +4524,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
         window.__m365PostWriteCount += 1;
         if (window.__m365PostWriteCount !== 1) return;
         window.setTimeout(() => {
-          history.pushState({}, "", "/chat/${routeUuid}");
+          history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
           document.getElementById("thread").innerHTML = "";
           window.__m365ExpectedUserInsertions += 1;
           appendMessage("user", "This is a different M365 conversation after the old result was written.");
@@ -4563,7 +4568,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
     }))()`);
     assert.deepEqual(pageState, {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       writeCount: 1,
       leakObserved: false,
       unexpectedUserInsertions: 0,
@@ -4612,7 +4617,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "M365 replacement-route backend execution to start"
     );
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/chat/${routeUuid}");
+      history.pushState({}, "", "/chat/conversation/${routeUuid}" + location.search);
       document.getElementById("thread").innerHTML = "";
       window.__m365ExpectedUserInsertions += 1;
       appendMessage("user", "This is a different M365 conversation.");
@@ -4635,7 +4640,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       bodyContainsOldResult: (document.body.innerText || "").includes(${JSON.stringify(outputToken)})
     }))()`);
     assert.deepEqual(pageState, {
-      pathname: `/chat/${routeUuid}`,
+      pathname: `/chat/conversation/${routeUuid}`,
       unexpectedUserInsertions: 0,
       expectedUserInsertionsRemaining: 0,
       userMessages: 1,
@@ -4660,7 +4665,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
     const routeUuidA = m365RouteUuid(nonce, "a");
     const routeUuidB = m365RouteUuid(nonce, "b");
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/chat/${routeUuidA}");
+      history.pushState({}, "", "/chat/conversation/${routeUuidA}" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "Existing M365 route ${routeUuidA}");
       return true;
     })()`);
@@ -4690,7 +4695,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
       "existing M365 route backend execution to start"
     );
     await page.evaluate(`(() => {
-      history.pushState({}, "", "/chat/${routeUuidB}");
+      history.pushState({}, "", "/chat/conversation/${routeUuidB}" + location.search);
       document.querySelector("main")?.setAttribute("aria-label", "Other permanent M365 route ${routeUuidB}");
       return true;
     })()`);
@@ -4709,7 +4714,7 @@ async function runM365FirstResponseRouteAssignmentE2E(debugPort) {
         .filter((node) => (node.innerText || node.textContent || "").includes(${JSON.stringify(outputToken)})).length
     }))()`);
     assert.deepEqual(pageState, {
-      pathname: `/chat/${routeUuidB}`,
+      pathname: `/chat/conversation/${routeUuidB}`,
       unexpectedUserInsertions: 0,
       expectedUserInsertionsRemaining: 0,
       userMessages: 1,
@@ -4857,7 +4862,7 @@ async function appendLiveChatGptHelper(page, { nonce, userText, helperText, rout
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     if (${JSON.stringify(String(routePath || ""))}) {
-      history.pushState({}, "", ${JSON.stringify(String(routePath || ""))});
+      history.pushState({}, "", ${JSON.stringify(String(routePath || ""))} + location.search);
       document.querySelector("main")?.setAttribute(
         "aria-label",
         ${JSON.stringify(`Conversation route ${nonce}`)}
@@ -5250,6 +5255,7 @@ async function assertContentOperationLocksClear(page) {
       return {
         contentWorld: true,
         activeCallId: typeof activeCallId === "string" ? activeCallId : "",
+        pendingHelperDeliveries: pendingHelperDeliveries.size,
         activeCallToken: Boolean(activeCallToken),
         preparingRunnableDispatch: Boolean(preparingRunnableDispatchToken),
         activeComposerDelivery: Boolean(activeComposerDeliveryToken),
@@ -5267,6 +5273,7 @@ async function assertContentOperationLocksClear(page) {
     const current = worlds.find((entry) => entry.value?.contentWorld)?.value;
     if (!current) return undefined;
     const clear = current.activeCallId === "" &&
+      current.pendingHelperDeliveries === 0 &&
       current.activeCallToken === false &&
       current.preparingRunnableDispatch === false &&
       current.activeComposerDelivery === false &&
@@ -5282,6 +5289,7 @@ async function assertContentOperationLocksClear(page) {
   assert.deepEqual(state, {
     contentWorld: true,
     activeCallId: "",
+    pendingHelperDeliveries: 0,
     activeCallToken: false,
     preparingRunnableDispatch: false,
     activeComposerDelivery: false,

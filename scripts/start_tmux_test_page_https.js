@@ -16,7 +16,7 @@ const PAGE_PATH = path.join(ROOT_DIR, "tests", "manual", "tmux-test-page.html");
 const CHATGPT_CONTRACT_PAGE_PATH = path.join(ROOT_DIR, "tests", "manual", "chatgpt-contract-test-page.html");
 const CHATGPT_CONTRACT_PATH = "/chatgpt-contract-test-page.html";
 const CSP_DRAWIO_PATH = "/drawio-csp-test-page.html";
-const M365_CHAT_ROUTE_PATTERN = /^\/chat(?:\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\/?$/i;
+const M365_CHAT_ROUTE_PATTERN = /^\/chat(?:\/(?:conversation\/)?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})?\/?$/i;
 const CSP_DRAWIO_NONCE = "ai-chat-shell-e2e-drawio-csp-2026";
 
 ensureCertificate();
