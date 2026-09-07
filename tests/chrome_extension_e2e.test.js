@@ -6255,13 +6255,23 @@ async function runDrawioPngPagesE2E(page) {
   const xml = first.replace('</mxfile>', `${secondDiagram}\n</mxfile>`);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(xml, "drawio-png-pages"))}, "text")`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.dataset.currentTitle === 'PNG page one'`, "multi-page diagram ready");
-  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-view"]').click()`);
-  await waitForEvaluate(page, `Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog'))`, "Skills overlay before PNG interaction");
-  await page.evaluate(`(() => {
+  // Setup is read-only Skills management, separate from the trusted PNG
+  // interaction. Await the real requests so an older dialog or background
+  // refresh cannot falsely satisfy a DOM-presence wait.
+  const management = await page.evaluateAcrossContexts(`(async () => {
+    if (typeof viewSkillCatalog !== 'function') return null;
+    await viewSkillCatalog();
+    await viewSkillCatalog();
+    return { ready: Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog')) };
+  })()`);
+  assert.ok(management.some((entry) => entry?.value?.ready), "Fresh Skills management requests must complete before PNG interaction");
+  const scrolled = await page.evaluate(`(() => {
     const section = document.querySelector('#ai-chat-shell-exec-skill-dialog section');
     section.style.maxHeight = '120px';
     section.scrollTop = section.scrollHeight;
+    return section.scrollTop > 0;
   })()`);
+  assert.equal(scrolled, true, "The management overlay fixture must actually be scrolled");
   await verifyDrawioPngDownload(page, "PNG page one");
   await page.send("Browser.grantPermissions", { origin: new URL(TEST_PAGE_URL).origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   await trustedDrawioAction(page, "copy-png");
