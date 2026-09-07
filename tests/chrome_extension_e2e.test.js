@@ -6174,7 +6174,15 @@ async function trustedDrawioAction(page, action) {
   // The broader suite intentionally leaves Skills management open. Dismiss it
   // through its real Close control before interacting with the preview beneath.
   if (await page.evaluate(`Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog'))`)) {
+    const closeHit = await page.evaluate(`(() => {
+      const button = document.querySelector('#ai-chat-shell-exec-skill-dialog button');
+      button.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const rect = button.getBoundingClientRect();
+      return document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) === button;
+    })()`);
+    assert.equal(closeHit, true, "Scrolled Skills Close control must be reachable");
     await trustedClick(page, '#ai-chat-shell-exec-skill-dialog button');
+    await waitForEvaluate(page, `!document.getElementById('ai-chat-shell-exec-skill-dialog')`, "Skills overlay dismissed before PNG action");
   }
   if (await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === false`)) {
     await trustedClick(page, `#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]`);
@@ -6249,6 +6257,11 @@ async function runDrawioPngPagesE2E(page) {
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.dataset.currentTitle === 'PNG page one'`, "multi-page diagram ready");
   await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-view"]').click()`);
   await waitForEvaluate(page, `Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog'))`, "Skills overlay before PNG interaction");
+  await page.evaluate(`(() => {
+    const section = document.querySelector('#ai-chat-shell-exec-skill-dialog section');
+    section.style.maxHeight = '120px';
+    section.scrollTop = section.scrollHeight;
+  })()`);
   await verifyDrawioPngDownload(page, "PNG page one");
   await page.send("Browser.grantPermissions", { origin: new URL(TEST_PAGE_URL).origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   await trustedDrawioAction(page, "copy-png");
