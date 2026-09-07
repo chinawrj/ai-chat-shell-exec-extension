@@ -6171,12 +6171,25 @@ async function runDrawioPreviewE2E(page) {
 }
 
 async function trustedDrawioAction(page, action) {
+  // The broader suite intentionally leaves Skills management open. Dismiss it
+  // through its real Close control before interacting with the preview beneath.
+  if (await page.evaluate(`Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog'))`)) {
+    await trustedClick(page, '#ai-chat-shell-exec-skill-dialog button');
+  }
+  if (await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-advanced-controls')?.hidden === false`)) {
+    await trustedClick(page, `#${EXTENSION_STATUS_ID} [data-shell-tool-action="more"]`);
+  }
   const point = await page.evaluate(`(() => {
     const button = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('[data-action="${action}"]');
     const rect = button.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, disabled: button.disabled };
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
+    return { x, y, disabled: button.disabled, hit: document.elementFromPoint(x, y) === host && host.shadowRoot.elementFromPoint(x, y) === button,
+      blocker: document.elementFromPoint(x, y)?.outerHTML.slice(0, 160) };
+
   })()`);
   assert.equal(point.disabled, false, `${action} must be enabled`);
+  assert.equal(point.hit, true, `${action} must receive the trusted click; blocker=${point.blocker}`);
   for (const type of ["mousePressed", "mouseReleased"]) {
     await page.send("Input.dispatchMouseEvent", { type, x: point.x, y: point.y, button: "left", clickCount: 1 });
   }
@@ -6234,6 +6247,8 @@ async function runDrawioPngPagesE2E(page) {
   const xml = first.replace('</mxfile>', `${secondDiagram}\n</mxfile>`);
   await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(xml, "drawio-png-pages"))}, "text")`);
   await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.dataset.currentTitle === 'PNG page one'`, "multi-page diagram ready");
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} [data-shell-tool-action="skill-view"]').click()`);
+  await waitForEvaluate(page, `Boolean(document.getElementById('ai-chat-shell-exec-skill-dialog'))`, "Skills overlay before PNG interaction");
   await verifyDrawioPngDownload(page, "PNG page one");
   await page.send("Browser.grantPermissions", { origin: new URL(TEST_PAGE_URL).origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   await trustedDrawioAction(page, "copy-png");
