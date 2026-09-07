@@ -108,4 +108,19 @@ function runBackgroundWithStore(syncStore) {
   }]));
 }
 
+{
+  const store = { ...defaultStore, defaultTimeoutMs: 180000, settingsMigrationVersion: 3 };
+  delete store.maxOutputChars;
+  const writes = runBackgroundWithStore(store);
+  assert.equal(JSON.stringify(writes), JSON.stringify([{ maxOutputChars: 80000 }]));
+  assert.equal(store.maxOutputChars, 80000, "A missing output setting must receive the new default.");
+}
+
+for (const savedLimit of [20000, 12345, 80000, 200000]) {
+  const store = { ...defaultStore, defaultTimeoutMs: 180000, settingsMigrationVersion: 3, maxOutputChars: savedLimit };
+  const writes = runBackgroundWithStore(store);
+  assert.equal(writes.length, 0, "Changing the default must not migrate an existing output limit.");
+  assert.equal(store.maxOutputChars, savedLimit);
+}
+
 console.log("background settings migration tests passed");

@@ -257,7 +257,7 @@ async function main() {
   assert.equal(sentPayloads[2].cmd, "version");
   assert.equal(sentPayloads[2].boardName, "");
   assert.equal(sentPayloads[2].timeoutMs, 180000);
-  assert.equal(sentPayloads[2].maxOutputChars, 20000);
+  assert.equal(sentPayloads[2].maxOutputChars, 80000);
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].state, "completed");
   assert.equal(localStore["shellCallLedger:v1"].calls["board-key-1"].target, "%40");
 

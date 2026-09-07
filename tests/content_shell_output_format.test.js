@@ -65,6 +65,33 @@ const shortCommand = "pwd";
 const shortOutput = context.formatShellOutput({ cmd: shortCommand }, response, "2026-05-22T00:00:00.000Z");
 assert.match(shortOutput, /^\$ pwd$/m);
 assert.doesNotMatch(shortOutput, /^cmdHash:/m);
+assert.doesNotMatch(shortOutput, /^truncated: true$|^outputNotice:/m);
+
+const defaultBoundOutput = context.formatShellOutput({ cmd: "verbose-command" }, {
+  ...response, stdout: "x".repeat(80000), truncated: true
+}, "2026-05-22T00:00:00.000Z");
+assert.equal(context.boundPendingHelperReply(defaultBoundOutput), defaultBoundOutput,
+  "The new 80000-character default plus its AI truncation notice must survive pending-delivery persistence intact.");
+
+for (const stdout of ["retained output", ""]) {
+  const truncatedOutput = context.formatShellOutput({ cmd: "verbose-command" }, {
+    ...response,
+    stdout,
+    truncated: true
+  }, "2026-05-22T00:00:00.000Z");
+  assert.match(truncatedOutput, /^truncated: true$/m);
+  assert.match(truncatedOutput, /^outputNotice: .*truncated.*fully captured/m,
+    "Truncation must include an explicit explanation in the AI-visible shell-output.");
+  assert.match(truncatedOutput, /empty stdout does not prove the command produced no output/);
+  assert.match(truncatedOutput, /logs\/files in smaller ranges|narrow the query/);
+  assert.match(truncatedOutput, /Continue reading the remaining output from existing logs\/files in smaller ranges until complete/,
+    "The AI must be told to continue reading saved remaining output until complete.");
+  assert.match(truncatedOutput, /If the missing output was not saved, it cannot be recovered/,
+    "Continuation advice must not imply uncaptured, unsaved output can be recovered.");
+  assert.match(truncatedOutput, /do not blindly rerun commands with side effects/,
+    "Recovery advice must not encourage replaying a completed side-effecting command.");
+  assert.ok(truncatedOutput.indexOf("outputNotice:") < truncatedOutput.lastIndexOf("```"));
+}
 
 const multilineCommand = "printf one\nprintf two";
 const multilineOutput = context.formatShellOutput({ cmd: multilineCommand }, response, "2026-05-22T00:00:00.000Z");

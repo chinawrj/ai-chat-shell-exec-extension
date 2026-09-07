@@ -4,7 +4,7 @@ const DEFAULTS = {
   requireApproval: false,
   autoSend: true,
   defaultTimeoutMs: 180000,
-  maxOutputChars: 20000,
+  maxOutputChars: 80000,
   maxChainCalls: 100,
   disableAuthorRoleFilter: true
 };

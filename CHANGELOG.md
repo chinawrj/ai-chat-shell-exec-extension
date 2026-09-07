@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.17] - 2026-09-07
+
+- Raises the default Max output chars from 20,000 to 80,000 across popup settings, background shell/board fallbacks, and server defaults. Saved settings and per-request overrides retain their existing values.
+- Fixes silent empty shell output after the START marker leaves tmux history. DONE remains recognizable independently, and a live run retains its last bounded output previously verified under its own START marker instead of adopting unrelated pane text.
+- Marks lost/incomplete capture and internal capture-limit truncation explicitly, including status-file completion and server-restart recovery. The AI-visible shell-output explicitly asks the AI to continue reading remaining saved output in smaller log/file ranges until complete, distinguishes unsaved output that cannot be recovered, and explains that empty stdout does not prove a command was silent.
+- Keeps observable output activity tracking after START loss, while capture failures during recovery preserve the original idle clock. Adds focused real-tmux regressions for history rollover, capture limits, retained prefixes, idle behavior, process-loss recovery, and no-repeat status replay.
+
 ## [0.11.16] - 2026-09-04
 
 - Fixes M365 first-conversation helper recovery for the site's real `/chat` to `/chat/conversation/<UUID>` URL assignment. The previous direct-tail-only recognition treated this route as ordinary navigation, which could discard an in-flight result or mark an unexecuted helper as historical and later display `Already handled` without sending a response.

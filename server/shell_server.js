@@ -17,7 +17,7 @@ const PORT = 17371;
 const EXTENSION_ID = "lkmeogidbglhedgekjgbpbfjkpapnhke";
 const ALLOWED_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 const DEFAULT_TIMEOUT_MS = 180000;
-const DEFAULT_MAX_OUTPUT_CHARS = 20000;
+const DEFAULT_MAX_OUTPUT_CHARS = 80000;
 const MAX_SHELL_SCRIPT_BYTES = 1024 * 1024;
 const MAX_INTERACTIVE_COMMAND_CHARS = 8000;
 const MAX_WEBSOCKET_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -1266,19 +1266,19 @@ async function recoverCompletedPersistentTmuxOwner(owner, state, pane) {
     return;
   }
   const interruptSignal = readTmuxShellInterruptSignal(owner.interruptedPath);
-  const captured = owner.startMarker && owner.doneMarker
-    ? await captureTmuxPane(pane.id).catch(() => "")
-    : "";
+  const capture = owner.startMarker && owner.doneMarker
+    ? await captureTmuxPaneSnapshot(pane.id).catch(() => ({ text: "", truncated: true }))
+    : { text: "", truncated: true };
   const extracted = owner.startMarker && owner.doneMarker
-    ? extractTmuxRunOutput(captured, owner.startMarker, owner.doneMarker, owner.maxOutputChars || DEFAULT_MAX_OUTPUT_CHARS)
-    : { stdout: "", truncated: false, foundDone: false };
+    ? extractTmuxRunOutput(capture.text, owner.startMarker, owner.doneMarker, owner.maxOutputChars || DEFAULT_MAX_OUTPUT_CHARS, capture)
+    : { stdout: "", truncated: true, foundDone: false };
   completeServerShellCall(owner.ledgerKey, {
     exitCode: state.exitCode,
     stdout: extracted.stdout,
     stderr: formatTmuxShellInterruptMessage(interruptSignal),
     durationMs: Date.now() - Number(owner.createdAt || Date.now()),
     timedOut: false,
-    truncated: extracted.truncated === true,
+    truncated: extracted.truncated === true || !extracted.foundDone,
     executed: true,
     executionCompleted: true,
     completionMarkerMissing: extracted.foundDone !== true,
@@ -3442,15 +3442,15 @@ async function handleShellRunControlMessage(message) {
 async function observePersistentTmuxShellIdle(owner, pane) {
   const timeoutMs = clampNumber(owner.idleTimeoutMs, 1000, 10 * 60 * 1000, DEFAULT_TIMEOUT_MS);
   const captured = owner.startMarker && owner.doneMarker
-    ? await captureTmuxPane(pane.id).catch(() => "")
-    : "";
-  const extracted = owner.startMarker && owner.doneMarker
+    ? await captureTmuxPane(pane.id).catch(() => null)
+    : null;
+  const extracted = captured !== null
     ? extractTmuxRunOutput(captured, owner.startMarker, owner.doneMarker, owner.maxOutputChars || DEFAULT_MAX_OUTPUT_CHARS)
     : { foundStart: false, outputFingerprint: "" };
   const now = Date.now();
   let lastOutputAt = Number(owner.lastOutputAt || owner.createdAt || now);
   let idleState = String(owner.idleState || "running");
-  const outputChanged = extracted.foundStart && extracted.outputFingerprint !== String(owner.idleOutputFingerprint || "");
+  const outputChanged = Boolean(extracted.outputFingerprint) && extracted.outputFingerprint !== String(owner.idleOutputFingerprint || "");
   if (outputChanged) {
     lastOutputAt = now;
     idleState = "running";
@@ -4042,16 +4042,33 @@ async function runTmuxShell({
   let processExitMissingSince = 0;
   let unknownStateSince = 0;
   let continuedAfterTimeout = false;
-  let lastCapture = "";
+  let retainedStdout = "";
+  let lastExtracted = extractTmuxRunOutput("", startMarker, doneMarker, maxOutputChars);
   let lastOutputFingerprint = "";
+  const captureOutput = async () => {
+    try {
+      const capture = await captureTmuxPaneSnapshot(pane.id);
+      const extracted = extractTmuxRunOutput(capture.text, startMarker, doneMarker, maxOutputChars, capture);
+      if (extracted.foundStart) {
+        retainedStdout = extracted.stdout;
+      } else {
+        // Only reuse text previously bounded by this run's START. A markerless
+        // pane tail could contain another command or a manually entered draft.
+        extracted.stdout = retainedStdout;
+      }
+      lastExtracted = extracted;
+    } catch {
+      lastExtracted = { ...lastExtracted, foundDone: false, truncated: true };
+    }
+    return lastExtracted;
+  };
   try {
     await sendTmuxLiteralLine(pane.id, `/bin/sh ${shellQuote(launcherPath)}`);
 
     while (true) {
       await sleep(TMUX_POLL_INTERVAL_MS);
-      lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
-      const extracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
-      if (extracted.foundStart && extracted.outputFingerprint !== lastOutputFingerprint) {
+      const extracted = await captureOutput();
+      if (extracted.outputFingerprint !== lastOutputFingerprint) {
         lastOutputFingerprint = extracted.outputFingerprint;
         control.lastOutputAt = Date.now();
         if (control.awaitingUser) {
@@ -4136,8 +4153,7 @@ async function runTmuxShell({
         // Give the terminal one short flush window for the done marker, then
         // return immediately even if pane capture lost that marker.
         await sleep(50);
-        lastCapture = await captureTmuxPane(pane.id).catch(() => lastCapture);
-        const finalExtracted = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        const finalExtracted = await captureOutput();
         const executed = fs.existsSync(executedPath);
         const interruptSignal = readTmuxShellInterruptSignal(interruptedPath);
         return {
@@ -4150,7 +4166,7 @@ async function runTmuxShell({
           exitCode: finalExtracted.foundDone ? finalExtracted.exitCode : state.exitCode,
           stdout: finalExtracted.stdout,
           stderr: formatTmuxShellInterruptMessage(interruptSignal),
-          truncated: finalExtracted.truncated,
+          truncated: finalExtracted.truncated || !finalExtracted.foundDone,
           timedOut: false,
           completionMarkerMissing: !finalExtracted.foundDone,
           processKnown: true,
@@ -4205,14 +4221,14 @@ async function runTmuxShell({
         if (Date.now() - processExitMissingSince < markerLossGraceMs) {
           continue;
         }
-        const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+        const partial = lastExtracted;
         return {
           executed: fs.existsSync(executedPath),
           executionCompleted: false,
           exitCode: 124,
           stdout: partial.stdout,
           stderr: "Timed out waiting for tmux completion marker after the shell process exited without reporting completion.",
-          truncated: partial.truncated,
+          truncated: true,
           timedOut: true,
           timeoutReason: "process-exited-missing-completion",
           processKnown: true,
@@ -4233,14 +4249,14 @@ async function runTmuxShell({
       if (Date.now() - unknownStateSince < markerLossGraceMs) {
         continue;
       }
-      const partial = extractTmuxRunOutput(lastCapture, startMarker, doneMarker, maxOutputChars);
+      const partial = lastExtracted;
       return {
         executed: fs.existsSync(executedPath),
         executionCompleted: false,
         exitCode: 124,
         stdout: partial.stdout,
         stderr: "Timed out waiting for tmux command completion marker and could not confirm a running shell process.",
-        truncated: partial.truncated,
+        truncated: true,
         timedOut: true,
         timeoutReason: "process-state-unknown",
         processKnown: false,
@@ -5554,6 +5570,11 @@ function buildTmuxTargetExample(panes, cmd = "pwd") {
 }
 
 async function captureTmuxPane(target, maxOutputChars = 1000000) {
+  const capture = await captureTmuxPaneSnapshot(target, maxOutputChars);
+  return capture.text;
+}
+
+async function captureTmuxPaneSnapshot(target, maxOutputChars = 1000000) {
   const result = await runTmuxCommand([
     "capture-pane",
     "-p",
@@ -5563,7 +5584,10 @@ async function captureTmuxPane(target, maxOutputChars = 1000000) {
     "-t",
     target
   ], { timeoutMs: 5000 });
-  return appendLimited("", result.stdout, maxOutputChars);
+  return {
+    text: appendLimited("", result.stdout, maxOutputChars),
+    truncated: result.stdoutTruncated === true || result.stdout.length > maxOutputChars
+  };
 }
 
 function getBoardTimingConfig() {
@@ -6534,33 +6558,33 @@ function socketExists(socketPath) {
   }
 }
 
-function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars = DEFAULT_MAX_OUTPUT_CHARS) {
+function extractTmuxRunOutput(captured, startMarker, doneMarker, maxOutputChars = DEFAULT_MAX_OUTPUT_CHARS, capture = {}) {
   const lines = String(captured || "").split(/\r?\n/);
   const startIndex = lines.findIndex((line) => line.includes(startMarker));
+  const donePattern = new RegExp(`${escapeRegExp(doneMarker)}:(\\d+)(?:\\s|$)`);
+  const doneIndex = lines.findIndex((line, index) => index > startIndex && donePattern.test(line));
+  const exitMatch = doneIndex >= 0 ? lines[doneIndex].match(donePattern) : null;
   if (startIndex < 0) {
     return {
       foundStart: false,
-      foundDone: false,
-      exitCode: 124,
+      foundDone: doneIndex >= 0,
+      exitCode: exitMatch ? Number(exitMatch[1]) : 124,
       stdout: "",
-      truncated: false,
-      outputFingerprint: ""
+      truncated: true,
+      outputFingerprint: hashText(String(captured || ""))
     };
   }
 
-  const doneIndex = lines.findIndex((line, index) => index > startIndex && line.includes(doneMarker));
   const endIndex = doneIndex >= 0 ? doneIndex : lines.length;
   const output = lines.slice(startIndex + 1, endIndex).join("\n").replace(/\n+$/, "");
   const stdout = appendLimited("", output, maxOutputChars);
-  const doneLine = doneIndex >= 0 ? lines[doneIndex] : "";
-  const exitMatch = doneLine.match(new RegExp(`${escapeRegExp(doneMarker)}:(\\d+)`));
 
   return {
     foundStart: true,
     foundDone: doneIndex >= 0,
     exitCode: exitMatch ? Number(exitMatch[1]) : 124,
     stdout,
-    truncated: output.length > stdout.length,
+    truncated: (capture.truncated === true && doneIndex < 0) || output.length > stdout.length,
     outputFingerprint: hashText(output)
   };
 }
@@ -6574,6 +6598,7 @@ function runCommandRaw(command, args, { timeoutMs = 5000, maxOutputChars = 10000
 
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
     let timedOut = false;
 
     const timer = setTimeout(() => {
@@ -6583,7 +6608,9 @@ function runCommandRaw(command, args, { timeoutMs = 5000, maxOutputChars = 10000
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk.toString("utf8"), maxOutputChars);
+      const text = chunk.toString("utf8");
+      stdoutTruncated ||= stdout.length + text.length > maxOutputChars;
+      stdout = appendLimited(stdout, text, maxOutputChars);
     });
 
     child.stderr.on("data", (chunk) => {
@@ -6593,13 +6620,13 @@ function runCommandRaw(command, args, { timeoutMs = 5000, maxOutputChars = 10000
     child.on("error", (error) => {
       clearTimeout(timer);
       const message = `${stderr}${stderr ? "\n" : ""}${error.message}`;
-      resolve({ ok: false, stdout, stderr: message, exitCode: 127, timedOut });
+      resolve({ ok: false, stdout, stdoutTruncated, stderr: message, exitCode: 127, timedOut });
     });
 
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       const exitCode = Number.isInteger(code) ? code : 128;
-      resolve({ ok: exitCode === 0 && !timedOut, stdout, stderr, exitCode, signal, timedOut });
+      resolve({ ok: exitCode === 0 && !timedOut, stdout, stdoutTruncated, stderr, exitCode, signal, timedOut });
     });
   });
 }

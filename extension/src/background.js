@@ -70,7 +70,7 @@ const DEFAULT_SETTINGS = {
   requireApproval: false,
   autoSend: true,
   defaultTimeoutMs: 180000,
-  maxOutputChars: 20000,
+  maxOutputChars: 80000,
   maxChainCalls: DEFAULT_MAX_CHAIN_CALLS,
   disableAuthorRoleFilter: true
 };
@@ -1004,7 +1004,7 @@ async function handleWriteFileMessage(message) {
 async function handleRunShellMessage(message, sender = {}) {
   const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 180000;
-  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
+  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || DEFAULT_SETTINGS.maxOutputChars;
   const callKey = message.callKey || message.id || "";
   const force = isForceMessage(message);
   const payload = {
@@ -1154,7 +1154,7 @@ async function handleRunResultPresentedMessage(message) {
 async function handleRunBoardMessage(message) {
   const settings = await syncGet(["defaultTimeoutMs", "maxOutputChars"]);
   const timeoutMs = message.timeoutMs || settings.defaultTimeoutMs || 180000;
-  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || 20000;
+  const maxOutputChars = message.maxOutputChars || settings.maxOutputChars || DEFAULT_SETTINGS.maxOutputChars;
   const callKey = message.callKey || message.id || "";
   const force = isForceMessage(message);
   const payload = {

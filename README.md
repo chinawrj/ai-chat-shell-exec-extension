@@ -331,6 +331,8 @@ The individual controls behave as follows:
 
 Drag the panel title to move the floating window. You can also click a bind mode and drag the relevant page element onto the panel when the page supports dragging. Bindings and panel position are stored per origin, so a calibration for one site does not affect another.
 
+The default **Max output chars** is **80,000** (configurable from 1,000 to 200,000). Updates preserve saved values; to adopt the new default in an existing profile, set this field to 80000 and save. Shell output that exceeds a result/capture limit or loses its tmux history boundary is marked `truncated: true`, with an AI-facing notice to continue reading the remaining output from existing logs/files in smaller ranges until complete. Missing output that was not saved cannot be recovered; use a narrower query for needed information and avoid blindly repeating commands with side effects. An empty stdout with this warning does not mean the command produced no output.
+
 Use the popup's portable config area to move settings and bindings to another Chrome profile or machine. It exports only extension settings and calibration selectors; it does not export shell command ledgers or page content.
 
 ## Local Multi-Agent Tabs

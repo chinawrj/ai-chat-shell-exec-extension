@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.16";
+const CONTENT_SCRIPT_VERSION = "0.11.17";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -9286,7 +9286,10 @@ function formatShellOutput(call, response, startedAt) {
     response.idleTimeoutReached === true ? "idleTimeoutReached: true" : "",
     Number.isFinite(response.idleTimeoutMs) && response.idleTimeoutMs > 0 ? `idleTimeoutMs: ${response.idleTimeoutMs}` : "",
     response.continuedAfterTimeout ? "continuedAfterTimeout: true" : "",
-    response.truncated ? "truncated: true" : ""
+    response.truncated ? "truncated: true" : "",
+    response.truncated
+      ? "outputNotice: Output was truncated or could not be fully captured; an empty stdout does not prove the command produced no output. Continue reading the remaining output from existing logs/files in smaller ranges until complete. If the missing output was not saved, it cannot be recovered; narrow the query to retrieve the needed information, and do not blindly rerun commands with side effects."
+      : ""
   ].filter(Boolean);
 
   return [

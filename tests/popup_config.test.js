@@ -124,7 +124,7 @@ function makeContext() {
       },
       storage: {
         sync: {
-          get: async (keys) => Object.fromEntries(keys.map((key) => [key, syncStore[key]])),
+          get: async (keys) => Object.fromEntries(keys.filter((key) => Object.hasOwn(syncStore, key)).map((key) => [key, syncStore[key]])),
           set: async (value) => {
             writes.sync = value;
           }
@@ -157,12 +157,23 @@ function makeContext() {
   vm.createContext(context);
   const script = fs.readFileSync(path.join(__dirname, "..", "extension", "src", "popup.js"), "utf8");
   vm.runInContext(script, context, { filename: "popup.js" });
-  return { context, elements, writes };
+  return { context, elements, writes, syncStore };
 }
 
 (async () => {
-  const { context, elements, writes } = makeContext();
+  const { context, elements, writes, syncStore } = makeContext();
   await context.loadSettings();
+  assert.equal(Number(elements.get("maxOutputChars").value), 9000, "Popup loading must preserve a saved custom output bound.");
+  syncStore.maxOutputChars = 20000;
+  await context.loadSettings();
+  assert.equal(Number(elements.get("maxOutputChars").value), 20000, "The old saved 20000 value must not be migrated.");
+  delete syncStore.maxOutputChars;
+  await context.loadSettings();
+  assert.equal(Number(elements.get("maxOutputChars").value), 80000, "Popup loading must display 80000 when no output limit is saved.");
+  syncStore.maxOutputChars = 9000;
+  await context.loadSettings();
+  assert.equal(context.sanitizeSettings({ maxOutputChars: 20000 }).maxOutputChars, 20000);
+  assert.equal(context.sanitizeSettings({ maxOutputChars: 12345 }).maxOutputChars, 12345);
   await context.loadCurrentSite();
   await context.refreshHealth();
   assert.equal(elements.get("health").textContent, "Server v0.6.0, protocol 12, helper 4, skill 6, Skills v2/3, apps Terminal/Ghostty, vision ok, pid 123");
@@ -227,7 +238,7 @@ function makeContext() {
     autoSend: true,
     requireApproval: true,
     defaultTimeoutMs: 600000,
-    maxOutputChars: 20000,
+    maxOutputChars: 80000,
     maxChainCalls: 123456
   }));
   assert.equal(JSON.stringify(writes.local), JSON.stringify({
