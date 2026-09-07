@@ -114,7 +114,7 @@ Environment substitution happens only during `cmd: load`; it never changes the r
 
 For intentional repeated requests with the same payload, the AI may add a simple no-space identity suffix to the start marker, such as `ai-helper-shell-start:2`, `ai-helper-board-start:2`, `ai-helper-board-R1-start:2`, `ai-helper-file-start:2`, `ai-helper-drawio-start:2`, `ai-helper-agent-message-start:2`, `ai-helper-agent-roster-start:2`, or `ai-helper-agent-task-status-start:2`.
 
-For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io rendering remains entirely local and never contacts the shell backend: the last complete helper alone controls the preview, success stays silent, and a validation/render failure clears the old SVG, keeps only the latest error, and sends one bounded error report through the same reliable composer-delivery path. The preview includes Maximize/Restore for browser-viewport viewing. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
+For executable/file helpers, the content script waits until the assistant stops streaming, sends the request through the extension background worker to a local WebSocket server, then posts the captured output back into the chat composer as a `shell-output` block. Draw.io rendering remains entirely local and never contacts the shell backend: the last complete helper alone controls the preview, success stays silent, and a validation/render failure clears the old SVG, keeps only the latest error, and sends one bounded error report through the same reliable composer-delivery path. The preview includes Maximize/Restore, a named page selector with Previous/Next navigation for multi-page files, Copy PNG, and Download PNG. PNG exports use the current page’s complete diagram bounds at natural 1× scale with a white background, excluding blank page margins and preview controls. Backend duplicate-control metadata is never posted to the model: an already-presented result is handled only in the local panel, while an execution whose result was never presented may be restored as a clean original result without `duplicate`, `skipped`, replay, or reason fields.
 
 ## Latest Extension Panel Screenshots
 
@@ -152,6 +152,10 @@ The panel is state-driven: it keeps the healthy idle view minimal and reveals an
 | Advanced controls | Page binding at the bottom |
 | --- | --- |
 | <img src="docs/release-assets/v0.11.13/extension-panel-advanced.png" width="328" alt="Expanded extension panel with the permanent Force run entry under Setup and recovery and a separate Skills header chip"> | <img src="docs/release-assets/v0.11.13/extension-panel-page-binding.png" width="328" alt="Bottom of the expanded extension panel showing Page binding folded by default"> |
+
+The Draw.io preview now includes current-page PNG copy/download and named multi-page navigation:
+
+<img src="docs/release-assets/v0.11.19/drawio-preview.png" width="760" alt="Draw.io preview with Copy PNG, Download PNG, page selector, and previous/next page controls">
 
 ## Basic Helper Screenshots
 
@@ -617,7 +621,9 @@ ai-helper-drawio-start
 ai-helper-drawio-end
 ````
 
-The Draw.io body is the complete native file, not a command, path, target, or shell-encoded payload. The content script treats only the last complete candidate as current and gives valid XML to the packaged sandbox viewer. It never forwards XML to background/server/tmux or posts a rendered image to the composer. Success stays silent; validation or renderer failure clears the prior render, exposes only the latest local error, and sends a bounded `shell-output` error report through the extension's durable one-write delivery queue. The user sees the SVG; the AI must rely on the user's textual feedback after success. The preview can be moved, resized, closed/reopened, downloaded, or maximized to the browser viewport and restored.
+The Draw.io body is the complete native file, not a command, path, target, or shell-encoded payload. The content script treats only the last complete candidate as current and gives valid XML to the packaged sandbox viewer. It never forwards XML to background/server/tmux or posts a rendered image to the composer. Success stays silent; validation or renderer failure clears the prior render, exposes only the latest local error, and sends a bounded `shell-output` error report through the extension's durable one-write delivery queue. The user sees the SVG; the AI must rely on the user's textual feedback after success. The preview can be moved, resized, closed/reopened, or maximized to the browser viewport and restored. Multi-page files expose a persistent **Page** selector and **Previous/Next** buttons; switching pages also changes the PNG export and filename. **Copy PNG** writes an `image/png` image to the clipboard, and **Download PNG** saves the same tightly cropped current-page content at natural 1× scale with a white background. Neither includes the preview toolbar, viewport, or blank paper margins. **Download .drawio** saves the complete original multi-page document.
+
+Clipboard access requires a supported secure browser context and permission. If copying fails, use Download PNG. Export errors stay in the preview without sending an AI reply or clearing the SVG. Bounds above 8192 pixels per side or 16 megapixels, serialized SVG above 8 MiB, or PNG above 32 MiB produce an explicit error; split a large diagram across pages instead of expecting automatic rescaling.
 
 For agent messages, use:
 

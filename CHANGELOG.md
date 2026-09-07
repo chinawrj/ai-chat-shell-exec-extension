@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.11.19] - 2026-09-07
+
+- Adds Copy PNG and Download PNG to the Draw.io preview. Both export the current page at natural 1× scale, tightly cropped to its diagram content, including labels and negative-coordinate shapes, with a white background. Preview zoom, toolbar, viewport, and blank paper margins do not enlarge the PNG.
+- Adds a persistent named page selector for multi-page `.drawio` files. Switching pages updates the preview title and PNG filename; Close/Reopen preserves the selected page. Download .drawio still saves the complete original document.
+- Keeps PNG rendering inside the existing unprivileged local sandbox. Clipboard writes begin only from a trusted user click; asynchronous results are bound to the current frame, artifact, request, and page revision. Page changes, newer helpers, Close, and navigation cancel pending export. Clipboard, encoding, and size failures remain local and preserve the rendered SVG and original-file download.
+- Bounds PNG export to 8192 pixels per side, 16 megapixels, 8 MiB serialized SVG, and 32 MiB PNG, with a bounded timeout. Oversized diagrams report an explicit error instead of silently changing scale.
+- Adds focused protocol, clipboard, download, lifecycle, and multi-page regression coverage plus real unpacked-Chrome PNG pixel, clipboard, page-selection, and restrictive-CSP checks.
+
 ## [0.11.18] - 2026-09-07
 
 - Fixes board helpers incorrectly returning `Board prompt probe failed` after tmux history exceeds the capture prefix budget. Prompt readiness now reads the current screen with one preceding boundary row instead of retaining the beginning of up to 20,000 history lines. The boundary row and any soft-wrapped continuation are discarded so a clipped long line cannot become a short false prompt.

@@ -24,6 +24,7 @@ const E2E_TIMEOUT_MS = 45000;
 const MIN_CHROMIUM_MAJOR = 116;
 const FORCE_HEADLESS = process.env.AI_SHELL_E2E_HEADLESS === "1";
 const SKILLS_ONLY = process.env.AI_SHELL_E2E_SKILLS_ONLY === "1";
+const DRAWIO_PNG_ONLY = process.env.AI_SHELL_E2E_DRAWIO_PNG_ONLY === "1";
 const DRAWIO_ONLY = process.env.AI_SHELL_E2E_DRAWIO_ONLY === "1";
 const CHATGPT_ONLY = process.env.AI_SHELL_E2E_CHATGPT_ONLY === "1";
 const FORCE_IDLE_ONLY = process.env.AI_SHELL_E2E_FORCE_IDLE_ONLY === "1";
@@ -224,6 +225,7 @@ async function main() {
   const debugPort = await waitForChromeDebugPort(profileDir);
   const pageWsUrl = await waitForChromePageWebSocket(debugPort, "about:blank");
   const page = await CdpClient.connect(pageWsUrl);
+  page.debugPort = debugPort;
   cleanup.push(() => page.close());
 
   await page.send("Page.enable");
@@ -344,10 +346,11 @@ async function main() {
     return;
   }
 
-  if (DRAWIO_ONLY) {
+  if (DRAWIO_ONLY || DRAWIO_PNG_ONLY) {
     await page.send("Page.bringToFront");
     await waitForEvaluate(page, "document.visibilityState === 'visible'", "Draw.io-only preview page to become visible");
-    await runDrawioPreviewE2E(page);
+    if (DRAWIO_PNG_ONLY) await runDrawioPngPagesE2E(page);
+    else await runDrawioPreviewE2E(page);
     await runDrawioCspEmbeddingE2E(page);
     return;
   }
@@ -6163,7 +6166,120 @@ async function runDrawioPreviewE2E(page) {
   if (SCREENSHOT_DIR) {
     await savePanelScreenshot(page, path.join(SCREENSHOT_DIR, "extension-panel-drawio.png"));
   }
+  await runDrawioPngPagesE2E(page);
   clearInterval(keepVisibleTimer);
+}
+
+async function trustedDrawioAction(page, action) {
+  const point = await page.evaluate(`(() => {
+    const button = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('[data-action="${action}"]');
+    const rect = button.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, disabled: button.disabled };
+  })()`);
+  assert.equal(point.disabled, false, `${action} must be enabled`);
+  for (const type of ["mousePressed", "mouseReleased"]) {
+    await page.send("Input.dispatchMouseEvent", { type, x: point.x, y: point.y, button: "left", clickCount: 1 });
+  }
+}
+
+async function verifyDrawioPngDownload(page, title, expected = { width: 222, height: 82 }) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-chat-drawio-png-"));
+  cleanup.push(() => fs.rmSync(directory, { recursive: true, force: true }));
+  await page.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: directory });
+  await trustedDrawioAction(page, "download-png");
+  try {
+    await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.status').textContent.startsWith('PNG downloaded.')`, "PNG download to complete", 20000);
+  } catch (error) {
+    throw new Error(`${error.message}; status=${await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.status').textContent`)}; console=${JSON.stringify(page.consoleMessages.slice(-8))}`);
+  }
+  const file = path.join(directory, `${title}.png`);
+  const deadline = Date.now() + 10000;
+  let bytes = Buffer.alloc(0);
+  while (Date.now() < deadline) {
+    try { bytes = fs.readFileSync(file); } catch {}
+    if (bytes.length >= 24 && bytes.subarray(-12).toString("hex") === "0000000049454e44ae426082") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(bytes.subarray(-12).toString("hex"), "0000000049454e44ae426082", "Wait for the browser download to finish writing the PNG");
+  assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  assert.equal(bytes.readUInt32BE(16), expected.width, "PNG width must be the content bounds, excluding page/viewport and offsets");
+  assert.equal(bytes.readUInt32BE(20), expected.height);
+  const pixels = await page.evaluate(`(async () => {
+    const image = new Image();
+    image.src = 'data:image/png;base64,${bytes.toString("base64")}';
+    await image.decode();
+    const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+    const context = canvas.getContext('2d'); context.drawImage(image, 0, 0);
+    const data = context.getImageData(0, 0, image.width, image.height).data;
+    let dark = 0, filled = 0;
+    for (let y = 15; y < image.height - 15; y++) for (let x = 15; x < image.width - 15; x++) {
+      const index = (y * image.width + x) * 4;
+      if (data[index] < 100 && data[index + 1] < 100 && data[index + 2] < 100) dark++;
+      if (data[index + 2] > data[index] + 10) filled++;
+    }
+    return { dark, filled };
+  })()`);
+  assert.ok(pixels.dark > 20, "Raster PNG must preserve the HTML label, not just empty shapes");
+  assert.ok(pixels.filled > 100, "Raster PNG must contain the diagram fill");
+  return bytes;
+}
+
+async function runDrawioPngPagesE2E(page) {
+  const first = drawioXml("PNG page one", "&lt;b&gt;First HTML label&lt;/b&gt;")
+    .replace('x="120" y="100"', 'x="-360" y="-240"');
+  const secondDiagram = drawioXml("PNG page two", "Second HTML label")
+    .match(/<diagram[\s\S]*?<\/diagram>/)[0]
+    .replace('width="220" height="80"', 'width="320" height="100"')
+    .replace('x="120" y="100"', 'x="4000" y="3000"');
+  const xml = first.replace('</mxfile>', `${secondDiagram}\n</mxfile>`);
+  await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(xml, "drawio-png-pages"))}, "text")`);
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.dataset.currentTitle === 'PNG page one'`, "multi-page diagram ready");
+  await verifyDrawioPngDownload(page, "PNG page one");
+  await page.send("Browser.grantPermissions", { origin: new URL(TEST_PAGE_URL).origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  await trustedDrawioAction(page, "copy-png");
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.status').textContent.startsWith('PNG copied to clipboard.')`, "actual clipboard PNG write", 20000);
+  const copied = await page.evaluate(`(async () => {
+    const items = await navigator.clipboard.read();
+    const blob = await items[0].getType('image/png');
+    const bitmap = await createImageBitmap(blob);
+    const result = { type: blob.type, width: bitmap.width, height: bitmap.height }; bitmap.close(); return result;
+  })()`);
+  assert.deepEqual(copied, { type: "image/png", width: 222, height: 82 });
+  const selectExpression = `(() => {
+    const select = document.querySelector('select[aria-label="Draw.io page"]');
+    if (!select) return null;
+    const rect = select.getBoundingClientRect(); return { options: Array.from(select.options, (option) => option.textContent), value: select.value, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`;
+  let selectPage = page;
+  const worlds = await page.evaluateAcrossContexts(selectExpression);
+  if (!worlds.some((entry) => entry?.value?.options?.length === 2)) {
+    // Sandboxed extension viewers may run in a separate renderer process.
+    const frameUrl = await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.drawio-frame-current iframe').src`);
+    const targets = await fetchHttpJson(`http://127.0.0.1:${page.debugPort}/json/list`);
+    const target = targets.find((entry) => entry.type === "iframe" && entry.url === frameUrl);
+    if (target?.webSocketDebuggerUrl) {
+      const framePage = await CdpClient.connect(target.webSocketDebuggerUrl);
+      selectPage = framePage;
+      cleanup.push(() => framePage.close());
+      worlds.push({ value: await framePage.evaluate(selectExpression) });
+    }
+  }
+  assert.ok(worlds.some((entry) => entry?.value?.options?.length === 2), "Multi-page files must expose both page names in a persistent selector");
+  const nextPoint = await selectPage.evaluate(`(() => { const r = document.querySelector('button[aria-label="Next page"]').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  const framePoint = await page.evaluate(`(() => { const r = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.drawio-frame-current iframe').getBoundingClientRect(); return { x: r.x, y: r.y }; })()`);
+  for (const type of ["mousePressed", "mouseReleased"]) {
+    await page.send("Input.dispatchMouseEvent", { type, x: framePoint.x + nextPoint.x, y: framePoint.y + nextPoint.y, button: "left", clickCount: 1 });
+  }
+  await waitForEvaluate(page, `document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.currentTitle === 'PNG page two'`, "trusted page selector changes the displayed page");
+  await verifyDrawioPngDownload(page, "PNG page two", { width: 322, height: 102 });
+  await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('[data-action="close"]').click()`);
+  await page.evaluate(`document.querySelector('#${EXTENSION_STATUS_ID} #ai-chat-shell-exec-drawio-action').click()`);
+  assert.equal(await page.evaluate(`document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.currentTitle`), "PNG page two", "Close/reopen must preserve the selected page");
+  if (SCREENSHOT_DIR) {
+    const clip = await page.evaluate(`(() => { const w = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).shadowRoot.querySelector('.window'); w.style.left = "24px"; w.style.right = "auto"; const r = w.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 }; })()`);
+    const screenshot = await page.send("Page.captureScreenshot", { format: "png", clip });
+    fs.writeFileSync(path.join(SCREENSHOT_DIR, "drawio-preview.png"), Buffer.from(screenshot.data, "base64"));
+  }
 }
 
 async function ensureDrawioPageVisible(page) {
@@ -6197,6 +6313,7 @@ async function runDrawioCspEmbeddingE2E(page) {
       !iframe?.getAttribute("src");
   })()`, "Draw.io preview under frame-src self CSP", E2E_TIMEOUT_MS * 2);
 
+  await verifyDrawioPngDownload(page, "Draw.io CSP E2E");
   const finalState = await page.evaluate(`(() => {
     const host = document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)});
     const shadow = host?.shadowRoot;

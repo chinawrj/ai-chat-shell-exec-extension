@@ -40,7 +40,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.18";
+const CONTENT_SCRIPT_VERSION = "0.11.19";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",

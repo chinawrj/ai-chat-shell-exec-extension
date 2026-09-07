@@ -14,6 +14,8 @@
   let previewShadow = null;
   let previewElements = null;
   let currentArtifact = null;
+  let pendingPngExport = null;
+  let activePngAction = null;
   let pendingArtifactId = "";
   let renderGeneration = 0;
   let renderCount = 0;
@@ -276,6 +278,7 @@
       });
     }
 
+    cancelPngExport();
     renderGeneration += 1;
     const generation = renderGeneration;
     pendingArtifactId = artifactId;
@@ -486,7 +489,8 @@
         title: String(message?.title || artifact.title || "Draw.io preview"),
         byteLength: artifact.byteLength,
         pageCount: Number(message?.pageCount || artifact.pageCount || 1),
-        candidateKey: artifact.candidateKey
+        candidateKey: artifact.candidateKey,
+        iframe, channel, pageRevision: 0
       };
       pendingArtifactId = "";
       renderCount += 1;
@@ -494,6 +498,7 @@
       previewElements.title.textContent = currentArtifact.title;
       previewElements.meta.textContent = `${currentArtifact.pageCount} page${currentArtifact.pageCount === 1 ? "" : "s"} · ${currentArtifact.byteLength.toLocaleString()} bytes · ${currentArtifact.artifactId.slice(0, 12)}`;
       previewElements.download.disabled = false;
+      updatePngButtons();
       clearErrorLog();
       setPreviewState("ready");
       setPreviewStatus("SVG ready. Only the latest complete helper is displayed.");
@@ -773,8 +778,10 @@
   }
 
   function clearCurrentArtifact(emptyText) {
+    cancelPngExport();
     previewElements?.viewport?.querySelector?.(".drawio-frame-current")?.remove();
     currentArtifact = null;
+    updatePngButtons();
     if (!previewElements) {
       return;
     }
@@ -836,11 +843,11 @@
         :host { all: initial; }
         .window { position: fixed; right: 24px; top: 36px; z-index: 2147483646; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; width: min(760px, calc(100vw - 48px)); height: min(590px, calc(100vh - 72px)); min-width: 420px; min-height: 320px; resize: both; overflow: hidden; border: 1px solid rgba(100,116,139,.42); border-radius: 14px; background: #fff; box-shadow: 0 26px 80px rgba(15,23,42,.28), 0 5px 20px rgba(15,23,42,.13); color: #172033; font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
         .window.maximized { left: 8px; right: 8px; top: 8px; bottom: 8px; width: auto; height: auto; min-width: 0; min-height: 0; resize: none; border-radius: 10px; }
-        header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 11px 10px 14px; border-bottom: 1px solid #e3e7ee; background: #f8fafc; cursor: move; user-select: none; }
-        .heading { min-width: 0; }
+        header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 11px 10px 14px; border-bottom: 1px solid #e3e7ee; background: #f8fafc; cursor: move; user-select: none; }
+        .heading { min-width: 0; flex: 1 1 150px; }
         .title { display: block; overflow: hidden; color: #172033; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
         .meta { display: block; margin-top: 2px; overflow: hidden; color: #6b778d; font: 10px ui-monospace,SFMono-Regular,Menlo,monospace; text-overflow: ellipsis; white-space: nowrap; }
-        .actions { display: flex; gap: 4px; flex-shrink: 0; }
+        .actions { display: flex; flex-wrap: wrap; gap: 4px; }
         button { border: 1px solid transparent; border-radius: 7px; padding: 5px 7px; background: transparent; color: #334155; cursor: pointer; font: 11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
         button:hover { border-color: #cbd5e1; background: #fff; }
         button:disabled { cursor: default; opacity: .45; }
@@ -861,7 +868,7 @@
       <section class="window" role="dialog" aria-label="Draw.io preview">
         <header data-drawio-drag-handle>
           <div class="heading"><span class="title">Draw.io preview</span><span class="meta">Waiting for a valid helper</span></div>
-          <div class="actions"><button type="button" data-action="download" disabled>Download .drawio</button><button type="button" data-action="maximize" title="Maximize preview to the browser viewport" aria-pressed="false">Maximize</button><button type="button" data-action="close">Close</button></div>
+          <div class="actions"><button type="button" data-action="copy-png" disabled title="Copy the current page content as a tightly cropped PNG">Copy PNG</button><button type="button" data-action="download-png" disabled title="Download the current page content as a tightly cropped PNG">Download PNG</button><button type="button" data-action="download" disabled>Download .drawio</button><button type="button" data-action="maximize" title="Maximize preview to the browser viewport" aria-pressed="false">Maximize</button><button type="button" data-action="close">Close</button></div>
         </header>
         <div class="viewport"><div class="empty">Waiting for the last complete and valid draw.io helper.</div></div>
         <div class="status" aria-live="polite">Draw.io preview is idle.</div>
@@ -877,11 +884,15 @@
       status: previewShadow.querySelector(".status"),
       logDetails: previewShadow.querySelector("details"),
       log: previewShadow.querySelector("pre"),
+      copyPng: previewShadow.querySelector('[data-action="copy-png"]'),
+      downloadPng: previewShadow.querySelector('[data-action="download-png"]'),
       download: previewShadow.querySelector('[data-action="download"]'),
       maximize: previewShadow.querySelector('[data-action="maximize"]'),
       close: previewShadow.querySelector('[data-action="close"]'),
       dragHandle: previewShadow.querySelector("[data-drawio-drag-handle]")
     };
+    previewElements.copyPng.addEventListener("click", copyCurrentPng);
+    previewElements.downloadPng.addEventListener("click", downloadCurrentPng);
     previewElements.close.addEventListener("click", close);
     previewElements.download.addEventListener("click", downloadCurrent);
     previewElements.maximize.addEventListener("click", toggleMaximize);
@@ -921,6 +932,7 @@
   function setPreviewState(state) {
     ensurePreview();
     previewHost.dataset.state = String(state || "idle");
+    updatePngButtons();
     updateHostDiagnostics();
   }
 
@@ -942,6 +954,7 @@
   }
 
   function close() {
+    cancelPngExport();
     if (previewHost) {
       previewHost.hidden = true;
     }
@@ -994,7 +1007,163 @@
     return true;
   }
 
+  function validatePngDimensions(width, height) {
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0 ||
+        width > 8192 || height > 8192 || width * height > 16 * 1024 * 1024) {
+      throw new Error("PNG bounds exceed the supported size (8192 pixels per side, 16 megapixels).");
+    }
+    return { width, height };
+  }
+
+  function classifyDrawioPngMessage(event, expected) {
+    const message = event?.data;
+    if (event?.source !== expected?.source || !message || message.channel !== expected.channel ||
+        message.artifactId !== expected.artifactId || message.requestId !== expected.requestId) return "";
+    if (message.type === "ai-chat-drawio-export-error") return "error";
+    if (message.type === "ai-chat-drawio-exported-png") return "png";
+    return "";
+  }
+
+  function updatePngButtons() {
+    const disabled = !currentArtifact || Boolean(pendingArtifactId) || Boolean(pendingPngExport) || Boolean(activePngAction);
+    if (previewElements?.copyPng) previewElements.copyPng.disabled = disabled;
+    if (previewElements?.downloadPng) previewElements.downloadPng.disabled = disabled;
+  }
+
+  function cancelPngExport() {
+    pendingPngExport?.reject(new Error("PNG export cancelled because the preview or selected page changed."));
+  }
+
+  function isPngOwner(owner) {
+    return currentArtifact === owner.artifact && renderGeneration === owner.generation &&
+      currentArtifact?.pageRevision === owner.pageRevision && !pendingArtifactId && previewHost?.hidden === false;
+  }
+
+  function requestPngExport() {
+    if (!currentArtifact?.iframe?.contentWindow || pendingArtifactId || pendingPngExport || activePngAction || previewHost?.hidden !== false) {
+      throw new Error("Wait for the current diagram to finish rendering or exporting.");
+    }
+    const owner = { artifact: currentArtifact, generation: renderGeneration, pageRevision: currentArtifact.pageRevision };
+    const expected = { source: currentArtifact.iframe.contentWindow, channel: currentArtifact.channel,
+      artifactId: currentArtifact.artifactId, requestId: buildChannelToken("png", renderGeneration) };
+    let timer;
+    const promise = new Promise((resolve, reject) => {
+      let settled = false;
+      function finish(error, value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        window.removeEventListener("message", onMessage, true);
+        if (pendingPngExport === owner) pendingPngExport = null;
+        updatePngButtons();
+        if (error) reject(error); else resolve(value);
+      }
+      async function onMessage(event) {
+        const kind = classifyDrawioPngMessage(event, expected);
+        if (!kind || settled) return;
+        try {
+          if (!isPngOwner(owner)) throw new Error("The selected diagram changed. Export the current page again.");
+          if (kind === "error") throw new Error(safeErrorMessage(event.data.error));
+          const { blob, width, height, pageRevision } = event.data;
+          validatePngDimensions(width, height);
+          if (pageRevision !== owner.pageRevision || !(blob instanceof Blob) || blob.type !== "image/png" ||
+              blob.size < 24 || blob.size > 32 * 1024 * 1024) throw new Error("The viewer returned an invalid PNG.");
+          const header = new DataView(await blob.slice(0, 24).arrayBuffer());
+          if (header.getUint32(0) !== 0x89504e47 || header.getUint32(4) !== 0x0d0a1a0a ||
+              header.getUint32(8) !== 13 || header.getUint32(12) !== 0x49484452 ||
+              header.getUint32(16) !== width || header.getUint32(20) !== height) throw new Error("The viewer returned an invalid PNG header.");
+          if (!isPngOwner(owner)) throw new Error("The selected diagram changed. Export the current page again.");
+          finish(null, blob);
+        } catch (error) { finish(error); }
+      }
+      owner.reject = (error) => finish(error);
+      pendingPngExport = owner;
+      window.addEventListener("message", onMessage, true);
+      timer = setTimeout(() => finish(new Error("PNG export timed out. Try again or use a smaller diagram.")), 15000);
+      try { expected.source.postMessage({ type: "ai-chat-drawio-export-png", ...expected, source: undefined }, "*"); }
+      catch (error) { finish(error); }
+    });
+    updatePngButtons();
+    return { promise, owner };
+  }
+
+  function showPngError(error, owner) {
+    if (!owner || isPngOwner(owner)) setPreviewStatus(`PNG export failed: ${safeErrorMessage(error)} Download .drawio remains available.`);
+  }
+
+  async function copyCurrentPng(event) {
+    if (!event?.isTrusted) return false;
+    let request;
+    try {
+      if (!navigator.clipboard?.write || typeof ClipboardItem !== "function") throw new Error("Image clipboard access is unavailable. Use Download PNG.");
+      request = requestPngExport();
+      activePngAction = request.owner;
+      updatePngButtons();
+      setPreviewStatus("Copying the current page content as PNG…");
+      // Start clipboard.write within the trusted click, preserving user activation
+      // while the sandbox asynchronously rasterizes the PNG.
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": request.promise })]);
+      if (isPngOwner(request.owner)) setPreviewStatus("PNG copied to clipboard. Canvas is cropped to the current page’s diagram content.");
+      return true;
+    } catch (error) {
+      request?.promise.catch(() => {});
+      if (request && pendingPngExport === request.owner) request.owner.reject(error);
+      showPngError(error, request?.owner);
+      return false;
+    } finally {
+      if (activePngAction === request?.owner) activePngAction = null;
+      updatePngButtons();
+    }
+  }
+
+  async function downloadCurrentPng(event) {
+    if (!event?.isTrusted) return false;
+    let request;
+    try {
+      request = requestPngExport();
+      activePngAction = request.owner;
+      updatePngButtons();
+      setPreviewStatus("Preparing the current page content as PNG…");
+      const blob = await request.promise;
+      if (!isPngOwner(request.owner)) return false;
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = safeDownloadName(currentArtifact.title).replace(/\.drawio$/i, ".png");
+        anchor.click();
+      } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+      setPreviewStatus("PNG downloaded. Canvas is cropped to the current page’s diagram content.");
+      return true;
+    } catch (error) { showPngError(error, request?.owner); return false; }
+    finally {
+      if (activePngAction === request?.owner) activePngAction = null;
+      updatePngButtons();
+    }
+  }
+
+  globalThis.window?.addEventListener("message", (event) => {
+    const artifact = currentArtifact;
+    const message = event.data;
+    if (!artifact || event.source !== artifact.iframe?.contentWindow || !message ||
+        message.channel !== artifact.channel || message.artifactId !== artifact.artifactId) return;
+    if (message.type === "ai-chat-drawio-page-changed" && Number.isSafeInteger(message.pageIndex) &&
+        message.pageIndex >= 0 && message.pageIndex < artifact.pageCount &&
+        Number.isSafeInteger(message.pageRevision) && message.pageRevision > artifact.pageRevision) {
+      cancelPngExport();
+      artifact.pageRevision = message.pageRevision;
+      artifact.title = compactText(message.title || `Page ${message.pageIndex + 1}`, 160);
+      previewElements.title.textContent = artifact.title;
+      setPreviewStatus(`Page ${message.pageIndex + 1} of ${artifact.pageCount}. PNG export uses this page’s diagram content.`);
+      updateHostDiagnostics();
+    } else if (message.type === "ai-chat-drawio-page-error") {
+      cancelPngExport();
+      setPreviewStatus(`Page switch failed: ${safeErrorMessage(message.error)}`);
+    }
+  }, true);
+
   function resetForPage() {
+    cancelPngExport();
     renderGeneration += 1;
     pendingArtifactId = "";
     activeStage?.cancel("page lifecycle changed", { log: false });
@@ -1078,6 +1247,8 @@
     createVisibleTimeWatchdog,
     createRenderAttemptWatchdog,
     classifyDrawioViewerMessage,
+    classifyDrawioPngMessage,
+    validatePngDimensions,
     extractCspScriptNonce,
     buildViewerSrcdoc
   });

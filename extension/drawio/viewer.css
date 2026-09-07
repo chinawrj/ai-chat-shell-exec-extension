@@ -61,3 +61,10 @@ body {
   height: auto;
   margin: auto;
 }
+
+body { display: flex; flex-direction: column; }
+#viewer { flex: 1; min-height: 0; overflow: auto; }
+.page-selector { display: flex; align-items: center; gap: 8px; flex: none; padding: 8px 18px; border-bottom: 1px solid #e3e7ee; background: #f8fafc; font: 12px system-ui, sans-serif; color: #334155; }
+.page-selector select { min-width: 0; max-width: 100%; flex: 1; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; background: white; color: #172033; font: inherit; }
+.page-selector button { flex: none; width: 28px; height: 28px; padding: 0; border: 1px solid #cbd5e1; border-radius: 6px; background: white; color: #334155; font: 20px system-ui, sans-serif; cursor: pointer; }
+.page-selector button:disabled { opacity: .4; cursor: default; }
