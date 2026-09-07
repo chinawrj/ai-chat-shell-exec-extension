@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.11.18] - 2026-09-07
+
+- Fixes board helpers incorrectly returning `Board prompt probe failed` after tmux history exceeds the capture prefix budget. Prompt readiness now reads the current screen with one preceding boundary row instead of retaining the beginning of up to 20,000 history lines. The boundary row and any soft-wrapped continuation are discarded so a clipped long line cannot become a short false prompt.
+- Separates readiness snapshots from command-output capture and per-request output limits. Both screen snapshots must be complete and stable; truncated captures, changing screens, replaced panes, and busy shell foreground processes never grant readiness. Historical prompt-shaped text cannot substitute for the current screen.
+- Adds real-tmux regressions with 192,016-character and 1,728,016-character histories and independently bounded result output, plus focused positive, negative, capture-limit, readiness, and pane-revalidation tests. Existing board queue, persistent lease, recovery, and non-authoritative prompt semantics are preserved.
+
 ## [0.11.17] - 2026-09-07
 
 - Raises the default Max output chars from 20,000 to 80,000 across popup settings, background shell/board fallbacks, and server defaults. Saved settings and per-request overrides retain their existing values.

@@ -4501,7 +4501,11 @@ async function readStableBoardPrompt(pane, timing) {
       !await isTmuxPaneReadyForHelper(pane)) {
     return "";
   }
-  const first = normalizeBoardOutput(await captureTmuxPane(pane.id, DEFAULT_MAX_OUTPUT_CHARS));
+  const firstCapture = await captureTmuxBoardPromptSnapshot(pane.id);
+  if (firstCapture.truncated) {
+    return "";
+  }
+  const first = normalizeBoardOutput(firstCapture.text);
   await sleep(timing.probeIdleMs);
   const currentPane = await verifyTmuxShellPaneBeforeDispatch(pane, {
     socketPath: getTmuxSocketPath() || "default-socket",
@@ -4511,7 +4515,11 @@ async function readStableBoardPrompt(pane, timing) {
       !await isTmuxPaneReadyForHelper(currentPane)) {
     return "";
   }
-  const second = normalizeBoardOutput(await captureTmuxPane(pane.id, DEFAULT_MAX_OUTPUT_CHARS));
+  const secondCapture = await captureTmuxBoardPromptSnapshot(pane.id);
+  if (secondCapture.truncated) {
+    return "";
+  }
+  const second = normalizeBoardOutput(secondCapture.text);
   if (first !== second) {
     return "";
   }
@@ -5572,6 +5580,33 @@ function buildTmuxTargetExample(panes, cmd = "pwd") {
 async function captureTmuxPane(target, maxOutputChars = 1000000) {
   const capture = await captureTmuxPaneSnapshot(target, maxOutputChars);
   return capture.text;
+}
+
+async function captureTmuxBoardPromptSnapshot(target) {
+  // Read the current screen plus one boundary row, never a history prefix.
+  // The history count and capture share one tmux command list. With -J, the
+  // boundary row joins any soft-wrapped continuation at the top of the screen;
+  // dropping that first logical line excludes both history and partial lines.
+  // Without history, row -1 clamps to row zero and no line should be dropped.
+  // Neither a truncated prefix nor an arbitrary suffix proves a full prompt.
+  const result = await runTmuxCommandRaw([
+    "display-message", "-p", "-t", target, "#{history_size}",
+    ";", "capture-pane", "-p", "-J", "-S", "-1", "-t", target
+  ], { timeoutMs: 5000, maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS });
+  if (!result.ok) {
+    throw new Error((result.stderr || "Board prompt screen capture failed.").trim());
+  }
+  const headerEnd = result.stdout.indexOf("\n");
+  const historySize = result.stdout.slice(0, headerEnd);
+  if (headerEnd < 0 || !/^\d+$/.test(historySize) || !Number.isSafeInteger(Number(historySize))) {
+    return { text: "", truncated: true };
+  }
+  let text = result.stdout.slice(headerEnd + 1);
+  if (Number(historySize) > 0) {
+    const boundaryEnd = text.indexOf("\n");
+    text = boundaryEnd < 0 ? "" : text.slice(boundaryEnd + 1);
+  }
+  return { text, truncated: result.stdoutTruncated === true };
 }
 
 async function captureTmuxPaneSnapshot(target, maxOutputChars = 1000000) {
