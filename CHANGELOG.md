@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.20] - 2026-09-08
+
+- Adds a trusted-click **Preview** control beside every complete non-user Draw.io helper, including historical helpers restored after a page refresh. The selected helper opens locally even when an earlier Skill helper would otherwise own the panel's manual recovery action.
+- Keeps historical helpers inert until Preview is clicked, preserves Force run's executable/Skill behavior, and never dispatches Skill/shell work or writes manual-preview success or failure into the chat composer.
+- Binds each Preview control and pending renderer to its exact route, lifecycle, rendered root, semantic payload, and block position. Repeated scans preserve the selected historical diagram until a genuinely newer Draw.io helper appears; stale, detached, changed, disabled, synthetic-click, and cross-route requests fail closed.
+- Adds focused ownership, same-XML, cancellation, recovery, multi-helper, user-role, and settings-race tests plus a real unpacked-Chrome refresh scenario covering Skill-before-Draw.io history, per-helper trusted clicks, Close/Reopen, automatic-preview resumption, and zero backend/composer side effects.
+
 ## [0.11.19] - 2026-09-07
 
 - Adds Copy PNG and Download PNG to the Draw.io preview. Both export the current page at natural 1× scale, tightly cropped to its diagram content, including labels and negative-coordinate shapes, with a white background. Preview zoom, toolbar, viewport, and blank paper margins do not enlarge the PNG.
