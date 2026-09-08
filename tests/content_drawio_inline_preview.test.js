@@ -6,19 +6,48 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 class FakeElement {
-  constructor() { this.children = []; this.style = {}; this.isConnected = true; this.listeners = {}; }
+  constructor() {
+    this.children = [];
+    this.style = {};
+    this.isConnected = true;
+    this.listeners = {};
+    this.domInsertions = 0;
+  }
   get childNodes() { return this.children; }
+  get nextSibling() {
+    const index = this.parentElement?.children.indexOf(this) ?? -1;
+    return index < 0 ? null : this.parentElement.children[index + 1] || null;
+  }
   get classList() { return { contains: (name) => this.className === name }; }
   attachShadow() { this.shadowRoot = new FakeElement(); return this.shadowRoot; }
-  appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+  appendChild(child) {
+    this.domInsertions += 1;
+    if (child.parentElement) {
+      child.parentElement.children = child.parentElement.children.filter((entry) => entry !== child);
+    }
+    this.children.push(child);
+    child.parentElement = this;
+    child.isConnected = true;
+    return child;
+  }
   insertBefore(child, before) {
+    this.domInsertions += 1;
+    if (child.parentElement) {
+      child.parentElement.children = child.parentElement.children.filter((entry) => entry !== child);
+    }
     const index = this.children.indexOf(before);
     this.children.splice(index < 0 ? this.children.length : index, 0, child);
     child.parentElement = this;
+    child.isConnected = true;
   }
   setAttribute(name, value) { this[name] = value; }
   addEventListener(name, listener) { this.listeners[name] = listener; }
-  remove() { this.isConnected = false; this.parentElement.children = this.parentElement.children.filter((c) => c !== this); }
+  remove() {
+    this.isConnected = false;
+    if (this.parentElement) {
+      this.parentElement.children = this.parentElement.children.filter((c) => c !== this);
+    }
+  }
 }
 
 class MockNode extends FakeElement {
@@ -162,12 +191,59 @@ async function main() {
   assert.equal(previewCalls.length, 0, 'Cold Skill then Draw.io history stays inert');
   c.syncDrawioPreviewButtons(candidates);
   assert.equal(vm.runInContext('drawioPreviewButtons.size', c), 2, 'User copies receive no Preview button');
-  const hosts = vm.runInContext('Array.from(drawioPreviewButtons.values(), e => e.host)', c);
+  let controls = vm.runInContext('Array.from(drawioPreviewButtons.values())', c);
+  assert.equal(controls.flatMap((entry) => [entry.before.host, entry.after.host]).length, 4,
+    'Each eligible Draw.io helper receives start and end Preview controls');
+  assert.deepEqual(Array.from(controls, (entry) => [
+    entry.before.host['data-drawio-preview-position'],
+    entry.after.host['data-drawio-preview-position']
+  ]), [['start', 'end'], ['start', 'end']]);
+  assert.deepEqual(Array.from(controls[0].before.button.title.matchAll(/\(first\)/g)).length, 1);
+  assert.deepEqual(Array.from(controls[0].after.button.title.matchAll(/\(first\)/g)).length, 1);
+  assert.equal(controls[0].before.button['aria-label'], controls[0].before.button.title);
+  assert.equal(controls[0].after.button['aria-label'], controls[0].after.button.title);
+  root.domInsertions = 0;
   c.syncDrawioPreviewButtons(candidates);
-  assert.equal(vm.runInContext('Array.from(drawioPreviewButtons.values())[0].host', c), hosts[0], 'Rescans reuse controls');
+  assert.equal(root.domInsertions, 0, 'An unchanged rescan performs no control DOM writes');
+  assert.equal(vm.runInContext('Array.from(drawioPreviewButtons.values())[0].before.host', c), controls[0].before.host,
+    'Rescans reuse the start control');
+  assert.equal(vm.runInContext('Array.from(drawioPreviewButtons.values())[0].after.host', c), controls[0].after.host,
+    'Rescans reuse the end control');
   assert.equal(first.textRoot.textContent, helper(drawioXml('first'), 'first'), 'Control insertion preserves helper source');
-  hosts[0].shadowRoot.children[0].listeners.click({ isTrusted: false });
-  assert.equal(previewCalls.length, 0, 'Page script cannot synthesize Preview');
+  controls[0].before.button.listeners.click({ isTrusted: false });
+  controls[0].after.button.listeners.click({ isTrusted: false });
+  assert.equal(previewCalls.length, 0, 'Page script cannot synthesize either Preview control');
+  const trustedEvent = { isTrusted: true, preventDefault() {}, stopPropagation() {} };
+  controls[0].after.button.listeners.click(trustedEvent);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(previewCalls.at(-1).xml, /name="first"/, 'The end control previews its exact helper');
+  controls[0].before.button.listeners.click(trustedEvent);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(previewCalls.at(-1).xml, /name="first"/, 'The start control previews the same exact helper');
+  previewCalls.length = 0;
+  reopens = 0;
+
+  const oldBeforeHost = controls[0].before.host;
+  const oldAfterHost = controls[0].after.host;
+  oldAfterHost.isConnected = false;
+  c.syncDrawioPreviewButtons(candidates);
+  controls = vm.runInContext('Array.from(drawioPreviewButtons.values())', c);
+  assert.notEqual(controls[0].before.host, oldBeforeHost, 'A missing end control rebuilds the pair');
+  assert.notEqual(controls[0].after.host, oldAfterHost, 'A missing end control is replaced');
+  assert.equal(oldBeforeHost.isConnected, false, 'Pair rebuild removes the surviving stale control');
+
+  const secondPair = controls[1];
+  second.node.hidden = true;
+  c.syncDrawioPreviewButtons(candidates);
+  assert.equal(vm.runInContext('drawioPreviewButtons.size', c), 1, 'A hidden helper exposes no controls');
+  assert.equal(secondPair.before.host.isConnected, false);
+  assert.equal(secondPair.after.host.isConnected, false);
+  second.node.hidden = false;
+  c.syncDrawioPreviewButtons(candidates);
+  assert.equal(vm.runInContext('drawioPreviewButtons.size', c), 2, 'A visible helper restores both controls');
+  assert.equal(c.parsePlainTextHelperBlocks('ai-helper-drawio-start\n<mxfile>').length, 0,
+    'An incomplete helper cannot create either control');
+
   const snapshot = c.createRenderedHelperCandidateSnapshot(first);
   assert.equal(await c.previewDrawioCandidate(snapshot, { isTrusted: false }), false);
   assert.equal(await c.previewDrawioCandidate(snapshot, { isTrusted: true }), true);
@@ -243,8 +319,10 @@ async function main() {
   candidates = [first, { ...first, call: second.call, blockIndex: 1 }];
   c.syncDrawioPreviewButtons(candidates);
   assert.equal(vm.runInContext('drawioPreviewButtons.size', c), 2);
-  const labels = vm.runInContext('Array.from(drawioPreviewButtons.values(), e => e.host.shadowRoot.children[0].textContent)', c);
-  assert.deepEqual(Array.from(labels), ['Preview 1', 'Preview 2']);
+  const labels = vm.runInContext('Array.from(drawioPreviewButtons.values(), e => [e.before.button.textContent, e.after.button.textContent])', c);
+  assert.deepEqual(Array.from(labels, (pair) => Array.from(pair)), [
+    ['Preview 1', 'Preview 1'], ['Preview 2', 'Preview 2']
+  ]);
   c.clearDrawioPreviewButtons();
   const pre = new FakeElement();
   const wrapper = new FakeElement();
@@ -253,8 +331,22 @@ async function main() {
   first.textRoot.closest = (selector) => selector === 'pre' ? pre : first.node;
   c.syncDrawioPreviewButtons(candidates);
   assert.deepEqual(pre.children.slice(0, 2).map((host) => host.shadowRoot.children[0].textContent),
-    ['Preview 1', 'Preview 2'], 'Nested pre code keeps controls in reading order without moving source nodes');
+    ['Preview 1', 'Preview 2'], 'Nested pre code keeps start controls in reading order without moving source nodes');
   assert.equal(pre.children[2], wrapper);
+  assert.deepEqual(pre.children.slice(3).map((host) => host.shadowRoot.children[0].textContent),
+    ['Preview 1', 'Preview 2'], 'Nested pre code keeps end controls in reading order after the helper');
+  const sharedEntries = vm.runInContext('Array.from(drawioPreviewButtons.values())', c);
+  sharedEntries[0].after.host.isConnected = false;
+  c.syncDrawioPreviewButtons(candidates);
+  const rebuiltSharedEntries = vm.runInContext('Array.from(drawioPreviewButtons.values())', c);
+  assert.notEqual(rebuiltSharedEntries[0].before.host, sharedEntries[0].before.host);
+  assert.equal(rebuiltSharedEntries[1].before.host, sharedEntries[1].before.host,
+    'Partial rebuild reuses the unaffected helper pair');
+  assert.deepEqual(pre.children.slice(0, 2).map((host) => host.shadowRoot.children[0].textContent),
+    ['Preview 1', 'Preview 2'], 'Partial rebuild preserves shared-root start order');
+  assert.equal(pre.children[2], wrapper, 'Partial rebuild never moves the source node');
+  assert.deepEqual(pre.children.slice(3).map((host) => host.shadowRoot.children[0].textContent),
+    ['Preview 1', 'Preview 2'], 'Partial rebuild preserves shared-root end order');
   candidates = [];
   c.syncDrawioPreviewButtons(candidates);
   assert.equal(vm.runInContext('drawioPreviewButtons.size', c), 0, 'Removed candidates shed their controls');

@@ -53,7 +53,7 @@ ai-helper-drawio-start
 ai-helper-drawio-end
 ````
 
-After refreshing a conversation, existing Draw.io helpers stay closed. Click **Preview** beside a complete Draw.io code block to view that specific diagram, even when a Skill helper appears before it. Multiple helpers in one code block have numbered Preview buttons. Manual previews (including errors) stay local and never process Skills or write to the composer; a newly generated diagram resumes automatic preview. Force run keeps its existing executable/Skill behavior.
+After refreshing a conversation, existing Draw.io helpers stay closed. Click **Preview** above the start or below the end of a complete Draw.io code block to view that specific diagram, even when a Skill helper appears before it. Multiple helpers in one code block have matching numbered Preview buttons at both boundaries. Manual previews (including errors) stay local and never process Skills or write to the composer; a newly generated diagram resumes automatic preview. Force run keeps its existing executable/Skill behavior.
 
 The Draw.io helper body is the file itself, not a command. After streaming settles, the extension makes the last complete helper the sole current outcome in a movable/resizable floating preview. A valid helper replaces the preview with its SVG; a malformed or renderer-failing helper clears the previous SVG/download and exposes only its bounded error log. Rendering uses a pinned packaged viewer in a sandboxed extension iframe, never tmux or the local WebSocket server. Success stays silent, while failure uses the durable composer-delivery path for one bounded error report.
 

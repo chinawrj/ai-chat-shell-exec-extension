@@ -43,7 +43,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.20";
+const CONTENT_SCRIPT_VERSION = "0.11.21";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -5033,7 +5033,10 @@ function getLastActionableSkillCandidate(allCandidates, root = null) {
 function clearDrawioPreviewButtons() {
   drawioPreviewClickSequence += 1;
   manualDrawioSelection = null;
-  for (const entry of drawioPreviewButtons.values()) entry.host.remove();
+  for (const entry of drawioPreviewButtons.values()) {
+    entry.before.host.remove();
+    entry.after.host.remove();
+  }
   drawioPreviewButtons.clear();
 }
 
@@ -5048,6 +5051,7 @@ function getPreviewableDrawioCandidates(allCandidates) {
 
 function syncDrawioPreviewButtons(allCandidates) {
   const retained = new Set();
+  const orderedControlsByTextRoot = new Map();
   const candidates = getPreviewableDrawioCandidates(allCandidates);
   for (const candidate of candidates) {
     const snapshot = createRenderedHelperCandidateSnapshot(candidate);
@@ -5055,50 +5059,98 @@ function syncDrawioPreviewButtons(allCandidates) {
     retained.add(key);
     const siblings = candidates.filter((entry) => entry.textRoot === candidate.textRoot);
     const buttonText = siblings.length > 1 ? `Preview ${siblings.indexOf(candidate) + 1}` : "Preview";
-    const existing = drawioPreviewButtons.get(key);
-    if (existing?.host.isConnected &&
-        isRenderedHelperCandidateSnapshotCurrent(existing.snapshot, candidate)) {
-      existing.button.textContent = buttonText;
-      continue;
-    }
-    existing?.host.remove();
     const anchor = candidate.textRoot || candidate.node;
     if (!anchor?.parentElement) continue;
-    const host = document.createElement("span");
-    host.className = "ai-chat-shell-exec-drawio-inline";
-    const shadow = host.attachShadow({ mode: "open" });
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = buttonText;
+    const existing = drawioPreviewButtons.get(key);
+    if (existing?.before.host.isConnected && existing?.after.host.isConnected &&
+        isRenderedHelperCandidateSnapshotCurrent(existing.snapshot, candidate)) {
+      existing.before.button.textContent = buttonText;
+      existing.after.button.textContent = buttonText;
+      rememberOrderedDrawioControls(orderedControlsByTextRoot, anchor, existing, false);
+      continue;
+    }
+    existing?.before.host.remove();
+    existing?.after.host.remove();
     const label = candidate.call.helperIdSource === "marker"
       ? candidate.call.helperId : `diagram ${candidates.indexOf(candidate) + 1}`;
-    button.title = `Preview this Draw.io helper (${label})`;
-    button.setAttribute("aria-label", button.title);
-    button.style.cssText = "all:initial;display:inline-block;box-sizing:border-box;margin:4px 6px 4px 0;padding:5px 10px;border:1px solid #315782;border-radius:6px;background:#1e3a5f;color:#dbeafe;font:600 12px/1.4 system-ui;cursor:pointer";
-    button.addEventListener("click", (event) => {
-      if (event.isTrusted !== true) return;
-      event.preventDefault();
-      event.stopPropagation();
-      previewDrawioCandidate(snapshot, event).catch((error) => {
-        console.error("[AI Chat Draw.io] Manual preview failed.", error);
-      });
-    });
-    shadow.appendChild(button);
-    // A pre's first child puts Preview immediately above the helper marker.
-    // Multiple helpers in one text root retain distinct labelled buttons.
-    const pre = anchor.closest?.("pre");
-    if (pre) {
-      const firstContent = Array.from(pre.childNodes).find((node) =>
-        !node.classList?.contains("ai-chat-shell-exec-drawio-inline"));
-      pre.insertBefore(host, firstContent || null);
-    } else anchor.parentElement.insertBefore(host, anchor);
-    drawioPreviewButtons.set(key, { host, button, snapshot });
+    const before = createDrawioPreviewControl(snapshot, buttonText, label, "start");
+    const after = createDrawioPreviewControl(snapshot, buttonText, label, "end");
+    const entry = { before, after, snapshot };
+    drawioPreviewButtons.set(key, entry);
+    rememberOrderedDrawioControls(orderedControlsByTextRoot, anchor, entry, true);
   }
   for (const [key, entry] of drawioPreviewButtons) {
     if (retained.has(key)) continue;
-    entry.host.remove();
+    entry.before.host.remove();
+    entry.after.host.remove();
     drawioPreviewButtons.delete(key);
   }
+  for (const group of orderedControlsByTextRoot.values()) {
+    if (group.needsPlacement) placeOrderedDrawioControls(group);
+  }
+}
+
+function rememberOrderedDrawioControls(groups, anchor, entry, needsPlacement) {
+  const group = groups.get(anchor) || { anchor, entries: [], needsPlacement: false };
+  group.entries.push(entry);
+  group.needsPlacement ||= needsPlacement;
+  groups.set(anchor, group);
+}
+
+function placeOrderedDrawioControls(group) {
+  const anchor = group?.anchor;
+  const entries = group?.entries || [];
+  if (!anchor?.parentElement || entries.length === 0) return;
+  // Reflow both boundaries after additions/removals so rebuilding only one
+  // pair cannot reverse multiple helpers that share a single rendered root.
+  const pre = anchor.closest?.("pre");
+  if (pre) {
+    const firstContent = Array.from(pre.childNodes).find((node) =>
+      !node.classList?.contains("ai-chat-shell-exec-drawio-inline")) || null;
+    insertDrawioControlsBefore(pre, entries.map((entry) => entry.before.host), firstContent);
+    insertDrawioControlsBefore(pre, entries.map((entry) => entry.after.host), null);
+    return;
+  }
+  const parent = anchor.parentElement;
+  insertDrawioControlsBefore(parent, entries.map((entry) => entry.before.host), anchor);
+  let afterBoundary = anchor.nextSibling;
+  while (afterBoundary?.classList?.contains("ai-chat-shell-exec-drawio-inline")) {
+    afterBoundary = afterBoundary.nextSibling;
+  }
+  insertDrawioControlsBefore(parent, entries.map((entry) => entry.after.host), afterBoundary || null);
+}
+
+function insertDrawioControlsBefore(parent, hosts, boundary) {
+  let insertionPoint = boundary;
+  for (let index = hosts.length - 1; index >= 0; index -= 1) {
+    parent.insertBefore(hosts[index], insertionPoint);
+    insertionPoint = hosts[index];
+  }
+}
+
+function createDrawioPreviewControl(snapshot, buttonText, label, position) {
+  const host = document.createElement("span");
+  host.className = "ai-chat-shell-exec-drawio-inline";
+  host.setAttribute("data-drawio-preview-position", position);
+  const shadow = host.attachShadow({ mode: "open" });
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = buttonText;
+  button.title = position === "end"
+    ? `Preview this Draw.io helper after its end marker (${label})`
+    : `Preview this Draw.io helper (${label})`;
+  button.setAttribute("aria-label", button.title);
+  button.style.cssText = "all:initial;display:inline-block;box-sizing:border-box;margin:4px 6px 4px 0;padding:5px 10px;border:1px solid #315782;border-radius:6px;background:#1e3a5f;color:#dbeafe;font:600 12px/1.4 system-ui;cursor:pointer";
+  button.addEventListener("click", (event) => {
+    if (event.isTrusted !== true) return;
+    event.preventDefault();
+    event.stopPropagation();
+    previewDrawioCandidate(snapshot, event).catch((error) => {
+      console.error("[AI Chat Draw.io] Manual preview failed.", error);
+    });
+  });
+  shadow.appendChild(button);
+  return { host, button };
 }
 
 function findManualDrawioCandidate(snapshot) {

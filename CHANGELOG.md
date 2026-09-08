@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.11.21] - 2026-09-08
+
+- Adds a second trusted-click **Preview** control below every complete non-user Draw.io helper, complementing the existing control above the helper. Both controls bind to the same exact candidate and preserve the existing local-only preview, ownership, and safety behavior.
+- Keeps matching numbered controls in reading order at both boundaries when one rendered code block contains multiple Draw.io helpers. Repeated scans reuse both controls, while a missing or stale control rebuilds its pair without moving or changing the helper text.
+- Extends focused and real unpacked-Chrome coverage for start/end control creation, identity binding, synthetic-click rejection, trusted end-control preview, start-control Close/Reopen recovery, paired cleanup/rebuild, multi-helper ordering, and zero backend/composer side effects.
+
 ## [0.11.20] - 2026-09-08
 
 - Adds a trusted-click **Preview** control beside every complete non-user Draw.io helper, including historical helpers restored after a page refresh. The selected helper opens locally even when an earlier Skill helper would otherwise own the panel's manual recovery action.

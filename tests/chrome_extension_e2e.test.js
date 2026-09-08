@@ -5945,9 +5945,9 @@ async function runDrawioInlinePreviewE2E(debugPort) {
       }, { once: true });
     ` });
     await page.send("Page.navigate", { url: `${TEST_PAGE_URL}?drawio-inline-history=${Date.now()}` });
-    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 1`, "inline Preview in the historical Draw.io block");
+    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 2`, "start and end Preview controls in the historical Draw.io block");
     await page.send("Page.reload", { ignoreCache: true });
-    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 1`, "inline Preview restored after real page refresh");
+    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 2`, "start and end Preview controls restored after real page refresh");
     await ensureDrawioPageVisible(page);
     await page.evaluate(`new Promise((resolve) => setTimeout(resolve, ${STARTUP_SETTLE_MS}))`);
     await installContentRuntimeMessageCounter(page);
@@ -5961,12 +5961,12 @@ async function runDrawioInlinePreviewE2E(debugPort) {
     assert.equal(initial.previewVisible, false, "Refreshing Skill then Draw.io history must not open a preview.");
     assert.equal(initial.renders, 0, "Adding inline controls must not turn old history into live generation.");
     assert.deepEqual(initial.code, [skillHelper, oldHelper], "Inline controls must preserve exact helper text.");
-    await page.evaluate(`document.querySelector(${JSON.stringify(inlineSelector)}).shadowRoot.querySelector("button").click()`);
+    await page.evaluate(`document.querySelector(${JSON.stringify(`${inlineSelector}[data-drawio-preview-position="end"]`)}).shadowRoot.querySelector("button").click()`);
     await page.evaluate("new Promise((resolve) => setTimeout(resolve, 300))");
     assert.equal(await page.evaluate(`Number(document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)})?.dataset.renderCount || 0)`), 0,
       "Host-page synthetic Preview clicks must not render historical XML.");
 
-    await trustedInlineDrawioPreview(page, "inline-history-first");
+    await trustedInlineDrawioPreview(page, "inline-history-first", "end");
     await waitForInlineDrawioTitle(page, "Historical Draw.io first");
     await trustedDrawioAction(page, "close");
     const firstRenderCount = await page.evaluate(`Number(document.getElementById(${JSON.stringify(DRAWIO_PREVIEW_ID)}).dataset.renderCount)`);
@@ -5977,7 +5977,7 @@ async function runDrawioInlinePreviewE2E(debugPort) {
     await trustedDrawioAction(page, "close");
 
     await page.evaluate(`appendAssistantToolCall(${JSON.stringify(drawioHelper(newerXml, "inline-history-second"))}, "text")`);
-    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 2`, "distinct Preview controls for both historical diagrams");
+    await waitForEvaluate(page, `document.querySelectorAll(${JSON.stringify(inlineSelector)}).length === 4`, "start and end Preview controls for both historical diagrams");
     await waitForInlineDrawioTitle(page, "Historical Draw.io second");
     await trustedDrawioAction(page, "close");
     await trustedInlineDrawioPreview(page, "inline-history-second");
@@ -5987,7 +5987,7 @@ async function runDrawioInlinePreviewE2E(debugPort) {
     await waitForInlineDrawioTitle(page, "Historical Draw.io first");
     await page.evaluate(`document.getElementById("thread").appendChild(document.createElement("span")); new Promise((resolve) => setTimeout(resolve, 2600))`);
     await waitForInlineDrawioTitle(page, "Historical Draw.io first");
-    assert.equal(await page.evaluate(`document.querySelectorAll(${JSON.stringify(inlineSelector)}).length`), 2,
+    assert.equal(await page.evaluate(`document.querySelectorAll(${JSON.stringify(inlineSelector)}).length`), 4,
       "Repeated scans must not duplicate Preview controls or override an explicitly selected earlier diagram.");
 
     await appendLiveAssistantHelper(page, drawioHelper(drawioXml("Fresh automatic Draw.io", "Live generation resumes automatic preview"), "inline-live-latest"));
@@ -6016,10 +6016,11 @@ async function waitForInlineDrawioTitle(page, title) {
   })()`, `inline Preview for ${title}`);
 }
 
-async function trustedInlineDrawioPreview(page, identity) {
+async function trustedInlineDrawioPreview(page, identity, position = "start") {
   const point = await page.evaluate(`(() => {
     const host = Array.from(document.querySelectorAll(".ai-chat-shell-exec-drawio-inline"))
-      .find((node) => node.shadowRoot?.querySelector("button")?.title === ${JSON.stringify(`Preview this Draw.io helper (${identity})`)});
+      .find((node) => node.getAttribute("data-drawio-preview-position") === ${JSON.stringify(position)} &&
+        node.shadowRoot?.querySelector("button")?.title.includes(${JSON.stringify(`(${identity})`)}));
     const button = host?.shadowRoot?.querySelector("button");
     if (!button) return null;
     button.scrollIntoView({ block: "center", behavior: "instant" });
@@ -6027,7 +6028,7 @@ async function trustedInlineDrawioPreview(page, identity) {
     const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
     return { x, y, hit: document.elementFromPoint(x, y) === host && host.shadowRoot.elementFromPoint(x, y) === button };
   })()`);
-  assert.ok(point?.hit, `Historical helper Preview must be a real pointer target: ${identity}; ${JSON.stringify(point)}`);
+  assert.ok(point?.hit, `Historical helper ${position} Preview must be a real pointer target: ${identity}; ${JSON.stringify(point)}`);
   for (const type of ["mousePressed", "mouseReleased"]) {
     await page.send("Input.dispatchMouseEvent", { type, x: point.x, y: point.y, button: "left", clickCount: 1 });
   }
