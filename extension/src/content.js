@@ -26,6 +26,9 @@ const STATUS_TEXT_ID = "ai-chat-shell-exec-status-text";
 const STATUS_INDICATOR_ID = "ai-chat-shell-exec-status-indicator";
 const STATUS_DETAIL_ID = "ai-chat-shell-exec-status-detail";
 const ADVANCED_CONTROLS_ID = "ai-chat-shell-exec-advanced-controls";
+const drawioPreviewButtons = new Map();
+let manualDrawioSelection = null;
+let drawioPreviewClickSequence = 0;
 const DRAWIO_CONTEXT_ACTION_ID = "ai-chat-shell-exec-drawio-action";
 const DEBUG_BODY_ID = "ai-chat-shell-exec-debug-body";
 const PENDING_AGENT_DELIVERY_ID = "ai-chat-shell-exec-agent-pending";
@@ -311,6 +314,7 @@ function deactivateExtension() {
   document.getElementById(STATUS_ID)?.remove();
   document.getElementById(SKILL_CATALOG_DIALOG_ID)?.remove();
   skillInstallErrors.clear();
+  clearDrawioPreviewButtons();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
 }
@@ -915,6 +919,7 @@ async function scanForShellCall(options = {}) {
       return;
     }
   }
+  syncDrawioPreviewButtons(allCandidates);
   const hasDrawioCandidate = allCandidates.some((entry) => isDrawioHelperCall(entry.call));
   const hasSkillCandidate = allCandidates.some((entry) => isSkillHelperCall(entry.call));
 
@@ -1421,6 +1426,7 @@ function beginPageLifecycle(options = {}) {
     commitActiveRunnableCallRouteHandoff(activeRunnableCallRouteHandoff);
   }
   updateContextualPanelActions();
+  clearDrawioPreviewButtons();
   globalThis.AiChatDrawioPreview?.resetForPage?.();
   updateDrawioContextAction();
 
@@ -5022,7 +5028,122 @@ function getLastActionableSkillCandidate(allCandidates, root = null) {
     : candidate;
 }
 
+// Empty light-DOM hosts keep controls out of helper text, copy operations and
+// generation evidence. Never split or rewrite the host's rendered code nodes.
+function clearDrawioPreviewButtons() {
+  drawioPreviewClickSequence += 1;
+  manualDrawioSelection = null;
+  for (const entry of drawioPreviewButtons.values()) entry.host.remove();
+  drawioPreviewButtons.clear();
+}
+
+function getPreviewableDrawioCandidates(allCandidates) {
+  return allCandidates.filter((candidate) =>
+    isDrawioHelperCall(candidate.call) &&
+    getMessageAuthorRole(candidate.node) !== "user" &&
+    !isM365SubmittedUserMessageNode(candidate.node) &&
+    isVisibleElement(candidate.textRoot || candidate.node)
+  );
+}
+
+function syncDrawioPreviewButtons(allCandidates) {
+  const retained = new Set();
+  const candidates = getPreviewableDrawioCandidates(allCandidates);
+  for (const candidate of candidates) {
+    const snapshot = createRenderedHelperCandidateSnapshot(candidate);
+    const key = buildCandidateCallKey(candidate, snapshot.semanticCallKey);
+    retained.add(key);
+    const siblings = candidates.filter((entry) => entry.textRoot === candidate.textRoot);
+    const buttonText = siblings.length > 1 ? `Preview ${siblings.indexOf(candidate) + 1}` : "Preview";
+    const existing = drawioPreviewButtons.get(key);
+    if (existing?.host.isConnected &&
+        isRenderedHelperCandidateSnapshotCurrent(existing.snapshot, candidate)) {
+      existing.button.textContent = buttonText;
+      continue;
+    }
+    existing?.host.remove();
+    const anchor = candidate.textRoot || candidate.node;
+    if (!anchor?.parentElement) continue;
+    const host = document.createElement("span");
+    host.className = "ai-chat-shell-exec-drawio-inline";
+    const shadow = host.attachShadow({ mode: "open" });
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = buttonText;
+    const label = candidate.call.helperIdSource === "marker"
+      ? candidate.call.helperId : `diagram ${candidates.indexOf(candidate) + 1}`;
+    button.title = `Preview this Draw.io helper (${label})`;
+    button.setAttribute("aria-label", button.title);
+    button.style.cssText = "all:initial;display:inline-block;box-sizing:border-box;margin:4px 6px 4px 0;padding:5px 10px;border:1px solid #315782;border-radius:6px;background:#1e3a5f;color:#dbeafe;font:600 12px/1.4 system-ui;cursor:pointer";
+    button.addEventListener("click", (event) => {
+      if (event.isTrusted !== true) return;
+      event.preventDefault();
+      event.stopPropagation();
+      previewDrawioCandidate(snapshot, event).catch((error) => {
+        console.error("[AI Chat Draw.io] Manual preview failed.", error);
+      });
+    });
+    shadow.appendChild(button);
+    // A pre's first child puts Preview immediately above the helper marker.
+    // Multiple helpers in one text root retain distinct labelled buttons.
+    const pre = anchor.closest?.("pre");
+    if (pre) {
+      const firstContent = Array.from(pre.childNodes).find((node) =>
+        !node.classList?.contains("ai-chat-shell-exec-drawio-inline"));
+      pre.insertBefore(host, firstContent || null);
+    } else anchor.parentElement.insertBefore(host, anchor);
+    drawioPreviewButtons.set(key, { host, button, snapshot });
+  }
+  for (const [key, entry] of drawioPreviewButtons) {
+    if (retained.has(key)) continue;
+    entry.host.remove();
+    drawioPreviewButtons.delete(key);
+  }
+}
+
+function findManualDrawioCandidate(snapshot) {
+  if (snapshot.pageIdentity !== getCurrentPageIdentity() ||
+      snapshot.generation !== pageLifecycleGeneration) return null;
+  return getPreviewableDrawioCandidates(extractShellCallCandidates(getConversationRoot()))
+    .find((candidate) => isRenderedHelperCandidateSnapshotCurrent(snapshot, candidate)) || null;
+}
+
+async function previewDrawioCandidate(snapshot, event) {
+  if (event?.isTrusted !== true || !extensionActive || refreshPageLifecycle() ||
+      !findManualDrawioCandidate(snapshot)) return false;
+  const sequence = ++drawioPreviewClickSequence;
+  const settings = await chrome.storage.sync.get(["enabled", "enabledHosts"]);
+  refreshPageLifecycle();
+  const candidate = findManualDrawioCandidate(snapshot);
+  if (sequence !== drawioPreviewClickSequence || !extensionActive ||
+      settings.enabled === false || !isCurrentHostEnabled(settings.enabledHosts) || !candidate) return false;
+  const preview = globalThis.AiChatDrawioPreview;
+  if (!preview?.consider) return false;
+  const latest = getPreviewableDrawioCandidates(extractShellCallCandidates(getConversationRoot())).at(-1);
+  const latestSemanticKey = buildSemanticCallKey(latest?.call);
+  const selection = manualDrawioSelection &&
+    manualDrawioSelection.latestSemanticKey === latestSemanticKey &&
+    isRenderedHelperCandidateSnapshotCurrent(manualDrawioSelection.snapshot, candidate)
+    ? manualDrawioSelection : { latestSemanticKey, snapshot };
+  manualDrawioSelection = selection;
+  const isCurrent = () => manualDrawioSelection === selection &&
+    extensionActive && Boolean(findManualDrawioCandidate(snapshot));
+  // Manual historical previews are wholly local, including errors. They never
+  // unmark baseline helpers, load Skills, or enqueue a reply to an old turn.
+  const rendering = preview.consider({ xml: candidate.call.xml, isCurrent });
+  preview.reopen();
+  const result = await rendering;
+  if (!isCurrent() || result?.cancelled) return false;
+  updateDrawioContextAction();
+  return result?.ok === true;
+}
+
 function processLatestDrawioCandidates(allCandidates) {
+  if (manualDrawioSelection) {
+    const latest = getPreviewableDrawioCandidates(allCandidates).at(-1);
+    if (buildSemanticCallKey(latest?.call) === manualDrawioSelection.latestSemanticKey) return;
+    manualDrawioSelection = null;
+  }
   const preview = globalThis.AiChatDrawioPreview;
   if (!preview?.validateDrawioXml || !preview?.consider) {
     console.error("[AI Chat Draw.io] Preview runtime is unavailable.");

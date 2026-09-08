@@ -224,6 +224,9 @@
   }
 
   function consider(candidate) {
+    if (candidate?.isCurrent && !candidate.isCurrent()) {
+      return Promise.resolve({ ok: false, cancelled: true });
+    }
     const xml = String(candidate?.xml || "");
     const validation = candidate?.validation?.ok === true
       ? candidate.validation
@@ -239,7 +242,9 @@
       return Promise.resolve(result);
     }
     if (pendingArtifactId === artifactId) {
+      activeStage?.setIsCurrent(candidate?.isCurrent);
       updateHostDiagnostics();
+      if (candidate?.isCurrent && activeStage) return activeStage.promise;
       return Promise.resolve({ ok: true, unchanged: true, artifactId });
     }
     if (currentArtifact?.artifactId === artifactId) {
@@ -298,7 +303,8 @@
       title: validation.title,
       byteLength: validation.byteLength,
       pageCount: validation.pageCount,
-      candidateKey
+      candidateKey,
+      isCurrent: candidate?.isCurrent
     });
     return activeStage.promise;
   }
@@ -351,7 +357,21 @@
       resolvePromise({ ok: false, cancelled: true, error: reason, artifactId: artifact.artifactId });
     }
 
+    function cancelStaleManualPreview() {
+      if (!artifact.isCurrent || artifact.isCurrent()) return false;
+      const ownsStage = activeStage?.generation === artifact.generation;
+      cancel("manual preview source changed", { log: false });
+      if (ownsStage) {
+        activeStage = null;
+        setPreviewState(currentArtifact ? "ready" : "idle");
+        setPreviewStatus("Preview cancelled because its helper changed. Click Preview again.");
+        updateHostDiagnostics();
+      }
+      return true;
+    }
+
     function fail(message) {
+      if (cancelStaleManualPreview()) return;
       if (settled) {
         return;
       }
@@ -394,6 +414,7 @@
     }
 
     function mountPreparedViewerAttempt(embedStrategy) {
+      if (cancelStaleManualPreview()) return;
       if (settled) {
         return;
       }
@@ -468,6 +489,7 @@
     }
 
     function succeed(message) {
+      if (cancelStaleManualPreview()) return;
       if (settled) {
         return;
       }
@@ -570,7 +592,8 @@
       generation: artifact.generation,
       get layer() { return layer; },
       promise,
-      cancel
+      cancel,
+      setIsCurrent(guard) { artifact.isCurrent = guard; }
     };
   }
 
