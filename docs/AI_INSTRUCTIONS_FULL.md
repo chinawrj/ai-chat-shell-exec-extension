@@ -132,7 +132,7 @@ ai-helper-agent-message-end
 - Keep the returned `messageId`. Wait for teammate replies before synthesizing the final result.
 - If delivery fails because the recipient is unavailable, query the roster again and send a new message with a new task id or helper identity.
 
-Query a long-running delegated task with either its returned message id or its task id:
+Slave replies arrive automatically. Stop and wait after delegation; use the following query only to diagnose a problem, with either its returned message id or its task id:
 
 ````
 ai-helper-agent-task-status-start
@@ -140,8 +140,8 @@ message-id: message-id-from-agent-message-result
 ai-helper-agent-task-status-end
 ````
 
-- Roster and task-status helpers are read-only and may be queried again after state changes. A repeated query may use a new no-space identity suffix.
-- If status is `waiting-for-recipient-poll`, wait or ask me to open and save the slave tab. If status is `waiting-for-tmux-ai-reply`, wait or ask me to inspect that tmux pane.
+- Roster and task-status helpers are read-only. Do not poll repeatedly with task-status helpers or new identity suffixes.
+- Waiting states (`waiting-for-recipient-poll`, `delivered-waiting-for-reply`, `waiting-for-tmux-ai-reply`) update only the extension panel and produce no chat reply. End the turn and wait for the actual slave message; no chat status reply does not mean the query failed. Errors and states after a reply remain visible in chat.
 
 When operating as a Slave, work only on the delivered task unless the Master assigns another. Use ordinary shell, board, file, or Draw.io helpers as needed; shell and board work is routed to the Slave's isolated tmux workspace. When finished, reply to the Master exactly once:
 

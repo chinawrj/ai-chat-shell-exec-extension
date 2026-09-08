@@ -645,18 +645,84 @@ async function main() {
   })()`, "agent roster helper result from master tab");
   assert.match(rosterHelperText, /Agent roster result:/);
 
-  const statusHelperId = `status-e2e-${Date.now()}`;
-  await appendLiveAssistantHelper(masterPage, [
-    `ai-helper-agent-task-status-start:${statusHelperId}`,
-    `task-id: ${helperAgentTaskId}`,
-    "ai-helper-agent-task-status-end"
-  ].join("\n"));
-  const statusHelperText = await waitForEvaluateValue(masterPage, `(() => {
-    const text = document.body.innerText || "";
-    return text.includes("Agent task status result:") &&
-      text.includes(${JSON.stringify(`task-id: ${helperAgentTaskId}`)}) ? text : "";
-  })()`, "agent task-status helper result from master tab");
-  assert.match(statusHelperText, /Agent task status result:/);
+  await waitForEvaluate(masterPage, `(() => {
+    const submitted = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .some((node) => (node.innerText || "").includes("Agent roster result:"));
+    return submitted && !(document.getElementById("composer")?.innerText || "").trim();
+  })()`, "roster submission before task waiting regression");
+  await installContentRuntimeMessageCounter(masterPage);
+  const waitingUserMessagesBefore = await masterPage.evaluate(`(() => {
+    window.__agentWaitingComposerMutations = 0;
+    window.__agentWaitingComposerObserver = new MutationObserver((records) => {
+      window.__agentWaitingComposerMutations += records.length;
+    });
+    window.__agentWaitingComposerObserver.observe(document.getElementById("composer"), {
+      childList: true, subtree: true, characterData: true
+    });
+    return Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+      .map((node) => node.innerText || "");
+  })()`);
+  const statusQueryCountBefore = await contentRuntimeMessageCount(masterPage, "agent-task-status");
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await appendLiveAssistantHelper(masterPage, [
+      `ai-helper-agent-task-status-start:status-waiting-e2e-${attempt}`,
+      `task-id: ${helperAgentTaskId}`,
+      "ai-helper-agent-task-status-end"
+    ].join("\n"));
+    await waitFor(async () => {
+      const count = await contentRuntimeMessageCount(masterPage, "agent-task-status");
+      const state = await contentHelperDeliveryState(masterPage, "agent-task-status");
+      return count === statusQueryCountBefore + attempt && !state.activeCallId && state.pending === 0;
+    }, `waiting task-status query ${attempt} completes without queued delivery`);
+    await waitForEvaluate(masterPage, `(() => {
+      const text = document.getElementById(${JSON.stringify(EXTENSION_STATUS_ID)})?.innerText || "";
+      return text.includes(${JSON.stringify(helperAgentTaskId)}) &&
+        text.includes("waiting for the slave reply");
+    })()`, `waiting task-status query ${attempt} stays in plugin panel`);
+  }
+  const waitingState = await masterPage.evaluate(`(() => {
+    window.__agentWaitingComposerObserver.disconnect();
+    return {
+      composer: document.getElementById("composer")?.innerText || "",
+      mutations: window.__agentWaitingComposerMutations,
+      users: Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .map((node) => node.innerText || "")
+    };
+  })()`);
+  assert.equal(waitingState.composer, "", "Unfinished slave status must not fill the master composer.");
+  assert.equal(waitingState.mutations, 0, "Even transient composer writes are forbidden for waiting status.");
+  assert.deepEqual(waitingState.users, waitingUserMessagesBefore,
+    "Repeated queries for an unfinished slave task must not submit waiting messages.");
+
+  const waitingTask = await sendLocalAgentRequest(masterPage, {
+    type: "agent-task-status", agentId: "master", taskId: helperAgentTaskId
+  });
+  assert.equal(waitingTask.ok, true, JSON.stringify(waitingTask));
+  assert.ok(!waitingTask.replyMessage, "The waiting regression must run before any slave response exists.");
+  const completedSlaveBody = `slave completed after three silent status queries ${helperAgentTaskId}`;
+  const completedSlaveReply = await sendLocalAgentRequest(page, {
+    type: "agent-send",
+    from: "slave-a",
+    to: "master",
+    taskId: helperAgentTaskId,
+    replyTo: waitingTask.message.messageId,
+    body: completedSlaveBody
+  });
+  assert.equal(completedSlaveReply.ok, true, JSON.stringify(completedSlaveReply));
+  await waitForEvaluate(masterPage, `(() => {
+    const messages = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    return messages.filter((node) => (node.innerText || "").includes(${JSON.stringify(completedSlaveBody)})).length === 1 &&
+      !(document.getElementById("composer")?.innerText || "").trim();
+  })()`, "actual slave response is submitted once after silent waiting queries");
+  await waitFor(async () => {
+    const status = await sendLocalAgentRequest(masterPage, {
+      type: "agent-task-status", agentId: "master", taskId: helperAgentTaskId
+    });
+    return status.ok && status.status === "replied-and-acked";
+  }, "actual slave response is acknowledged after submission");
+  await masterPage.evaluate("new Promise((resolve) => setTimeout(resolve, 2500))");
+  assert.equal(await pageUserMessageCount(masterPage), waitingUserMessagesBefore.length + 1,
+    "A real slave response remains deliverable once, without revived waiting messages or duplicate polling writes.");
 
   const tmuxAiTaskId = `task-tmux-ai-e2e-${Date.now()}`;
   const tmuxAiBody = `tmux AI agent task delivered from browser e2e ${tmuxAiTaskId}`;

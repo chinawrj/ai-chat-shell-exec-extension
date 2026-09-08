@@ -1193,7 +1193,8 @@ async function testAgentMessageOutputExplainsTmuxAiDelivery() {
   assert.match(output, /replyCommand: sh '\/tmp\/agent-replies\/msg-001-slave-tmux-reply\.sh'/);
   assert.match(output, /nextStep: Write final answer/);
   assert.match(output, /statusMessageId: msg-001/);
-  assert.match(output, /statusAction: Ask for an agent task-status query/);
+  assert.match(output, /statusAction: The slave reply will arrive automatically/);
+  assert.match(output, /Wait without repeated task-status queries/);
   assert.doesNotMatch(output, /^ai-helper-agent-task-status-start$/m);
   assert.doesNotMatch(output, /^ai-helper-agent-task-status-end$/m);
 }
@@ -1296,62 +1297,173 @@ async function testAgentRosterHelperRequiresRegisteredPage() {
   assert.match(replyText, /Current page is not configured as an agent/);
 }
 
-async function testAgentTaskStatusHelperDispatchesAndFormatsNextAction() {
+function createTaskStatusDeliveryHarness() {
   const context = loadContentContext();
+  const writes = [];
+  const statuses = [];
   const sentMessages = [];
-  let replyText = "";
-  let submittedCount = 0;
+  const submissions = new Map();
+  let sendCount = 0;
   context.getCurrentAgentProfile = async () => ({ role: "master", agentId: "master" });
-  context.setStatus = () => {};
-  context.countSubmittedMessagesMatching = () => submittedCount;
+  context.setStatus = (text, state) => statuses.push({ text, state });
+  context.countSubmittedMessagesMatching = (text) => submissions.get(text) || 0;
   context.insertReply = async (text) => {
-    replyText = text;
+    writes.push(text);
     return mockComposerWithText(text);
   };
   context.clickSendWhenReady = async () => {
-    submittedCount = 1;
+    sendCount += 1;
+    const text = writes.at(-1);
+    submissions.set(text, (submissions.get(text) || 0) + 1);
     return true;
   };
   context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend: true });
-  context.chrome.runtime.sendMessage = async (payload) => {
-    sentMessages.push(payload);
-    if (payload.type === "agent-task-status") {
-      return {
-        ok: true,
-        agentId: "master",
-        status: "waiting-for-tmux-ai-reply",
-        ageMs: 5000,
-        nextAction: "Keep the tmux-ai pane running.",
-        message: {
-          messageId: "msg-001",
-          taskId: "task-001",
-          from: "master",
-          to: "slave-tmux",
-          deliverySurface: "tmux-ai",
-          replyMode: "cli"
-        }
-      };
-    }
-    throw new Error(`Unexpected message type: ${payload.type}`);
-  };
-
   const call = context.parseCallPayload([
     "ai-helper-agent-task-status-start",
     "message-id: msg-001",
     "ai-helper-agent-task-status-end"
   ].join("\n"));
-  await context.runAndReply("call-status", call);
+  const response = {
+    ok: true,
+    agentId: "master",
+    status: "waiting-for-tmux-ai-reply",
+    ageMs: 5000,
+    nextAction: "Keep the tmux-ai pane running.",
+    message: {
+      messageId: "msg-001",
+      taskId: "task-001",
+      from: "master",
+      to: "slave-tmux",
+      deliverySurface: "tmux-ai",
+      replyMode: "cli"
+    }
+  };
+  context.chrome.runtime.sendMessage = async (payload) => {
+    sentMessages.push(payload);
+    assert.equal(payload.type, "agent-task-status");
+    return response;
+  };
+  return { context, writes, statuses, sentMessages, call, response, getSendCount: () => sendCount };
+}
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0].type, "agent-task-status");
-  assert.equal(sentMessages[0].agentId, "master");
-  assert.equal(sentMessages[0].messageId, "msg-001");
-  assert.equal(sentMessages[0].taskId, "");
-  assert.match(replyText, /Agent task status result/);
-  assert.match(replyText, /status: waiting-for-tmux-ai-reply/);
-  assert.match(replyText, /delivery: tmux-ai/);
-  assert.match(replyText, /replyMode: cli/);
-  assert.match(replyText, /nextAction: Keep the tmux-ai pane running/);
+async function testWaitingAgentTaskStatusIsPanelOnlyAcrossRepeatedQueriesAndForce() {
+  for (const status of ["waiting-for-recipient-poll", "delivered-waiting-for-reply", "waiting-for-tmux-ai-reply"]) {
+    for (const autoSend of [true, false]) {
+      const h = createTaskStatusDeliveryHarness();
+      h.response.status = status;
+      h.context.chrome.storage.sync.get = async () => ({ requireApproval: false, autoSend });
+      h.context.isForceRunCandidateSnapshotCurrent = () => true;
+      // Separate new helpers for one still-running task must not restart a chat loop.
+      for (let i = 0; i < 3; i += 1) {
+        const result = await h.context.runAndReply(`waiting-${i}`, { ...h.call, helperId: `query-${i}` }, { force: i === 2 });
+        assert.equal(result.panelOnly, true);
+        assert.equal(result.retryable, false);
+        assert.equal(vm.runInContext("activeCallId", h.context), "", "Waiting must release backend ownership.");
+      }
+      assert.equal(h.sentMessages.length, 3);
+      assert.ok(h.sentMessages.every((message) => message.agentId === "master" && message.messageId === "msg-001"));
+      assert.deepEqual(h.writes, [], `${status} must not touch the composer, even with autoSend=${autoSend}.`);
+      assert.equal(h.getSendCount(), 0);
+      assert.equal(vm.runInContext("pendingHelperDeliveries.size", h.context), 0);
+      assert.deepEqual(h.context.__localStore, {}, "Waiting must not create a reloadable output or presentation receipt.");
+      assert.equal(h.statuses.at(-1).state, "idle");
+      assert.ok(h.statuses.at(-1).text.includes(status));
+      assert.match(h.statuses.at(-1).text, /task-001.*waiting for the slave reply/);
+    }
+  }
+}
+
+async function testNonWaitingAndFailedAgentTaskStatusStillReachChat() {
+  for (const status of ["reply-waiting-for-master", "replied-waiting-for-master", "reply-acked", "replied-and-acked", "future-status"]) {
+    const h = createTaskStatusDeliveryHarness();
+    h.response.status = status;
+    await h.context.runAndReply("completed-status", h.call);
+    assert.equal(h.writes.length, 1, `${status} must retain status delivery.`);
+    assert.ok(h.writes[0].includes(`status: ${status}`));
+    assert.match(h.writes[0], /Agent task status result/);
+    assert.match(h.writes[0], /messageId: msg-001/);
+    assert.equal(h.getSendCount(), 1);
+  }
+  for (const transportFailure of [false, true]) {
+    const h = createTaskStatusDeliveryHarness();
+    h.response.ok = false;
+    h.response.error = "Task could not be inspected";
+    if (transportFailure) h.context.chrome.runtime.sendMessage = async () => { throw new Error("Task could not be inspected"); };
+    await h.context.runAndReply("failed-status", h.call);
+    assert.equal(h.writes.length, 1, "Query failures must remain visible to the AI.");
+    assert.match(h.writes[0], /Agent task status query failed/);
+    assert.match(h.writes[0], /Task could not be inspected/);
+    assert.equal(h.getSendCount(), 1);
+  }
+}
+
+async function testWaitingStatusDoesNotBlockActualSlaveReply() {
+  const { handleAgentHubMessage, resetAgentHubForTests } = require("../server/shell_server");
+  resetAgentHubForTests();
+  try {
+    for (const role of ["master", "slave"]) {
+      assert.equal(handleAgentHubMessage({ type: "agent-register", agentId: role, role }).ok, true);
+    }
+    assert.equal(handleAgentHubMessage({
+      type: "agent-send", from: "master", to: "slave", messageId: "msg-001", taskId: "task-001", body: "Work until complete."
+    }).ok, true);
+    assert.equal(handleAgentHubMessage({ type: "agent-ack", agentId: "slave", messageId: "msg-001" }).ok, true);
+    const h = createTaskStatusDeliveryHarness();
+    h.context.chrome.runtime.sendMessage = async (payload) => {
+      h.sentMessages.push(payload);
+      return handleAgentHubMessage(payload);
+    };
+    for (let i = 0; i < 3; i += 1) {
+      await h.context.runAndReply(`live-waiting-${i}`, h.call);
+      await h.context.pollAndDeliverAgentMessage();
+    }
+    assert.deepEqual(h.writes, [], "An executing slave with no response must produce no Master chat writes.");
+    assert.equal(h.getSendCount(), 0);
+    assert.equal(handleAgentHubMessage({
+      type: "agent-send", from: "slave", to: "master", taskId: "task-001", replyTo: "msg-001",
+      messageId: "actual-reply", body: "Task complete: verified result."
+    }).ok, true);
+    await h.context.pollAndDeliverAgentMessage();
+    await h.context.pollAndDeliverAgentMessage();
+    assert.equal(h.writes.length, 1);
+    assert.match(h.writes[0], /Message id: actual-reply/);
+    assert.match(h.writes[0], /Task complete: verified result/);
+    assert.equal(h.getSendCount(), 1);
+    assert.equal(h.sentMessages.filter((message) => message.type === "agent-ack").length, 1);
+    assert.equal(handleAgentHubMessage({ type: "agent-poll", agentId: "master" }).messages.length, 0);
+  } finally {
+    resetAgentHubForTests();
+  }
+}
+
+async function testReloadDropsOnlyUnwrittenLegacyWaitingStatus() {
+  const h = createTaskStatusDeliveryHarness();
+  const identity = h.context.getCurrentPageIdentity();
+  const key = h.context.pendingHelperDeliveryStorageKey();
+  const reply = h.context.formatAgentTaskStatusOutput(h.call, h.response, "unused");
+  const makeEntry = (callId, overrides = {}) => ({
+    callId, kind: "agent-task-status", call: { ...h.call }, response: { ok: true }, reply,
+    pageIdentity: identity, phase: "queued", createdAt: Date.now(), updatedAt: Date.now(), ...overrides
+  });
+  const entries = [
+    ...["waiting-for-recipient-poll", "delivered-waiting-for-reply", "waiting-for-tmux-ai-reply"].map((status) =>
+      makeEntry(status, { reply: h.context.formatAgentTaskStatusOutput(h.call, { ...h.response, status }, "unused") })),
+    makeEntry("inserted", { phase: "inserted" }),
+    makeEntry("unconfirmed", { phase: "submitted-unconfirmed" }),
+    makeEntry("submitted", { phase: "submitted" }),
+    makeEntry("failed", { response: { ok: false } }),
+    makeEntry("completed", { reply: h.context.formatAgentTaskStatusOutput(h.call, { ...h.response, status: "replied-waiting-for-master" }, "unused") }),
+    makeEntry("unrelated", { kind: "shell", call: { kind: "shell", cmd: "printf waiting" } }),
+    makeEntry("extra-content", { reply: `${reply}\nUnrelated content must not be discarded.` })
+  ];
+  h.context.__localStore[key] = { version: 1, pageIdentity: identity, entries, presentedExecutions: [] };
+  await h.context.loadPendingHelperDeliveriesForCurrentPage();
+  const expected = ["inserted", "unconfirmed", "submitted", "failed", "completed", "unrelated", "extra-content"];
+  assert.deepEqual(Array.from(vm.runInContext("pendingHelperDeliveries.keys()", h.context)), expected);
+  assert.deepEqual(Array.from(h.context.__localStore[key].entries, (entry) => entry.callId), expected);
+  assert.deepEqual(h.writes, [], "Migration must not edit or send an existing composer.");
+  assert.equal(h.getSendCount(), 0);
+  assert.deepEqual(h.sentMessages, [], "Migration must not query the backend or claim presentation.");
 }
 
 async function testAgentSetupCheckExplainsMissingSlave() {
@@ -1584,7 +1696,10 @@ async function waitFor(predicate, label) {
   await testAgentMessageFailureOutputShowsNextAction();
   await testAgentRosterHelperDispatchesAndFormatsSlaveCapabilities();
   await testAgentRosterHelperRequiresRegisteredPage();
-  await testAgentTaskStatusHelperDispatchesAndFormatsNextAction();
+  await testWaitingAgentTaskStatusIsPanelOnlyAcrossRepeatedQueriesAndForce();
+  await testNonWaitingAndFailedAgentTaskStatusStillReachChat();
+  await testWaitingStatusDoesNotBlockActualSlaveReply();
+  await testReloadDropsOnlyUnwrittenLegacyWaitingStatus();
   await testAgentSetupCheckExplainsMissingSlave();
   await testAgentSetupCheckAcceptsWebSlave();
   await testAgentSetupCheckExplainsTmuxAiReadyState();

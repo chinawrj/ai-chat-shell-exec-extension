@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.11.22] - 2026-09-08
+
+- Stops Master chat loops while a Slave is still working: successful task-status queries in the three unreplied states update only the extension panel, including repeated queries and Force run. Actual Slave replies, query errors, and states after a reply retain normal delivery.
+- Removes only unwritten queued waiting-status outputs from older local snapshots on refresh, preserving existing composer ownership and unrelated outputs.
+- Updates Master instructions and task receipts to wait for automatic Slave replies instead of repeatedly querying task status.
+- Adds positive and negative regressions for all waiting states, Force and auto-send settings, completed/error responses, legacy queue recovery, and actual reply delivery. Real Chrome coverage checks three successive status queries produce zero composer mutations or chat submissions, followed by one real reply and acknowledgement.
+
 ## [0.11.21] - 2026-09-08
 
 - Adds a second trusted-click **Preview** control below every complete non-user Draw.io helper, complementing the existing control above the helper. Both controls bind to the same exact candidate and preserve the existing local-only preview, ownership, and safety behavior.

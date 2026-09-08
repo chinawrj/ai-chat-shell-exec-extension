@@ -378,7 +378,7 @@ Specific task instructions for the slave.
 ai-helper-agent-message-end
 ````
 
-After sending a task, keep the returned messageId. If the task takes too long, query status with:
+After sending a task, keep the returned messageId and wait for the automatic slave reply. Do not repeatedly query status; use this only to diagnose a problem:
 
 ````
 ai-helper-agent-task-status-start
@@ -427,7 +427,7 @@ message-id: msg-001
 ai-helper-agent-task-status-end
 ````
 
-Task-status output includes states such as `waiting-for-recipient-poll`, `delivered-waiting-for-reply`, `waiting-for-tmux-ai-reply`, and `replied-waiting-for-master`, plus a `nextAction`.
+Waiting task states (`waiting-for-recipient-poll`, `delivered-waiting-for-reply`, and `waiting-for-tmux-ai-reply`) update only the extension panel. They never fill or send the chat composer, including repeated queries and Force run. The Master should end its turn and wait for the actual slave reply, which is delivered automatically. Query errors and states after a reply, such as `replied-waiting-for-master`, still return chat output. On refresh, older queued waiting-status outputs are discarded locally; already-inserted text keeps its existing delivery ownership.
 
 Agent pages can send messages through the same hub:
 

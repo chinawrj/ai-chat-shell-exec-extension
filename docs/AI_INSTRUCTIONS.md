@@ -243,7 +243,7 @@ Specific task instructions for the slave.
 ai-helper-agent-message-end
 ````
 
-After the message result returns, keep the `messageId`. If the task takes too long, query status with exactly one helper block and no prose:
+After the message result returns, keep the `messageId`. Slave replies arrive automatically; stop and wait without repeated status queries. Use a status query only to diagnose a problem, with exactly one helper block and no prose:
 
 ````
 ai-helper-agent-task-status-start
@@ -259,8 +259,8 @@ Rules:
 - Ask different slaves to work on independent files or hypotheses to avoid conflicts.
 - Wait for messages from slaves before synthesizing final conclusions.
 - If an agent-message fails because the recipient is missing, run the roster helper again, choose an online slave, and resend with a new helper identity and task id.
-- Roster and task-status helpers are read-only and may be queried again when state changes or a task is long-running. If a repeated query is not executed, add a new identity suffix such as `ai-helper-agent-roster-start:2` or `ai-helper-agent-task-status-start:2`.
-- If status says `waiting-for-recipient-poll`, wait or ask the user to open/save that slave tab. If status says `waiting-for-tmux-ai-reply`, wait for the tmux AI or ask the user to inspect the tmux pane.
+- Roster and task-status helpers are read-only. Do not use task-status helpers as a polling loop, even with new identity suffixes.
+- The waiting states `waiting-for-recipient-poll`, `delivered-waiting-for-reply`, and `waiting-for-tmux-ai-reply` appear only in the extension panel and produce no chat reply. After such a query, end the turn and wait for the actual slave message; the absence of a chat status reply is not a reason to query again. Errors and states after a reply remain visible in chat.
 - If local shell output is needed in the master tab, use the normal shell helper block; it runs in the master's own agent tmux workspace when this page is configured as an agent.
 `````
 

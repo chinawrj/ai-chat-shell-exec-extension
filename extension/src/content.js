@@ -43,7 +43,7 @@ const SKILL_SYNC_POLL_INTERVAL_MS = 10000;
 const CHATGPT_COMPLETED_HELPER_EVIDENCE_MS = 8000;
 const FORCE_RUN_IDLE_TIMEOUT_MS = 20_000;
 const DEBUG_PROFILE_PREFIX = "panelDebugOpen:";
-const CONTENT_SCRIPT_VERSION = "0.11.21";
+const CONTENT_SCRIPT_VERSION = "0.11.22";
 const PANEL_STATE_THEME = Object.freeze({
   idle: Object.freeze({
     background: "#111827",
@@ -1634,6 +1634,7 @@ async function loadPendingHelperDeliveriesForCurrentPage() {
     }
     const entries = prunePendingHelperDeliveryEntries(snapshot.entries)
       .filter((entry) => !(entry.removeWhenQueuedAfterSkillSync === true && entry.phase === "queued"))
+      .filter((entry) => !isQueuedWaitingAgentTaskStatusDelivery(entry))
       .map((entry) => {
         const restored = { ...entry, restored: true };
         const storedSequence = Number(restored.creationSequence || 0);
@@ -7772,6 +7773,14 @@ async function runAndReply(callId, call, options = {}) {
       updateStopHelperButton(false);
     }
 
+    // A waiting status is local progress, not a new message for the AI. Sending
+    // it into the chat invites another status helper and creates a busy loop
+    // while the slave is still working. Its eventual reply arrives via polling.
+    if (isWaitingAgentTaskStatus(call, response)) {
+      setWaitingAgentTaskStatus(call, response);
+      return { retryable: false, response, panelOnly: true };
+    }
+
     let effectiveResponse = response;
     let recoveredUnpresentedResult = false;
     // Duplicate metadata is backend execution-control state, never model
@@ -9591,7 +9600,7 @@ function formatAgentMessageOutput(call, response, startedAt) {
     delivery.replyCommand ? `replyCommand: ${delivery.replyCommand}` : "",
     delivery.nextStep ? `nextStep: ${delivery.nextStep}` : "",
     `statusMessageId: ${message.messageId || response.messageId || ""}`,
-    "statusAction: Ask for an agent task-status query with this message id if progress needs checking.",
+    "statusAction: The slave reply will arrive automatically. Wait without repeated task-status queries; use a query only to diagnose a problem. Waiting states appear only in the extension panel.",
     `durationMs: ${response.durationMs || 0}`,
     "```"
   ].filter((line) => line !== "").join("\n");
@@ -9700,6 +9709,36 @@ function formatAgentsForShellOutput(agents) {
       return parts.filter(Boolean).join(" ");
     })
     .join("\n");
+}
+
+function isWaitingAgentTaskStatus(call, response) {
+  return isAgentTaskStatusHelperCall(call) && response?.ok === true &&
+    ["waiting-for-recipient-poll", "delivered-waiting-for-reply", "waiting-for-tmux-ai-reply"]
+      .includes(response.status);
+}
+
+function isQueuedWaitingAgentTaskStatusDelivery(entry) {
+  if (entry?.phase !== "queued" || entry.kind !== "agent-task-status" ||
+      !isAgentTaskStatusHelperCall(entry.call) || entry.response?.ok !== true) {
+    return false;
+  }
+  // Older snapshots did not retain response.status. Recognize only the exact
+  // generated status envelope; arbitrary helper output mentioning "waiting"
+  // must remain deliverable. Never change already-inserted composer ownership.
+  const match = /^Agent task status result:\n```shell-output\nagent-task-status\nagentId: [^\n]*\nstatus: ([^\n]+)\nageMs: \d+\nmessageId: [^\n]*(?:\n(?:task-id|from|to|delivery|replyMode|nextAction): [^\n]*)*\n```$/.exec(entry.reply || "");
+  return Boolean(match) && isWaitingAgentTaskStatus(entry.call, {
+    ok: true,
+    status: match[1]
+  });
+}
+
+function setWaitingAgentTaskStatus(call, response) {
+  const task = summarizeCommand(response.message?.taskId || call.taskId ||
+    response.message?.messageId || call.messageId || "task");
+  setStatus(`Agent task ${task}: ${response.status}; waiting for the slave reply`, "idle", {
+    owner: "helper-delivery",
+    ownerKey: buildSemanticCallKey(call)
+  });
 }
 
 function formatAgentTaskStatusOutput(call, response, startedAt) {
